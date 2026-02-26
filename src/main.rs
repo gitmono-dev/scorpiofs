@@ -2,7 +2,7 @@ use std::{ffi::OsStr, net::SocketAddr, sync::Arc};
 
 use clap::Parser;
 use rfuse3::raw::logfs::LoggingFileSystem;
-use scorpio::{
+use scorpiofs::{
     daemon::daemon_main,
     fuse::MegaFuse,
     manager::{fetch::CheckHash, ScorpioManager},

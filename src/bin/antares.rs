@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use clap::{Parser, Subcommand};
 use reqwest::blocking::Client;
-use scorpio::{
+use scorpiofs::{
     antares::{AntaresManager, AntaresPaths},
     daemon::antares::{AntaresDaemon, AntaresServiceImpl},
     util::config,
