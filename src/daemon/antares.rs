@@ -81,7 +81,7 @@ where
     }
 
     /// Run the HTTP server until it receives a shutdown signal.
-    /// Note: For graceful shutdown with mount cleanup, use AntaresDaemon<AntaresServiceImpl>.
+    /// Note: For graceful shutdown with mount cleanup, use `AntaresDaemon<AntaresServiceImpl>`.
     pub async fn serve(self, bind_addr: SocketAddr) -> Result<(), ApiError> {
         let router = self.router();
         let shutdown_timeout = self.shutdown_timeout;

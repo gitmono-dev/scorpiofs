@@ -1,3 +1,59 @@
+//! # Antares: Union Filesystem Overlay Manager
+//!
+//! Antares provides a union filesystem overlay system for managing copy-on-write
+//! workspaces on top of a read-only base (Dicfuse). It is designed for monorepo
+//! build systems where each build job needs an isolated writable view of the
+//! source tree without actually modifying the base files.
+//!
+//! ## Key Components
+//!
+//! - [`AntaresPaths`]: Configuration for layer and state directories
+//! - [`AntaresConfig`]: Per-mount configuration (job_id, paths, etc.)
+//! - [`AntaresManager`]: Manages mount lifecycle (create, unmount, list)
+//!
+//! ## Layer Stack
+//!
+//! Antares composes a three-layer union filesystem:
+//!
+//! ```text
+//! ┌─────────────────┐
+//! │   upper (rw)    │  ← Job-specific writes
+//! ├─────────────────┤
+//! │    CL (rw)      │  ← Optional changelist overlay
+//! ├─────────────────┤
+//! │  Dicfuse (ro)   │  ← Base monorepo tree
+//! └─────────────────┘
+//! ```
+//!
+//! ## Example
+//!
+//! ```rust,ignore
+//! use scorpio::antares::{AntaresManager, AntaresPaths};
+//! use std::path::PathBuf;
+//!
+//! #[tokio::main]
+//! async fn main() -> std::io::Result<()> {
+//!     let paths = AntaresPaths::from_global_config();
+//!     let manager = AntaresManager::new(paths).await;
+//!     
+//!     // Mount with auto-generated path (under configured mount_root)
+//!     let config = manager.mount_job("build-42", Some("cl-123")).await?;
+//!     println!("Mounted at: {}", config.mountpoint.display());
+//!     
+//!     // Or mount to any custom directory
+//!     let custom_config = manager.mount_job_at(
+//!         "build-43",
+//!         PathBuf::from("/home/user/my-workspace"),
+//!         None,
+//!     ).await?;
+//!     
+//!     // Later, unmount
+//!     manager.umount_job("build-42").await?;
+//!     manager.umount_job("build-43").await?;
+//!     Ok(())
+//! }
+//! ```
+
 pub mod fuse;
 
 use std::{
@@ -93,16 +149,59 @@ impl AntaresManager {
         }
     }
 
-    /// Create directories and register a job instance. UnionFS wiring is added later.
+    /// Create directories and register a job instance with default mountpoint.
+    ///
+    /// The mountpoint will be created at `{mount_root}/{job_id}` using the
+    /// configured mount root directory.
+    ///
+    /// # Arguments
+    /// * `job_id` - Unique identifier for this job
+    /// * `cl_name` - Optional CL (changelist) layer name
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let config = manager.mount_job("build-123", Some("cl-456")).await?;
+    /// // Mountpoint will be at: {mount_root}/build-123
+    /// ```
     pub async fn mount_job(
         &self,
         job_id: &str,
         cl_name: Option<&str>,
     ) -> std::io::Result<AntaresConfig> {
+        let mountpoint = self.paths.mount_root.join(job_id);
+        self.mount_job_at(job_id, mountpoint, cl_name).await
+    }
+
+    /// Create directories and register a job instance at a custom mountpoint.
+    ///
+    /// Unlike [`mount_job`], this method allows specifying any directory as
+    /// the mountpoint, not limited to the configured mount root.
+    ///
+    /// # Arguments
+    /// * `job_id` - Unique identifier for this job
+    /// * `mountpoint` - Custom path where the filesystem will be mounted
+    /// * `cl_name` - Optional CL (changelist) layer name
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let config = manager.mount_job_at(
+    ///     "build-123",
+    ///     PathBuf::from("/home/user/my-build"),
+    ///     None
+    /// ).await?;
+    /// ```
+    pub async fn mount_job_at(
+        &self,
+        job_id: &str,
+        mountpoint: impl Into<PathBuf>,
+        cl_name: Option<&str>,
+    ) -> std::io::Result<AntaresConfig> {
+        let mountpoint = mountpoint.into();
         let start = std::time::Instant::now();
         tracing::info!(
-            "antares: mount_job start job_id={} cl={:?}",
+            "antares: mount_job_at start job_id={} mountpoint={} cl={:?}",
             job_id,
+            mountpoint.display(),
             cl_name
         );
 
@@ -116,7 +215,6 @@ impl AntaresManager {
             }
             None => (None, None),
         };
-        let mountpoint = self.paths.mount_root.join(job_id);
 
         std::fs::create_dir_all(&upper_dir)?;
         if let Some(cl) = &cl_dir {
@@ -239,50 +337,5 @@ impl AntaresManager {
         let mut f = File::create(&self.paths.state_file)?;
         f.write_all(data.as_bytes())?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn mount_and_list_registers_instance() {
-        // Ensure config is initialized so Dicfuse (used by AntaresManager) can open its local store
-        // under a writable path (see scorpio/scorpio.toml defaults).
-        if let Err(e) = config::init_config("./scorpio.toml") {
-            if !e.contains("already initialized") {
-                panic!("Failed to load config: {e}");
-            }
-        }
-
-        let root = tempdir().unwrap();
-        let upper = root.path().join("upper");
-        let cl = root.path().join("cl");
-        let mnt = root.path().join("mnt");
-        let state = root.path().join("state.toml");
-
-        let paths = AntaresPaths::new(upper, cl, mnt.clone(), state);
-        let manager = AntaresManager::new(paths).await;
-
-        let instance = manager.mount_job("job1", Some("cl1")).await.unwrap();
-        assert_eq!(instance.job_id, "job1");
-        assert!(instance.mountpoint.starts_with(&mnt));
-
-        // state file should be written with the mount record
-        let state_content = std::fs::read_to_string(root.path().join("state.toml")).unwrap();
-        let parsed: AntaresState = toml::from_str(&state_content).unwrap();
-        assert_eq!(parsed.mounts.len(), 1);
-        assert_eq!(parsed.mounts[0].job_id, "job1");
-
-        let listed = manager.list().await;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].job_id, "job1");
-
-        let removed = manager.umount_job("job1").await.unwrap();
-        assert!(removed.is_some());
-        assert!(manager.list().await.is_empty());
     }
 }

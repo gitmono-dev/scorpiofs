@@ -2,6 +2,13 @@
 name = "scorpio"
 version = "0.1.0"
 edition = "2021"
+description = "FUSE-based virtual filesystem with Antares overlay for monorepo builds"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/web3infra-foundation/scorpiofs"
+documentation = "https://docs.rs/scorpio"
+keywords = ["fuse", "filesystem", "overlay", "monorepo", "build-system"]
+categories = ["filesystem", "development-tools::build-utils"]
+readme = "README.md"
 
 
 [lib]
