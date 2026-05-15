@@ -675,9 +675,7 @@ impl Filesystem for Dicfuse {
                 }));
             }
         }
-        Ok(ReplyDirectory {
-            entries: iter(d.into_iter()),
-        })
+        Ok(ReplyDirectory { entries: iter(d) })
     }
 
     async fn readdirplus<'a>(
@@ -797,9 +795,7 @@ impl Filesystem for Dicfuse {
                 }));
             }
         }
-        Ok(ReplyDirectoryPlus {
-            entries: iter(d.into_iter()),
-        })
+        Ok(ReplyDirectoryPlus { entries: iter(d) })
     }
 
     async fn create(
