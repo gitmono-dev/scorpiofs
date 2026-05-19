@@ -645,9 +645,7 @@ mod tests {
                 }
             }
 
-            Ok(ReplyDirectory {
-                entries: iter(out.into_iter()),
-            })
+            Ok(ReplyDirectory { entries: iter(out) })
         }
 
         async fn releasedir(
