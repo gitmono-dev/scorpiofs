@@ -21,6 +21,7 @@ use scorpiofs::{
     util::config,
 };
 use serial_test::serial;
+use std::io::Write;
 use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::time::{sleep, Duration};
@@ -412,6 +413,78 @@ async fn test_fuse_multiple_custom_mounts() {
 
         let _ = std::fs::remove_dir_all(&base);
         println!("✓ Test completed successfully");
+    };
+
+    match tokio::time::timeout(Duration::from_secs(120), test_future).await {
+        Ok(_) => println!("✓ Test passed"),
+        Err(_) => panic!("Test timed out"),
+    }
+}
+
+/// Test that appending to an existing file on an Antares FUSE mount succeeds.
+///
+/// This covers the reproduced regression where reopening an existing file with
+/// append mode could fail with `EBADF`.
+///
+/// Run with:
+///   sudo -E cargo test --test antares_test test_fuse_append_existing_file -- --exact --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+#[serial]
+async fn test_fuse_append_existing_file() {
+    let test_future = async {
+        init_config();
+
+        if !fuse_prereqs_available() {
+            return;
+        }
+
+        let test_id = Uuid::new_v4();
+        let base = PathBuf::from(format!("/tmp/antares_append_test_{test_id}"));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let mountpoint = base.join("workspace");
+        let paths = AntaresPaths::new(
+            base.join("upper"),
+            base.join("cl"),
+            base.join("mnt"),
+            base.join("state.toml"),
+        );
+        let manager = AntaresManager::new(paths).await;
+
+        let config = manager
+            .mount_job_at("append-test-job", mountpoint.clone(), None)
+            .await
+            .expect("mount_job_at should succeed");
+        sleep(Duration::from_millis(500)).await;
+
+        let file_path = config.mountpoint.join("event.jsonl");
+
+        std::fs::write(&file_path, b"{\"seq\":1}\n").expect("initial write should succeed");
+
+        let mut append_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .expect("opening existing file in append mode should succeed");
+        append_file
+            .write_all(b"{\"seq\":2}\n")
+            .expect("appending to existing file should succeed");
+        append_file
+            .flush()
+            .expect("flush after append should succeed");
+        append_file
+            .sync_all()
+            .expect("sync_all after append should succeed");
+        drop(append_file);
+
+        let content = std::fs::read_to_string(&file_path).expect("reading appended file");
+        assert_eq!(content, "{\"seq\":1}\n{\"seq\":2}\n");
+
+        manager
+            .umount_job("append-test-job")
+            .await
+            .expect("manager umount should succeed");
+        let _ = std::fs::remove_dir_all(&base);
     };
 
     match tokio::time::timeout(Duration::from_secs(120), test_future).await {

@@ -94,8 +94,11 @@ impl AntaresFuse {
 
         let overlay = self.build_overlay().await?;
         let logfs = LoggingFileSystem::new(overlay);
+        // Keep Antares mounts on the safer non-writeback path for now.
+        // With writeback cache enabled, reopening an existing file in append mode
+        // can fail inside libfuse-fs passthrough I/O with EBADF.
         let handle =
-            mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), true).await;
+            mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), false).await;
 
         // Spawn background task to run the FUSE session
         let fuse_task = tokio::spawn(async move {

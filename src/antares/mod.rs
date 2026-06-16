@@ -73,6 +73,24 @@ use crate::{
     util::config,
 };
 
+fn unmount_grace_duration() -> std::time::Duration {
+    const DEFAULT_MS: u64 = 150;
+    match std::env::var("ANTARES_UNMOUNT_GRACE_MS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) => std::time::Duration::from_millis(ms.clamp(0, 3_000)),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    default_ms = DEFAULT_MS,
+                    "invalid ANTARES_UNMOUNT_GRACE_MS, using default"
+                );
+                std::time::Duration::from_millis(DEFAULT_MS)
+            }
+        },
+        Err(_) => std::time::Duration::from_millis(DEFAULT_MS),
+    }
+}
+
 /// Global paths used by Antares to place layers and state.
 #[derive(Debug, Clone)]
 pub struct AntaresPaths {
@@ -308,15 +326,19 @@ impl AntaresManager {
     pub async fn umount_job(&self, job_id: &str) -> std::io::Result<Option<AntaresConfig>> {
         use tracing::{info, warn};
 
-        // Lock and get the config, but do not remove yet
-        let mut instances = self.instances.lock().await;
-        let config = match instances.get(job_id) {
+        // Look up config first so we can quiesce without holding the state lock.
+        let config = match self.instances.lock().await.get(job_id) {
             Some(cfg) => cfg.clone(),
             None => return Ok(None),
         };
 
         let mount_path = &config.mountpoint;
         info!("Attempting to unmount FUSE mount at {:?}", mount_path);
+        let grace = unmount_grace_duration();
+        if !grace.is_zero() {
+            info!("Quiescing {:?} for {:?} before unmount", mount_path, grace);
+            tokio::time::sleep(grace).await;
+        }
 
         // Try to unmount via the stored FUSE handle first (proper teardown)
         let mut fuse_handles = self.fuse_handles.lock().await;
@@ -366,6 +388,7 @@ impl AntaresManager {
         drop(fuse_handles);
 
         // Remove from bookkeeping and persist (even if unmount failed)
+        let mut instances = self.instances.lock().await;
         let removed = instances.remove(job_id);
         drop(instances);
         self.persist_state().await?;
@@ -409,5 +432,60 @@ impl AntaresManager {
         let mut f = File::create(&self.paths.state_file)?;
         f.write_all(data.as_bytes())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unmount_grace_duration;
+    use serial_test::serial;
+
+    fn set_unmount_grace_env(value: Option<&str>) {
+        // SAFETY: tests mutate process env in a controlled way and do not run in parallel here.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("ANTARES_UNMOUNT_GRACE_MS", value),
+                None => std::env::remove_var("ANTARES_UNMOUNT_GRACE_MS"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_unmount_grace_duration_defaults_to_150ms() {
+        set_unmount_grace_env(None);
+        assert_eq!(
+            unmount_grace_duration(),
+            std::time::Duration::from_millis(150)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_unmount_grace_duration_accepts_explicit_value() {
+        set_unmount_grace_env(Some("275"));
+        assert_eq!(
+            unmount_grace_duration(),
+            std::time::Duration::from_millis(275)
+        );
+        set_unmount_grace_env(None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_unmount_grace_duration_clamps_and_falls_back() {
+        set_unmount_grace_env(Some("50000"));
+        assert_eq!(
+            unmount_grace_duration(),
+            std::time::Duration::from_millis(3_000)
+        );
+
+        set_unmount_grace_env(Some("not-a-number"));
+        assert_eq!(
+            unmount_grace_duration(),
+            std::time::Duration::from_millis(150)
+        );
+
+        set_unmount_grace_env(None);
     }
 }
