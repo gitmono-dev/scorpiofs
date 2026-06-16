@@ -336,10 +336,7 @@ impl AntaresManager {
         info!("Attempting to unmount FUSE mount at {:?}", mount_path);
         let grace = unmount_grace_duration();
         if !grace.is_zero() {
-            info!(
-                "Quiescing {:?} for {:?} before unmount",
-                mount_path, grace
-            );
+            info!("Quiescing {:?} for {:?} before unmount", mount_path, grace);
             tokio::time::sleep(grace).await;
         }
 
