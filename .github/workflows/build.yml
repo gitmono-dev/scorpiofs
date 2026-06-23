@@ -19,8 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout rk8s dependency
-        run: git clone --depth 1 --branch codex/stabilize-libfuse-buck2-races https://github.com/rk8s-dev/rk8s.git ../rk8s
       
       - name: Install Rust ${{ matrix.rust }}
         uses: dtolnay/rust-toolchain@master
