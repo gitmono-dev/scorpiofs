@@ -59,29 +59,66 @@ https://crates.io/crates/scorpiofs
 
 1. Start the mono server (e.g. `http://localhost:8000`).
 2. Edit **`scorpio.toml`** (not `config.toml`): set `base_url`, `workspace`, and `store_path`. The `config.toml` file is a **runtime state file** (tracks mounted workspaces), created automatically on first run.
-3. Build and run the main binary:
+3. Build the binaries (`scorpio` and the deprecated `antares` alias) and run the daemon:
 
 ```bash
 cargo build --release
-cargo run --release -- --config-path scorpio.toml --http-addr 0.0.0.0:2725
+./target/release/scorpio serve            # or: cargo run --release -- serve
 ```
+
+The unified `scorpio` binary uses subcommands:
 
 ```bash
-Usage: scorpio [OPTIONS]
-
-Options:
-  -c, --config-path <CONFIG_PATH>  Path to the configuration file [default: scorpio.toml]
-      --http-addr <HTTP_ADDR>      HTTP bind address [default: 0.0.0.0:2725]
+scorpio serve [--http-addr 0.0.0.0:2725]   # run the workspace daemon (FUSE mount + HTTP API)
+scorpio mount <job_id> [--cl <cl>]         # mount an Antares job instance
+scorpio umount <job_id>                    # unmount an Antares job instance
+scorpio list                               # list tracked Antares instances
+scorpio http-mount <path> [--job-id <id>] [--cl <cl>] [--endpoint <url>]  # mount via a running HTTP daemon
+scorpio config init|validate|show          # generate / check / print configuration
+scorpio doctor                             # diagnose FUSE/permissions/mega connectivity
+scorpio completions <bash|zsh|fish|...>    # print a shell completion script
 ```
 
-The `antares` binary provides overlay mount management (CLI and optional standalone HTTP server on port 2726):
+`http-mount --endpoint` defaults to `http://127.0.0.1:2725/antares` (the Antares
+API nested in a local `scorpio serve`); point it at another daemon's base URL to
+mount against a remote/standalone daemon (e.g. `http://host:2726` for a
+standalone `antares serve`).
+
+Generate and install completions, e.g. for bash:
 
 ```bash
-cargo run --release --bin antares -- --config-path scorpio.toml list
-cargo run --release --bin antares -- serve --bind 0.0.0.0:2726
+scorpio completions bash > /usr/share/bash-completion/completions/scorpio
 ```
+
+Global options (`--config-path`, `--log-level`, `--http-addr`, and the Antares
+path overrides `--upper-root`/`--cl-root`/`--mount-root`/`--state-file`) work
+with any subcommand. Running `scorpio` with **no** subcommand is a deprecated
+shorthand for `scorpio serve` (it still honors `-c`/`--http-addr`).
+
+The CLI returns stable exit codes for scripting: `0` success, `2` config error,
+`3` mount/unmount failure, `4` HTTP bind failure, `1` other internal error.
+
+The `antares` binary is a **deprecated compatibility alias** for the
+`mount`/`umount`/`list`/`http-mount` commands and a standalone HTTP daemon
+(`antares serve --bind 0.0.0.0:2726`). It does **not** include `completions`;
+prefer the `scorpio` binary. The alias is retained for at least one minor release.
 
 ### How to Interact?
+
+`scorpio serve` exposes an HTTP API on `--http-addr` (default `0.0.0.0:2725`).
+
+> ⚠️ **The HTTP API is unauthenticated** — anyone who can reach the port can
+> trigger mounts/unmounts. Bind it to loopback or put it behind a firewall /
+> authenticating reverse proxy. The systemd unit and `docker-compose.yml`
+> default to `127.0.0.1`. See [deploy/README.md](deploy/README.md).
+
+**Liveness — `GET /health`** (root, lightweight; no remote/FUSE probing, no path
+leakage; use it for container/systemd health checks):
+
+```bash
+curl http://localhost:2725/health
+# {"status":"ok","version":"0.2.2","uptime_secs":42,"mount_count":0}
+```
 
 **Recommended — Antares API** (nested under the main server at `/antares/*`):
 
@@ -93,9 +130,11 @@ curl -X POST http://localhost:2725/antares/mounts \
 curl http://localhost:2725/antares/mounts
 ```
 
-See [docs/antares.md](docs/antares.md) for the full Antares API (including `GET /antares/mounts/{id}/ready`).
+See [docs/antares.md](docs/antares.md) for the full Antares API (including per-mount readiness `GET /antares/mounts/{id}/ready`).
 
-**Legacy API** (`/api/fs/*`, still supported):
+**Legacy API** (`/api/fs/*` and `/api/config`) — **deprecated**: still works for
+at least one minor release, but every response carries a `Deprecation: true`
+header and a server-side warning log. Prefer the Antares API.
 
 ```bash
 curl -X POST http://localhost:2725/api/fs/mount \
@@ -112,11 +151,11 @@ See [docs/api.md](docs/api.md) for request/response details.
 
 ### How to Configure?
 
-An example `scorpio.toml` is included in the repository root:
+A minimal `scorpio.toml` — usually only `base_url` / `lfs_url` need changing:
 
 ```toml
 base_url = "http://localhost:8000"
-lfs_url = "http://localhost:8000"
+lfs_url = "http://localhost:8000/lfs"
 store_path = "/tmp/scorpio-megadir/store"
 workspace = "/tmp/scorpio-megadir/mount"
 config_file = "config.toml"
@@ -127,6 +166,16 @@ load_dir_depth = "3"
 fetch_file_thread = "10"
 ```
 
+A fully-commented template with every key is in
+[`scorpio.toml.example`](scorpio.toml.example). You can also manage config from
+the CLI:
+
+```bash
+scorpio config init myconfig.toml        # write a template
+scorpio config validate                  # offline-check a file, reporting all problems
+scorpio config show                      # print the effective merged config
+```
+
 ### `scorpio.toml` Configuration Guide
 
 - **`base_url`** — Mega/monorepo service base URL (e.g. `http://localhost:8000`).
@@ -135,11 +184,97 @@ fetch_file_thread = "10"
 - **`store_path`** — Local directory for cached/stored files (must be writable).
 - **`config_file`** — Runtime state file path (default `config.toml`; records `works=[]` mounted paths). This is **not** the main config file.
 - **`git_author`** / **`git_email`** — Default Git author metadata.
+- **`log_level`** — Default tracing filter directive (e.g. `"info"`, `"scorpio=debug"`). See *Logging* below.
 - **`dicfuse_readable`** — Allow reading from read-only directories (`"true"` / `"false"`).
 - **`load_dir_depth`** — Directory preload depth during initialization.
 - **`fetch_file_thread`** — Concurrent download thread count.
 
+### Logging
+
+All runtime diagnostics go through `tracing` and are written to stderr (so
+journald / `docker logs` collect them). The active filter is chosen by this
+precedence (highest first):
+
+```
+--log-level <directive>  >  SCORPIO_LOG  >  RUST_LOG  >  config log_level  >  "info"
+```
+
+A directive is a standard `EnvFilter` string, e.g. `info`, `scorpio=debug`, or
+`warn,scorpiofs::dicfuse=trace`. An invalid directive falls back to `info`
+rather than aborting startup.
+
 Antares-specific keys use flat names in `scorpio.toml` (e.g. `antares_mount_root`, `antares_upper_root`). See [docs/antares.md](docs/antares.md#配置) for the full list.
+
+### Environment Variable Overrides
+
+Every configuration key can be overridden with an environment variable, which is
+convenient for containers and 12-factor deployments. The resolution precedence is:
+
+```
+CLI overrides  >  environment (SCORPIO_*)  >  config file  >  built-in defaults
+```
+
+The environment variable name is `SCORPIO_` followed by the upper-cased flat key.
+For example:
+
+| Config key            | Environment variable           |
+|-----------------------|--------------------------------|
+| `base_url`            | `SCORPIO_BASE_URL`             |
+| `lfs_url`             | `SCORPIO_LFS_URL`             |
+| `workspace`           | `SCORPIO_WORKSPACE`           |
+| `store_path`          | `SCORPIO_STORE_PATH`         |
+| `load_dir_depth`      | `SCORPIO_LOAD_DIR_DEPTH`     |
+| `antares_upper_root`  | `SCORPIO_ANTARES_UPPER_ROOT` |
+
+```bash
+SCORPIO_BASE_URL=http://mega.example.com SCORPIO_WORKSPACE=/tmp/ws \
+  scorpio serve
+```
+
+The config file is also read in a forward-looking sectioned form
+(`[server]` / `[dicfuse]` / `[antares]`), which coexists with the legacy flat
+keys for backward compatibility. Invalid values (a non-numeric `load_dir_depth`,
+an unknown `dicfuse_stat_mode`, a malformed URL, an out-of-range number) fail
+fast at startup with the offending field name. The main `scorpio.toml` is treated
+as read-only input and is never rewritten.
+
+### How to Deploy?
+
+ScorpioFS mounts a FUSE filesystem, so every deployment target needs a
+FUSE-capable host (`/dev/fuse` + the `fuse` module + `fuse3`). Run
+`scorpio doctor` to check a host. Full guidance is in
+[deploy/README.md](deploy/README.md).
+
+**Docker / Compose** — a multi-stage [`Dockerfile`](Dockerfile) and
+[`docker-compose.yml`](docker-compose.yml) are provided; config is entirely
+env-driven (`SCORPIO_*`), and FUSE needs `/dev/fuse` + `CAP_SYS_ADMIN`:
+
+```bash
+docker build -t scorpiofs .
+docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+  --security-opt apparmor:unconfined \
+  -e SCORPIO_BASE_URL=http://your-mega:8000 -e SCORPIO_LFS_URL=http://your-mega:8000/lfs \
+  -p 127.0.0.1:2725:2725 scorpiofs
+```
+
+**systemd** — unit files are in [`deploy/systemd/`](deploy/systemd/)
+(`Type=simple`, `AmbientCapabilities=CAP_SYS_ADMIN`, `TimeoutStopSec=45`,
+loopback bind by default, journald logging).
+
+**install.sh** — [`install.sh`](install.sh) downloads a release tarball,
+**verifies its SHA256 checksum**, and installs the binaries + a generated config.
+It supports `--dry-run`, `--uninstall`, and never edits `/etc/fuse.conf` unless
+you pass `--enable-user-allow-other`:
+
+```bash
+bash install.sh --version v0.3.0 --dry-run   # preview
+sudo bash install.sh --version v0.3.0        # install
+```
+
+Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which builds the binaries, produces `scorpiofs-<version>-<target>.tar.gz` +
+SHA256 checksums, publishes a GitHub Release, and (behind a protected
+environment for manual approval) can publish to crates.io.
 
 ### How to Contribute?
 
@@ -147,6 +282,9 @@ Contributions are welcome! Please follow these steps:
 1. Fork the repository.
 2. Create a new branch for your feature or bug fix.
 3. Submit a pull request with a clear description of your changes.
+
+For local load/performance testing, see [script/README.md](script/README.md) and
+the read benchmark `cargo run --release --example fs_read_perf -- <dir>`.
 
 ### Reference
 [1] Rachel Potvin and Josh Levenberg. 2016. Why Google stores billions of lines of code in a single repository. Commun. ACM 59, 7 (July 2016), 78–87. https://doi.org/10.1145/2854146

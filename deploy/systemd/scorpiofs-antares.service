@@ -1,0 +1,44 @@
+[Unit]
+Description=ScorpioFS Antares standalone HTTP daemon
+Documentation=https://github.com/web3infra-foundation/scorpiofs
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Optional companion service. The main `scorpiofs.service` already nests the
+# Antares API under /antares on port 2725; enable this only if you want a
+# separate standalone Antares daemon on its own port.
+
+[Service]
+Type=simple
+
+User=scorpiofs
+Group=scorpiofs
+SupplementaryGroups=fuse
+AmbientCapabilities=CAP_SYS_ADMIN
+
+# The leading '+' runs this step as root so it can create and chown the dirs.
+ExecStartPre=+/usr/bin/install -d -o scorpiofs -g scorpiofs \
+    /var/lib/scorpiofs/antares/upper \
+    /var/lib/scorpiofs/antares/cl \
+    /var/lib/scorpiofs/antares/mnt
+
+# Standalone Antares HTTP daemon (the `antares serve` form). Binds loopback by
+# default — the HTTP API is unauthenticated; expose it only behind a firewall /
+# reverse proxy.
+ExecStart=/usr/local/bin/antares --config-path /etc/scorpiofs/scorpio.toml serve --bind 127.0.0.1:2726
+
+# Lazily unmount any residual per-job Antares mounts (deepest first) plus the root.
+ExecStopPost=-/bin/sh -c 'for m in $(findmnt -rno TARGET --submounts /var/lib/scorpiofs/antares/mnt 2>/dev/null | sort -r); do fusermount3 -u -z "$m"; done'
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45
+KillMode=mixed
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keep GitHub Actions (including the supply-chain-sensitive release workflow)
+  # updated intentionally. For maximum hardening, pin actions to full commit
+  # SHAs; Dependabot will then propose SHA bumps via PRs you review.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Track Rust dependency updates.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly

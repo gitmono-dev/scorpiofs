@@ -2,6 +2,8 @@
 init_test_d.db
 path.db
 test_config.toml
+# Runtime mount-state file (works=[]). Generated on demand; not user config.
+config.toml
 target/
 .vscode/
 __pycache__/

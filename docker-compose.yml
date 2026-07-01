@@ -1,0 +1,46 @@
+# docker compose up — brings up a ScorpioFS daemon plus its mega backend.
+#
+# IMPORTANT: FUSE in containers needs the host's /dev/fuse device and
+# CAP_SYS_ADMIN, and is NOT available on every Docker host (e.g. some managed
+# / rootless environments). See deploy/README.md for prerequisites.
+
+services:
+  # The mega/monorepo backend. Replace the image with the one you run; the
+  # default tag is a placeholder so this file is self-documenting, not a promise
+  # that the image exists. Adjust the port/command to your mega deployment.
+  mega:
+    image: ghcr.io/web3infra-foundation/mega:latest
+    # command: ["...mega server args..."]
+    expose:
+      - "8000"
+    # Uncomment to expose the mega API on the host:
+    # ports:
+    #   - "8000:8000"
+    restart: unless-stopped
+
+  scorpiofs:
+    build:
+      context: .
+    depends_on:
+      - mega
+    environment:
+      # base_url / lfs_url are required and point at the mega service above.
+      SCORPIO_BASE_URL: "http://mega:8000"
+      SCORPIO_LFS_URL: "http://mega:8000/lfs"
+      # Override any other key the same way, e.g.:
+      # SCORPIO_LOG_LEVEL: "scorpio=debug"
+    devices:
+      - "/dev/fuse"
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      # FUSE mounts frequently need the default AppArmor profile relaxed.
+      - apparmor:unconfined
+    ports:
+      # Bind the host side to loopback: the HTTP API is UNAUTHENTICATED, so do
+      # not expose it on all host interfaces. For remote access put it behind a
+      # firewall / authenticating reverse proxy and change this mapping.
+      - "127.0.0.1:2725:2725"
+    # `scorpiofs` is the default CMD (`serve`); the HEALTHCHECK from the image
+    # polls GET /health.
+    restart: on-failure

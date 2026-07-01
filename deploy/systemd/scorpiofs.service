@@ -1,0 +1,63 @@
+[Unit]
+Description=ScorpioFS workspace daemon (FUSE mount + HTTP API)
+Documentation=https://github.com/web3infra-foundation/scorpiofs
+After=network-online.target
+Wants=network-online.target
+# Restart rate limiting (these directives belong in [Unit]).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Run as a dedicated, unprivileged user. It must be able to open /dev/fuse, so
+# add it to the `fuse` group (create the user/group during installation).
+User=scorpiofs
+Group=scorpiofs
+SupplementaryGroups=fuse
+
+# CAP_SYS_ADMIN is required to mount FUSE. This is a high-privilege capability;
+# the unprivileged alternative is the setuid `fusermount3` helper (shipped by
+# the `fuse3` package) — see deploy/README.md for the trade-offs.
+AmbientCapabilities=CAP_SYS_ADMIN
+
+# Ensure runtime directories exist (FHS-friendly paths). Adjust to match
+# scorpio.toml / the SCORPIO_* environment. The leading '+' runs this step as
+# root (regardless of User= above) so it can create and chown the directories.
+ExecStartPre=+/usr/bin/install -d -o scorpiofs -g scorpiofs \
+    /var/lib/scorpiofs/mount \
+    /var/lib/scorpiofs/store \
+    /var/lib/scorpiofs/antares/upper \
+    /var/lib/scorpiofs/antares/cl \
+    /var/lib/scorpiofs/antares/mnt
+
+# Bind the (unauthenticated) HTTP API to loopback by default. To expose it,
+# change to 0.0.0.0 ONLY behind a firewall / reverse proxy with access control.
+ExecStart=/usr/local/bin/scorpio --config-path /etc/scorpiofs/scorpio.toml serve --http-addr 127.0.0.1:2725
+
+# Belt-and-suspenders cleanup of residual mountpoints after stop (the daemon
+# already unmounts on SIGTERM). The leading '-' ignores failures. The first line
+# lazily unmounts any per-job Antares mounts (deepest first); the second the root.
+ExecStopPost=-/bin/sh -c 'for m in $(findmnt -rno TARGET --submounts /var/lib/scorpiofs/antares/mnt 2>/dev/null | sort -r); do fusermount3 -u -z "$m"; done'
+ExecStopPost=-/usr/bin/fusermount3 -u -z /var/lib/scorpiofs/mount
+
+Restart=on-failure
+RestartSec=5s
+
+# Must exceed the in-process shutdown budget (daemon join 20s + Antares cleanup
+# 15s) so systemd does not SIGKILL before graceful unmount completes.
+TimeoutStopSec=45
+KillMode=mixed
+
+LimitNOFILE=65536
+
+# Logs go to journald.
+StandardOutput=journal
+StandardError=journal
+
+# NOTE: Some systemd sandboxing (ProtectSystem=strict, PrivateMounts=yes,
+# ReadOnlyPaths, etc.) conflicts with FUSE mount propagation. Enable hardening
+# selectively and verify mounts still appear on the host.
+
+[Install]
+WantedBy=multi-user.target
