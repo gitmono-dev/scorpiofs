@@ -1,6 +1,6 @@
 [package]
 name = "scorpiofs"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "FUSE-based virtual filesystem with Antares overlay for monorepo builds"
 license = "MIT OR Apache-2.0"
@@ -22,7 +22,11 @@ reqwest = { version = "0.13.1", features = ["json", "blocking"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["full"] }
 axum = { version = "0.8.8", features = ["macros"] }
-rfuse3 = {  version = "0.0.8", features = ["tokio-runtime", "unprivileged", "file-lock"] }
+rfuse3 = { version = "0.0.9", features = [
+    "tokio-runtime",
+    "unprivileged",
+    "file-lock",
+] }
 clap = { version = "4.5.57", features = ["derive"] }
 
 toml = "0.9.8"
@@ -39,7 +43,7 @@ async-recursion = "1.1.1"
 bytes = "1.11.1"
 futures = "0.3.31"
 uuid = { version = "1.20.0", features = ["v4"] }
-libfuse-fs = { version = "0.1.13"}
+libfuse-fs = "0.1.14"
 whoami = "1.6.0"
 thiserror = "2.0.18"
 crossbeam = "0.8.4"

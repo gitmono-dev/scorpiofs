@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use libfuse_fs::{
-    passthrough::{new_passthroughfs_layer, PassthroughArgs},
+    passthrough::new_antares_passthroughfs_layer,
     unionfs::{config::Config, layer::Layer, OverlayFs},
 };
 use tokio::task::JoinHandle;
@@ -49,24 +49,15 @@ impl AntaresFuse {
         let mut lower_layers: Vec<Arc<dyn Layer>> = Vec::new();
 
         if let Some(cl_dir) = &self.cl_dir {
-            let cl_layer = new_passthroughfs_layer(PassthroughArgs {
-                root_dir: cl_dir,
-                mapping: None::<String>,
-            })
-            .await?;
+            let cl_layer = new_antares_passthroughfs_layer(cl_dir).await?;
             lower_layers.push(Arc::new(cl_layer) as Arc<dyn Layer>);
         }
 
         lower_layers.push(self.dic.clone() as Arc<dyn Layer>);
 
         // Upper layer mirrors upper_dir to keep writes separated from lower layers.
-        let upper_layer: Arc<dyn Layer> = Arc::new(
-            new_passthroughfs_layer(PassthroughArgs {
-                root_dir: &self.upper_dir,
-                mapping: None::<String>,
-            })
-            .await?,
-        );
+        let upper_layer: Arc<dyn Layer> =
+            Arc::new(new_antares_passthroughfs_layer(&self.upper_dir).await?);
 
         // passthrough Upper  - readwrite file system over upper dir
         // passthrough CL  - readwrite file system over upper dir

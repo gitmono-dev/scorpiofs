@@ -43,6 +43,9 @@ fn init_config() {
 #[tokio::test]
 async fn test_mount_and_list_registers_instance() {
     init_config();
+    if !fuse_prereqs_available() {
+        return;
+    }
 
     let root = tempdir().unwrap();
     let paths = AntaresPaths::new(
@@ -75,6 +78,9 @@ async fn test_mount_and_list_registers_instance() {
 #[tokio::test]
 async fn test_mount_job_at_custom_path() {
     init_config();
+    if !fuse_prereqs_available() {
+        return;
+    }
 
     let root = tempdir().unwrap();
     let custom_mount = root.path().join("custom_mountpoint");
@@ -117,6 +123,9 @@ async fn test_mount_job_at_custom_path() {
 #[tokio::test]
 async fn test_mount_job_at_multiple_custom_paths() {
     init_config();
+    if !fuse_prereqs_available() {
+        return;
+    }
 
     let root = tempdir().unwrap();
     let paths = AntaresPaths::new(
@@ -161,6 +170,9 @@ async fn test_mount_job_at_multiple_custom_paths() {
 #[tokio::test]
 async fn test_mount_job_at_with_pathbuf() {
     init_config();
+    if !fuse_prereqs_available() {
+        return;
+    }
 
     let root = tempdir().unwrap();
     let paths = AntaresPaths::new(
@@ -413,6 +425,67 @@ async fn test_fuse_multiple_custom_mounts() {
 
         let _ = std::fs::remove_dir_all(&base);
         println!("✓ Test completed successfully");
+    };
+
+    match tokio::time::timeout(Duration::from_secs(120), test_future).await {
+        Ok(_) => println!("✓ Test passed"),
+        Err(_) => panic!("Test timed out"),
+    }
+}
+
+/// Run with:
+///   sudo -E cargo test --test antares_test test_fuse_write_then_metadata -- --exact --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+#[serial]
+async fn test_fuse_write_then_metadata() {
+    let test_future = async {
+        init_config();
+
+        if !fuse_prereqs_available() {
+            return;
+        }
+
+        let test_id = Uuid::new_v4();
+        let base = PathBuf::from(format!("/tmp/antares_write_meta_test_{test_id}"));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let mountpoint = base.join("workspace");
+        let paths = AntaresPaths::new(
+            base.join("upper"),
+            base.join("cl"),
+            base.join("mnt"),
+            base.join("state.toml"),
+        );
+        let manager = AntaresManager::new(paths).await;
+
+        let config = manager
+            .mount_job_at("write-meta-test-job", mountpoint.clone(), None)
+            .await
+            .expect("mount_job_at should succeed");
+        sleep(Duration::from_millis(500)).await;
+
+        // Buck2 pattern: write linker_wrapper.sh, then immediate metadata + chmod.
+        let out_dir = config
+            .mountpoint
+            .join("buck-out/v2/gen/linker_wrapper/a83718dde72c05c6");
+        std::fs::create_dir_all(&out_dir).expect("mkdir buck-out path should succeed");
+
+        let script = out_dir.join("linker_wrapper.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexec \"$@\"\n").expect("write should succeed");
+
+        let meta = std::fs::metadata(&script).expect("metadata after write should succeed");
+        assert!(meta.is_file());
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("set_permissions after write should succeed");
+
+        manager
+            .umount_job("write-meta-test-job")
+            .await
+            .expect("manager umount should succeed");
+        let _ = std::fs::remove_dir_all(&base);
     };
 
     match tokio::time::timeout(Duration::from_secs(120), test_future).await {
