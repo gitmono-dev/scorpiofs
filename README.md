@@ -21,7 +21,7 @@ allows you to mount a remote filesystem using SFTP
 - [google-drive-ocamlfuse](https://github.com/astrada/google-drive-ocamlfuse.git) lets you mount your Google Drive on Linux.
 ![Github stars](https://img.shields.io/github/stars/astrada/google-drive-ocamlfuse.svg)
 
-### Why the Mega Need a FUSE?
+### Why the Monorepo need a FUSE?
 
 Because the code organization requirements are different from the existing popular distributed version management software Git, clients targeting Monorepo need to implement various additional features to support code pull tasks for large repositories. These requirements include:
 

@@ -9,7 +9,7 @@ services:
   # default tag is a placeholder so this file is self-documenting, not a promise
   # that the image exists. Adjust the port/command to your mega deployment.
   mega:
-    image: ghcr.io/web3infra-foundation/mega:latest
+    image: ghcr.io/gitmono-dev/mega:latest
     # command: ["...mega server args..."]
     expose:
       - "8000"

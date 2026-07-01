@@ -7,16 +7,16 @@
 # package installation and any /etc/fuse.conf change are explicit, never silent.
 #
 # Quick (convenience) path:
-#   curl -fsSL https://raw.githubusercontent.com/web3infra-foundation/scorpiofs/main/install.sh | bash -s -- --version v0.3.0
+#   curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh | bash -s -- --version v0.3.0
 #
 # Safer path (download, inspect, then run):
-#   curl -fsSLO https://raw.githubusercontent.com/web3infra-foundation/scorpiofs/main/install.sh
+#   curl -fsSLO https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh
 #   less install.sh
 #   bash install.sh --version v0.3.0
 #
 set -euo pipefail
 
-REPO="web3infra-foundation/scorpiofs"
+REPO="gitmono-dev/scorpiofs"
 VERSION=""
 PREFIX="/usr/local"
 CONFDIR="/etc/scorpiofs"

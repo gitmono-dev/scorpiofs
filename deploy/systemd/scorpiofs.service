@@ -1,6 +1,6 @@
 [Unit]
 Description=ScorpioFS workspace daemon (FUSE mount + HTTP API)
-Documentation=https://github.com/web3infra-foundation/scorpiofs
+Documentation=https://github.com/gitmono-dev/scorpiofs
 After=network-online.target
 Wants=network-online.target
 # Restart rate limiting (these directives belong in [Unit]).

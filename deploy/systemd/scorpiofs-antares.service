@@ -1,6 +1,6 @@
 [Unit]
 Description=ScorpioFS Antares standalone HTTP daemon
-Documentation=https://github.com/web3infra-foundation/scorpiofs
+Documentation=https://github.com/gitmono-dev/scorpiofs
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60

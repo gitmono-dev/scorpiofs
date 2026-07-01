@@ -59,7 +59,7 @@ Scorpiofs 是一个基于 FUSE 的虚拟文件系统，其中的 **Antares** 子
 2. **Antares 管理器初始化**
    - 在 libra 初始化时创建 `AntaresManager` 实例
    - 配置合适的路径结构（upper_root, cl_root, mount_root, state_file）
-   - 可参考 [tests/antares_test.rs](https://github.com/web3infra-foundation/scorpiofs/blob/master/tests/antares_test.rs)
+   - 可参考 [tests/antares_test.rs](https://github.com/gitmono-dev/scorpiofs/blob/master/tests/antares_test.rs)
 
 3. **Worktree 与 Antares 的映射**
    ```rust
@@ -101,16 +101,16 @@ Scorpiofs 是一个基于 FUSE 的虚拟文件系统，其中的 **Antares** 子
 
 ### 参考资料
 
-- [Scorpiofs Antares 文档](https://github.com/web3infra-foundation/scorpiofs/blob/master/src/antares/mod.rs)
-- [Scorpiofs 测试示例](https://github.com/web3infra-foundation/scorpiofs/blob/master/tests/antares_test.rs)
+- [Scorpiofs Antares 文档](https://github.com/gitmono-dev/scorpiofs/blob/master/src/antares/mod.rs)
+- [Scorpiofs 测试示例](https://github.com/gitmono-dev/scorpiofs/blob/master/tests/antares_test.rs)
 - [Git worktree 官方文档](https://git-scm.com/docs/git-worktree)
-- [Libra 仓库](https://github.com/web3infra-foundation/libra)
+- [Libra 仓库](https://github.com/libra-tools/libra)
 
 ---
 
 ## 代码标准
 
-1. 所有 **PR** 提交必须签署 `Signed-off-by` 和使用 `GPG` 签名，即提交代码时（使用 `git commit` 命令时）至少使用 `-s -S` 两个参数，参考 [Contributing Guide](https://github.com/web3infra-foundation/libra/blob/main/docs/contributing.md)；
+1. 所有 **PR** 提交必须签署 `Signed-off-by` 和使用 `GPG` 签名，即提交代码时（使用 `git commit` 命令时）至少使用 `-s -S` 两个参数，参考 [Contributing Guide](https://github.com/libra-tools/libra/blob/main/docs/contributing.md)；
 2. 所有 **PR** 提交必须通过 `GitHub Actions` 自动化测试，提交 **PR** 后请关注 `GitHub Actions` 结果；
 3. 代码注释均需要使用英文；
 4. 代码风格遵循 Rust 官方规范，提交前运行 `cargo fmt` 和 `cargo clippy`；
@@ -120,7 +120,7 @@ Scorpiofs 是一个基于 FUSE 的虚拟文件系统，其中的 **Antares** 子
 
 ## PR 提交地址
 
-提交到 [libra](https://github.com/web3infra-foundation/libra) 仓库的 `main` 分支 `src/commands/worktree` 目录；
+提交到 [libra](https://github.com/libra-tools/libra) 仓库的 `main` 分支 `src/commands/worktree` 目录；
 
 ---
 
@@ -198,6 +198,6 @@ Scorpiofs 是一个基于 FUSE 的虚拟文件系统，其中的 **Antares** 子
 
 ## 附加资源
 
-- [Antares 使用示例](https://github.com/web3infra-foundation/scorpiofs/blob/master/src/lib.rs#L35-L90)
+- [Antares 使用示例](https://github.com/gitmono-dev/scorpiofs/blob/master/src/lib.rs#L35-L90)
 - [FUSE 开发指南](https://www.kernel.org/doc/html/latest/filesystems/fuse.html)
 - [Rust 异步编程](https://rust-lang.github.io/async-book/)
