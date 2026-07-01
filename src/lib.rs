@@ -6,13 +6,13 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use scorpiofs::prelude::*;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Initialize configuration
-//!     scorpio::util::config::init_config("scorpio.toml")?;
+//!     scorpiofs::util::config::init_config("scorpio.toml")?;
 //!     
 //!     // Create Antares service for managing mounts
 //!     let service = AntaresServiceImpl::new(None).await;
@@ -34,14 +34,14 @@
 //!
 //! ### Method 1: Using AntaresManager with Default Paths
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use scorpiofs::antares::{AntaresManager, AntaresPaths};
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
 //!     // Initialize configuration first
-//!     scorpio::util::config::init_config("scorpio.toml").unwrap();
+//!     scorpiofs::util::config::init_config("scorpio.toml").unwrap();
 //!     
 //!     // Configure paths for layers
 //!     let paths = AntaresPaths::new(
@@ -71,13 +71,13 @@
 //!
 //! Mount to any arbitrary directory using `mount_job_at`:
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use scorpiofs::antares::{AntaresManager, AntaresPaths};
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
-//!     scorpio::util::config::init_config("scorpio.toml").unwrap();
+//!     scorpiofs::util::config::init_config("scorpio.toml").unwrap();
 //!     
 //!     let paths = AntaresPaths::from_global_config();
 //!     let manager = AntaresManager::new(paths).await;
@@ -103,7 +103,7 @@
 //!
 //! For lower-level control over the FUSE mount:
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use scorpiofs::antares::fuse::AntaresFuse;
 //! use scorpiofs::dicfuse::DicfuseManager;
 //! use std::path::PathBuf;
@@ -111,7 +111,7 @@
 //! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
 //!     // Initialize configuration
-//!     scorpio::util::config::init_config("scorpio.toml").unwrap();
+//!     scorpiofs::util::config::init_config("scorpio.toml").unwrap();
 //!     
 //!     // Get shared Dicfuse instance (read-only base layer)
 //!     let dicfuse = DicfuseManager::global().await;
@@ -141,13 +141,13 @@
 //!
 //! For production deployments, use the HTTP daemon for centralized mount management:
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use scorpiofs::daemon::antares::{AntaresDaemon, AntaresServiceImpl, CreateMountRequest};
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     scorpio::util::config::init_config("scorpio.toml")?;
+//!     scorpiofs::util::config::init_config("scorpio.toml")?;
 //!     
 //!     // Create service with mount recovery
 //!     let service = Arc::new(AntaresServiceImpl::new_with_recovery(None).await);
@@ -181,8 +181,10 @@
 extern crate log;
 
 pub mod antares;
+pub mod cli;
 pub mod daemon;
 pub mod dicfuse;
+pub mod doctor;
 pub mod fuse;
 pub mod manager;
 pub mod server;
@@ -194,7 +196,7 @@ pub mod util;
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use scorpiofs::prelude::*;
 /// ```
 pub mod prelude {

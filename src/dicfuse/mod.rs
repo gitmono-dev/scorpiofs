@@ -329,7 +329,9 @@ mod tests {
 
         let fs = Dicfuse::new().await;
         let mountpoint = OsStr::new(&mount_path);
-        let mut mount_handle = crate::server::mount_filesystem(fs, mountpoint).await;
+        let mut mount_handle = crate::server::mount_filesystem(fs, mountpoint)
+            .await
+            .unwrap();
         let handle = &mut mount_handle;
         tokio::select! {
             res = handle => res.unwrap(),

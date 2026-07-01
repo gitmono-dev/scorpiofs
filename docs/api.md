@@ -4,11 +4,39 @@
 
 The main `scorpio` binary exposes a legacy HTTP API on port **2725** (default `0.0.0.0:2725`, overridable via `--http-addr`). These endpoints manage workspace mounts and expose read-only configuration.
 
-> **Recommended API:** For build-system overlay mounts, use the Antares API documented in [antares.md](./antares.md). When running the main `scorpio` process, Antares routes are nested under the `/antares` prefix (e.g. `GET /antares/health`, `POST /antares/mounts`). The legacy `/api/fs/*` endpoints remain available for compatibility.
+> **Recommended API:** For build-system overlay mounts, use the Antares API documented in [antares.md](./antares.md). When running the main `scorpio` process, Antares routes are nested under the `/antares` prefix (e.g. `GET /antares/health`, `POST /antares/mounts`).
+
+> **Deprecation:** The legacy `/api/fs/*` and `/api/config` endpoints remain available for at least one minor release but are **deprecated**. Every response from these routes carries a `Deprecation: true` header (RFC 8594) and the server logs a warning on each call. Migrate to the Antares API (`/antares/*`).
 
 > **Git routes:** Git-related HTTP routes (`/api/git/*`) exist in `src/daemon/git.rs` but are **not enabled** in the default server. They are not documented here.
 
 **Base URL (default):** `http://localhost:2725`
+
+---
+
+## Health (liveness)
+
+### `GET /health`
+
+A lightweight, **non-deprecated**, root-level liveness probe. It checks only that
+the process is up and the router responds; it does **not** contact the remote
+mega server, perform deep FUSE checks, or leak absolute workspace/store paths.
+Use it for container/systemd liveness checks. For per-mount readiness use
+`GET /antares/mounts/{mount_id}/ready`.
+
+**Response (200):**
+
+```json
+{
+  "status": "ok",
+  "version": "0.2.2",
+  "uptime_secs": 42,
+  "mount_count": 0
+}
+```
+
+`mount_count` is `null` if the mount manager is momentarily busy (the probe uses
+a non-blocking lock so liveness never stalls behind an in-flight mount).
 
 ---
 
@@ -166,10 +194,10 @@ The main `scorpio` binary exposes a legacy HTTP API on port **2725** (default `0
 
 ---
 
-### 6. Update Configuration (non-functional)
+### 6. Update Configuration (deprecated, non-functional)
 
 **URL:** `POST /api/config`  
-**Description:** **Does not persist or apply configuration changes.** The handler only echoes the request body fields in the response. Configuration changes require editing `scorpio.toml` and restarting the process. This endpoint may be deprecated in a future release.
+**Description:** **Deprecated and does not persist or apply configuration changes.** The handler only echoes the request body fields in the response and returns a `Deprecation: true` header. Configuration changes require editing `scorpio.toml` and restarting the process. The request still uses the legacy field names `mega_url`/`mount_path` (mapping to `base_url`/`workspace`); since the endpoint is deprecated they are kept as-is rather than renamed.
 
 **Request Body (JSON):**
 
@@ -185,7 +213,7 @@ The main `scorpio` binary exposes a legacy HTTP API on port **2725** (default `0
 
 ```json
 {
-  "status": "success",
+  "status": "Success",
   "config": {
     "mega_url": "http://example.com",
     "mount_path": "/new/mount",
@@ -194,7 +222,7 @@ The main `scorpio` binary exposes a legacy HTTP API on port **2725** (default `0
 }
 ```
 
-> Note: `POST` returns `"success"` (lowercase) while `GET` returns `"Success"` (capital S). This is current implementation behavior.
+> Note: `POST` and `GET /api/config` now both return `"Success"` (the prior lowercase `"success"` mismatch has been unified). Responses also carry `Deprecation: true`.
 
 ---
 

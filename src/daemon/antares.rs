@@ -83,10 +83,6 @@ where
     /// Run the HTTP server until it receives a shutdown signal.
     /// Note: For graceful shutdown with mount cleanup, use `AntaresDaemon<AntaresServiceImpl>`.
     pub async fn serve(self, bind_addr: SocketAddr) -> Result<(), ApiError> {
-        let router = self.router();
-        let shutdown_timeout = self.shutdown_timeout;
-        let service = self.service.clone();
-
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .map_err(|e| {
@@ -97,6 +93,18 @@ where
             })?;
 
         tracing::info!("Antares daemon listening on {}", bind_addr);
+        self.serve_with_listener(listener).await
+    }
+
+    /// Serve on an already-bound listener. Lets callers bind up-front so a bind
+    /// failure can be mapped to a distinct exit code instead of a generic error.
+    pub async fn serve_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), ApiError> {
+        let router = self.router();
+        let shutdown_timeout = self.shutdown_timeout;
+        let service = self.service.clone();
 
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {

@@ -1,113 +1,174 @@
-use std::{ffi::OsStr, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf};
 
-use clap::Parser;
-use rfuse3::raw::logfs::LoggingFileSystem;
-use scorpiofs::{
-    daemon::daemon_main,
-    fuse::MegaFuse,
-    manager::{fetch::CheckHash, ScorpioManager},
-    server::mount_filesystem,
-    util::config,
-};
-#[cfg(not(unix))]
-use tokio::signal;
-use tokio::sync::oneshot;
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
+use scorpiofs::{cli, doctor};
 
-/// Command line arguments for the application
+/// Scorpio: FUSE-based virtual filesystem with an Antares build overlay.
+///
+/// With no subcommand, `scorpio` runs the workspace daemon (`serve`), preserving
+/// backward compatibility with `scorpio -c <cfg> --http-addr <addr>`.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Path to the configuration file
-    #[arg(short, long, default_value = "scorpio.toml")]
+#[command(name = "scorpio", author, version, about, long_about = None)]
+struct Cli {
+    /// Path to the configuration file.
+    #[arg(short, long, default_value = "scorpio.toml", global = true)]
     config_path: String,
 
-    /// HTTP bind address for the daemon (Antares API lives under /antares/*)
-    #[arg(long, default_value = "0.0.0.0:2725")]
+    /// HTTP bind address for the workspace daemon (Antares API lives under /antares/*).
+    #[arg(long, default_value = "0.0.0.0:2725", global = true)]
     http_addr: SocketAddr,
+
+    /// Log filter directive (e.g. "info", "scorpio=debug"). Overrides
+    /// SCORPIO_LOG, RUST_LOG, and the config `log_level`.
+    #[arg(long, global = true)]
+    log_level: Option<String>,
+
+    /// Override the Antares per-job upper-layer root.
+    #[arg(long, global = true)]
+    upper_root: Option<PathBuf>,
+    /// Override the Antares per-job CL-layer root.
+    #[arg(long, global = true)]
+    cl_root: Option<PathBuf>,
+    /// Override the Antares per-job mountpoint root.
+    #[arg(long, global = true)]
+    mount_root: Option<PathBuf>,
+    /// Override the Antares state file path.
+    #[arg(long, global = true)]
+    state_file: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run the workspace daemon (FUSE mount + HTTP API). Default when no subcommand is given.
+    Serve,
+    /// Mount an Antares job instance.
+    Mount {
+        /// Unique job identifier.
+        job_id: String,
+        /// Optional CL layer name.
+        #[arg(long)]
+        cl: Option<String>,
+    },
+    /// Unmount an Antares job instance.
+    Umount {
+        /// Job identifier to remove.
+        job_id: String,
+    },
+    /// List tracked Antares instances.
+    List,
+    /// Mount via a running HTTP daemon (recommended for build systems).
+    HttpMount {
+        /// Unique job identifier (recommended).
+        #[arg(long)]
+        job_id: Option<String>,
+        /// Monorepo path to mount (e.g. "/third-party/mega").
+        path: String,
+        /// Optional CL identifier.
+        #[arg(long)]
+        cl: Option<String>,
+        /// Daemon base URL (the request goes to `{endpoint}/mounts`).
+        #[arg(long, default_value = "http://127.0.0.1:2725/antares")]
+        endpoint: String,
+    },
+    /// Inspect or validate configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Run environment diagnostics (FUSE, /etc/fuse.conf, directories, mega server).
+    Doctor,
+    /// Generate a shell completion script (bash, zsh, fish, ...).
+    Completions {
+        /// Target shell.
+        shell: Shell,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Write a configuration template to a file.
+    Init {
+        /// Output path.
+        #[arg(default_value = "scorpio.toml")]
+        path: String,
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Offline-validate a configuration file, reporting all problems.
+    Validate,
+    /// Print the effective (merged) configuration.
+    Show,
 }
 
 #[tokio::main]
 async fn main() {
-    println!(
-        r#"
-        ____   ___   __   ____  ____   __    __  
-        / ___) / __) /  \ (  _ \(  _ \ (  )  /  \ 
-        \___ \( (__ (  O ) )   / ) __/  )(  (  O )
-        (____/ \___) \__/ (__\_)(__)   (__)  \__/ 
-"#
+    let cli = Cli::parse();
+
+    let overrides = cli::antares_overrides(
+        cli.upper_root.clone(),
+        cli.cl_root.clone(),
+        cli.mount_root.clone(),
+        cli.state_file.clone(),
     );
-    let args = Args::parse();
 
-    if let Err(e) = config::init_config(&args.config_path) {
-        eprintln!("Failed to load config: {e}");
-        std::process::exit(1);
-    }
-
-    let mut manager = ScorpioManager::from_toml(config::config_file()).unwrap();
-    manager.check().await;
-    //init scorpio configuration
-
-    let fuse_interface = MegaFuse::new_from_manager(&manager).await;
-    let workspace = config::workspace();
-    let mountpoint = OsStr::new(workspace);
-    let lgfs = LoggingFileSystem::new(fuse_interface.clone());
-    let mut mount_handle = mount_filesystem(lgfs, mountpoint).await;
-
-    print!("server running...");
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let mut daemon_task = tokio::spawn(daemon_main(
-        Arc::new(fuse_interface),
-        manager,
-        shutdown_rx,
-        args.http_addr,
-    ));
-
-    let mut mount_finished = false;
-    tokio::select! {
-        res = &mut mount_handle => {
-            mount_finished = true;
-            if let Err(e) = res {
-                eprintln!("FUSE session ended with error: {e:?}");
-            }
+    // These commands need neither a loaded config nor logging; handle them
+    // before `cli::init` so they work even when the config is missing/invalid.
+    match &cli.command {
+        Some(Commands::Completions { shell }) => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(*shell, &mut cmd, "scorpio", &mut std::io::stdout());
+            return;
         }
-        _ = shutdown_signal() => {
-            // fallthrough to shutdown sequence below
+        Some(Commands::Config {
+            action: ConfigAction::Init { path, force },
+        }) => {
+            std::process::exit(cli::config_init(path, *force));
         }
-    }
-
-    // Stop HTTP server first (this triggers Antares shutdown cleanup), then unmount the main workspace FS.
-    let _ = shutdown_tx.send(());
-    match tokio::time::timeout(std::time::Duration::from_secs(20), &mut daemon_task).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => eprintln!("HTTP daemon task join failed: {e}"),
-        Err(_) => {
-            eprintln!("HTTP daemon shutdown timed out; aborting task");
-            daemon_task.abort();
+        Some(Commands::Config {
+            action: ConfigAction::Validate,
+        }) => {
+            std::process::exit(cli::config_validate(&cli.config_path, overrides.clone()));
         }
+        _ => {}
     }
 
-    if !mount_finished {
-        println!("unmount....");
-        let _ = mount_handle.unmount().await;
+    if let Err(code) = cli::init(&cli.config_path, cli.log_level.as_deref(), overrides) {
+        std::process::exit(code);
     }
-}
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("failed to install SIGINT handler");
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
+    let code = match cli.command {
+        None => {
+            // Unconditional (not log-level gated) deprecation note for the
+            // legacy flag-only invocation form.
+            eprintln!(
+                "note: running `scorpio` without a subcommand is deprecated; use `scorpio serve`"
+            );
+            cli::serve(cli.http_addr).await
         }
-    }
+        Some(Commands::Serve) => cli::serve(cli.http_addr).await,
+        Some(Commands::Mount { job_id, cl }) => cli::antares_mount(&job_id, cl.as_deref()).await,
+        Some(Commands::Umount { job_id }) => cli::antares_umount(&job_id).await,
+        Some(Commands::List) => cli::antares_list().await,
+        Some(Commands::HttpMount {
+            job_id,
+            path,
+            cl,
+            endpoint,
+        }) => cli::http_mount(job_id.as_deref(), &path, cl.as_deref(), &endpoint),
+        Some(Commands::Config {
+            action: ConfigAction::Show,
+        }) => cli::config_show(),
+        Some(Commands::Config { .. }) => {
+            unreachable!("config init/validate handled before config init")
+        }
+        Some(Commands::Doctor) => doctor::run().await,
+        Some(Commands::Completions { .. }) => unreachable!("handled before config init"),
+    };
 
-    #[cfg(not(unix))]
-    {
-        let _ = signal::ctrl_c().await;
-    }
+    std::process::exit(code);
 }

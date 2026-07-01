@@ -1,14 +1,13 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{Parser, Subcommand};
-use reqwest::blocking::Client;
-use scorpiofs::{
-    antares::{AntaresManager, AntaresPaths},
-    daemon::antares::{AntaresDaemon, AntaresServiceImpl},
-    util::config,
-};
+use scorpiofs::cli;
 
-/// Antares build overlay manager (skeleton).
+/// Antares build overlay manager.
+///
+/// Deprecated compatibility alias: prefer the unified `scorpio` binary
+/// (`scorpio mount|umount|list|http-mount`, and `scorpio serve` for the
+/// workspace daemon). This alias is retained for at least one minor release.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -73,144 +72,40 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    eprintln!(
+        "note: the `antares` binary is a deprecated compatibility alias; prefer `scorpio <subcommand>`"
+    );
+
     let cli = Cli::parse();
 
-    if let Err(e) = config::init_config(&cli.config_path) {
-        eprintln!("Failed to load config: {e}");
-        std::process::exit(1);
+    let overrides = cli::antares_overrides(
+        cli.upper_root.clone(),
+        cli.cl_root.clone(),
+        cli.mount_root.clone(),
+        cli.state_file.clone(),
+    );
+    if let Err(code) = cli::init(&cli.config_path, None, overrides) {
+        std::process::exit(code);
     }
 
-    let mut paths = AntaresPaths::from_global_config();
-    if let Some(p) = cli.upper_root {
-        paths.upper_root = p;
-    }
-    if let Some(p) = cli.cl_root {
-        paths.cl_root = p;
-    }
-    if let Some(p) = cli.mount_root {
-        paths.mount_root = p;
-    }
-    if let Some(p) = cli.state_file {
-        paths.state_file = p;
-    }
-
-    match cli.command {
-        Commands::Mount { job_id, cl } => {
-            let manager = AntaresManager::new(paths.clone()).await;
-            match manager.mount_job(&job_id, cl.as_deref()).await {
-                Ok(instance) => {
-                    println!(
-                        "mounted job {} at {}",
-                        job_id,
-                        instance.mountpoint.display()
-                    );
-                }
-                Err(err) => {
-                    eprintln!("failed to mount job {}: {}", job_id, err);
-                    std::process::exit(1);
-                }
+    let code = match cli.command {
+        Commands::Mount { job_id, cl } => cli::antares_mount(&job_id, cl.as_deref()).await,
+        Commands::Umount { job_id } => cli::antares_umount(&job_id).await,
+        Commands::List => cli::antares_list().await,
+        Commands::Serve { bind } => match bind.parse::<SocketAddr>() {
+            Ok(addr) => cli::antares_serve(addr).await,
+            Err(e) => {
+                eprintln!("Invalid bind address '{bind}': {e}");
+                cli::exit::CONFIG
             }
-        }
-        Commands::Umount { job_id } => {
-            let manager = AntaresManager::new(paths.clone()).await;
-            match manager.umount_job(&job_id).await {
-                Ok(Some(_)) => println!("unmounted job {}", job_id),
-                Ok(None) => {
-                    eprintln!("job {} not found", job_id);
-                    std::process::exit(1);
-                }
-                Err(err) => {
-                    eprintln!("failed to unmount job {}: {}", job_id, err);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::List => {
-            let manager = AntaresManager::new(paths.clone()).await;
-            let items = manager.list().await;
-            if items.is_empty() {
-                println!("no active jobs");
-            } else {
-                for it in items {
-                    let cl = it
-                        .cl_dir
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(none)".to_string());
-                    println!(
-                        "job_id={} mount={} upper={} cl={}",
-                        it.job_id,
-                        it.mountpoint.display(),
-                        it.upper_dir.display(),
-                        cl
-                    );
-                }
-            }
-        }
-        Commands::Serve { bind } => {
-            // Initialize tracing for daemon mode
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::from_default_env()
-                        .add_directive("scorpio=info".parse().unwrap()),
-                )
-                .init();
-
-            let addr: SocketAddr = bind.parse().unwrap_or_else(|e| {
-                eprintln!("Invalid bind address '{}': {}", bind, e);
-                std::process::exit(1);
-            });
-
-            // Create service with new Dicfuse instance
-            let service = Arc::new(AntaresServiceImpl::new(None).await);
-            let daemon = AntaresDaemon::new(service);
-
-            tracing::info!("Starting Antares daemon on {}", addr);
-
-            if let Err(e) = daemon.serve(addr).await {
-                tracing::error!("Daemon error: {}", e);
-                std::process::exit(1);
-            }
-        }
+        },
         Commands::HttpMount {
             job_id,
             path,
             cl,
             endpoint,
-        } => {
-            let client = Client::new();
-            let url = format!("{}/mounts", endpoint.trim_end_matches('/'));
-            let payload = serde_json::json!({
-                "job_id": job_id,
-                "path": path,
-                "cl": cl,
-            });
+        } => cli::http_mount(job_id.as_deref(), &path, cl.as_deref(), &endpoint),
+    };
 
-            let resp = client
-                .post(url)
-                .header("content-type", "application/json")
-                .json(&payload)
-                .send();
-
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    let created: serde_json::Value = r.json().unwrap_or_else(|e| {
-                        eprintln!("failed to parse response json: {e}");
-                        std::process::exit(1);
-                    });
-                    println!("{}", serde_json::to_string_pretty(&created).unwrap());
-                }
-                Ok(r) => {
-                    let status = r.status();
-                    let body = r.text().unwrap_or_default();
-                    eprintln!("http mount failed: status={} body={}", status, body);
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("http mount request failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
+    std::process::exit(code);
 }

@@ -1,0 +1,58 @@
+# ScorpioFS configuration template.
+#
+# Copy to `scorpio.toml` and adjust. Every key can also be overridden by an
+# environment variable named `SCORPIO_<KEY_UPPERCASE>` (e.g. SCORPIO_BASE_URL),
+# and on the CLI; precedence is: CLI > env > this file > built-in defaults.
+#
+# Only `base_url` and `lfs_url` typically need changing for a local setup; the
+# rest have sensible defaults and may be omitted.
+
+# --- Server / endpoints ---
+# Mega/monorepo service base URL (required to reach a real server).
+base_url = "http://localhost:8000"
+# Git LFS endpoint (usually the same host as base_url).
+lfs_url = "http://localhost:8000/lfs"
+
+# --- Core paths ---
+# FUSE mount point exposed to users.
+workspace = "/tmp/scorpio-megadir/mount"
+# Local directory for cached/stored file content (must be writable).
+store_path = "/tmp/scorpio-megadir/store"
+# Runtime mount-state file (records mounted workspaces as `works=[]`).
+# This is NOT user config; it is created/updated automatically at runtime.
+config_file = "config.toml"
+
+# --- Git author metadata ---
+git_author = "MEGA"
+git_email = "admin@mega.org"
+
+# --- Logging ---
+# Default tracing filter directive, e.g. "info" or "scorpio=debug".
+log_level = "info"
+
+# --- Dicfuse (read-only base layer) tuning ---
+dicfuse_readable = "true"
+load_dir_depth = "3"
+fetch_file_thread = "10"
+dicfuse_import_concurrency = "4"
+dicfuse_dir_sync_ttl_secs = "5"
+dicfuse_reply_ttl_secs = "2"
+dicfuse_fetch_dir_timeout_secs = "10"
+dicfuse_connect_timeout_secs = "3"
+dicfuse_fetch_dir_max_retries = "3"
+# One of: "fast" | "accurate".
+dicfuse_stat_mode = "accurate"
+dicfuse_open_buff_max_bytes = "268435456"
+dicfuse_open_buff_max_files = "4096"
+
+# --- Antares (build overlay) layer roots and tuning ---
+antares_upper_root = "/tmp/scorpio-megadir/antares/upper"
+antares_cl_root = "/tmp/scorpio-megadir/antares/cl"
+antares_mount_root = "/tmp/scorpio-megadir/antares/mnt"
+antares_state_file = "/tmp/scorpio-megadir/antares/state.toml"
+antares_load_dir_depth = "3"
+antares_dicfuse_stat_mode = "fast"
+antares_dicfuse_open_buff_max_bytes = "67108864"
+antares_dicfuse_open_buff_max_files = "1024"
+antares_dicfuse_dir_sync_ttl_secs = "120"
+antares_dicfuse_reply_ttl_secs = "60"

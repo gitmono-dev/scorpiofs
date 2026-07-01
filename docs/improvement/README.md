@@ -41,6 +41,28 @@
 | P3 | HTTP 鉴权评估(localhost 默认 / token) | 部署/易用性 |
 | P3 | perf 脚本集成 / banner 清理 | 易用性 |
 
+## 实施状态(已全部落地)
+
+本计划的 P0–P3 改进项均已实现并通过逐项 code review。功能与代码映射如下:
+
+| 改进项 | 实现 |
+|---|---|
+| 强类型 config 兼容层 + env 覆盖 + 启动期校验 | `src/util/config.rs`(`ScorpioConfig` 强类型、`RawResolver` 优先级 `CLI>env>file>default`、`SCORPIO_*`、URL/数值/枚举校验、移除 `set_defaults` 回写) |
+| 统一状态文件路径 + 消除 `to_toml` 静默失败 | `src/manager/mod.rs` 原子写、全部用 `config::config_file()`、错误传播 + 回滚 |
+| 统一日志(tracing + EnvFilter) | `src/util/logging.rs`、`main.rs`/`antares.rs`/`server`/`fetch` 全量改 `tracing`,`log_level` 配置项 |
+| 统一 CLI 子命令框架 | `src/cli.rs` + `src/main.rs`(`serve/mount/umount/list/http-mount/config/doctor/completions`,旧 flag 兼容,`antares` 别名,稳定退出码,主二进制改名 `scorpio`) |
+| 废弃/合并老 API + `/health` + status 统一 | `src/daemon/mod.rs`(根级 `GET /health`、`Deprecation` 头 + 日志、`POST /api/config` status 统一) |
+| shell completion + lib.rs doctest | `scorpio completions`(clap_complete)、`src/lib.rs` 示例改 crate 名 + `no_run` |
+| 生产路径 unwrap/panic 清理 + banner | unmount/mount/daemon/`from_toml`/signal 全部优雅化;banner 移除 |
+| `scorpio config init/validate/show` | `src/cli.rs` + `config::validate_file`(收集全部问题) |
+| `scorpio doctor` + config.toml 出库 + init.bash 改造 | `src/doctor.rs`、`.gitignore`/`.libraignore`、`scorpio.toml.example`、`script/mktestdirs.sh` |
+| 部署:Dockerfile + compose + systemd + install.sh | `Dockerfile`、`docker-compose.yml`、`deploy/systemd/*.service`、`install.sh`、`deploy/README.md` |
+| CI release + 供应链 | `.github/workflows/release.yml`(tar + SHA256 + 受保护环境 crates.io 门禁)、`LICENSE-MIT`/`LICENSE-APACHE`、`.github/dependabot.yml` |
+| perf 脚本集成 | `script/run.rs` → `examples/fs_read_perf.rs`(cargo example)、`script/README.md` |
+| HTTP 鉴权(P3 评估) | 已在 `deploy/README.md` 文档化风险,systemd/compose 默认 loopback;token/mTLS 留作后续 |
+
+> 历史问题描述(下文各 Phase / 子文档)保留为设计背景;实际状态以本表为准。
+
 ## 实施路线建议
 
 - **Phase 0(立即修正)**:只改文档与示例,修复 `docs/antares.md`、`docs/api.md`、`README.md` 与当前实现不一致的问题。该阶段不改变运行时行为,风险最低。**进度:** `docs/antares.md`、`docs/api.md`、仓库根 `README.md` 和 `docs/perf_test.md` 的主要文档漂移已完成同步(扁平键对齐、URL 前缀章节、`/mounts/{id}/ready`、删除幽灵 git 结构、补 `select` 端点、`mega_url`/`mount_path` 映射表、README 指向 `scorpio.toml`/`workspace`/`--http-addr`、清理开发者本机路径)。剩余 Phase 0 风险主要是后续代码变更再次引入文档漂移。

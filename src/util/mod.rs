@@ -5,6 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 pub mod config;
+pub mod logging;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct GPath {

@@ -17,16 +17,16 @@ macro_rules! call_fuse_function {
     ($self:ident,$func:ident, $req:expr , $inode:expr, $($args:expr),*) => {
         if let Some(ovl_inode) = $self.inodes_alloc.get_ovl_inode($inode/READONLY_INODE).await {
             if let Some(ovl_inode_root) = $self.overlayfs.lock().await.get(&ovl_inode){
-                println!(" overlay child inode root");
+                tracing::trace!("overlay child inode root");
                 ovl_inode_root.$func($req,$inode,$($args),*).await
             }else{
                 $self.dic.$func($req,$inode,$($args),*).await
             }
         }else if let Some(ovl_inode_root) = $self.overlayfs.lock().await.get(&$inode){
-            println!(" overlay inode root");
+            tracing::trace!("overlay inode root");
             ovl_inode_root.$func($req,$inode,$($args),*).await
         }else if ($inode < READONLY_INODE){
-            println!(" readonly inode root");
+            tracing::trace!("readonly inode root");
             $self.dic.$func($req,$inode,$($args),*).await
         }else{
             //TODO : don't panic, return error .

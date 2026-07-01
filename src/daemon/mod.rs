@@ -1,7 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Request, State},
+    middleware::Next,
+    response::Response,
     routing::{get, post},
     Router,
 };
@@ -99,6 +101,21 @@ struct SelectResponse {
     mount: Option<MountInfo>, // Mount information available when task is finished
     message: String,          // Human-readable status message
 }
+/// Liveness response for the root `GET /health` endpoint.
+///
+/// Intentionally lightweight: it reports only process-level liveness and never
+/// performs remote (mega) or deep FUSE checks, and never leaks absolute
+/// workspace/store paths. Deep checks belong in readiness / `scorpio doctor`.
+#[derive(Debug, Serialize, Deserialize)]
+struct HealthResponse {
+    status: String,
+    version: String,
+    uptime_secs: u64,
+    /// Number of tracked mounts. `null` if the manager lock is momentarily held
+    /// by an in-flight mount (liveness must never block on it).
+    mount_count: Option<usize>,
+}
+
 /// Application state shared across all request handlers.
 /// Contains shared resources and task tracking for the daemon.
 #[derive(Clone)]
@@ -106,6 +123,7 @@ struct ScoState {
     fuse: Arc<MegaFuse>,                      // Shared FUSE filesystem interface
     manager: Arc<Mutex<ScorpioManager>>,      // Shared workspace manager
     tasks: Arc<DashMap<String, MountStatus>>, // Thread-safe storage for async mount tasks
+    started: std::time::Instant,              // Process start time, for uptime reporting
 }
 
 /// Resolve a mount request to an inode and whether it should be treated as a temporary mount.
@@ -170,14 +188,20 @@ pub async fn daemon_main(
     fuse: Arc<MegaFuse>,
     manager: ScorpioManager,
     shutdown_rx: oneshot::Receiver<()>,
-    bind_addr: SocketAddr,
-) {
+    listener: tokio::net::TcpListener,
+) -> std::io::Result<()> {
     let inner = ScoState {
         fuse,
         manager: Arc::new(Mutex::new(manager)),
         tasks: Arc::new(DashMap::new()), // Initialize empty task tracking map
+        started: std::time::Instant::now(),
     };
-    let mut app = Router::new()
+
+    // Legacy `/api/fs/*` and `/api/config` routes are deprecated in favor of the
+    // Antares API (`/antares/*`). They keep working for at least one minor
+    // release but are tagged with a `Deprecation: true` response header and a
+    // warning log via the middleware below.
+    let deprecated = Router::new()
         .route("/api/fs/mount", post(mount_handler))
         .route("/api/fs/mpoint", get(mounts_handler))
         .route("/api/fs/select/{request_id}", get(select_handler))
@@ -187,6 +211,11 @@ pub async fn daemon_main(
         // Note: git-related routes have been moved to `src/daemon/git.rs`
         // and are currently disabled here. To enable them, merge the
         // router returned by `daemon::git::router()` into this `app`.
+        .layer(axum::middleware::from_fn(deprecation_middleware));
+
+    let mut app = Router::new()
+        .route("/health", get(health_handler))
+        .merge(deprecated)
         .with_state(inner);
 
     // Antares route - create service with new Dicfuse instance
@@ -196,7 +225,8 @@ pub async fn daemon_main(
     let antares_router = antares_daemon.router();
     let app = app.nest("/antares", antares_router);
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
+    // The listener is bound by the caller so bind failures surface as a clean
+    // CLI exit code instead of a panic inside this task.
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
@@ -213,7 +243,39 @@ pub async fn daemon_main(
             }
         })
         .await
-        .unwrap()
+}
+
+/// Root liveness probe. Lightweight by design: reports process status, version,
+/// uptime, and the number of tracked mounts, without remote/FUSE deep checks or
+/// leaking absolute paths. Readiness/deep checks live under `/antares/...` and
+/// `scorpio doctor`.
+async fn health_handler(State(state): State<ScoState>) -> axum::Json<HealthResponse> {
+    // Use `try_lock` so liveness never blocks: `perform_mount_task` holds this
+    // mutex across remote fetch/download work, so an `await`ing `lock()` here
+    // could stall the probe under load.
+    let mount_count = state.manager.try_lock().ok().map(|m| m.works.len());
+    axum::Json(HealthResponse {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_secs: state.started.elapsed().as_secs(),
+        mount_count,
+    })
+}
+
+/// Tags responses from deprecated routes with `Deprecation: true` (RFC 8594)
+/// and emits a warning log so callers can discover and migrate off them.
+async fn deprecation_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    tracing::warn!(
+        "deprecated endpoint called: {method} {uri}; prefer the Antares API (/antares/*) — see docs/api.md"
+    );
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("deprecation"),
+        axum::http::HeaderValue::from_static("true"),
+    );
+    response
 }
 
 /// Asynchronous mount handler for clients.
@@ -332,7 +394,28 @@ async fn perform_mount_task(state: ScoState, req: MountRequest) -> Result<MountI
             node: inode,
             hash: temp_hash,
         });
-        let _ = ml.to_toml("config.toml");
+        // Persist to the configured state file. On failure, roll back both the
+        // in-memory entry and the overlay mount so memory, disk, and the actual
+        // mount table stay consistent instead of pretending success.
+        let state_file = config::config_file();
+        // Convert the (`!Send`) `Box<dyn Error>` into an owned message inside the
+        // match so it is dropped before the await below; otherwise the handler
+        // future would be `!Send`.
+        let persist_err = match ml.to_toml(state_file) {
+            Ok(()) => None,
+            Err(e) => Some(format!("Failed to persist mount state: {e}")),
+        };
+        if let Some(msg) = persist_err {
+            ml.works.pop();
+            drop(ml);
+            tracing::error!("failed to persist mount state to '{state_file}': {msg}");
+            if let Err(ue) = state.fuse.overlay_umount_byinode(inode).await {
+                tracing::error!(
+                    "failed to roll back overlay mount for inode {inode} after state persist failure: {ue}"
+                );
+            }
+            return Err(msg);
+        }
 
         return Ok(mount_info);
     }
@@ -433,34 +516,51 @@ async fn unmount_handler(
     }
     match handle {
         Ok(_) => {
-            let path_str = if let Some(path) = &req.path {
-                path.clone()
+            // Derive the canonical (normalized `GPath`) path of the resource that
+            // was actually unmounted, so CL cleanup + state bookkeeping match the
+            // keys stored in `works`. The unmount above prefers `inode` over
+            // `path`, so resolve from `inode` first for consistency (and to avoid
+            // unmounting A while removing bookkeeping for B). Avoid panics: if the
+            // path can't be resolved, log and skip bookkeeping — the unmount
+            // already succeeded.
+            let path_str = if let Some(inode) = req.inode {
+                match state.fuse.dic.store.find_path(inode).await {
+                    Some(path) => Some(path.to_string()),
+                    None => {
+                        tracing::warn!(
+                            "unmounted inode {inode} but could not resolve its path for cleanup"
+                        );
+                        None
+                    }
+                }
             } else {
-                //todo be path by inode .
-                let path = state
-                    .fuse
-                    .dic
-                    .store
-                    .find_path(req.inode.unwrap())
-                    .await
-                    .unwrap();
-                path.to_string()
+                // Normalize so it matches the stored `GPath` keys (e.g. "/repo" -> "repo").
+                req.path
+                    .as_ref()
+                    .map(|path| GPath::from(path.clone()).to_string())
             };
 
-            // Try to get the CL link from the path and clean up CL layer
-            if let Some(cl_pos) = path_str.rfind('_') {
-                let potential_cl_link = &path_str[cl_pos + 1..];
-                // Simple validation - CL links are usually not entire paths
-                if !potential_cl_link.contains('/') && !potential_cl_link.is_empty() {
-                    let store_path = config::store_path();
-                    let _ = state
-                        .fuse
-                        .remove_cl_layer_by_cl_link(store_path, potential_cl_link)
-                        .await;
+            if let Some(path_str) = path_str {
+                // Try to get the CL link from the path and clean up CL layer
+                if let Some(cl_pos) = path_str.rfind('_') {
+                    let potential_cl_link = &path_str[cl_pos + 1..];
+                    // Simple validation - CL links are usually not entire paths
+                    if !potential_cl_link.contains('/') && !potential_cl_link.is_empty() {
+                        let store_path = config::store_path();
+                        let _ = state
+                            .fuse
+                            .remove_cl_layer_by_cl_link(store_path, potential_cl_link)
+                            .await;
+                    }
+                }
+
+                // The filesystem is already unmounted at this point; a state-file
+                // update failure (or a benign "not tracked" path) is logged rather
+                // than silently dropped, but does not undo the successful unmount.
+                if let Err(e) = state.manager.lock().await.remove_workspace(&path_str).await {
+                    tracing::warn!("failed to update mount state after unmounting {path_str}: {e}");
                 }
             }
-
-            let _ = state.manager.lock().await.remove_workspace(&path_str).await;
 
             axum::Json(UmountResponse {
                 status: SUCCESS.into(),
@@ -490,11 +590,19 @@ async fn config_handler() -> axum::Json<ConfigResponse> {
     })
 }
 
+/// Deprecated, non-functional configuration update endpoint.
+///
+/// This handler does NOT persist or apply any configuration; it only echoes the
+/// request. It is tagged `Deprecation: true` (see `deprecation_middleware`).
+/// Configuration changes should go through the config file + restart. The
+/// request struct still uses the legacy `mega_url`/`mount_path` field names
+/// (mapping to `base_url`/`workspace`); since the endpoint is deprecated and
+/// non-functional, the names are kept for backward compatibility rather than
+/// renamed. The `status` casing now matches `GET /api/config` ("Success").
 async fn update_config_handler(
     State(_state): State<ScoState>,
     req: axum::Json<ConfigRequest>,
 ) -> axum::Json<ConfigResponse> {
-    // update the Configration by request.
     let config_info = ConfigInfo {
         mega_url: req.mega_url.clone().unwrap_or_default(),
         mount_path: req.mount_path.clone().unwrap_or_default(),
@@ -502,7 +610,7 @@ async fn update_config_handler(
     };
 
     axum::Json(ConfigResponse {
-        status: "success".to_string(),
+        status: SUCCESS.to_string(),
         config: config_info,
     })
 }
@@ -524,7 +632,63 @@ mod tests {
             fuse: Arc::new(fuse),
             manager: Arc::new(Mutex::new(ScorpioManager { works: vec![] })),
             tasks: Arc::new(DashMap::new()),
+            started: std::time::Instant::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_health_handler_reports_liveness() {
+        let state = make_state().await;
+        let body = health_handler(State(state)).await.0;
+        assert_eq!(body.status, "ok");
+        assert_eq!(body.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(body.mount_count, Some(0));
+        // Must not leak any absolute path in the liveness payload.
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            !json.contains('/'),
+            "health payload must not leak paths: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deprecation_header_present_only_on_legacy_routes() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = make_state().await;
+        let deprecated = Router::new()
+            .route("/api/config", get(config_handler))
+            .layer(axum::middleware::from_fn(deprecation_middleware));
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .merge(deprecated)
+            .with_state(state);
+
+        // `/health` is NOT deprecated.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().get("deprecation").is_none());
+
+        // `/api/config` is deprecated → `Deprecation: true`.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("deprecation").unwrap(), "true");
     }
 
     #[tokio::test]
