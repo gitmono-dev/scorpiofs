@@ -2,6 +2,8 @@
 name = "scorpiofs"
 version = "0.2.2"
 edition = "2021"
+# `cargo run` (no --bin) runs the main `scorpio` binary; `antares` is the alias.
+default-run = "scorpio"
 description = "FUSE-based virtual filesystem with Antares overlay for monorepo builds"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/web3infra-foundation/scorpiofs"
@@ -15,6 +17,12 @@ readme = "README.md"
 name = "scorpiofs"
 path = "src/lib.rs"
 
+# The main binary is `scorpio` (the crate/lib is `scorpiofs`). `antares` is
+# auto-discovered from src/bin/antares.rs and kept as a deprecated alias.
+[[bin]]
+name = "scorpio"
+path = "src/main.rs"
+
 
 [dependencies]
 git-internal = "0.4.1"
@@ -24,6 +32,7 @@ tokio = { version = "1.49.0", features = ["full"] }
 axum = { version = "0.8.8", features = ["macros"] }
 rfuse3 = {  version = "0.0.8", features = ["tokio-runtime", "unprivileged", "file-lock"] }
 clap = { version = "4.5.57", features = ["derive"] }
+clap_complete = "4.5"
 
 toml = "0.9.8"
 libc = "0.2.180"
@@ -46,9 +55,10 @@ crossbeam = "0.8.4"
 dashmap = "6.1.0"
 ring = "0.17.14"
 hex = "0.4.3"
+url = "2.5"
 
 async-trait = "0.1.89"
-tracing-subscriber = "0.3.22"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 
 [features]

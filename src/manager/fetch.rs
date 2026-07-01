@@ -205,22 +205,22 @@ impl DownloadManager {
                         }
                         Err(e) => {
                             if task.is_max_retries_exceeded() {
-                                eprintln!(
-                                    "Worker {}: Failed to download file {} (path: {}) after {} retries, giving up: {}",
+                                tracing::error!(
+                                    "worker {}: failed to download file {} (path: {}) after {} retries, giving up: {}",
                                     worker_id, task.file_id, task.save_path.display(), task.retry_count, e
                                 );
                                 // Max retries exceeded, proceed to decrement counter
                             } else {
-                                eprintln!(
-                                    "Worker {}: Failed to download file {} (path: {}) on attempt {}, retrying: {}",
+                                tracing::warn!(
+                                    "worker {}: failed to download file {} (path: {}) on attempt {}, retrying: {}",
                                     worker_id, task.file_id, task.save_path.display(), task.retry_count + 1, e
                                 );
 
                                 // Create retry task and re-enqueue
                                 let retry_task = task.retry();
                                 if let Err(retry_err) = sender.send(retry_task) {
-                                    eprintln!(
-                                        "Worker {}: Failed to re-enqueue retry task for file {} (path: {}): {}",
+                                    tracing::error!(
+                                        "worker {}: failed to re-enqueue retry task for file {} (path: {}): {}",
                                         worker_id, task.file_id, task.save_path.display(), retry_err
                                     );
                                     // If we can't re-enqueue, we still need to decrement the counter
@@ -315,7 +315,7 @@ impl DownloadManager {
     pub fn get_global() -> &'static DownloadManager {
         DOWNLOAD_MANAGER.get_or_init(|| {
             let worker_count = config::fetch_file_thread();
-            println!("Initializing global download manager with {worker_count} workers");
+            tracing::debug!("initializing global download manager with {worker_count} workers");
             DownloadManager::new(worker_count)
         })
     }
@@ -327,7 +327,7 @@ pub fn enqueue_file_download(file_id: ObjectHash, save_path: PathBuf) {
     let task = DownloadTask::new(file_id, save_path);
 
     if let Err(e) = download_manager.enqueue_download(task) {
-        eprintln!("Failed to enqueue download task for file {file_id}: {e}");
+        tracing::error!("failed to enqueue download task for file {file_id}: {e}");
     }
 }
 
@@ -390,7 +390,9 @@ impl CheckHash for ScorpioManager {
             }
             //Get config file path from scorpio_config.rs
             let config_file = config::config_file();
-            let _ = self.to_toml(config_file);
+            if let Err(e) = self.to_toml(config_file) {
+                tracing::error!("failed to persist workspace state to '{config_file}': {e}");
+            }
         }
     }
 
@@ -416,7 +418,9 @@ impl CheckHash for ScorpioManager {
         fetch_code(&p, _lower).await.unwrap();
         self.works.push(workdir.clone());
         let config_file = config::config_file();
-        let _ = self.to_toml(config_file);
+        if let Err(e) = self.to_toml(config_file) {
+            tracing::error!("failed to persist workspace state to '{config_file}': {e}");
+        }
 
         workdir
     }
@@ -447,7 +451,16 @@ pub async fn fetch<P: AsRef<Path>>(
     fetch_code(&o, _lower).await?;
     manager.works.push(workdir.clone());
     let config_file = config::config_file();
-    let _ = manager.to_toml(config_file);
+    if let Err(e) = manager.to_toml(config_file) {
+        // Roll back the in-memory push so a persistence failure does not leave a
+        // phantom checked-out workspace that blocks future mount retries and
+        // shows up in `/api/fs/mpoint`.
+        manager.works.pop();
+        tracing::error!("failed to persist workspace state to '{config_file}': {e}");
+        return Err(std::io::Error::other(format!(
+            "failed to persist workspace state: {e}"
+        )));
+    }
 
     // Get the commit information of the previous version and
     // write it into the commit file.
@@ -472,7 +485,7 @@ async fn worker_thread(
         let path = tokio::select! {
             _ = time::sleep(timeout_duration) => {
                 // If timeout and no more tree, finish this thread.
-                println!("Timeout occurred while waiting for path");
+                tracing::debug!("timeout occurred while waiting for path");
                 break;
             },
             path = async {
@@ -520,20 +533,20 @@ async fn worker_thread(
                                     }
                                 }
                                 Err(e) => {
-                                    println!("Failed to parse tree: {e:?}");
+                                    tracing::error!("failed to parse tree: {e:?}");
                                 }
                             }
                         }
                         Err(e) => {
-                            println!("Failed to get response bytes: {e:?}");
+                            tracing::error!("failed to get response bytes: {e:?}");
                         }
                     }
                 } else {
-                    println!("Failed to fetch tree: {}", response.status());
+                    tracing::warn!("failed to fetch tree: {}", response.status());
                 }
             }
             Err(e) => {
-                println!("Failed to send request: {e:?}");
+                tracing::error!("failed to send request: {e:?}");
             }
         }
     }
@@ -568,9 +581,8 @@ async fn worker_ro_thread(
             }
             // mkdir
             tokio::fs::create_dir_all(real_path).await.unwrap();
-        } else {
-            let e = fetch_and_save_file(&item.id, real_path).await;
-            println!("{e:?}");
+        } else if let Err(e) = fetch_and_save_file(&item.id, real_path).await {
+            tracing::error!("failed to fetch file: {e:?}");
         }
     }
     for h in handlers {
@@ -604,7 +616,7 @@ async fn fetch_code(path: &GPath, save_path: impl AsRef<Path>) -> std::io::Resul
 
     // Send tree to storage
     if let Err(e) = tree_sender.send((path.clone(), initial_tree.clone())).await {
-        eprintln!("Failed to send initial tree: {e}");
+        tracing::error!("failed to send initial tree: {e}");
     }
 
     let dir_count = initial_tree
@@ -622,7 +634,7 @@ async fn fetch_code(path: &GPath, save_path: impl AsRef<Path>) -> std::io::Resul
         if item.mode == TreeItemMode::Tree {
             // Create directory and add to queue for processing
             if let Err(e) = tokio::fs::create_dir_all(&real_path).await {
-                eprintln!("Failed to create directory {real_path:?}: {e}");
+                tracing::error!("failed to create directory {real_path:?}: {e}");
                 // If we failed to create directory, reduce the producer count
                 active_producers.fetch_sub(1, Ordering::Release);
                 continue;
@@ -655,7 +667,7 @@ async fn fetch_code(path: &GPath, save_path: impl AsRef<Path>) -> std::io::Resul
                             if let Err(e) =
                                 tree_sender.send((current_path.clone(), tree.clone())).await
                             {
-                                eprintln!("Worker {worker_id}: Failed to send tree: {e}");
+                                tracing::warn!("worker {worker_id}: failed to send tree: {e}");
                             }
 
                             // Process each item in the tree
@@ -683,8 +695,8 @@ async fn fetch_code(path: &GPath, save_path: impl AsRef<Path>) -> std::io::Resul
                             }
                         }
                         Err(e) => {
-                            eprintln!(
-                                "Worker {worker_id}: Failed to fetch tree for {current_path}: {e}",
+                            tracing::warn!(
+                                "worker {worker_id}: failed to fetch tree for {current_path}: {e}",
                             );
                         }
                     }
@@ -707,7 +719,7 @@ async fn fetch_code(path: &GPath, save_path: impl AsRef<Path>) -> std::io::Resul
     let storepath = save_path.as_ref().parent().unwrap().join("tree.db");
     let store_handle = tokio::spawn(async move {
         if let Err(e) = store_trees(storepath.to_str().unwrap(), tree_receiver).await {
-            eprintln!("Failed to store trees: {e}");
+            tracing::error!("failed to store trees: {e}");
         }
     });
 
@@ -724,7 +736,7 @@ async fn fetch_code(path: &GPath, save_path: impl AsRef<Path>) -> std::io::Resul
 
     // LFS restore removed — previously fetched LFS objects here.
 
-    println!("Finished downloading code for {path}");
+    tracing::info!("finished downloading code for {path}");
     Ok(())
 }
 
@@ -734,7 +746,7 @@ async fn _set_parent_commit(work_path: &Path, repo_path: &str) -> std::io::Resul
     let parent_commit = match fetch_parent_commit(repo_path).await {
         Ok(info) => info,
         Err(e) => {
-            eprintln!("Failed to fetch parent commit info: {e}");
+            tracing::error!("failed to fetch parent commit info: {e}");
             return Err(std::io::Error::other("Failed to fetch parent commit info"));
         }
     };
@@ -768,7 +780,7 @@ async fn fetch_and_save_file(
         // Save the data to a file
         tokio::fs::write(save_path, data).await?;
     } else {
-        eprintln!("Request failed with status: {}", response.status());
+        tracing::warn!("request failed with status: {}", response.status());
     }
 
     Ok(())
