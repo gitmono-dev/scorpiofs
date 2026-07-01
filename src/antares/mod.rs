@@ -68,6 +68,33 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// The FUSE unmount helper to invoke, resolved once.
+///
+/// Prefers fuse3's `fusermount3` — which this project's fuse3-based stack uses
+/// and which the deployment artifacts (Dockerfile / install.sh / systemd)
+/// install — and falls back to fuse2's `fusermount` for fuse2-only hosts.
+pub(crate) fn fusermount_bin() -> &'static str {
+    use std::sync::OnceLock;
+    static BIN: OnceLock<&'static str> = OnceLock::new();
+    BIN.get_or_init(|| {
+        if binary_on_path("fusermount3") {
+            "fusermount3"
+        } else if binary_on_path("fusermount") {
+            "fusermount"
+        } else {
+            // Neither present; default to the modern helper so any resulting
+            // error names what the docs tell users to install.
+            "fusermount3"
+        }
+    })
+}
+
+fn binary_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
 use crate::{
     dicfuse::{Dicfuse, DicfuseManager},
     util::config,
@@ -353,7 +380,7 @@ impl AntaresManager {
                         mount_path, e
                     );
                     // Fallback to fusermount -u
-                    let _ = tokio::process::Command::new("fusermount")
+                    let _ = tokio::process::Command::new(crate::antares::fusermount_bin())
                         .arg("-u")
                         .arg(mount_path)
                         .output()
@@ -362,7 +389,7 @@ impl AntaresManager {
             }
         } else {
             // No FUSE handle available, use fusermount directly
-            let output = tokio::process::Command::new("fusermount")
+            let output = tokio::process::Command::new(crate::antares::fusermount_bin())
                 .arg("-u")
                 .arg(mount_path)
                 .output()
