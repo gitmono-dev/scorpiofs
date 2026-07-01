@@ -98,7 +98,7 @@ impl AntaresFuse {
         // With writeback cache enabled, reopening an existing file in append mode
         // can fail inside libfuse-fs passthrough I/O with EBADF.
         let handle =
-            mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), false).await;
+            mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), false).await?;
 
         // Spawn background task to run the FUSE session
         let fuse_task = tokio::spawn(async move {
@@ -1251,7 +1251,9 @@ mod tests {
             "Mounting simple passthrough overlay at: {}",
             mount.display()
         );
-        let handle = crate::server::mount_filesystem(overlay, mount.as_os_str()).await;
+        let handle = crate::server::mount_filesystem(overlay, mount.as_os_str())
+            .await
+            .unwrap();
 
         // Spawn background task
         let fuse_task = tokio::spawn(async move {
@@ -1927,7 +1929,9 @@ mod tests {
 
         println!("Mounting deep overlay at: {}", mount.display());
         let logfs = LoggingFileSystem::new(overlay);
-        let handle = crate::server::mount_filesystem(logfs, mount.as_os_str()).await;
+        let handle = crate::server::mount_filesystem(logfs, mount.as_os_str())
+            .await
+            .unwrap();
 
         // Run FUSE session in the background.
         let _fuse_task = tokio::spawn(async move {

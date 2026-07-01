@@ -502,7 +502,8 @@ async fn test_scorpio_dir(
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let mut mount_handle: rfuse3::raw::MountHandle = mount_filesystem(lgfs, mountpoint).await;
+    let mut mount_handle: rfuse3::raw::MountHandle =
+        mount_filesystem(lgfs, mountpoint).await.unwrap();
 
     let arc_fuse = Arc::new(fuse_interface);
     let repo_dir = SCOR_DIR.join("dir_test");
