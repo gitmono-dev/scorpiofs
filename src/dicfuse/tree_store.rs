@@ -3,8 +3,8 @@ use std::{
     io::{Error, ErrorKind},
 };
 
-use bincode::{Decode, Encode};
 use asyncfuse::{raw::reply::ReplyEntry, FileType};
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 
@@ -164,10 +164,7 @@ impl TreeStorage {
         let mut children = Vec::new();
         let inode = self.get_storage_item(inode)?;
         for child in inode.children {
-            match self.get_item(child) {
-                Ok(item) => children.push(item),
-                Err(e) => return Err(e),
-            }
+            children.push(self.get_item(child)?);
         }
         Ok(children)
     }

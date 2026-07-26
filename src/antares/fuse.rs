@@ -259,11 +259,6 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use bytes::Bytes;
-    use libfuse_fs::{
-        context::OperationContext,
-        unionfs::{config::Config as UnionConfig, layer::Layer, OverlayFs},
-    };
     use asyncfuse::{
         raw::{
             reply::{
@@ -273,6 +268,11 @@ mod tests {
             Filesystem, Request,
         },
         FileType, Inode, Result as FuseResult, Timestamp,
+    };
+    use bytes::Bytes;
+    use libfuse_fs::{
+        context::OperationContext,
+        unionfs::{config::Config as UnionConfig, layer::Layer, OverlayFs},
     };
     use serial_test::serial;
     use tokio::time::{sleep, Duration};
@@ -1849,11 +1849,11 @@ mod tests {
     async fn deep_write_goes_to_upper() {
         use std::sync::Arc;
 
+        use asyncfuse::raw::logfs::LoggingFileSystem;
         use libfuse_fs::{
             passthrough::{new_passthroughfs_layer, PassthroughArgs},
             unionfs::{config::Config, OverlayFs},
         };
-        use asyncfuse::raw::logfs::LoggingFileSystem;
         // Only  LoggingFileSystem DEBUG
         use tracing_subscriber::EnvFilter;
         let _ = tracing_subscriber::fmt()

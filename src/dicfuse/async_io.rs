@@ -1,12 +1,12 @@
 use std::{ffi::OsStr, num::NonZeroU32, time::Duration};
 
-use bytes::Bytes;
-use futures::stream::iter;
 use asyncfuse::{
     notify::Notify,
     raw::{prelude::*, reply::DirectoryEntry},
     Errno, Inode, Result,
 };
+use bytes::Bytes;
+use futures::stream::iter;
 
 use super::Dicfuse;
 use crate::dicfuse::{
@@ -774,11 +774,12 @@ impl Filesystem for Dicfuse {
                             _ => default_file_entry(item.get_inode()),
                         };
                         default_entry.ttl = self.reply_ttl();
-                        let default_ft = if default_entry.attr.kind == asyncfuse::FileType::Directory {
-                            asyncfuse::FileType::Directory
-                        } else {
-                            asyncfuse::FileType::RegularFile
-                        };
+                        let default_ft =
+                            if default_entry.attr.kind == asyncfuse::FileType::Directory {
+                                asyncfuse::FileType::Directory
+                            } else {
+                                asyncfuse::FileType::RegularFile
+                            };
                         (default_entry, default_ft)
                     }
                 };

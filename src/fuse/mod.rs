@@ -5,12 +5,12 @@ use std::{
     sync::Arc,
 };
 
+use asyncfuse::raw::{Filesystem, Request};
 use inode_alloc::InodeAlloc;
 use libfuse_fs::{
     overlayfs::{config, OverlayFs},
     passthrough::{new_passthroughfs_layer, PassthroughArgs},
 };
-use asyncfuse::raw::{Filesystem, Request};
 use tokio::sync::Mutex;
 
 use crate::{
