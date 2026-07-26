@@ -128,8 +128,11 @@ pub async fn mount_filesystem_with_antares_cache<
     let gid = unsafe { libc::getgid() };
 
     let mut mount_options = MountOptions::default();
-    // .allow_other(true)
-    mount_options.force_readdir_plus(true).uid(uid).gid(gid);
+    mount_options
+        .allow_other(true)
+        .force_readdir_plus(true)
+        .uid(uid)
+        .gid(gid);
     if enable_antares_cache {
         apply_antares_cache_mount_options(&mut mount_options);
     }
