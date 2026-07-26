@@ -57,7 +57,7 @@ impl Filesystem for MegaFuse {
     async fn destroy(&self, req: Request) {
         self.dic.destroy(req).await;
         let map_lock = &self.overlayfs.lock().await;
-        for (_, ovl_fs) in map_lock.iter() {
+        for ovl_fs in map_lock.values() {
             ovl_fs.destroy(req).await;
         }
     }
