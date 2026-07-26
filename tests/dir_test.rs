@@ -12,8 +12,8 @@ use std::{
 };
 
 // use http::Method;
-use lazy_static::lazy_static;
 use asyncfuse::raw::logfs::LoggingFileSystem;
+use lazy_static::lazy_static;
 use scorpiofs::{
     dicfuse::store,
     fuse::MegaFuse,
