@@ -10,7 +10,7 @@ use libfuse_fs::{
     overlayfs::{config, OverlayFs},
     passthrough::{new_passthroughfs_layer, PassthroughArgs},
 };
-use rfuse3::raw::{Filesystem, Request};
+use asyncfuse::raw::{Filesystem, Request};
 use tokio::sync::Mutex;
 
 use crate::{

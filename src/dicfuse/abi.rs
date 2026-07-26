@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rfuse3::{
+use asyncfuse::{
     raw::reply::{FileAttr, ReplyEntry},
     FileType, Timestamp,
 };

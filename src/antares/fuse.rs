@@ -17,7 +17,7 @@ pub struct AntaresFuse {
     /// Background task running the FUSE session.
     fuse_task: Option<JoinHandle<()>>,
 }
-use rfuse3::raw::logfs::LoggingFileSystem;
+use asyncfuse::raw::logfs::LoggingFileSystem;
 impl AntaresFuse {
     /// Build directories for upper / optional CL layers.
     pub async fn new(
@@ -264,7 +264,7 @@ mod tests {
         context::OperationContext,
         unionfs::{config::Config as UnionConfig, layer::Layer, OverlayFs},
     };
-    use rfuse3::{
+    use asyncfuse::{
         raw::{
             reply::{
                 DirectoryEntry, FileAttr, ReplyAttr, ReplyCreated, ReplyData, ReplyDirectory,
@@ -469,7 +469,7 @@ mod tests {
             _req: Request,
             inode: Inode,
             _fh: Option<u64>,
-            _set_attr: rfuse3::SetAttr,
+            _set_attr: asyncfuse::SetAttr,
         ) -> FuseResult<ReplyAttr> {
             // Minimal: accept setattr and return current attrs. Overlay copy-up uses this to
             // preserve ownership/mode; our in-memory layer does not model these changes yet.
@@ -600,7 +600,7 @@ mod tests {
             }
             let parent_parent_inode = if parent == 1 { 1 } else { parent_node.parent };
 
-            let mut out: Vec<std::result::Result<DirectoryEntry, rfuse3::Errno>> = Vec::new();
+            let mut out: Vec<std::result::Result<DirectoryEntry, asyncfuse::Errno>> = Vec::new();
 
             // offset 0: ".", offset 1: "..", offset 2+: children
             if offset < 1 {
@@ -662,9 +662,9 @@ mod tests {
             end: u64,
             _type: u32,
             _pid: u32,
-        ) -> FuseResult<rfuse3::raw::reply::ReplyLock> {
+        ) -> FuseResult<asyncfuse::raw::reply::ReplyLock> {
             // In-memory test layer: no locks held, report F_UNLCK.
-            Ok(rfuse3::raw::reply::ReplyLock {
+            Ok(asyncfuse::raw::reply::ReplyLock {
                 start,
                 end,
                 r#type: libc::F_UNLCK as u32,
@@ -706,7 +706,7 @@ mod tests {
             let inode = self
                 .create_child(parent, name, FileType::RegularFile, 0o644)
                 .await
-                .map_err(rfuse3::Errno::from)?;
+                .map_err(asyncfuse::Errno::from)?;
             let st = self.state.read().await;
             let node = st
                 .nodes
@@ -732,7 +732,7 @@ mod tests {
             let inode = self
                 .create_child(parent, name, FileType::Directory, 0o755)
                 .await
-                .map_err(rfuse3::Errno::from)?;
+                .map_err(asyncfuse::Errno::from)?;
             let st = self.state.read().await;
             let node = st
                 .nodes
@@ -1853,7 +1853,7 @@ mod tests {
             passthrough::{new_passthroughfs_layer, PassthroughArgs},
             unionfs::{config::Config, OverlayFs},
         };
-        use rfuse3::raw::logfs::LoggingFileSystem;
+        use asyncfuse::raw::logfs::LoggingFileSystem;
         // Only  LoggingFileSystem DEBUG
         use tracing_subscriber::EnvFilter;
         let _ = tracing_subscriber::fmt()

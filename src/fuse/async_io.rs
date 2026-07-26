@@ -1,6 +1,6 @@
 use std::{ffi::OsStr, num::NonZeroU32};
 
-use rfuse3::{raw::prelude::*, Inode, Result};
+use asyncfuse::{raw::prelude::*, Inode, Result};
 
 use super::MegaFuse;
 use crate::READONLY_INODE;

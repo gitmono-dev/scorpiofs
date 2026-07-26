@@ -54,7 +54,7 @@
 
 use std::ffi::{OsStr, OsString};
 
-use rfuse3::{
+use asyncfuse::{
     raw::{Filesystem, MountHandle, Session},
     MountOptions,
 };

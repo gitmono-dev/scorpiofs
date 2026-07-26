@@ -40,7 +40,7 @@ use libfuse_fs::{
     context::OperationContext,
     unionfs::{layer::Layer, Inode},
 };
-use rfuse3::{
+use asyncfuse::{
     raw::reply::{ReplyCreated, ReplyEntry},
     Result,
 };
@@ -147,8 +147,8 @@ impl Layer for Dicfuse {
         };
 
         let type_bits: libc::mode_t = match attr.kind {
-            rfuse3::FileType::Directory => libc::S_IFDIR,
-            rfuse3::FileType::Symlink => libc::S_IFLNK,
+            asyncfuse::FileType::Directory => libc::S_IFDIR,
+            asyncfuse::FileType::Symlink => libc::S_IFLNK,
             _ => libc::S_IFREG,
         };
 

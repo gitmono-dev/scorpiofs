@@ -4,7 +4,7 @@ use std::{
 };
 
 use bincode::{Decode, Encode};
-use rfuse3::{raw::reply::ReplyEntry, FileType};
+use asyncfuse::{raw::reply::ReplyEntry, FileType};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 
