@@ -1,6 +1,6 @@
 [package]
 name = "scorpiofs"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 # `cargo run` (no --bin) runs the main `scorpio` binary; `antares` is the alias.
 default-run = "scorpio"
@@ -52,7 +52,7 @@ async-recursion = "1.1.1"
 bytes = "1.11.1"
 futures = "0.3.31"
 uuid = { version = "1.20.0", features = ["v4"] }
-libfuse-fs = "0.1.15"
+libfuse-fs = "0.2.0"
 whoami = "1.6.0"
 thiserror = "2.0.18"
 crossbeam = "0.8.4"
