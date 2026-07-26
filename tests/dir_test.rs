@@ -12,8 +12,8 @@ use std::{
 };
 
 // use http::Method;
+use asyncfuse::raw::logfs::LoggingFileSystem;
 use lazy_static::lazy_static;
-use rfuse3::raw::logfs::LoggingFileSystem;
 use scorpiofs::{
     dicfuse::store,
     fuse::MegaFuse,
@@ -502,7 +502,7 @@ async fn test_scorpio_dir(
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let mut mount_handle: rfuse3::raw::MountHandle =
+    let mut mount_handle: asyncfuse::raw::MountHandle =
         mount_filesystem(lgfs, mountpoint).await.unwrap();
 
     let arc_fuse = Arc::new(fuse_interface);

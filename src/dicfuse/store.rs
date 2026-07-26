@@ -12,12 +12,12 @@ use std::{
 };
 
 use async_recursion::async_recursion;
+use asyncfuse::{raw::reply::ReplyEntry, FileType};
 use crossbeam::queue::SegQueue;
 use dashmap::{mapref::one::Ref, DashMap};
 use futures::future::join_all;
 use once_cell::sync::Lazy;
 use reqwest::Client;
-use rfuse3::{raw::reply::ReplyEntry, FileType};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tracing::{debug, info, warn};

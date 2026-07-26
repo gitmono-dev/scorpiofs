@@ -1,12 +1,12 @@
 use std::{ffi::OsStr, num::NonZeroU32, time::Duration};
 
-use bytes::Bytes;
-use futures::stream::iter;
-use rfuse3::{
+use asyncfuse::{
     notify::Notify,
     raw::{prelude::*, reply::DirectoryEntry},
     Errno, Inode, Result,
 };
+use bytes::Bytes;
+use futures::stream::iter;
 
 use super::Dicfuse;
 use crate::dicfuse::{
@@ -199,10 +199,10 @@ impl Filesystem for Dicfuse {
                         ino: 0,
                         size: 0,
                         blocks: 0,
-                        atime: rfuse3::Timestamp::new(0, 0),
-                        mtime: rfuse3::Timestamp::new(0, 0),
-                        ctime: rfuse3::Timestamp::new(0, 0),
-                        kind: rfuse3::FileType::RegularFile,
+                        atime: asyncfuse::Timestamp::new(0, 0),
+                        mtime: asyncfuse::Timestamp::new(0, 0),
+                        ctime: asyncfuse::Timestamp::new(0, 0),
+                        kind: asyncfuse::FileType::RegularFile,
                         perm: 0,
                         nlink: 0,
                         uid: 0,
@@ -649,7 +649,7 @@ impl Filesystem for Dicfuse {
         if offset < 1 {
             d.push(Ok(DirectoryEntry {
                 inode: parent, // . points to current directory
-                kind: rfuse3::FileType::Directory,
+                kind: asyncfuse::FileType::Directory,
                 name: ".".into(),
                 offset: 1,
             }));
@@ -658,7 +658,7 @@ impl Filesystem for Dicfuse {
         if offset < 2 {
             d.push(Ok(DirectoryEntry {
                 inode: parent_parent_inode, // .. points to parent directory
-                kind: rfuse3::FileType::Directory,
+                kind: asyncfuse::FileType::Directory,
                 name: "..".into(),
                 offset: 2,
             }));
@@ -715,7 +715,7 @@ impl Filesystem for Dicfuse {
         if offset < 1 {
             d.push(Ok(DirectoryEntryPlus {
                 inode: parent, // . points to current directory
-                kind: rfuse3::FileType::Directory,
+                kind: asyncfuse::FileType::Directory,
                 name: ".".into(),
                 offset: 1,
                 generation: 0,
@@ -728,7 +728,7 @@ impl Filesystem for Dicfuse {
         if offset < 2 {
             d.push(Ok(DirectoryEntryPlus {
                 inode: parent_parent_inode, // .. points to parent directory
-                kind: rfuse3::FileType::Directory,
+                kind: asyncfuse::FileType::Directory,
                 name: "..".into(),
                 offset: 2,
                 generation: 0,
@@ -774,11 +774,12 @@ impl Filesystem for Dicfuse {
                             _ => default_file_entry(item.get_inode()),
                         };
                         default_entry.ttl = self.reply_ttl();
-                        let default_ft = if default_entry.attr.kind == rfuse3::FileType::Directory {
-                            rfuse3::FileType::Directory
-                        } else {
-                            rfuse3::FileType::RegularFile
-                        };
+                        let default_ft =
+                            if default_entry.attr.kind == asyncfuse::FileType::Directory {
+                                asyncfuse::FileType::Directory
+                            } else {
+                                asyncfuse::FileType::RegularFile
+                            };
                         (default_entry, default_ft)
                     }
                 };

@@ -9,7 +9,7 @@ use std::{
     collections::HashMap, ffi::OsStr, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
 };
 
-use rfuse3::raw::logfs::LoggingFileSystem;
+use asyncfuse::raw::logfs::LoggingFileSystem;
 use tokio::sync::oneshot;
 
 use crate::{
