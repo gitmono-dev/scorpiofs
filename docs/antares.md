@@ -260,6 +260,42 @@ Antares 路由可通过两种方式暴露,**路径前缀不同**:
 
 ---
 
+### 4.3. List changed paths
+
+**Endpoint**: `GET /mounts/{mount_id}/changes` (primary process:
+`GET /antares/mounts/{mount_id}/changes`)
+
+**Description**: Returns the paths represented by the optional CL layer and
+the private writable upper layer. The service does not walk the remote Dicfuse
+base. Upper-layer entries override CL entries for the same path, character
+device whiteouts are reported as `deleted`, and other entries are reported as
+`modified`. The `.libra` linked-worktree metadata path is excluded.
+
+**Response** (200 OK):
+
+```json
+{
+  "mount_id": "550e8400-e29b-41d4-a716-446655440000",
+  "generation": 14695981039346656037,
+  "changes": [
+    {
+      "kind": "modified",
+      "path": "src/lib.rs"
+    },
+    {
+      "kind": "deleted",
+      "path": "src/obsolete.rs"
+    }
+  ]
+}
+```
+
+`generation` is a stable fingerprint of the sorted changed-path set. Clients
+must still compare candidate files against their own index and object model;
+this endpoint reports overlay candidates, not Git status.
+
+---
+
 ### 5. 删除挂载
 
 **端点**: `DELETE /mounts/{mount_id}`
