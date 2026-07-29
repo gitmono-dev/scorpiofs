@@ -56,7 +56,9 @@ impl TreeStore for sled::Db {
                     let path = std::str::from_utf8(&path)
                         .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF8 path"))?
                         .strip_prefix(TREE_KEY_PREFIX)
-                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid tree cache key"))?;
+                        .ok_or_else(|| {
+                            Error::new(ErrorKind::InvalidData, "Invalid tree cache key")
+                        })?;
                     let decoded_tree = serde_json::from_slice(&encoded_value)
                         .map_err(|_| Error::other("Deserialization error"))?;
                     Ok((PathBuf::from(path), decoded_tree))
@@ -609,11 +611,7 @@ mod test {
         .unwrap();
 
         if let Some(encoded_value) = db.get(t.id.as_ref()).unwrap() {
-            // use bincode to deserialize the value .
-            let config = bincode::config::standard();
-            let decoded: Tree = bincode::decode_from_slice(&encoded_value, config)
-                .unwrap()
-                .0;
+            let decoded: Tree = serde_json::from_slice(&encoded_value).unwrap();
             println!(" {decoded}");
         };
     }
@@ -629,9 +627,10 @@ mod test {
         for result in iter {
             match result {
                 Ok((key, value)) => {
-                    // Deserialize the value into the original tree structure using bincode
-                    let config = bincode::config::standard();
-                    let tree: Tree = bincode::decode_from_slice(&value, config).unwrap().0;
+                    if !key.starts_with(super::TREE_KEY_PREFIX.as_bytes()) {
+                        continue;
+                    }
+                    let tree: Tree = serde_json::from_slice(&value).unwrap();
                     let key_str = std::str::from_utf8(&key).unwrap();
 
                     println!("path:{key_str}");

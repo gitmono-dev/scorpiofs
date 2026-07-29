@@ -343,7 +343,9 @@ where
         AxumPath(mount_id): AxumPath<Uuid>,
         Json(request): Json<RefreshPlanRequest>,
     ) -> Result<Json<RefreshPlanResponse>, ApiError> {
-        Ok(Json(service.plan_worktree_refresh(mount_id, request).await?))
+        Ok(Json(
+            service.plan_worktree_refresh(mount_id, request).await?,
+        ))
     }
 }
 
@@ -391,10 +393,7 @@ pub trait AntaresService: Send + Sync {
     async fn changed_paths(&self, mount_id: Uuid) -> Result<MountChangesResponse, ServiceError>;
 
     /// Return the lower-base binding and writable upper state used by Libra.
-    async fn worktree_state(
-        &self,
-        _mount_id: Uuid,
-    ) -> Result<WorktreeStateResponse, ServiceError> {
+    async fn worktree_state(&self, _mount_id: Uuid) -> Result<WorktreeStateResponse, ServiceError> {
         Err(ServiceError::Unsupported(
             "worktree state is not implemented by this Antares service".into(),
         ))
@@ -2006,10 +2005,7 @@ impl AntaresService for AntaresServiceImpl {
         })?
     }
 
-    async fn worktree_state(
-        &self,
-        mount_id: Uuid,
-    ) -> Result<WorktreeStateResponse, ServiceError> {
+    async fn worktree_state(&self, mount_id: Uuid) -> Result<WorktreeStateResponse, ServiceError> {
         let (path, base_revision, mount_state, upper_dir) = {
             let mounts = self.mounts.read().await;
             let entry = mounts
@@ -2025,16 +2021,15 @@ impl AntaresService for AntaresServiceImpl {
 
         // A VCS worktree treats an optional CL layer as part of its supplied
         // base, not as a user edit. Only the private upper layer is dirty.
-        let changes = tokio::task::spawn_blocking(move || {
-            scan_mount_changes(mount_id, &upper_dir, None)
-        })
-        .await
-        .map_err(|error| {
-            ServiceError::Internal(format!(
-                "Antares worktree-state scan task failed for mount {}: {}",
-                mount_id, error
-            ))
-        })??;
+        let changes =
+            tokio::task::spawn_blocking(move || scan_mount_changes(mount_id, &upper_dir, None))
+                .await
+                .map_err(|error| {
+                    ServiceError::Internal(format!(
+                        "Antares worktree-state scan task failed for mount {}: {}",
+                        mount_id, error
+                    ))
+                })??;
 
         Ok(WorktreeStateResponse {
             mount_id,
@@ -2110,7 +2105,9 @@ impl AntaresService for AntaresServiceImpl {
             None => RefreshPlanDisposition::Unbound,
             Some(current) if current != expected => RefreshPlanDisposition::BaseMismatch,
             Some(current) if current == target => RefreshPlanDisposition::AlreadyAtTarget,
-            Some(_) if request.require_clean && worktree.dirty => RefreshPlanDisposition::BlockedDirty,
+            Some(_) if request.require_clean && worktree.dirty => {
+                RefreshPlanDisposition::BlockedDirty
+            }
             Some(_) => RefreshPlanDisposition::Ready,
         };
 
