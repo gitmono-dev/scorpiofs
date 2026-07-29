@@ -2053,6 +2053,23 @@ impl AntaresService for AntaresServiceImpl {
             ));
         }
 
+        let existing_base = {
+            let mounts = self.mounts.read().await;
+            let entry = mounts
+                .get(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.base_revision.clone()
+        };
+        if let Some(existing) = existing_base {
+            if existing != base_revision {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "mount {} is already bound to base revision {}",
+                    mount_id, existing
+                )));
+            }
+            return self.worktree_state(mount_id).await;
+        }
+
         let state = self.worktree_state(mount_id).await?;
         if state.dirty {
             return Err(ServiceError::InvalidRequest(
@@ -2269,6 +2286,11 @@ impl AntaresService for AntaresServiceImpl {
                 mount_id, entry.state
             )));
         }
+        if entry.base_revision.is_some() {
+            return Err(ServiceError::InvalidRequest(
+                "cannot modify a CL layer after binding a Libra worktree base".into(),
+            ));
+        }
 
         let cl_root = crate::util::config::antares_cl_root();
         let cl_dir_str = format!("{}/{}", cl_root, mount_id);
@@ -2440,6 +2462,11 @@ impl AntaresService for AntaresServiceImpl {
                 "mount {} is currently in state {:?}; cannot clear CL",
                 mount_id, entry.state
             )));
+        }
+        if entry.base_revision.is_some() {
+            return Err(ServiceError::InvalidRequest(
+                "cannot modify a CL layer after binding a Libra worktree base".into(),
+            ));
         }
 
         if entry.cl.is_none() {
