@@ -450,6 +450,10 @@ pub struct CreateMountRequest {
     pub build_id: Option<String>,
     /// Monorepo path to mount (e.g., "/third-party/mega")
     pub path: String,
+    /// Repository path represented by CL API file entries. Defaults to `path`
+    /// for backwards compatibility.
+    #[serde(default)]
+    pub cl_path: Option<String>,
     /// Optional CL (changelist) identifier for the CL layer
     #[serde(default)]
     pub cl: Option<String>,
@@ -1056,8 +1060,25 @@ impl AntaresServiceImpl {
     }
 
     fn relative_path_for_mount(entry_path: &str, mount_path: &str) -> Option<PathBuf> {
-        let entry = Self::normalize_abs_path(entry_path);
+        let raw_entry = entry_path.trim();
+        if raw_entry.is_empty() {
+            return None;
+        }
+
         let mount = Self::normalize_abs_path(mount_path);
+        if !raw_entry.starts_with('/') {
+            // The CL API returns paths relative to the repository selected by
+            // mount_path. Keep entries that already carry the mount prefix
+            // compatible with older servers, otherwise use them as-is.
+            let mount_prefix = mount.trim_start_matches('/');
+            let rel = raw_entry
+                .strip_prefix(mount_prefix)
+                .and_then(|path| path.strip_prefix('/'))
+                .unwrap_or(raw_entry);
+            return Self::validated_relative_path(rel);
+        }
+
+        let entry = Self::normalize_abs_path(raw_entry);
         if mount == "/" {
             let rel = entry.trim_start_matches('/');
             if rel.is_empty() {
@@ -1067,13 +1088,7 @@ impl AntaresServiceImpl {
         }
 
         let prefix = format!("{}/", mount);
-        if !entry.starts_with(&prefix) {
-            return None;
-        }
-        let rel = entry[prefix.len()..].trim_start_matches('/');
-        if rel.is_empty() {
-            return None;
-        }
+        let rel = entry.strip_prefix(&prefix)?;
         Self::validated_relative_path(rel)
     }
 
@@ -1284,6 +1299,7 @@ impl AntaresServiceImpl {
     async fn build_cl_layer(
         &self,
         mount_path: &str,
+        cl_path: &str,
         cl_link: &str,
         cl_dir: &Path,
     ) -> Result<(), ServiceError> {
@@ -1307,13 +1323,26 @@ impl AntaresServiceImpl {
             return Ok(());
         }
 
+        let normalized_mount_path = Self::normalize_abs_path(mount_path);
+        let normalized_cl_path = Self::normalize_abs_path(cl_path);
+        let cl_mount_relative = if normalized_mount_path == normalized_cl_path {
+            PathBuf::new()
+        } else {
+            Self::relative_path_for_mount(&normalized_cl_path, &normalized_mount_path).ok_or_else(|| {
+                ServiceError::InvalidRequest(format!(
+                    "CL repository path `{}` is outside Antares mount path `{}`",
+                    cl_path, mount_path
+                ))
+            })?
+        };
+
         let client = Self::http_client()?;
         for file in files {
-            let rel_path = match Self::relative_path_for_mount(&file.path, mount_path) {
+            let repo_relative_path = match Self::relative_path_for_mount(&file.path, &normalized_cl_path) {
                 Some(p) => p,
                 None => continue,
             };
-            let dest = cl_dir.join(rel_path);
+            let dest = cl_dir.join(&cl_mount_relative).join(repo_relative_path);
             match file.action.as_str() {
                 "new" | "modified" => {
                     self.download_blob_to_path(&client, &file.sha, &dest)
@@ -1680,6 +1709,9 @@ impl AntaresService for AntaresServiceImpl {
         let start = Instant::now();
         let mut request = request;
         request.path = Self::normalize_mount_path(&request.path);
+        if let Some(cl_path) = request.cl_path.as_mut() {
+            *cl_path = Self::normalize_mount_path(cl_path);
+        }
 
         // 1. Validate request
         Self::validate_request(&request)?;
@@ -1791,7 +1823,12 @@ impl AntaresService for AntaresServiceImpl {
         {
             let cl_dir_path = PathBuf::from(cl_dir_str);
             if let Err(err) = self
-                .build_cl_layer(&request.path, cl_link, &cl_dir_path)
+                .build_cl_layer(
+                    &request.path,
+                    request.cl_path.as_deref().unwrap_or(&request.path),
+                    cl_link,
+                    &cl_dir_path,
+                )
                 .await
             {
                 let _ = std::fs::remove_dir_all(&mountpoint_str);
@@ -2351,7 +2388,7 @@ impl AntaresService for AntaresServiceImpl {
             return Err(ServiceError::FuseFailure(format!("unmount failed: {}", e)));
         }
 
-        if let Err(e) = self.build_cl_layer(&path, &cl_link, &cl_dir_path).await {
+        if let Err(e) = self.build_cl_layer(&path, &path, &cl_link, &cl_dir_path).await {
             tracing::error!("Failed to build CL layer for {}: {}", mount_id, e);
             let remount_result = old_fuse.mount().await;
             let mut mounts = self.mounts.write().await;
@@ -3548,6 +3585,7 @@ mod tests {
                     svc.create_mount(CreateMountRequest {
                         job_id: None,
                         build_id: None,
+                        cl_path: None,
                         path: format!("/project/path{}", i),
                         cl: None,
                     })
@@ -3572,6 +3610,7 @@ mod tests {
         let request = CreateMountRequest {
             job_id: None,
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
@@ -3592,6 +3631,7 @@ mod tests {
         let request = CreateMountRequest {
             job_id: Some("job-123".into()),
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
@@ -3610,6 +3650,7 @@ mod tests {
         let request = CreateMountRequest {
             job_id: Some("job-123".into()),
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
@@ -3634,12 +3675,14 @@ mod tests {
         let req1 = CreateMountRequest {
             job_id: Some("job-a".into()),
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
         let req2 = CreateMountRequest {
             job_id: Some("job-b".into()),
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
@@ -3662,6 +3705,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3688,6 +3732,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL1".into()),
             })
@@ -3699,6 +3744,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL2".into()),
             })
@@ -3725,6 +3771,7 @@ mod tests {
                 let request = CreateMountRequest {
                     job_id: None,
                     build_id: None,
+                    cl_path: None,
                     path: format!("/concurrent-path-{}", i),
                     cl: None,
                 };
@@ -3769,6 +3816,7 @@ mod tests {
         let request = CreateMountRequest {
             job_id: None,
             build_id: None,
+            cl_path: None,
             path: "/test-concurrent-ops".to_string(),
             cl: None,
         };
@@ -3804,6 +3852,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3826,6 +3875,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3850,6 +3900,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3886,6 +3937,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL123".into()),
             })
@@ -3910,6 +3962,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3931,6 +3984,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL123".into()),
             })
@@ -3957,6 +4011,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/test/path".into(),
                 cl: None,
             })
@@ -3997,6 +4052,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/test/path".into(),
                 cl: Some("CL123".into()),
             })
