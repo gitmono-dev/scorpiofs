@@ -736,6 +736,8 @@ struct MountEntry {
     job_id: Option<String>,
     /// The monorepo path being mounted
     path: String,
+    /// Repository path represented by CL API file entries.
+    cl_path: Option<String>,
     /// Optional CL identifier
     cl: Option<String>,
     /// Immutable revision selected by Libra for an interactive worktree.
@@ -902,8 +904,8 @@ fn scan_mount_changes(
     })
 }
 
-/// Type alias for path index: maps (monorepo_path, optional_cl) to mount_id.
-type PathIndex = Arc<RwLock<HashMap<(String, Option<String>), Uuid>>>;
+/// Type alias for path index: maps (monorepo_path, optional_cl, cl_path) to mount_id.
+type PathIndex = Arc<RwLock<HashMap<(String, Option<String>, Option<String>), Uuid>>>;
 /// Type alias for job index: maps a build task id (job_id/build_id) to mount_id.
 type JobIndex = Arc<RwLock<HashMap<String, Uuid>>>;
 
@@ -914,6 +916,8 @@ pub struct PersistedMountState {
     #[serde(default)]
     pub job_id: Option<String>,
     pub path: String,
+    #[serde(default)]
+    pub cl_path: Option<String>,
     pub cl: Option<String>,
     #[serde(default)]
     pub base_revision: Option<String>,
@@ -1502,6 +1506,7 @@ impl AntaresServiceImpl {
                     mount_id: e.mount_id,
                     job_id: e.job_id.clone(),
                     path: e.path.clone(),
+                    cl_path: e.cl_path.clone(),
                     cl: e.cl.clone(),
                     base_revision: e.base_revision.clone(),
                     mountpoint: e.mountpoint.clone(),
@@ -1606,10 +1611,15 @@ impl AntaresServiceImpl {
                     }
 
                     // Create entry
+                    let cl_path = persisted
+                        .cl_path
+                        .clone()
+                        .unwrap_or_else(|| persisted.path.clone());
                     let entry = MountEntry {
                         mount_id: persisted.mount_id,
                         job_id: persisted.job_id.clone(),
                         path: persisted.path.clone(),
+                        cl_path: Some(cl_path.clone()),
                         cl: persisted.cl.clone(),
                         base_revision: persisted.base_revision.clone(),
                         mountpoint: persisted.mountpoint.clone(),
@@ -1630,7 +1640,10 @@ impl AntaresServiceImpl {
                     if let Some(job_id) = persisted.job_id {
                         job_index.insert(job_id, persisted.mount_id);
                     } else {
-                        index.insert((persisted.path, persisted.cl), persisted.mount_id);
+                        index.insert(
+                            (persisted.path, persisted.cl, Some(cl_path)),
+                            persisted.mount_id,
+                        );
                     }
 
                     tracing::info!("Recovered mount {} at {:?}", persisted.mount_id, mountpoint);
@@ -1654,10 +1667,19 @@ impl AntaresServiceImpl {
         Ok(())
     }
 
-    /// Check if a path+cl combination is already mounted.
-    async fn is_path_already_mounted(&self, path: &str, cl: Option<&str>) -> bool {
+    /// Check if a path+CL+CL-path combination is already mounted.
+    async fn is_path_already_mounted(
+        &self,
+        path: &str,
+        cl: Option<&str>,
+        cl_path: Option<&str>,
+    ) -> bool {
         let index = self.path_index.read().await;
-        index.contains_key(&(path.to_string(), cl.map(|s| s.to_string())))
+        index.contains_key(&(
+            path.to_string(),
+            cl.map(|s| s.to_string()),
+            cl_path.map(|s| s.to_string()),
+        ))
     }
 
     /// Get service health information.
@@ -1715,6 +1737,9 @@ impl AntaresService for AntaresServiceImpl {
         if let Some(cl_path) = request.cl_path.as_mut() {
             *cl_path = Self::normalize_mount_path(cl_path);
         }
+        if request.cl_path.is_none() {
+            request.cl_path = Some(request.path.clone());
+        }
 
         // 1. Validate request
         Self::validate_request(&request)?;
@@ -1750,7 +1775,10 @@ impl AntaresService for AntaresServiceImpl {
                 let mut mounts = self.mounts.write().await;
                 if let Some(entry) = mounts.get_mut(&existing_id) {
                     // Guard against job_id reuse with different request params.
-                    if entry.path != request.path || entry.cl != request.cl {
+                    if entry.path != request.path
+                        || entry.cl != request.cl
+                        || entry.cl_path != request.cl_path
+                    {
                         return Err(ServiceError::InvalidRequest(format!(
                             "job_id/build_id '{}' already mounted with different path/cl",
                             job_id
@@ -1783,7 +1811,11 @@ impl AntaresService for AntaresServiceImpl {
                 }
             }
         } else if self
-            .is_path_already_mounted(&request.path, request.cl.as_deref())
+            .is_path_already_mounted(
+                &request.path,
+                request.cl.as_deref(),
+                request.cl_path.as_deref(),
+            )
             .await
         {
             return Err(ServiceError::InvalidRequest(format!(
@@ -1923,6 +1955,7 @@ impl AntaresService for AntaresServiceImpl {
             mount_id,
             job_id: task_id.clone(),
             path: request.path.clone(),
+            cl_path: request.cl_path.clone(),
             cl: request.cl.clone(),
             base_revision: None,
             mountpoint: mountpoint_str.clone(),
@@ -1945,7 +1978,14 @@ impl AntaresService for AntaresServiceImpl {
         if let Some(job_id) = task_id {
             job_index.insert(job_id, mount_id);
         } else {
-            index.insert((request.path.clone(), request.cl.clone()), mount_id);
+            index.insert(
+                (
+                    request.path.clone(),
+                    request.cl.clone(),
+                    request.cl_path.clone(),
+                ),
+                mount_id,
+            );
         }
 
         tracing::info!(
@@ -2289,12 +2329,13 @@ impl AntaresService for AntaresServiceImpl {
             entry.state = MountLifecycle::Unmounted;
             entry.update_last_seen();
             // Remove from mounts and index only after successful unmount
+            let cl_path = entry.cl_path.clone();
             let status = entry.to_status();
             mounts.remove(&mount_id);
             if let Some(job_id) = job_id {
                 job_index.remove(&job_id);
             } else {
-                index.remove(&(path, cl));
+                index.remove(&(path, cl, cl_path));
             }
             drop(mounts);
             drop(index);
@@ -2339,6 +2380,7 @@ impl AntaresService for AntaresServiceImpl {
         let path = entry.path.clone();
         let job_id = entry.job_id.clone();
         let old_cl = entry.cl.clone();
+        let cl_path = entry.cl_path.clone();
         let mountpoint = PathBuf::from(&entry.mountpoint);
         let upper_dir = PathBuf::from(&entry.upper_dir);
         let existing_cl_dir = entry.cl_dir.as_ref().map(PathBuf::from);
@@ -2392,7 +2434,12 @@ impl AntaresService for AntaresServiceImpl {
         }
 
         if let Err(e) = self
-            .build_cl_layer(&path, &path, &cl_link, &cl_dir_path)
+            .build_cl_layer(
+                &path,
+                cl_path.as_deref().unwrap_or(&path),
+                &cl_link,
+                &cl_dir_path,
+            )
             .await
         {
             tracing::error!("Failed to build CL layer for {}: {}", mount_id, e);
@@ -2470,8 +2517,8 @@ impl AntaresService for AntaresServiceImpl {
 
         if job_id.is_none() && old_cl != entry.cl {
             let path = entry.path.clone();
-            index.remove(&(path.clone(), old_cl));
-            index.insert((path, entry.cl.clone()), mount_id);
+            index.remove(&(path.clone(), old_cl, entry.cl_path.clone()));
+            index.insert((path, entry.cl.clone(), entry.cl_path.clone()), mount_id);
         }
 
         let mountpoint_for_preload = entry.mountpoint.clone();
@@ -2521,6 +2568,7 @@ impl AntaresService for AntaresServiceImpl {
         let path = entry.path.clone();
         let job_id = entry.job_id.clone();
         let old_cl = entry.cl.clone();
+        let cl_path = entry.cl_path.clone();
         let quiesce_grace = Self::cl_quiesce_grace_duration();
         let mountpoint = PathBuf::from(&entry.mountpoint);
         let upper_dir = PathBuf::from(&entry.upper_dir);
@@ -2628,8 +2676,8 @@ impl AntaresService for AntaresServiceImpl {
         entry.update_last_seen();
 
         if job_id.is_none() {
-            index.remove(&(path.clone(), old_cl));
-            index.insert((path, None), mount_id);
+            index.remove(&(path.clone(), old_cl, cl_path.clone()));
+            index.insert((path, None, cl_path), mount_id);
         }
 
         let mountpoint_for_preload = entry.mountpoint.clone();
