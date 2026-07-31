@@ -1926,7 +1926,11 @@ impl AntaresService for AntaresServiceImpl {
                 }
                 return Err(err);
             }
-        } else if index.contains_key(&(request.path.clone(), request.cl.clone())) {
+        } else if index.contains_key(&(
+            request.path.clone(),
+            request.cl.clone(),
+            request.cl_path.clone(),
+        )) {
             // Same rollback logic as above for legacy (path, cl) duplicates.
             let err = ServiceError::InvalidRequest(format!(
                 "path {} with cl {:?} is already mounted",
@@ -2068,6 +2072,12 @@ impl AntaresService for AntaresServiceImpl {
             let entry = mounts
                 .get(&mount_id)
                 .ok_or(ServiceError::NotFound(mount_id))?;
+            if matches!(entry.state, MountLifecycle::Quiescing) {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "mount {} is quiescing while its CL layer is reconfigured",
+                    mount_id
+                )));
+            }
             (
                 PathBuf::from(&entry.upper_dir),
                 entry.cl_dir.as_deref().map(PathBuf::from),
