@@ -2067,8 +2067,11 @@ impl AntaresService for AntaresServiceImpl {
     }
 
     async fn changed_paths(&self, mount_id: Uuid) -> Result<MountChangesResponse, ServiceError> {
+        // Retain this read lock through the blocking scan. CL updates need the write
+        // lock before entering Quiescing, so they cannot remove or recreate cl_dir
+        // while scan_mount_changes is reading it.
+        let mounts = self.mounts.read().await;
         let (upper_dir, cl_dir) = {
-            let mounts = self.mounts.read().await;
             let entry = mounts
                 .get(&mount_id)
                 .ok_or(ServiceError::NotFound(mount_id))?;
@@ -2083,7 +2086,7 @@ impl AntaresService for AntaresServiceImpl {
                 entry.cl_dir.as_deref().map(PathBuf::from),
             )
         };
-        tokio::task::spawn_blocking(move || {
+        let scan_result = tokio::task::spawn_blocking(move || {
             scan_mount_changes(mount_id, &upper_dir, cl_dir.as_deref())
         })
         .await
@@ -2092,7 +2095,9 @@ impl AntaresService for AntaresServiceImpl {
                 "Antares changed-path scan task failed for mount {}: {}",
                 mount_id, error
             ))
-        })?
+        })?;
+        drop(mounts);
+        scan_result
     }
 
     async fn worktree_state(&self, mount_id: Uuid) -> Result<WorktreeStateResponse, ServiceError> {
@@ -2172,6 +2177,12 @@ impl AntaresService for AntaresServiceImpl {
             let entry = mounts
                 .get_mut(&mount_id)
                 .ok_or(ServiceError::NotFound(mount_id))?;
+            if !matches!(entry.state, MountLifecycle::Mounted | MountLifecycle::Ready) {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "mount {} is currently in state {:?}; cannot bind a Libra worktree base",
+                    mount_id, entry.state
+                )));
+            }
             if entry.cl.is_some() {
                 return Err(ServiceError::InvalidRequest(
                     "cannot bind a Libra worktree base to a mount with a CL layer".into(),
