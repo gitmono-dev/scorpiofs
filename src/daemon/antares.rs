@@ -1328,20 +1328,23 @@ impl AntaresServiceImpl {
         let cl_mount_relative = if normalized_mount_path == normalized_cl_path {
             PathBuf::new()
         } else {
-            Self::relative_path_for_mount(&normalized_cl_path, &normalized_mount_path).ok_or_else(|| {
-                ServiceError::InvalidRequest(format!(
-                    "CL repository path `{}` is outside Antares mount path `{}`",
-                    cl_path, mount_path
-                ))
-            })?
+            Self::relative_path_for_mount(&normalized_cl_path, &normalized_mount_path).ok_or_else(
+                || {
+                    ServiceError::InvalidRequest(format!(
+                        "CL repository path `{}` is outside Antares mount path `{}`",
+                        cl_path, mount_path
+                    ))
+                },
+            )?
         };
 
         let client = Self::http_client()?;
         for file in files {
-            let repo_relative_path = match Self::relative_path_for_mount(&file.path, &normalized_cl_path) {
-                Some(p) => p,
-                None => continue,
-            };
+            let repo_relative_path =
+                match Self::relative_path_for_mount(&file.path, &normalized_cl_path) {
+                    Some(p) => p,
+                    None => continue,
+                };
             let dest = cl_dir.join(&cl_mount_relative).join(repo_relative_path);
             match file.action.as_str() {
                 "new" | "modified" => {
@@ -2388,7 +2391,10 @@ impl AntaresService for AntaresServiceImpl {
             return Err(ServiceError::FuseFailure(format!("unmount failed: {}", e)));
         }
 
-        if let Err(e) = self.build_cl_layer(&path, &path, &cl_link, &cl_dir_path).await {
+        if let Err(e) = self
+            .build_cl_layer(&path, &path, &cl_link, &cl_dir_path)
+            .await
+        {
             tracing::error!("Failed to build CL layer for {}: {}", mount_id, e);
             let remount_result = old_fuse.mount().await;
             let mut mounts = self.mounts.write().await;
