@@ -261,15 +261,25 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
 (`Type=simple`, `AmbientCapabilities=CAP_SYS_ADMIN`, `TimeoutStopSec=45`,
 loopback bind by default, journald logging).
 
-**install.sh** — [`install.sh`](install.sh) downloads a release tarball,
-**verifies its SHA256 checksum**, and installs the binaries + a generated config.
-It supports `--dry-run`, `--uninstall`, and never edits `/etc/fuse.conf` unless
-you pass `--enable-user-allow-other`:
+**install.sh** — [`install.sh`](install.sh) is an interactive installer. It
+asks for `base_url`, `lfs_url`, local paths, the HTTP bind address, FUSE
+permissions, and whether to create a systemd service. It downloads a release
+tarball, **verifies its SHA256 checksum**, creates the dedicated `scorpiofs`
+service user, and generates a config with absolute runtime paths. The HTTP API
+defaults to loopback because it has no authentication:
 
 ```bash
-bash install.sh --version v0.3.0 --dry-run   # preview
-sudo bash install.sh --version v0.3.0        # install
+bash install.sh                               # interactive
+bash install.sh --version v0.4.0 --dry-run    # preview
+sudo bash install.sh --version v0.4.0         # install
 ```
+
+For automation, use `--non-interactive` with `--base-url` and `--lfs-url`.
+Non-loopback HTTP binds require the explicit `--allow-public-api` flag and
+must be protected by a firewall or an authenticating reverse proxy. The script
+never edits `/etc/fuse.conf` unless the interactive prompt is accepted or
+`--enable-user-allow-other` is passed. `--uninstall` removes binaries and the
+unit but keeps configuration and data.
 
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which builds the binaries, produces `scorpiofs-<version>-<target>.tar.gz` +

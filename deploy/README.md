@@ -124,17 +124,31 @@ crashes; `ExecStopPost` lazily unmounts any residual mountpoint.
 
 ## install.sh
 
-`install.sh` downloads a release tarball, **verifies its SHA256 checksum**, and
-installs `scorpio`/`antares` plus a generated `/etc/scorpiofs/scorpio.toml`.
+`install.sh` is the recommended interactive installer. It asks for the
+Mega/monorepo `base_url`, `lfs_url`, local paths, HTTP bind address, FUSE
+permission, and whether to create a systemd service. It downloads a release
+tarball, **verifies its SHA256 checksum**, installs `scorpio`/`antares`, creates
+the `scorpiofs` service user, prepares the FUSE group and data directories, and
+generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 
+- Run `bash install.sh` for the interactive flow. It supports `curl | bash`
+  because prompts are read from `/dev/tty`.
+- The API defaults to `127.0.0.1:2725` because it has no authentication. A
+  non-loopback bind requires `--allow-public-api` and an external firewall or
+  authenticating reverse proxy.
 - Always supports `--dry-run` to preview every action.
-- It never modifies `/etc/fuse.conf` unless you pass `--enable-user-allow-other`.
+- It only modifies `/etc/fuse.conf` after the explicit interactive confirmation
+  or when `--enable-user-allow-other` is passed.
 - System packages are installed via apt/dnf/pacman (skip with `--no-deps`).
-- `--uninstall` removes the binaries and leaves config/data in place.
+- `--uninstall` removes the binaries and service unit and leaves config/data in
+  place.
 
 ```bash
-bash install.sh --version v0.3.0 --dry-run   # preview
-sudo bash install.sh --version v0.3.0        # install
+bash install.sh                                      # interactive install
+bash install.sh --version v0.4.0 --dry-run           # preview
+bash install.sh --version v0.4.0 --non-interactive \
+  --base-url https://mega.example.com \
+  --lfs-url https://mega.example.com/lfs              # automation
 ```
 
 ## Releases & supply chain
