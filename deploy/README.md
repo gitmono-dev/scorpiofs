@@ -163,7 +163,11 @@ Pushing a `v*` tag triggers `.github/workflows/release.yml`, which:
 - creates a GitHub Release with all artifacts attached.
 
 `install.sh` downloads the per-target tarball **and its `.sha256`**, then runs
-`sha256sum -c` and refuses to install on mismatch.
+`sha256sum -c` and refuses to install on mismatch. Before replacing installed
+binaries, it also runs both extracted binaries with `--version`; this catches
+CPU, dynamic-linker, and glibc incompatibilities without leaving a broken
+installation behind. GNU release binaries are built on Ubuntu 22.04 to retain
+glibc 2.35 compatibility.
 
 Publishing to **crates.io is decoupled** from the binary release: the
 `publish-crate` job targets a protected GitHub Environment (`crates-io`).

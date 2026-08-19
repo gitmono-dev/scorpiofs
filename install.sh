@@ -39,6 +39,8 @@ INTERACTIVE=1
 ASSUME_YES=0
 ALLOW_PUBLIC_API=0
 OVERWRITE_CONFIG=0
+SERVICE_CHOICE_SET=0
+FUSE_CHOICE_SET=0
 WORKDIR=""
 SUDO_BIN=""
 TARGET_USER=""
@@ -205,14 +207,14 @@ parse_args() {
             --store-path) [ "$#" -ge 2 ] || die "--store-path needs a value"; STORE_PATH="$2"; shift 2 ;;
             --http-addr) [ "$#" -ge 2 ] || die "--http-addr needs a value"; HTTP_ADDR="$2"; shift 2 ;;
             --allow-public-api) ALLOW_PUBLIC_API=1; shift ;;
-            --no-service) SETUP_SERVICE=0; shift ;;
+            --no-service) SETUP_SERVICE=0; SERVICE_CHOICE_SET=1; shift ;;
             --non-interactive) INTERACTIVE=0; shift ;;
             --yes) ASSUME_YES=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;
             --uninstall) DO_UNINSTALL=1; INTERACTIVE=0; shift ;;
             --no-deps) INSTALL_DEPS=0; shift ;;
-            --enable-user-allow-other) ENABLE_USER_ALLOW_OTHER=1; shift ;;
-            --no-user-allow-other) ENABLE_USER_ALLOW_OTHER=0; shift ;;
+            --enable-user-allow-other) ENABLE_USER_ALLOW_OTHER=1; FUSE_CHOICE_SET=1; shift ;;
+            --no-user-allow-other) ENABLE_USER_ALLOW_OTHER=0; FUSE_CHOICE_SET=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1 (see --help)" ;;
         esac
@@ -301,8 +303,12 @@ configure_interactively() {
     prompt_value HTTP_ADDR "HTTP listen address" "$HTTP_ADDR"
     prompt_value GIT_AUTHOR "Default Git author" "$GIT_AUTHOR"
     prompt_value GIT_EMAIL "Default Git email" "$GIT_EMAIL"
-    prompt_yes_no ENABLE_USER_ALLOW_OTHER "Enable user_allow_other in /etc/fuse.conf" "y"
-    prompt_yes_no SETUP_SERVICE "Install and start systemd service" "y"
+    if [ "$FUSE_CHOICE_SET" -eq 0 ]; then
+        prompt_yes_no ENABLE_USER_ALLOW_OTHER "Enable user_allow_other in /etc/fuse.conf" "y"
+    fi
+    if [ "$SERVICE_CHOICE_SET" -eq 0 ]; then
+        prompt_yes_no SETUP_SERVICE "Install and start systemd service" "y"
+    fi
     if [ "$SETUP_SERVICE" -eq 1 ]; then
         prompt_value SERVICE_USER "systemd service user" "$SERVICE_USER"
     fi
@@ -375,6 +381,13 @@ install_binaries() {
     tar -xzf "${WORKDIR}/${tarball}" -C "$WORKDIR"
     extracted="${WORKDIR}/scorpiofs-${VERSION}-${target}"
     [ -x "${extracted}/scorpio" ] && [ -x "${extracted}/antares" ] || die "release archive has an unexpected layout"
+    local smoke_output
+    if ! smoke_output="$("${extracted}/scorpio" --version 2>&1)"; then
+        die "downloaded scorpio cannot run on this host: ${smoke_output}. Install a release built for this Linux distribution"
+    fi
+    if ! smoke_output="$("${extracted}/antares" --version 2>&1)"; then
+        die "downloaded antares cannot run on this host: ${smoke_output}. Install a release built for this Linux distribution"
+    fi
     run_root install -d "${PREFIX}/bin"
     run_root install -m 0755 "${extracted}/scorpio" "${PREFIX}/bin/scorpio"
     run_root install -m 0755 "${extracted}/antares" "${PREFIX}/bin/antares"
