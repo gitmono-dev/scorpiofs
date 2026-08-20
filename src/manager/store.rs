@@ -13,6 +13,9 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::util::GPath;
 
+const TREE_KEY_PREFIX: &str = "tree:v2:";
+const COMMIT_KEY: &str = "commit:v2";
+
 pub trait TreeStore {
     fn insert_tree(&self, path: PathBuf, tree: Tree);
     fn get_bypath(&self, path: &Path) -> Result<Tree>;
@@ -21,20 +24,17 @@ pub trait TreeStore {
 
 impl TreeStore for sled::Db {
     fn insert_tree(&self, path: PathBuf, tree: Tree) {
-        let config = bincode::config::standard();
-        let value = bincode::encode_to_vec(&tree, config).unwrap();
-        let key = path.to_str().unwrap();
+        let value = serde_json::to_vec(&tree).unwrap();
+        let key = format!("{TREE_KEY_PREFIX}{}", path.to_str().unwrap());
         self.insert(key, value).unwrap();
     }
 
     fn get_bypath(&self, path: &Path) -> Result<Tree> {
-        let key = path.to_str().unwrap();
-        match self.get(key)? {
+        let key = format!("{TREE_KEY_PREFIX}{}", path.to_str().unwrap());
+        match self.get(&key)? {
             Some(encoded_value) => {
-                let config = bincode::config::standard();
-                let (decoded, _): (Tree, usize) =
-                    bincode::decode_from_slice(&encoded_value, config)
-                        .map_err(|_| std::io::Error::other("Deserialization error"))?;
+                let decoded = serde_json::from_slice(&encoded_value)
+                    .map_err(|_| std::io::Error::other("Deserialization error"))?;
                 Ok(decoded)
             }
             None => {
@@ -48,17 +48,19 @@ impl TreeStore for sled::Db {
     }
 
     fn db_tree_list(&self) -> Result<HashMap<PathBuf, Tree>> {
-        self.iter()
+        self.scan_prefix(TREE_KEY_PREFIX.as_bytes())
             .map(|item| match item {
                 // By returning a HashMap, we avoid using a double pointer loop structure in diff.rs.
                 Ok((path, encoded_value)) => {
                     // Convert the IVec to a string and then to a PathBuf
                     let path = std::str::from_utf8(&path)
-                        .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF8 path"))?;
-                    let config = bincode::config::standard();
-                    let (decoded_tree, _): (Tree, usize) =
-                        bincode::decode_from_slice(&encoded_value, config)
-                            .map_err(|_| Error::other("Deserialization error"))?;
+                        .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF8 path"))?
+                        .strip_prefix(TREE_KEY_PREFIX)
+                        .ok_or_else(|| {
+                            Error::new(ErrorKind::InvalidData, "Invalid tree cache key")
+                        })?;
+                    let decoded_tree = serde_json::from_slice(&encoded_value)
+                        .map_err(|_| Error::other("Deserialization error"))?;
                     Ok((PathBuf::from(path), decoded_tree))
                 }
                 Err(e) => Err(Error::new(ErrorKind::NotFound, e)),
@@ -74,23 +76,18 @@ pub trait CommitStore {
 }
 impl CommitStore for sled::Db {
     fn store_commit(&self, commit: Commit) -> Result<()> {
-        let config = bincode::config::standard();
-        let encoded_commit = bincode::encode_to_vec(&commit, config).unwrap();
-        let re = self.insert("COMMIT", encoded_commit)?;
-        if re.is_some() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other("Failed to store commit"))
-        }
+        let encoded_commit = serde_json::to_vec(&commit)
+            .map_err(|_| std::io::Error::other("Serialization error"))?;
+        self.insert(COMMIT_KEY, encoded_commit)?;
+        Ok(())
     }
 
     fn get_commit(&self) -> Result<Commit> {
-        let encoded_value = self.get("COMMIT")?;
-        let config = bincode::config::standard();
-        let (decoded, _): (Commit, usize) =
-            bincode::decode_from_slice(&encoded_value.unwrap(), config)
-                .map_err(|_| std::io::Error::other("Deserialization error"))?;
-        Ok(decoded)
+        let encoded_value = self
+            .get(COMMIT_KEY)?
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "Commit not found"))?;
+        serde_json::from_slice(&encoded_value)
+            .map_err(|_| std::io::Error::other("Deserialization error"))
     }
 }
 pub async fn store_trees(storepath: &str, mut tree_channel: Receiver<(GPath, Tree)>) -> Result<()> {
@@ -614,11 +611,7 @@ mod test {
         .unwrap();
 
         if let Some(encoded_value) = db.get(t.id.as_ref()).unwrap() {
-            // use bincode to deserialize the value .
-            let config = bincode::config::standard();
-            let decoded: Tree = bincode::decode_from_slice(&encoded_value, config)
-                .unwrap()
-                .0;
+            let decoded: Tree = serde_json::from_slice(&encoded_value).unwrap();
             println!(" {decoded}");
         };
     }
@@ -634,9 +627,10 @@ mod test {
         for result in iter {
             match result {
                 Ok((key, value)) => {
-                    // Deserialize the value into the original tree structure using bincode
-                    let config = bincode::config::standard();
-                    let tree: Tree = bincode::decode_from_slice(&value, config).unwrap().0;
+                    if !key.starts_with(super::TREE_KEY_PREFIX.as_bytes()) {
+                        continue;
+                    }
+                    let tree: Tree = serde_json::from_slice(&value).unwrap();
                     let key_str = std::str::from_utf8(&key).unwrap();
 
                     println!("path:{key_str}");

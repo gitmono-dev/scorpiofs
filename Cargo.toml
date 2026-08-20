@@ -1,6 +1,6 @@
 [package]
 name = "scorpiofs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # `cargo run` (no --bin) runs the main `scorpio` binary; `antares` is the alias.
 default-run = "scorpio"
@@ -25,7 +25,7 @@ path = "src/main.rs"
 
 
 [dependencies]
-git-internal = "0.4.1"
+git-internal = "0.8.5"
 reqwest = { version = "0.13.1", features = ["json", "blocking"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["full"] }

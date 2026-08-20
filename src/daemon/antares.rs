@@ -4,10 +4,11 @@
 //! AntaresService implementations. Includes graceful shutdown with cleanup.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::CString,
     net::SocketAddr,
     os::unix::ffi::OsStrExt,
+    os::unix::fs::FileTypeExt,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -77,6 +78,16 @@ where
             .route("/mounts/{mount_id}/cl", post(Self::build_cl))
             .route("/mounts/{mount_id}/cl", delete(Self::clear_cl))
             .route("/mounts/{mount_id}/ready", get(Self::mount_ready))
+            .route("/mounts/{mount_id}/changes", get(Self::mount_changes))
+            .route("/mounts/{mount_id}/worktree", get(Self::worktree_state))
+            .route(
+                "/mounts/{mount_id}/worktree/base",
+                post(Self::bind_worktree_base),
+            )
+            .route(
+                "/mounts/{mount_id}/worktree/refresh-plan",
+                post(Self::plan_worktree_refresh),
+            )
             .with_state(self.service.clone())
     }
 
@@ -300,6 +311,42 @@ where
         let resp = service.check_mount_ready(mount_id).await?;
         Ok(Json(resp))
     }
+
+    /// Return paths represented in this mount's private writable upper layer.
+    async fn mount_changes(
+        State(service): State<Arc<S>>,
+        AxumPath(mount_id): AxumPath<Uuid>,
+    ) -> Result<Json<MountChangesResponse>, ApiError> {
+        Ok(Json(service.changed_paths(mount_id).await?))
+    }
+
+    /// Return the Git-compatible worktree state for an interactive mount.
+    async fn worktree_state(
+        State(service): State<Arc<S>>,
+        AxumPath(mount_id): AxumPath<Uuid>,
+    ) -> Result<Json<WorktreeStateResponse>, ApiError> {
+        Ok(Json(service.worktree_state(mount_id).await?))
+    }
+
+    /// Bind an otherwise clean, CL-free mount to the revision selected by Libra.
+    async fn bind_worktree_base(
+        State(service): State<Arc<S>>,
+        AxumPath(mount_id): AxumPath<Uuid>,
+        Json(request): Json<BindWorktreeBaseRequest>,
+    ) -> Result<Json<WorktreeStateResponse>, ApiError> {
+        Ok(Json(service.bind_worktree_base(mount_id, request).await?))
+    }
+
+    /// Check whether Libra may safely perform a later base-tree switch.
+    async fn plan_worktree_refresh(
+        State(service): State<Arc<S>>,
+        AxumPath(mount_id): AxumPath<Uuid>,
+        Json(request): Json<RefreshPlanRequest>,
+    ) -> Result<Json<RefreshPlanResponse>, ApiError> {
+        Ok(Json(
+            service.plan_worktree_refresh(mount_id, request).await?,
+        ))
+    }
 }
 
 /// Asynchronous service boundary that the HTTP layer depends on.
@@ -342,6 +389,38 @@ pub trait AntaresService: Send + Sync {
     /// Background kernel warmup (Phase 2) is intentionally non-blocking.
     async fn check_mount_ready(&self, mount_id: Uuid) -> Result<MountReadyResponse, ServiceError>;
 
+    /// List paths changed in the mount's private writable upper layer.
+    async fn changed_paths(&self, mount_id: Uuid) -> Result<MountChangesResponse, ServiceError>;
+
+    /// Return the lower-base binding and writable upper state used by Libra.
+    async fn worktree_state(&self, _mount_id: Uuid) -> Result<WorktreeStateResponse, ServiceError> {
+        Err(ServiceError::Unsupported(
+            "worktree state is not implemented by this Antares service".into(),
+        ))
+    }
+
+    /// Bind a clean mount to the immutable revision selected by the VCS owner.
+    async fn bind_worktree_base(
+        &self,
+        _mount_id: Uuid,
+        _request: BindWorktreeBaseRequest,
+    ) -> Result<WorktreeStateResponse, ServiceError> {
+        Err(ServiceError::Unsupported(
+            "worktree base binding is not implemented by this Antares service".into(),
+        ))
+    }
+
+    /// Produce a non-mutating preflight for a future lower-base switch.
+    async fn plan_worktree_refresh(
+        &self,
+        _mount_id: Uuid,
+        _request: RefreshPlanRequest,
+    ) -> Result<RefreshPlanResponse, ServiceError> {
+        Err(ServiceError::Unsupported(
+            "worktree refresh planning is not implemented by this Antares service".into(),
+        ))
+    }
+
     async fn health_info(&self) -> HealthResponse;
     async fn shutdown_cleanup(&self) -> Result<(), ServiceError>;
 }
@@ -371,6 +450,10 @@ pub struct CreateMountRequest {
     pub build_id: Option<String>,
     /// Monorepo path to mount (e.g., "/third-party/mega")
     pub path: String,
+    /// Repository path represented by CL API file entries. Defaults to `path`
+    /// for backwards compatibility.
+    #[serde(default)]
+    pub cl_path: Option<String>,
     /// Optional CL (changelist) identifier for the CL layer
     #[serde(default)]
     pub cl: Option<String>,
@@ -404,6 +487,9 @@ pub struct MountStatus {
     pub path: String,
     /// Optional CL identifier
     pub cl: Option<String>,
+    /// Commit/revision selected by Libra for an interactive worktree mount.
+    #[serde(default)]
+    pub base_revision: Option<String>,
     /// The actual filesystem mountpoint
     pub mountpoint: String,
     pub layers: MountLayers,
@@ -456,9 +542,100 @@ pub struct MountReadyResponse {
     pub state: MountLifecycle,
 }
 
+/// Response for the `/mounts/{mount_id}/changes` endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MountChangesResponse {
+    pub mount_id: Uuid,
+    /// Stable fingerprint of the current changed-path set.
+    pub generation: u64,
+    pub changes: Vec<ChangedPath>,
+}
+
+/// Request used by Libra immediately after attaching a clean worktree mount.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BindWorktreeBaseRequest {
+    /// Immutable commit/revision that Dicfuse is expected to project for this mount.
+    pub base_revision: String,
+}
+
+/// Current ScorpioFS contribution to a Git-compatible worktree state.
+///
+/// HEAD, index, refs, commits, and conflict stages remain owned by Libra. The
+/// response only reports the pinned lower-base identity and upper-layer delta.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorktreeStateResponse {
+    pub mount_id: Uuid,
+    pub path: String,
+    pub base_revision: Option<String>,
+    pub mount_state: MountLifecycle,
+    pub dirty: bool,
+    pub changes: MountChangesResponse,
+}
+
+/// Non-mutating request for deciding whether a VCS owner may switch bases.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RefreshPlanRequest {
+    /// Optimistic lock: the revision Libra believes is mounted now.
+    pub expected_base_revision: String,
+    /// Resolved target revision. ScorpioFS does not resolve refs itself.
+    pub target_revision: String,
+    /// Reject dirty worktrees. Defaults to the safe Git-compatible behavior.
+    #[serde(default = "default_require_clean")]
+    pub require_clean: bool,
+}
+
+fn default_require_clean() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshPlanDisposition {
+    Ready,
+    AlreadyAtTarget,
+    Unbound,
+    BaseMismatch,
+    BlockedDirty,
+}
+
+/// Result of a refresh preflight. This endpoint never switches the FUSE lower layer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RefreshPlanResponse {
+    pub mount_id: Uuid,
+    pub current_base_revision: Option<String>,
+    pub target_revision: String,
+    pub disposition: RefreshPlanDisposition,
+    pub worktree: WorktreeStateResponse,
+}
+
+/// A path represented in the private writable upper layer.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChangedPath {
+    pub kind: ChangeKind,
+    /// Normalized path relative to the Antares mount root.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Modified,
+    Deleted,
+}
+
 /// Health check response payload.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HealthResponse {
+    /// Version of the VCS worktree control protocol.
+    pub protocol_version: u32,
+    /// Stable service identifier used during capability negotiation.
+    pub service: String,
+    /// ScorpioFS package version.
+    pub service_version: Option<String>,
+    /// Versioned control-plane capabilities supported by this service.
+    pub capabilities: Vec<String>,
     /// Service health status: "healthy" or "degraded"
     pub status: String,
     /// Current number of active mounts
@@ -487,6 +664,8 @@ pub enum ServiceError {
     NotFoundTask(String),
     #[error("failed to interact with fuse stack: {0}")]
     FuseFailure(String),
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
     #[error("unexpected error: {0}")]
     Internal(String),
 }
@@ -521,6 +700,9 @@ impl IntoResponse for ApiError {
             ApiError::Service(ServiceError::FuseFailure(msg)) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "FUSE_ERROR", msg.clone())
             }
+            ApiError::Service(ServiceError::Unsupported(msg)) => {
+                (StatusCode::NOT_IMPLEMENTED, "UNSUPPORTED", msg.clone())
+            }
             ApiError::Service(ServiceError::Internal(msg)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -554,8 +736,12 @@ struct MountEntry {
     job_id: Option<String>,
     /// The monorepo path being mounted
     path: String,
+    /// Repository path represented by CL API file entries.
+    cl_path: Option<String>,
     /// Optional CL identifier
     cl: Option<String>,
+    /// Immutable revision selected by Libra for an interactive worktree.
+    base_revision: Option<String>,
     /// Auto-generated mountpoint path
     mountpoint: String,
     /// Auto-generated upper directory
@@ -592,6 +778,7 @@ impl MountEntry {
             job_id: self.job_id.clone(),
             path: self.path.clone(),
             cl: self.cl.clone(),
+            base_revision: self.base_revision.clone(),
             mountpoint: self.mountpoint.clone(),
             layers: MountLayers {
                 upper: self.upper_dir.clone(),
@@ -618,8 +805,107 @@ fn current_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Type alias for path index: maps (monorepo_path, optional_cl) to mount_id.
-type PathIndex = Arc<RwLock<HashMap<(String, Option<String>), Uuid>>>;
+fn scan_layer_changes(
+    layer_dir: &Path,
+    changes: &mut BTreeMap<String, ChangedPath>,
+) -> Result<(), ServiceError> {
+    let mut pending = vec![layer_dir.to_path_buf()];
+
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            ServiceError::Internal(format!(
+                "failed to read Antares upper directory {:?}: {}",
+                directory, error
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ServiceError::Internal(format!(
+                    "failed to read an entry from Antares upper directory {:?}: {}",
+                    directory, error
+                ))
+            })?;
+            let path = entry.path();
+            let relative = path.strip_prefix(layer_dir).map_err(|error| {
+                ServiceError::Internal(format!(
+                    "Antares layer entry {:?} escaped layer directory {:?}: {}",
+                    path, layer_dir, error
+                ))
+            })?;
+            if relative
+                .components()
+                .next()
+                .is_some_and(|component| component.as_os_str() == ".libra")
+            {
+                continue;
+            }
+
+            let file_type = entry.file_type().map_err(|error| {
+                ServiceError::Internal(format!(
+                    "failed to inspect Antares upper entry {:?}: {}",
+                    path, error
+                ))
+            })?;
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+
+            let relative = relative.to_str().ok_or_else(|| {
+                ServiceError::Internal(format!(
+                    "Antares upper path {:?} is not valid UTF-8",
+                    relative
+                ))
+            })?;
+            let changed = ChangedPath {
+                kind: if file_type.is_char_device() {
+                    ChangeKind::Deleted
+                } else {
+                    ChangeKind::Modified
+                },
+                path: relative.to_string(),
+                source_path: None,
+            };
+            changes.insert(changed.path.clone(), changed);
+        }
+    }
+    Ok(())
+}
+
+fn scan_mount_changes(
+    mount_id: Uuid,
+    upper_dir: &Path,
+    cl_dir: Option<&Path>,
+) -> Result<MountChangesResponse, ServiceError> {
+    let mut by_path = BTreeMap::new();
+    if let Some(cl_dir) = cl_dir {
+        scan_layer_changes(cl_dir, &mut by_path)?;
+    }
+    scan_layer_changes(upper_dir, &mut by_path)?;
+    let changes: Vec<_> = by_path.into_values().collect();
+
+    let mut generation = 0xcbf29ce484222325_u64;
+    for change in &changes {
+        generation ^= match change.kind {
+            ChangeKind::Modified => 1,
+            ChangeKind::Deleted => 2,
+        };
+        generation = generation.wrapping_mul(0x100000001b3);
+        for byte in change.path.as_bytes() {
+            generation ^= u64::from(*byte);
+            generation = generation.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    Ok(MountChangesResponse {
+        mount_id,
+        generation,
+        changes,
+    })
+}
+
+/// Type alias for path index: maps (monorepo_path, optional_cl, cl_path) to mount_id.
+type PathIndex = Arc<RwLock<HashMap<(String, Option<String>, Option<String>), Uuid>>>;
 /// Type alias for job index: maps a build task id (job_id/build_id) to mount_id.
 type JobIndex = Arc<RwLock<HashMap<String, Uuid>>>;
 
@@ -630,7 +916,11 @@ pub struct PersistedMountState {
     #[serde(default)]
     pub job_id: Option<String>,
     pub path: String,
+    #[serde(default)]
+    pub cl_path: Option<String>,
     pub cl: Option<String>,
+    #[serde(default)]
+    pub base_revision: Option<String>,
     pub mountpoint: String,
     pub upper_dir: String,
     pub cl_dir: Option<String>,
@@ -641,6 +931,18 @@ pub struct PersistedMountState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PersistedState {
     pub mounts: Vec<PersistedMountState>,
+}
+
+/// Selects which process owns durable mount lifecycle state.
+///
+/// `ScorpioFs` preserves the standalone daemon behavior. `External` is for an
+/// embedding controller such as Libra: ScorpioFS keeps only the live FUSE
+/// handles and never writes or recovers a state file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StateOwnership {
+    #[default]
+    ScorpioFs,
+    External,
 }
 
 /// Concrete implementation of AntaresService.
@@ -660,6 +962,8 @@ pub struct AntaresServiceImpl {
     start_time: Instant,
     /// Path to the state file for persistence.
     state_file: PathBuf,
+    /// Durable state owner. External controllers must remain the sole writer.
+    state_ownership: StateOwnership,
 }
 
 impl AntaresServiceImpl {
@@ -671,6 +975,19 @@ impl AntaresServiceImpl {
     /// # Note
     /// Requires config to be initialized via `config::init_config()` before calling.
     pub async fn new(dicfuse: Option<Arc<Dicfuse>>) -> Self {
+        Self::new_with_state_ownership(dicfuse, StateOwnership::ScorpioFs).await
+    }
+
+    /// Create a service whose durable desired state is owned by the embedding
+    /// controller. The service never writes or recovers `antares_state_file`.
+    pub async fn new_external_state(dicfuse: Option<Arc<Dicfuse>>) -> Self {
+        Self::new_with_state_ownership(dicfuse, StateOwnership::External).await
+    }
+
+    async fn new_with_state_ownership(
+        dicfuse: Option<Arc<Dicfuse>>,
+        state_ownership: StateOwnership,
+    ) -> Self {
         let dic = match dicfuse {
             Some(d) => d,
             None => DicfuseManager::global().await,
@@ -687,6 +1004,7 @@ impl AntaresServiceImpl {
             job_index: Arc::new(RwLock::new(HashMap::new())),
             start_time: Instant::now(),
             state_file,
+            state_ownership,
         }
     }
 
@@ -746,8 +1064,25 @@ impl AntaresServiceImpl {
     }
 
     fn relative_path_for_mount(entry_path: &str, mount_path: &str) -> Option<PathBuf> {
-        let entry = Self::normalize_abs_path(entry_path);
+        let raw_entry = entry_path.trim();
+        if raw_entry.is_empty() {
+            return None;
+        }
+
         let mount = Self::normalize_abs_path(mount_path);
+        if !raw_entry.starts_with('/') {
+            // The CL API returns paths relative to the repository selected by
+            // mount_path. Keep entries that already carry the mount prefix
+            // compatible with older servers, otherwise use them as-is.
+            let mount_prefix = mount.trim_start_matches('/');
+            let rel = raw_entry
+                .strip_prefix(mount_prefix)
+                .and_then(|path| path.strip_prefix('/'))
+                .unwrap_or(raw_entry);
+            return Self::validated_relative_path(rel);
+        }
+
+        let entry = Self::normalize_abs_path(raw_entry);
         if mount == "/" {
             let rel = entry.trim_start_matches('/');
             if rel.is_empty() {
@@ -757,13 +1092,7 @@ impl AntaresServiceImpl {
         }
 
         let prefix = format!("{}/", mount);
-        if !entry.starts_with(&prefix) {
-            return None;
-        }
-        let rel = entry[prefix.len()..].trim_start_matches('/');
-        if rel.is_empty() {
-            return None;
-        }
+        let rel = entry.strip_prefix(&prefix)?;
         Self::validated_relative_path(rel)
     }
 
@@ -974,6 +1303,7 @@ impl AntaresServiceImpl {
     async fn build_cl_layer(
         &self,
         mount_path: &str,
+        cl_path: &str,
         cl_link: &str,
         cl_dir: &Path,
     ) -> Result<(), ServiceError> {
@@ -997,13 +1327,29 @@ impl AntaresServiceImpl {
             return Ok(());
         }
 
+        let normalized_mount_path = Self::normalize_abs_path(mount_path);
+        let normalized_cl_path = Self::normalize_abs_path(cl_path);
+        let cl_mount_relative = if normalized_mount_path == normalized_cl_path {
+            PathBuf::new()
+        } else {
+            Self::relative_path_for_mount(&normalized_cl_path, &normalized_mount_path).ok_or_else(
+                || {
+                    ServiceError::InvalidRequest(format!(
+                        "CL repository path `{}` is outside Antares mount path `{}`",
+                        cl_path, mount_path
+                    ))
+                },
+            )?
+        };
+
         let client = Self::http_client()?;
         for file in files {
-            let rel_path = match Self::relative_path_for_mount(&file.path, mount_path) {
-                Some(p) => p,
-                None => continue,
-            };
-            let dest = cl_dir.join(rel_path);
+            let repo_relative_path =
+                match Self::relative_path_for_mount(&file.path, &normalized_cl_path) {
+                    Some(p) => p,
+                    None => continue,
+                };
+            let dest = cl_dir.join(&cl_mount_relative).join(repo_relative_path);
             match file.action.as_str() {
                 "new" | "modified" => {
                     self.download_blob_to_path(&client, &file.sha, &dest)
@@ -1147,6 +1493,10 @@ impl AntaresServiceImpl {
 
     /// Persist current mount state to file.
     async fn persist_state(&self) {
+        if self.state_ownership == StateOwnership::External {
+            return;
+        }
+
         let mounts = self.mounts.read().await;
         let state = PersistedState {
             mounts: mounts
@@ -1156,7 +1506,9 @@ impl AntaresServiceImpl {
                     mount_id: e.mount_id,
                     job_id: e.job_id.clone(),
                     path: e.path.clone(),
+                    cl_path: e.cl_path.clone(),
                     cl: e.cl.clone(),
+                    base_revision: e.base_revision.clone(),
                     mountpoint: e.mountpoint.clone(),
                     upper_dir: e.upper_dir.clone(),
                     cl_dir: e.cl_dir.clone(),
@@ -1259,11 +1611,17 @@ impl AntaresServiceImpl {
                     }
 
                     // Create entry
+                    let cl_path = persisted
+                        .cl_path
+                        .clone()
+                        .unwrap_or_else(|| persisted.path.clone());
                     let entry = MountEntry {
                         mount_id: persisted.mount_id,
                         job_id: persisted.job_id.clone(),
                         path: persisted.path.clone(),
+                        cl_path: Some(cl_path.clone()),
                         cl: persisted.cl.clone(),
+                        base_revision: persisted.base_revision.clone(),
                         mountpoint: persisted.mountpoint.clone(),
                         upper_dir: persisted.upper_dir.clone(),
                         cl_dir: persisted.cl_dir.clone(),
@@ -1282,7 +1640,10 @@ impl AntaresServiceImpl {
                     if let Some(job_id) = persisted.job_id {
                         job_index.insert(job_id, persisted.mount_id);
                     } else {
-                        index.insert((persisted.path, persisted.cl), persisted.mount_id);
+                        index.insert(
+                            (persisted.path, persisted.cl, Some(cl_path)),
+                            persisted.mount_id,
+                        );
                     }
 
                     tracing::info!("Recovered mount {} at {:?}", persisted.mount_id, mountpoint);
@@ -1306,16 +1667,35 @@ impl AntaresServiceImpl {
         Ok(())
     }
 
-    /// Check if a path+cl combination is already mounted.
-    async fn is_path_already_mounted(&self, path: &str, cl: Option<&str>) -> bool {
+    /// Check if a path+CL+CL-path combination is already mounted.
+    async fn is_path_already_mounted(
+        &self,
+        path: &str,
+        cl: Option<&str>,
+        cl_path: Option<&str>,
+    ) -> bool {
         let index = self.path_index.read().await;
-        index.contains_key(&(path.to_string(), cl.map(|s| s.to_string())))
+        index.contains_key(&(
+            path.to_string(),
+            cl.map(|s| s.to_string()),
+            cl_path.map(|s| s.to_string()),
+        ))
     }
 
     /// Get service health information.
     pub async fn health_info_impl(&self) -> HealthResponse {
         let mounts = self.mounts.read().await;
         HealthResponse {
+            protocol_version: 1,
+            service: "scorpiofs".to_string(),
+            service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            capabilities: vec![
+                "mount.v1".to_string(),
+                "ready.v1".to_string(),
+                "changes.v1".to_string(),
+                "worktree-base.v1".to_string(),
+                "refresh-plan.v1".to_string(),
+            ],
             status: "healthy".to_string(),
             mount_count: mounts.len(),
             uptime_secs: self.start_time.elapsed().as_secs(),
@@ -1354,6 +1734,12 @@ impl AntaresService for AntaresServiceImpl {
         let start = Instant::now();
         let mut request = request;
         request.path = Self::normalize_mount_path(&request.path);
+        if let Some(cl_path) = request.cl_path.as_mut() {
+            *cl_path = Self::normalize_mount_path(cl_path);
+        }
+        if request.cl_path.is_none() {
+            request.cl_path = Some(request.path.clone());
+        }
 
         // 1. Validate request
         Self::validate_request(&request)?;
@@ -1389,7 +1775,10 @@ impl AntaresService for AntaresServiceImpl {
                 let mut mounts = self.mounts.write().await;
                 if let Some(entry) = mounts.get_mut(&existing_id) {
                     // Guard against job_id reuse with different request params.
-                    if entry.path != request.path || entry.cl != request.cl {
+                    if entry.path != request.path
+                        || entry.cl != request.cl
+                        || entry.cl_path != request.cl_path
+                    {
                         return Err(ServiceError::InvalidRequest(format!(
                             "job_id/build_id '{}' already mounted with different path/cl",
                             job_id
@@ -1422,7 +1811,11 @@ impl AntaresService for AntaresServiceImpl {
                 }
             }
         } else if self
-            .is_path_already_mounted(&request.path, request.cl.as_deref())
+            .is_path_already_mounted(
+                &request.path,
+                request.cl.as_deref(),
+                request.cl_path.as_deref(),
+            )
             .await
         {
             return Err(ServiceError::InvalidRequest(format!(
@@ -1465,7 +1858,12 @@ impl AntaresService for AntaresServiceImpl {
         {
             let cl_dir_path = PathBuf::from(cl_dir_str);
             if let Err(err) = self
-                .build_cl_layer(&request.path, cl_link, &cl_dir_path)
+                .build_cl_layer(
+                    &request.path,
+                    request.cl_path.as_deref().unwrap_or(&request.path),
+                    cl_link,
+                    &cl_dir_path,
+                )
                 .await
             {
                 let _ = std::fs::remove_dir_all(&mountpoint_str);
@@ -1528,7 +1926,11 @@ impl AntaresService for AntaresServiceImpl {
                 }
                 return Err(err);
             }
-        } else if index.contains_key(&(request.path.clone(), request.cl.clone())) {
+        } else if index.contains_key(&(
+            request.path.clone(),
+            request.cl.clone(),
+            request.cl_path.clone(),
+        )) {
             // Same rollback logic as above for legacy (path, cl) duplicates.
             let err = ServiceError::InvalidRequest(format!(
                 "path {} with cl {:?} is already mounted",
@@ -1557,7 +1959,9 @@ impl AntaresService for AntaresServiceImpl {
             mount_id,
             job_id: task_id.clone(),
             path: request.path.clone(),
+            cl_path: request.cl_path.clone(),
             cl: request.cl.clone(),
+            base_revision: None,
             mountpoint: mountpoint_str.clone(),
             upper_dir: upper_dir_str.clone(),
             cl_dir: cl_dir_str.clone(),
@@ -1578,7 +1982,14 @@ impl AntaresService for AntaresServiceImpl {
         if let Some(job_id) = task_id {
             job_index.insert(job_id, mount_id);
         } else {
-            index.insert((request.path.clone(), request.cl.clone()), mount_id);
+            index.insert(
+                (
+                    request.path.clone(),
+                    request.cl.clone(),
+                    request.cl_path.clone(),
+                ),
+                mount_id,
+            );
         }
 
         tracing::info!(
@@ -1653,6 +2064,178 @@ impl AntaresService for AntaresServiceImpl {
             .get(&mount_id)
             .ok_or(ServiceError::NotFound(mount_id))?;
         Ok(entry.to_status())
+    }
+
+    async fn changed_paths(&self, mount_id: Uuid) -> Result<MountChangesResponse, ServiceError> {
+        // Retain this read lock through the blocking scan. CL updates need the write
+        // lock before entering Quiescing, so they cannot remove or recreate cl_dir
+        // while scan_mount_changes is reading it.
+        let mounts = self.mounts.read().await;
+        let (upper_dir, cl_dir) = {
+            let entry = mounts
+                .get(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            if matches!(entry.state, MountLifecycle::Quiescing) {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "mount {} is quiescing while its CL layer is reconfigured",
+                    mount_id
+                )));
+            }
+            (
+                PathBuf::from(&entry.upper_dir),
+                entry.cl_dir.as_deref().map(PathBuf::from),
+            )
+        };
+        let scan_result = tokio::task::spawn_blocking(move || {
+            scan_mount_changes(mount_id, &upper_dir, cl_dir.as_deref())
+        })
+        .await
+        .map_err(|error| {
+            ServiceError::Internal(format!(
+                "Antares changed-path scan task failed for mount {}: {}",
+                mount_id, error
+            ))
+        })?;
+        drop(mounts);
+        scan_result
+    }
+
+    async fn worktree_state(&self, mount_id: Uuid) -> Result<WorktreeStateResponse, ServiceError> {
+        let (path, base_revision, mount_state, upper_dir) = {
+            let mounts = self.mounts.read().await;
+            let entry = mounts
+                .get(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            (
+                entry.path.clone(),
+                entry.base_revision.clone(),
+                entry.state.clone(),
+                PathBuf::from(&entry.upper_dir),
+            )
+        };
+
+        // A VCS worktree treats an optional CL layer as part of its supplied
+        // base, not as a user edit. Only the private upper layer is dirty.
+        let changes =
+            tokio::task::spawn_blocking(move || scan_mount_changes(mount_id, &upper_dir, None))
+                .await
+                .map_err(|error| {
+                    ServiceError::Internal(format!(
+                        "Antares worktree-state scan task failed for mount {}: {}",
+                        mount_id, error
+                    ))
+                })??;
+
+        Ok(WorktreeStateResponse {
+            mount_id,
+            path,
+            base_revision,
+            mount_state,
+            dirty: !changes.changes.is_empty(),
+            changes,
+        })
+    }
+
+    async fn bind_worktree_base(
+        &self,
+        mount_id: Uuid,
+        request: BindWorktreeBaseRequest,
+    ) -> Result<WorktreeStateResponse, ServiceError> {
+        let base_revision = request.base_revision.trim();
+        if base_revision.is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "base_revision cannot be empty".into(),
+            ));
+        }
+
+        let existing_base = {
+            let mounts = self.mounts.read().await;
+            let entry = mounts
+                .get(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.base_revision.clone()
+        };
+        if let Some(existing) = existing_base {
+            if existing != base_revision {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "mount {} is already bound to base revision {}",
+                    mount_id, existing
+                )));
+            }
+            return self.worktree_state(mount_id).await;
+        }
+
+        let state = self.worktree_state(mount_id).await?;
+        if state.dirty {
+            return Err(ServiceError::InvalidRequest(
+                "cannot bind a worktree base after local upper-layer changes exist".into(),
+            ));
+        }
+
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            if !matches!(entry.state, MountLifecycle::Mounted | MountLifecycle::Ready) {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "mount {} is currently in state {:?}; cannot bind a Libra worktree base",
+                    mount_id, entry.state
+                )));
+            }
+            if entry.cl.is_some() {
+                return Err(ServiceError::InvalidRequest(
+                    "cannot bind a Libra worktree base to a mount with a CL layer".into(),
+                ));
+            }
+            if let Some(existing) = &entry.base_revision {
+                if existing != base_revision {
+                    return Err(ServiceError::InvalidRequest(format!(
+                        "mount {} is already bound to base revision {}",
+                        mount_id, existing
+                    )));
+                }
+            } else {
+                entry.base_revision = Some(base_revision.to_string());
+                entry.update_last_seen();
+            }
+        }
+
+        self.persist_state().await;
+        self.worktree_state(mount_id).await
+    }
+
+    async fn plan_worktree_refresh(
+        &self,
+        mount_id: Uuid,
+        request: RefreshPlanRequest,
+    ) -> Result<RefreshPlanResponse, ServiceError> {
+        let expected = request.expected_base_revision.trim();
+        let target = request.target_revision.trim();
+        if expected.is_empty() || target.is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "expected_base_revision and target_revision cannot be empty".into(),
+            ));
+        }
+
+        let worktree = self.worktree_state(mount_id).await?;
+        let disposition = match worktree.base_revision.as_deref() {
+            None => RefreshPlanDisposition::Unbound,
+            Some(current) if current != expected => RefreshPlanDisposition::BaseMismatch,
+            Some(current) if current == target => RefreshPlanDisposition::AlreadyAtTarget,
+            Some(_) if request.require_clean && worktree.dirty => {
+                RefreshPlanDisposition::BlockedDirty
+            }
+            Some(_) => RefreshPlanDisposition::Ready,
+        };
+
+        Ok(RefreshPlanResponse {
+            mount_id,
+            current_base_revision: worktree.base_revision.clone(),
+            target_revision: target.to_string(),
+            disposition,
+            worktree,
+        })
     }
 
     async fn delete_mount(&self, mount_id: Uuid) -> Result<MountStatus, ServiceError> {
@@ -1767,12 +2350,13 @@ impl AntaresService for AntaresServiceImpl {
             entry.state = MountLifecycle::Unmounted;
             entry.update_last_seen();
             // Remove from mounts and index only after successful unmount
+            let cl_path = entry.cl_path.clone();
             let status = entry.to_status();
             mounts.remove(&mount_id);
             if let Some(job_id) = job_id {
                 job_index.remove(&job_id);
             } else {
-                index.remove(&(path, cl));
+                index.remove(&(path, cl, cl_path));
             }
             drop(mounts);
             drop(index);
@@ -1804,6 +2388,11 @@ impl AntaresService for AntaresServiceImpl {
                 mount_id, entry.state
             )));
         }
+        if entry.base_revision.is_some() {
+            return Err(ServiceError::InvalidRequest(
+                "cannot modify a CL layer after binding a Libra worktree base".into(),
+            ));
+        }
 
         let cl_root = crate::util::config::antares_cl_root();
         let cl_dir_str = format!("{}/{}", cl_root, mount_id);
@@ -1812,6 +2401,7 @@ impl AntaresService for AntaresServiceImpl {
         let path = entry.path.clone();
         let job_id = entry.job_id.clone();
         let old_cl = entry.cl.clone();
+        let cl_path = entry.cl_path.clone();
         let mountpoint = PathBuf::from(&entry.mountpoint);
         let upper_dir = PathBuf::from(&entry.upper_dir);
         let existing_cl_dir = entry.cl_dir.as_ref().map(PathBuf::from);
@@ -1864,7 +2454,15 @@ impl AntaresService for AntaresServiceImpl {
             return Err(ServiceError::FuseFailure(format!("unmount failed: {}", e)));
         }
 
-        if let Err(e) = self.build_cl_layer(&path, &cl_link, &cl_dir_path).await {
+        if let Err(e) = self
+            .build_cl_layer(
+                &path,
+                cl_path.as_deref().unwrap_or(&path),
+                &cl_link,
+                &cl_dir_path,
+            )
+            .await
+        {
             tracing::error!("Failed to build CL layer for {}: {}", mount_id, e);
             let remount_result = old_fuse.mount().await;
             let mut mounts = self.mounts.write().await;
@@ -1940,8 +2538,8 @@ impl AntaresService for AntaresServiceImpl {
 
         if job_id.is_none() && old_cl != entry.cl {
             let path = entry.path.clone();
-            index.remove(&(path.clone(), old_cl));
-            index.insert((path, entry.cl.clone()), mount_id);
+            index.remove(&(path.clone(), old_cl, entry.cl_path.clone()));
+            index.insert((path, entry.cl.clone(), entry.cl_path.clone()), mount_id);
         }
 
         let mountpoint_for_preload = entry.mountpoint.clone();
@@ -1976,6 +2574,11 @@ impl AntaresService for AntaresServiceImpl {
                 mount_id, entry.state
             )));
         }
+        if entry.base_revision.is_some() {
+            return Err(ServiceError::InvalidRequest(
+                "cannot modify a CL layer after binding a Libra worktree base".into(),
+            ));
+        }
 
         if entry.cl.is_none() {
             return Err(ServiceError::InvalidRequest(
@@ -1986,6 +2589,7 @@ impl AntaresService for AntaresServiceImpl {
         let path = entry.path.clone();
         let job_id = entry.job_id.clone();
         let old_cl = entry.cl.clone();
+        let cl_path = entry.cl_path.clone();
         let quiesce_grace = Self::cl_quiesce_grace_duration();
         let mountpoint = PathBuf::from(&entry.mountpoint);
         let upper_dir = PathBuf::from(&entry.upper_dir);
@@ -2093,8 +2697,8 @@ impl AntaresService for AntaresServiceImpl {
         entry.update_last_seen();
 
         if job_id.is_none() {
-            index.remove(&(path.clone(), old_cl));
-            index.insert((path, None), mount_id);
+            index.remove(&(path.clone(), old_cl, cl_path.clone()));
+            index.insert((path, None, cl_path), mount_id);
         }
 
         let mountpoint_for_preload = entry.mountpoint.clone();
@@ -2573,6 +3177,7 @@ mod tests {
                 job_id: task_id.clone(),
                 path: request.path,
                 cl: request.cl,
+                base_revision: None,
                 mountpoint: mountpoint.clone(),
                 layers: MountLayers {
                     upper: upper_dir,
@@ -2614,6 +3219,20 @@ mod tests {
                     s
                 })
                 .ok_or(ServiceError::NotFound(mount_id))
+        }
+
+        async fn changed_paths(
+            &self,
+            mount_id: Uuid,
+        ) -> Result<MountChangesResponse, ServiceError> {
+            if !self.mounts.read().await.contains_key(&mount_id) {
+                return Err(ServiceError::NotFound(mount_id));
+            }
+            Ok(MountChangesResponse {
+                mount_id,
+                generation: 0,
+                changes: Vec::new(),
+            })
         }
 
         async fn build_cl(
@@ -2666,6 +3285,14 @@ mod tests {
         async fn health_info(&self) -> HealthResponse {
             let mounts = self.mounts.read().await;
             HealthResponse {
+                protocol_version: 1,
+                service: "scorpiofs".to_string(),
+                service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                capabilities: vec![
+                    "mount.v1".to_string(),
+                    "ready.v1".to_string(),
+                    "changes.v1".to_string(),
+                ],
                 status: "healthy".to_string(),
                 mount_count: mounts.len(),
                 uptime_secs: 0,
@@ -2697,6 +3324,76 @@ mod tests {
         let service = Arc::new(MockAntaresService::new());
         let daemon = AntaresDaemon::new(service);
         daemon.router()
+    }
+
+    #[test]
+    fn changed_path_scan_ignores_libra_metadata_and_sorts_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let cl = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::create_dir_all(cl.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/z.rs"), "z").unwrap();
+        std::fs::write(root.path().join("src/a.rs"), "a").unwrap();
+        std::fs::write(root.path().join("src/shared.rs"), "upper").unwrap();
+        std::fs::write(cl.path().join("src/shared.rs"), "cl").unwrap();
+        std::fs::write(cl.path().join("src/cl-only.rs"), "cl").unwrap();
+        std::fs::write(root.path().join(".libra"), "gitdir: /tmp/metadata").unwrap();
+
+        let mount_id = Uuid::new_v4();
+        let response = scan_mount_changes(mount_id, root.path(), Some(cl.path())).unwrap();
+
+        assert_eq!(response.mount_id, mount_id);
+        assert_eq!(
+            response
+                .changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/cl-only.rs", "src/shared.rs", "src/z.rs"]
+        );
+        assert!(response
+            .changes
+            .iter()
+            .all(|change| change.kind == ChangeKind::Modified));
+    }
+
+    #[tokio::test]
+    async fn test_mount_changes_route() {
+        let app = create_test_router();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"job_id":"vcs-job","path":"/project"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: MountCreated = serde_json::from_slice(&body).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/mounts/{}/changes", created.mount_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let changes: MountChangesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(changes.mount_id, created.mount_id);
+        assert!(changes.changes.is_empty());
     }
 
     #[tokio::test]
@@ -2963,6 +3660,7 @@ mod tests {
                     svc.create_mount(CreateMountRequest {
                         job_id: None,
                         build_id: None,
+                        cl_path: None,
                         path: format!("/project/path{}", i),
                         cl: None,
                     })
@@ -2987,6 +3685,7 @@ mod tests {
         let request = CreateMountRequest {
             job_id: None,
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
@@ -3007,6 +3706,7 @@ mod tests {
         let request = CreateMountRequest {
             job_id: Some("job-123".into()),
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
@@ -3025,6 +3725,7 @@ mod tests {
         let request = CreateMountRequest {
             job_id: Some("job-123".into()),
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
@@ -3049,12 +3750,14 @@ mod tests {
         let req1 = CreateMountRequest {
             job_id: Some("job-a".into()),
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
         let req2 = CreateMountRequest {
             job_id: Some("job-b".into()),
             build_id: None,
+            cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
         };
@@ -3077,6 +3780,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3103,6 +3807,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL1".into()),
             })
@@ -3114,6 +3819,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL2".into()),
             })
@@ -3140,6 +3846,7 @@ mod tests {
                 let request = CreateMountRequest {
                     job_id: None,
                     build_id: None,
+                    cl_path: None,
                     path: format!("/concurrent-path-{}", i),
                     cl: None,
                 };
@@ -3184,6 +3891,7 @@ mod tests {
         let request = CreateMountRequest {
             job_id: None,
             build_id: None,
+            cl_path: None,
             path: "/test-concurrent-ops".to_string(),
             cl: None,
         };
@@ -3219,6 +3927,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3241,6 +3950,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3265,6 +3975,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3301,6 +4012,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL123".into()),
             })
@@ -3325,6 +4037,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
             })
@@ -3346,6 +4059,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL123".into()),
             })
@@ -3372,6 +4086,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/test/path".into(),
                 cl: None,
             })
@@ -3412,6 +4127,7 @@ mod tests {
             .create_mount(CreateMountRequest {
                 job_id: None,
                 build_id: None,
+                cl_path: None,
                 path: "/test/path".into(),
                 cl: Some("CL123".into()),
             })

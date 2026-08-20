@@ -214,7 +214,7 @@ pub mod prelude {
         AntaresDaemon, AntaresService, AntaresServiceImpl, ApiError, BuildClRequest,
         CreateMountRequest, ErrorBody, HealthResponse, MountCollection, MountCreated, MountLayers,
         MountLifecycle, MountReadyResponse, MountStatus, PersistedMountState, PersistedState,
-        ServiceError,
+        ServiceError, StateOwnership,
     };
 }
 
