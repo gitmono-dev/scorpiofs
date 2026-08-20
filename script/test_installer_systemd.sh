@@ -215,8 +215,10 @@ if [ "$service_user" != root ]; then
     chmod 0711 "${inaccessible_root}/data"
     : >"${inaccessible_root}/data/sentinel"
     chown root:root "${inaccessible_root}/data/sentinel"
+    # The root test process must open the repository file before dropping privileges.
+    # shellcheck disable=SC2024
     if inaccessible_output="$(sudo -u "$inaccessible_user" -H env -u SUDO_USER \
-        bash "${repo_root}/install.sh" \
+        bash -s -- \
             --version "$version" \
             --release-base-url "$release_base_url" \
             --non-interactive \
@@ -232,7 +234,8 @@ if [ "$service_user" != root ]; then
             --data-root "${inaccessible_root}/data" \
             --workspace "${inaccessible_root}/data/mount" \
             --store-path "${inaccessible_root}/data/store" \
-            --http-addr 127.0.0.1:2925 2>&1)"; then
+            --http-addr 127.0.0.1:2925 \
+            < "${repo_root}/install.sh" 2>&1)"; then
         printf 'installer accepted an inaccessible nonempty data-root\n' >&2
         exit 1
     fi
