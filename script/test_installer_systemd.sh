@@ -162,6 +162,36 @@ grep -Fq 'stop the ScorpioFS daemon, unmount this path, and retry' \
 test ! -e "${unmanaged_root}/prefix/bin/scorpio"
 : >"$systemctl_log"
 
+if [ "$service_user" != root ]; then
+    inaccessible_root="${test_root}/inaccessible-data"
+    mkdir -p "${inaccessible_root}/etc" "${inaccessible_root}/data"
+    chown "$service_user" "${inaccessible_root}/etc"
+    chmod 0711 "${inaccessible_root}/data"
+    : >"${inaccessible_root}/data/sentinel"
+    chown root:root "${inaccessible_root}/data/sentinel"
+    if inaccessible_output="$(sudo -u "$service_user" -H env -u SUDO_USER \
+        bash "${repo_root}/install.sh" \
+            --version "$version" \
+            --release-base-url "$release_base_url" \
+            --non-interactive \
+            --overwrite-config \
+            --no-service \
+            --no-deps \
+            --no-user-allow-other \
+            --base-url https://mega.example.com \
+            --lfs-url https://mega.example.com/lfs \
+            --prefix "${inaccessible_root}/prefix" \
+            --config-dir "${inaccessible_root}/etc" \
+            --data-root "${inaccessible_root}/data" \
+            --workspace "${inaccessible_root}/data/mount" \
+            --store-path "${inaccessible_root}/data/store" \
+            --http-addr 127.0.0.1:2925 2>&1)"; then
+        printf 'installer accepted an inaccessible nonempty data-root\n' >&2
+        exit 1
+    fi
+    grep -Fq 'could not inspect data-root; refusing to change ownership' <<<"$inaccessible_output"
+fi
+
 MOCK_STALE_MOUNT="${test_root}/data/mount" \
 SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --version "$version" \
@@ -180,7 +210,7 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --http-addr 127.0.0.1:2925
 
 grep -Fq 'ExecStopPost=-/bin/sh -c' "$unit_capture"
-grep -Fq -- "--submounts ${test_root}/data/antares/mnt" "$unit_capture"
+grep -Fq 'findmnt -rno TARGET 2>/dev/null | sort -r' "$unit_capture"
 grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${test_root}/data/mount" "$unit_capture"
 grep -Fxq 'enable scorpiofs.service' "$systemctl_log"
 grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"

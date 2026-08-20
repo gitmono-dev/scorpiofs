@@ -137,6 +137,14 @@ run_root() {
     fi
 }
 
+run_readonly() {
+    if [ -n "$SUDO_BIN" ]; then
+        "$SUDO_BIN" "$@"
+    else
+        "$@"
+    fi
+}
+
 require_privileges() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     if [ "$(id -u)" -eq 0 ]; then
@@ -318,9 +326,13 @@ validate_data_paths() {
         [ ! -L "$runtime_file" ] || die "runtime state file must not be a symbolic link: $runtime_file"
     done
     [ ! -L "$CONFDIR/scorpio.toml" ] || die "config file must not be a symbolic link: $CONFDIR/scorpio.toml"
-    if [ -d "$DATA_ROOT" ] && [ "$EXISTING_CONFIG" -eq 0 ] && \
-        [ -n "$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-        die "refusing to change ownership of a nonempty data-root without an existing ScorpioFS config: $DATA_ROOT"
+    if [ -d "$DATA_ROOT" ] && [ "$EXISTING_CONFIG" -eq 0 ]; then
+        local data_root_entry
+        if ! data_root_entry="$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
+            die "could not inspect data-root; refusing to change ownership without verifying it is empty: $DATA_ROOT"
+        fi
+        [ -z "$data_root_entry" ] || \
+            die "refusing to change ownership of a nonempty data-root without an existing ScorpioFS config: $DATA_ROOT"
     fi
 }
 
@@ -1050,9 +1062,7 @@ recover_stale_runtime_mounts() {
         # Mount health is a read-only check, so dry-runs must execute it to
         # preserve the same stale-versus-active decision as a real install.
         local probe_succeeded=0
-        if [ "$DRY_RUN" -eq 1 ]; then
-            if "${probe[@]}"; then probe_succeeded=1; fi
-        elif run_root "${probe[@]}"; then
+        if run_readonly "${probe[@]}"; then
             probe_succeeded=1
         fi
         if [ "$probe_succeeded" -eq 1 ] && [ "$detach_managed_mounts" -ne 1 ]; then
@@ -1210,6 +1220,8 @@ install_systemd_service() {
     fi
     local unit_tmp="${WORKDIR}/scorpiofs.service"
     local fuse_group_line=""
+    local escaped_antares_mount
+    escaped_antares_mount="$(toml_escape "$ANTARES_MOUNT_ROOT")"
     if getent group fuse >/dev/null 2>&1; then fuse_group_line="SupplementaryGroups=fuse"; fi
     cat > "$unit_tmp" <<EOF
 [Unit]
@@ -1229,7 +1241,7 @@ AmbientCapabilities=CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_SYS_ADMIN
 WorkingDirectory=${DATA_ROOT}
 ExecStart=${PREFIX}/bin/scorpio --config-path ${CONFDIR}/scorpio.toml serve --http-addr ${HTTP_ADDR}
-ExecStopPost=-/bin/sh -c 'for m in \$(findmnt -rno TARGET --submounts ${ANTARES_MOUNT_ROOT} 2>/dev/null | sort -r); do fusermount3 -u -z "\$m"; done'
+ExecStopPost=-/bin/sh -c 'root="${escaped_antares_mount}"; findmnt -rno TARGET 2>/dev/null | sort -r | while IFS= read -r m; do case "\$m" in "\$root"|"\$root"/*) fusermount3 -u -z "\$m";; esac; done'
 ExecStopPost=-/usr/bin/fusermount3 -u -z ${WORKSPACE}
 Restart=on-failure
 RestartSec=5s
