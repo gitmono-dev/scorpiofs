@@ -131,8 +131,8 @@ tarball, **verifies its SHA256 checksum**, installs `scorpio`/`antares`, creates
 the `scorpiofs` service user, prepares the FUSE group and data directories, and
 generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 
-- Run `bash install.sh` for the interactive flow. It supports `curl | bash`
-  because prompts are read from `/dev/tty`.
+- Run `sudo bash install.sh` for the interactive flow. It supports `curl | bash`
+  because prompts are read from a verified controlling terminal.
 - The API defaults to `127.0.0.1:2725` because it has no authentication. A
   non-loopback bind requires `--allow-public-api` and an external firewall or
   authenticating reverse proxy.
@@ -142,17 +142,39 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 - System packages are installed via apt/dnf/pacman (skip with `--no-deps`).
 - `--uninstall` removes the binaries and service unit and leaves config/data in
   place.
+- `--overwrite-config` (or `SCORPIO_OVERWRITE_CONFIG=1`) is required when an
+  automated upgrade should replace an existing `scorpio.toml`; otherwise its
+  contents are retained while ownership is reconciled with the service user.
+- `--workspace` and `--store-path` must be children of the dedicated
+  `--data-root`; filesystem roots and broad system directories are rejected.
 - `--release-base-url` (or `SCORPIO_RELEASE_BASE_URL`) points the installer at
   a mirror or local HTTP server using the same `<base>/<version>/<asset>`
   layout as GitHub releases. The PR build uses this to exercise a complete
   local package/checksum/install/config-validation flow.
 
 ```bash
-bash install.sh                                      # interactive install
-bash install.sh --version v0.4.0 --dry-run           # preview
-bash install.sh --version v0.4.0 --non-interactive \
+# Recommended interactive install: download, inspect, and execute.
+curl -fsSLO https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh
+less install.sh
+sudo bash install.sh
+
+# One-line interactive install.
+curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh | sudo bash
+
+# Automated install or reconfiguration.
+curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh | \
+  sudo bash -s -- --non-interactive --overwrite-config \
+    --base-url https://mega.example.com \
+    --lfs-url https://mega.example.com/lfs \
+    --http-addr 127.0.0.1:2725
+
+# Install binaries and config without systemd or /etc/fuse.conf changes.
+sudo bash install.sh --non-interactive --no-service --no-user-allow-other \
   --base-url https://mega.example.com \
-  --lfs-url https://mega.example.com/lfs              # automation
+  --lfs-url https://mega.example.com/lfs
+
+# Remove binaries and the unit while retaining config and data.
+sudo bash install.sh --uninstall
 ```
 
 ## Releases & supply chain

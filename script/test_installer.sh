@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+installer="${repo_root}/install.sh"
+test_root="$(mktemp -d)"
+trap 'rm -rf "$test_root"' EXIT
+
+common=(
+    --version v0.0.0-test
+    --non-interactive
+    --dry-run
+    --no-deps
+    --no-service
+    --no-user-allow-other
+    --base-url https://mega.example.com
+    --lfs-url https://mega.example.com/lfs
+    --prefix "$test_root/prefix"
+    --config-dir "$test_root/etc"
+    --data-root "$test_root/data"
+    --workspace "$test_root/data/mount"
+    --store-path "$test_root/data/store"
+    --http-addr 127.0.0.1:2725
+)
+
+expect_failure() {
+    local label="$1" expected="$2"
+    shift 2
+    if output="$(bash "$installer" "$@" 2>&1)"; then
+        printf 'expected failure for %s\n' "$label" >&2
+        exit 1
+    fi
+    if [[ "$output" != *"$expected"* ]]; then
+        printf 'unexpected error for %s:\n%s\n' "$label" "$output" >&2
+        exit 1
+    fi
+}
+
+bash "$installer" "${common[@]}" --http-addr 192.168.1.10:2725 --allow-public-api >/dev/null
+bash "$installer" "${common[@]}" \
+    --base-url 'http://[::1]:8000' \
+    --lfs-url 'http://[::1]:8000/lfs' \
+    --http-addr '[::1]:2725' >/dev/null
+
+expect_failure "missing URL host" "must include a host" "${common[@]}" --base-url http://
+expect_failure "URL port overflow" "between 1 and 65535" "${common[@]}" --lfs-url http://host:99999
+expect_failure "bind port overflow" "between 1 and 65535" "${common[@]}" --http-addr 127.0.0.1:99999
+expect_failure "unbracketed IPv6 bind" "IPv4:port or [IPv6]:port" "${common[@]}" --http-addr ::1:2725
+expect_failure "unauthorized public bind" "without --allow-public-api" \
+    "${common[@]}" --http-addr 192.168.1.10:2725
+expect_failure "filesystem root data path" "data-root is too broad" \
+    "${common[@]}" --data-root / --workspace /mount --store-path /store
+expect_failure "broad /var/lib data path" "data-root is too broad" \
+    "${common[@]}" --data-root /var/lib --workspace /var/lib/mount --store-path /var/lib/store
+expect_failure "workspace outside data root" "workspace must be inside data-root" \
+    "${common[@]}" --workspace /home
+expect_failure "systemd path specifier" "unsafe for shell or systemd" \
+    "${common[@]}" --data-root "$test_root/scorpio%Q" \
+    --workspace "$test_root/scorpio%Q/mount" --store-path "$test_root/scorpio%Q/store"
+
+if command -v setsid >/dev/null 2>&1; then
+    if output="$(setsid bash "$installer" --version v0.0.0-test --dry-run </dev/null 2>&1)"; then
+        printf 'expected failure without a controlling terminal\n' >&2
+        exit 1
+    fi
+    if [[ "$output" != *"requires a controlling terminal"* ]]; then
+        printf 'unexpected no-terminal error:\n%s\n' "$output" >&2
+        exit 1
+    fi
+fi
+
+printf 'installer validation tests passed\n'

@@ -9,6 +9,8 @@ developer-local paths (test data is created under `/tmp`).
 | `mktestdirs.sh` | Create empty scratch dirs for overlay/FUSE experiments. | `script/mktestdirs.sh` |
 | `run.sh` | Generate a small deep directory tree (10 × 1 MB files) under `/tmp`. | `script/run.sh` |
 | `run_1000_files.sh` | Generate a larger tree (~1000 files) under `/tmp`. | `script/run_1000_files.sh` |
+| `test_installer.sh` | Exercise installer input and safety validation without system changes. | `script/test_installer.sh` |
+| `test_installer_systemd.sh` | Verify generated mount cleanup and upgrade restart using mocked systemd commands. | `sudo script/test_installer_systemd.sh <version> <release-url> <test-root>` |
 | `fuse_test.py` | Python FUSE throughput/latency benchmark with plots. | `python3 script/fuse_test.py --help` |
 | `log_analysis.py` | Extract abnormal/unmatched request IDs from a ScorpioFS log (writes `output.txt`). | `python3 script/log_analysis.py` |
 

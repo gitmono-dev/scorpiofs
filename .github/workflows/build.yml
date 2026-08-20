@@ -51,6 +51,10 @@ jobs:
       - name: Build release
         run: cargo build --release --verbose
 
+      - name: Test installer validation
+        if: matrix.rust == 'stable'
+        run: bash script/test_installer.sh
+
       - name: Exercise installer with local release
         if: matrix.rust == 'stable'
         run: |
@@ -80,7 +84,7 @@ jobs:
             sleep 0.25
           done
 
-          sudo bash install.sh \
+          sudo env 'SCORPIO_GIT_AUTHOR=DOMAIN\Bob "Builder"' bash install.sh \
             --version "${version}" \
             --release-base-url http://127.0.0.1:18080 \
             --non-interactive \
@@ -100,3 +104,46 @@ jobs:
           "${install_root}/prefix/bin/antares" --version
           "${install_root}/prefix/bin/scorpio" \
             --config-path "${install_root}/etc/scorpio.toml" config validate
+          grep -F 'git_author = "DOMAIN\\Bob \"Builder\""' "${install_root}/etc/scorpio.toml"
+
+          sudo chown nobody:nogroup "${install_root}/etc/scorpio.toml"
+          sudo bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --data-root "${install_root}/data" \
+            --workspace "${install_root}/data/mount" \
+            --store-path "${install_root}/data/store" \
+            --http-addr 127.0.0.1:2825
+          test "$(stat -c '%U' "${install_root}/etc/scorpio.toml")" = "${USER}"
+          grep -F 'base_url = "https://mega.example.com"' "${install_root}/etc/scorpio.toml"
+
+          sudo bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --overwrite-config \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://new-mega.example.com \
+            --lfs-url https://new-mega.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --data-root "${install_root}/data" \
+            --workspace "${install_root}/data/mount" \
+            --store-path "${install_root}/data/store" \
+            --http-addr 127.0.0.1:2825
+          grep -F 'base_url = "https://new-mega.example.com"' "${install_root}/etc/scorpio.toml"
+
+          sudo bash script/test_installer_systemd.sh \
+            "${version}" \
+            http://127.0.0.1:18080 \
+            "${RUNNER_TEMP}/scorpiofs-systemd-test"

@@ -42,10 +42,14 @@ ALLOW_PUBLIC_API=0
 OVERWRITE_CONFIG=0
 SERVICE_CHOICE_SET=0
 FUSE_CHOICE_SET=0
+CONFIG_CHOICE_SET=0
 WORKDIR=""
 SUDO_BIN=""
 TARGET_USER=""
 TARGET_GROUP=""
+TTY_FD=""
+BIND_HOST=""
+BIND_PORT=""
 
 cleanup() {
     if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ]; then
@@ -69,12 +73,13 @@ Options:
   --data-root <dir>         Runtime/data root (default: /var/lib/scorpiofs).
   --base-url <url>          Mega/monorepo service URL.
   --lfs-url <url>           Git LFS endpoint URL.
-  --workspace <dir>         FUSE workspace directory.
-  --store-path <dir>        Local cache/store directory.
-  --http-addr <ip:port>     HTTP API bind address (default: 127.0.0.1:2725).
+  --workspace <dir>         FUSE workspace inside data-root.
+  --store-path <dir>        Local cache/store inside data-root.
+  --http-addr <socket>      IPv4:port or [IPv6]:port (default: 127.0.0.1:2725).
   --allow-public-api        Permit a non-loopback HTTP bind (use a firewall/auth proxy).
   --no-service              Do not create or start a systemd service.
   --non-interactive         Use arguments/environment without prompting.
+  --overwrite-config        Replace an existing scorpio.toml during an upgrade.
   --yes                     Accept safe defaults in interactive mode.
   --dry-run                 Print actions without changing the system.
   --uninstall               Stop/remove binaries and the systemd unit; keep data.
@@ -86,7 +91,7 @@ Options:
 Examples:
   sudo bash install.sh
   bash install.sh --base-url https://mega.example.com --lfs-url https://mega.example.com/lfs
-  bash install.sh --version v0.4.0 --non-interactive --dry-run
+  bash install.sh --version v0.4.0 --non-interactive --overwrite-config --dry-run
 
 The HTTP API has no authentication. The installer therefore defaults to
 127.0.0.1 and asks for explicit confirmation before accepting a public bind.
@@ -123,11 +128,8 @@ require_privileges() {
 }
 
 read_tty() {
-    if [ -r /dev/tty ]; then
-        IFS= read -r REPLY </dev/tty || REPLY=""
-    else
-        IFS= read -r REPLY || REPLY=""
-    fi
+    [ -n "$TTY_FD" ] || die "interactive input is unavailable; use --non-interactive"
+    IFS= read -r REPLY <&"$TTY_FD" || die "could not read interactive input from /dev/tty"
 }
 
 prompt_value() {
@@ -136,7 +138,7 @@ prompt_value() {
         printf -v "$variable" '%s' "$default"
         return 0
     fi
-    printf '%s [%s]: ' "$label" "$default" >/dev/tty 2>/dev/null || printf '%s [%s]: ' "$label" "$default"
+    printf '%s [%s]: ' "$label" "$default" >&"$TTY_FD"
     read_tty
     if [ -z "$REPLY" ]; then REPLY="$default"; fi
     printf -v "$variable" '%s' "$REPLY"
@@ -152,7 +154,7 @@ prompt_yes_no() {
         return 0
     fi
     while :; do
-        printf '%s [%s]: ' "$label" "$default" >/dev/tty 2>/dev/null || printf '%s [%s]: ' "$label" "$default"
+        printf '%s [%s]: ' "$label" "$default" >&"$TTY_FD"
         read_tty
         answer="${REPLY:-$default}"
         case "$answer" in
@@ -170,9 +172,80 @@ validate_url() {
         *) die "$field must start with http:// or https:// (got: $value)" ;;
     esac
     [[ "$value" != *[[:space:]]* ]] || die "$field must not contain whitespace"
-    [[ "$value" != *'"'* ]] || die "$field must not contain a double quote"
-    [[ "$value" != *"'"* ]] || die "$field must not contain a single quote"
-    [[ "$value" != *'`'* && "$value" != *'\\'* ]] || die "$field contains an unsafe character"
+    [[ "$value" != *'"'* && "$value" != *"'"* ]] || die "$field must not contain quotes"
+    [[ "$value" != *'`'* && "$value" != *\\* ]] || die "$field contains an unsafe character"
+    [[ "$value" != *'?'* && "$value" != *'#'* ]] || die "$field must not contain a query or fragment"
+
+    local remainder authority host port=""
+    remainder="${value#*://}"
+    authority="${remainder%%/*}"
+    [ -n "$authority" ] || die "$field must include a host"
+    [[ "$authority" != *'@'* ]] || die "$field must not contain credentials"
+
+    if [[ "$authority" =~ ^\[([^]]+)\](:([0-9]+))?$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[3]:-}"
+        validate_ipv6 "$field host" "$host"
+    else
+        host="$authority"
+        if [[ "$authority" == *:* ]]; then
+            host="${authority%:*}"
+            port="${authority##*:}"
+            [[ "$host" != *:* ]] || die "$field has an IPv6 host without brackets"
+        fi
+        validate_url_host "$field host" "$host"
+    fi
+    [ -z "$port" ] || validate_port "$field port" "$port"
+}
+
+validate_port() {
+    local field="$1" value="$2"
+    [[ "$value" =~ ^[0-9]{1,5}$ ]] || die "$field must be a numeric port"
+    (( 10#$value >= 1 && 10#$value <= 65535 )) || die "$field must be between 1 and 65535"
+}
+
+validate_ipv4() {
+    local field="$1" value="$2" a b c d extra octet
+    IFS=. read -r a b c d extra <<<"$value"
+    if [ -n "${extra:-}" ] || [ -z "${a:-}" ] || [ -z "${b:-}" ] || \
+        [ -z "${c:-}" ] || [ -z "${d:-}" ]; then
+        die "$field is not a valid IPv4 address"
+    fi
+    for octet in "$a" "$b" "$c" "$d"; do
+        if ! [[ "$octet" =~ ^[0-9]{1,3}$ ]] || (( 10#$octet > 255 )); then
+            die "$field is not a valid IPv4 address"
+        fi
+    done
+}
+
+validate_ipv6() {
+    local field="$1" value="$2"
+    [[ "$value" == *:* && "$value" =~ ^[0-9A-Fa-f:.]+$ ]] || \
+        die "$field is not a valid IPv6 address"
+    command -v getent >/dev/null 2>&1 || die "getent is required to validate IPv6 addresses"
+    getent ahostsv6 "$value" >/dev/null 2>&1 || die "$field is not a valid IPv6 address"
+}
+
+validate_url_host() {
+    local field="$1" value="$2" label
+    local -a labels
+    [ -n "$value" ] || die "$field must not be empty"
+    if [[ "$value" =~ ^[0-9.]+$ ]]; then
+        validate_ipv4 "$field" "$value"
+        return 0
+    fi
+    [[ "$value" != *'..'* ]] || die "$field is not a valid hostname"
+    IFS=. read -ra labels <<<"$value"
+    for label in "${labels[@]}"; do
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$ ]] || \
+            die "$field is not a valid hostname"
+    done
+}
+
+normalize_path() {
+    local value="$1"
+    while [ "$value" != "/" ] && [ "${value%/}" != "$value" ]; do value="${value%/}"; done
+    printf '%s' "$value"
 }
 
 validate_path() {
@@ -181,18 +254,70 @@ validate_path() {
     [[ "$value" == /* ]] || die "$field must be an absolute path: $value"
     [[ "$value" != *[[:space:]]* ]] || die "$field must not contain whitespace"
     [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "$field must not contain a newline"
-    [[ "$value" != *'"'* && "$value" != *'`'* && "$value" != *'$'* && "$value" != *'\\'* ]] || die "$field contains an unsafe shell character"
+    [[ "$value" != *'"'* && "$value" != *"'"* && "$value" != *'`'* && \
+        "$value" != *'$'* && "$value" != *\\* && "$value" != *'%'* ]] || \
+        die "$field contains a character unsafe for shell or systemd use"
+    [[ "$value" != *'//'* ]] || die "$field must not contain repeated slashes"
+    case "/${value#/}/" in
+        *'/../'*|*'/./'*) die "$field must not contain . or .. path components" ;;
+    esac
+    [ ! -L "$value" ] || die "$field must not be a symbolic link: $value"
+}
+
+validate_data_paths() {
+    case "$DATA_ROOT" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var|/var/lib|/var/log)
+            die "data-root is too broad and must be a dedicated ScorpioFS directory: $DATA_ROOT"
+            ;;
+    esac
+    case "$WORKSPACE" in
+        "$DATA_ROOT"/*) ;;
+        *) die "workspace must be inside data-root ($DATA_ROOT): $WORKSPACE" ;;
+    esac
+    case "$STORE_PATH" in
+        "$DATA_ROOT"/*) ;;
+        *) die "store-path must be inside data-root ($DATA_ROOT): $STORE_PATH" ;;
+    esac
 }
 
 validate_bind() {
-    local value="$1"
-    [[ "$value" =~ ^(127\.0\.0\.1|0\.0\.0\.0|::1|\[::1\]):[0-9]{1,5}$ ]] || \
-        die "--http-addr must be an IPv4/IPv6 loopback or wildcard address such as 127.0.0.1:2725"
+    local value="$1" host port
+    if [[ "$value" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+        validate_ipv6 "--http-addr" "$host"
+    elif [[ "$value" =~ ^([^:]+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+        validate_ipv4 "--http-addr" "$host"
+    else
+        die "--http-addr must be IPv4:port or [IPv6]:port"
+    fi
+    validate_port "--http-addr" "$port"
+    BIND_HOST="$host"
+    BIND_PORT="$port"
+}
+
+is_loopback_host() {
+    [[ "$1" == 127.* || "$1" == "::1" ]]
+}
+
+health_endpoint() {
+    local host="$BIND_HOST"
+    case "$host" in
+        0.0.0.0) host="127.0.0.1" ;;
+        ::) host="[::1]" ;;
+        *:*) host="[$host]" ;;
+    esac
+    printf 'http://%s:%s/health' "$host" "$BIND_PORT"
 }
 
 normalize_url() {
     local value="$1"
-    while [ "${value%/}" != "$value" ]; do value="${value%/}"; done
+    while [ "${value%/}" != "$value" ]; do
+        case "$value" in http://|https://) break ;; esac
+        value="${value%/}"
+    done
     printf '%s' "$value"
 }
 
@@ -212,6 +337,7 @@ parse_args() {
             --allow-public-api) ALLOW_PUBLIC_API=1; shift ;;
             --no-service) SETUP_SERVICE=0; SERVICE_CHOICE_SET=1; shift ;;
             --non-interactive) INTERACTIVE=0; shift ;;
+            --overwrite-config) OVERWRITE_CONFIG=1; CONFIG_CHOICE_SET=1; shift ;;
             --yes) ASSUME_YES=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;
             --uninstall) DO_UNINSTALL=1; INTERACTIVE=0; shift ;;
@@ -222,6 +348,22 @@ parse_args() {
             *) die "unknown option: $1 (see --help)" ;;
         esac
     done
+}
+
+apply_environment_options() {
+    case "${SCORPIO_OVERWRITE_CONFIG:-}" in
+        ""|0|false|FALSE|no|NO) ;;
+        1|true|TRUE|yes|YES) OVERWRITE_CONFIG=1; CONFIG_CHOICE_SET=1 ;;
+        *) die "SCORPIO_OVERWRITE_CONFIG must be 1/0, true/false, or yes/no" ;;
+    esac
+}
+
+open_interactive_tty() {
+    [ "$INTERACTIVE" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] || return 0
+    if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+        die "interactive input requires a controlling terminal; use --non-interactive with --base-url and --lfs-url"
+    fi
+    TTY_FD=3
 }
 
 detect_target() {
@@ -315,23 +457,26 @@ configure_interactively() {
     if [ "$SETUP_SERVICE" -eq 1 ]; then
         prompt_value SERVICE_USER "systemd service user" "$SERVICE_USER"
     fi
-    if [ -f "${CONFDIR}/scorpio.toml" ]; then
+    if [ -f "${CONFDIR}/scorpio.toml" ] && [ "$CONFIG_CHOICE_SET" -eq 0 ]; then
         prompt_yes_no OVERWRITE_CONFIG "Overwrite existing ${CONFDIR}/scorpio.toml" "n"
     fi
 
-    case "$HTTP_ADDR" in
-        127.0.0.1:*|::1:*|\[::1\]:*) ;;
-        *)
-            warn "${HTTP_ADDR} is not loopback. ScorpioFS has no HTTP authentication."
-            prompt_yes_no PUBLIC_API_OK "Continue with an externally reachable API only behind a firewall/auth proxy" "n"
-            if [ "$PUBLIC_API_OK" -eq 1 ]; then ALLOW_PUBLIC_API=1; else HTTP_ADDR="127.0.0.1:2725"; fi
-            ;;
-    esac
+    validate_bind "$HTTP_ADDR"
+    if ! is_loopback_host "$BIND_HOST"; then
+        warn "${HTTP_ADDR} is not loopback. ScorpioFS has no HTTP authentication."
+        prompt_yes_no PUBLIC_API_OK "Continue with an externally reachable API only behind a firewall/auth proxy" "n"
+        if [ "$PUBLIC_API_OK" -eq 1 ]; then ALLOW_PUBLIC_API=1; else HTTP_ADDR="127.0.0.1:2725"; fi
+    fi
 }
 
 validate_inputs() {
     BASE_URL="$(normalize_url "$BASE_URL")"
     LFS_URL="$(normalize_url "$LFS_URL")"
+    PREFIX="$(normalize_path "$PREFIX")"
+    CONFDIR="$(normalize_path "$CONFDIR")"
+    DATA_ROOT="$(normalize_path "$DATA_ROOT")"
+    WORKSPACE="$(normalize_path "$WORKSPACE")"
+    STORE_PATH="$(normalize_path "$STORE_PATH")"
     validate_url base_url "$BASE_URL"
     validate_url lfs_url "$LFS_URL"
     validate_url release-base-url "$RELEASE_BASE_URL"
@@ -340,13 +485,14 @@ validate_inputs() {
     validate_path data-root "$DATA_ROOT"
     validate_path workspace "$WORKSPACE"
     validate_path store-path "$STORE_PATH"
+    validate_data_paths
     validate_bind "$HTTP_ADDR"
-    case "$HTTP_ADDR" in
-        127.0.0.1:*|::1:*|\[::1\]:*) ;;
-        *) [ "$ALLOW_PUBLIC_API" -eq 1 ] || die "refusing non-loopback HTTP bind without --allow-public-api" ;;
-    esac
-    [[ "$GIT_AUTHOR" != *$'\n'* && "$GIT_AUTHOR" != *'"'* ]] || die "git author contains an unsafe character"
-    [[ "$GIT_EMAIL" != *$'\n'* && "$GIT_EMAIL" != *'"'* ]] || die "git email contains an unsafe character"
+    is_loopback_host "$BIND_HOST" || [ "$ALLOW_PUBLIC_API" -eq 1 ] || \
+        die "refusing non-loopback HTTP bind without --allow-public-api"
+    [[ "$GIT_AUTHOR" != *$'\n'* && "$GIT_AUTHOR" != *$'\r'* ]] || die "git author contains a newline"
+    [[ "$GIT_EMAIL" != *$'\n'* && "$GIT_EMAIL" != *$'\r'* ]] || die "git email contains a newline"
+    [ -n "$GIT_AUTHOR" ] || die "git author must not be empty"
+    [ -n "$GIT_EMAIL" ] || die "git email must not be empty"
     [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid service user: $SERVICE_USER"
 }
 
@@ -384,7 +530,9 @@ install_binaries() {
     note "extracting and installing to ${PREFIX}/bin"
     tar -xzf "${WORKDIR}/${tarball}" -C "$WORKDIR"
     extracted="${WORKDIR}/scorpiofs-${VERSION}-${target}"
-    [ -x "${extracted}/scorpio" ] && [ -x "${extracted}/antares" ] || die "release archive has an unexpected layout"
+    if [ ! -x "${extracted}/scorpio" ] || [ ! -x "${extracted}/antares" ]; then
+        die "release archive has an unexpected layout"
+    fi
     local smoke_output
     if ! smoke_output="$("${extracted}/scorpio" --version 2>&1)"; then
         die "downloaded scorpio cannot run on this host: ${smoke_output}. Install a release built for this Linux distribution"
@@ -437,35 +585,61 @@ prepare_directories() {
     run_root install -d "$CONFDIR"
 }
 
+toml_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
+}
+
 write_config() {
     local config_tmp="${WORKDIR:-${TMPDIR:-/tmp}}/scorpio.toml"
+    if [ -f "${CONFDIR}/scorpio.toml" ] && [ "$OVERWRITE_CONFIG" -ne 1 ]; then
+        warn "${CONFDIR}/scorpio.toml already exists; leaving its contents unchanged"
+        run_root chown "$TARGET_USER:$TARGET_GROUP" "${CONFDIR}/scorpio.toml"
+        run_root chmod 0640 "${CONFDIR}/scorpio.toml"
+        return 0
+    fi
     if [ "$DRY_RUN" -eq 1 ]; then
         note "would write ${CONFDIR}/scorpio.toml with the supplied URLs and paths"
         return 0
     fi
+    local escaped_base_url escaped_lfs_url escaped_workspace escaped_store_path
+    local escaped_config_file escaped_author escaped_email escaped_data_root
+    escaped_base_url="$(toml_escape "$BASE_URL")"
+    escaped_lfs_url="$(toml_escape "$LFS_URL")"
+    escaped_workspace="$(toml_escape "$WORKSPACE")"
+    escaped_store_path="$(toml_escape "$STORE_PATH")"
+    escaped_config_file="$(toml_escape "$DATA_ROOT/config.toml")"
+    escaped_author="$(toml_escape "$GIT_AUTHOR")"
+    escaped_email="$(toml_escape "$GIT_EMAIL")"
+    escaped_data_root="$(toml_escape "$DATA_ROOT")"
     umask 077
     cat > "$config_tmp" <<EOF
 # Generated by ScorpioFS install.sh. Edit base_url/lfs_url when the backend changes.
-base_url = "$BASE_URL"
-lfs_url = "$LFS_URL"
-workspace = "$WORKSPACE"
-store_path = "$STORE_PATH"
-config_file = "$DATA_ROOT/config.toml"
-git_author = "$GIT_AUTHOR"
-git_email = "$GIT_EMAIL"
+base_url = "$escaped_base_url"
+lfs_url = "$escaped_lfs_url"
+workspace = "$escaped_workspace"
+store_path = "$escaped_store_path"
+config_file = "$escaped_config_file"
+git_author = "$escaped_author"
+git_email = "$escaped_email"
 log_level = "info"
-antares_upper_root = "$DATA_ROOT/antares/upper"
-antares_cl_root = "$DATA_ROOT/antares/cl"
-antares_mount_root = "$DATA_ROOT/antares/mnt"
-antares_state_file = "$DATA_ROOT/antares/state.toml"
+antares_upper_root = "$escaped_data_root/antares/upper"
+antares_cl_root = "$escaped_data_root/antares/cl"
+antares_mount_root = "$escaped_data_root/antares/mnt"
+antares_state_file = "$escaped_data_root/antares/state.toml"
 EOF
-    if [ -f "${CONFDIR}/scorpio.toml" ] && [ "$OVERWRITE_CONFIG" -ne 1 ]; then
-        warn "${CONFDIR}/scorpio.toml already exists; leaving it unchanged"
-        rm -f "$config_tmp"
-        return 0
-    fi
     run_root install -m 0640 -o "$TARGET_USER" -g "$TARGET_GROUP" "$config_tmp" "${CONFDIR}/scorpio.toml"
     rm -f "$config_tmp"
+}
+
+validate_installed_config() {
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    if ! run_root "${PREFIX}/bin/scorpio" --config-path "${CONFDIR}/scorpio.toml" config validate; then
+        die "generated or retained config is invalid: ${CONFDIR}/scorpio.toml"
+    fi
 }
 
 enable_user_allow_other() {
@@ -513,6 +687,8 @@ AmbientCapabilities=CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_SYS_ADMIN
 WorkingDirectory=${DATA_ROOT}
 ExecStart=${PREFIX}/bin/scorpio --config-path ${CONFDIR}/scorpio.toml serve --http-addr ${HTTP_ADDR}
+ExecStopPost=-/bin/sh -c 'for m in \$(findmnt -rno TARGET --submounts ${DATA_ROOT}/antares/mnt 2>/dev/null | sort -r); do fusermount3 -u -z "\$m"; done'
+ExecStopPost=-/usr/bin/fusermount3 -u -z ${WORKSPACE}
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=45
@@ -526,8 +702,16 @@ WantedBy=multi-user.target
 EOF
     run_root install -m 0644 "$unit_tmp" /etc/systemd/system/scorpiofs.service
     run_root systemctl daemon-reload
-    if ! run_root systemctl enable --now scorpiofs.service; then
-        warn "systemd unit installed but could not start; inspect: systemctl status scorpiofs"
+    if ! run_root systemctl enable scorpiofs.service; then
+        die "could not enable scorpiofs.service; inspect: systemctl status scorpiofs"
+    fi
+    local service_action="start"
+    if run_root systemctl is-active --quiet scorpiofs.service; then
+        service_action="restart"
+        note "restarting the active ScorpioFS service to load the new binary and config"
+    fi
+    if ! run_root systemctl "$service_action" scorpiofs.service; then
+        die "systemd unit could not ${service_action}; inspect: systemctl status scorpiofs"
     fi
 }
 
@@ -545,9 +729,8 @@ uninstall() {
 main() {
     parse_args "$@"
     if [ "$DO_UNINSTALL" -eq 1 ]; then uninstall; exit 0; fi
-    if [ "$INTERACTIVE" -eq 1 ] && [ ! -e /dev/tty ] && [ "$ASSUME_YES" -eq 0 ]; then
-        die "interactive input requires a terminal; use --non-interactive with --base-url and --lfs-url"
-    fi
+    apply_environment_options
+    open_interactive_tty
 
     check_tools
     resolve_version
@@ -567,13 +750,14 @@ main() {
     ensure_service_account
     prepare_directories
     write_config
+    validate_installed_config
     enable_user_allow_other
     install_systemd_service
 
     note "installation complete"
     note "config: ${CONFDIR}/scorpio.toml"
     note "check:  ${PREFIX}/bin/scorpio --config-path ${CONFDIR}/scorpio.toml doctor"
-    note "health: curl http://127.0.0.1:${HTTP_ADDR##*:}/health"
+    note "health: curl $(health_endpoint)"
     if [ "$SETUP_SERVICE" -eq 1 ]; then
         note "logs:   journalctl -u scorpiofs -f"
     else

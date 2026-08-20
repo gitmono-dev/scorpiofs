@@ -272,17 +272,33 @@ service user, and generates a config with absolute runtime paths. The HTTP API
 defaults to loopback because it has no authentication:
 
 ```bash
-bash install.sh                               # interactive
-bash install.sh --version v0.4.0 --dry-run    # preview
-sudo bash install.sh --version v0.4.0         # install
+# Recommended: download, inspect, then run interactively.
+curl -fsSLO https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh
+less install.sh
+sudo bash install.sh
+
+# One-line interactive install.
+curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh | sudo bash
 ```
 
-For automation, use `--non-interactive` with `--base-url` and `--lfs-url`.
+The installer resolves the latest release by default. For automation, pass
+arguments after `bash -s --`; use `--overwrite-config` only when the supplied
+values should replace an existing installation:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh | \
+  sudo bash -s -- --non-interactive --overwrite-config \
+    --base-url https://mega.example.com \
+    --lfs-url https://mega.example.com/lfs
+```
+
 Non-loopback HTTP binds require the explicit `--allow-public-api` flag and
 must be protected by a firewall or an authenticating reverse proxy. The script
 never edits `/etc/fuse.conf` unless the interactive prompt is accepted or
 `--enable-user-allow-other` is passed. `--uninstall` removes binaries and the
-unit but keeps configuration and data. Mirrors and locally packaged builds can
+unit but keeps configuration and data. `--workspace` and `--store-path` must be
+inside the dedicated `--data-root`, preventing ownership changes to broad host
+directories. Mirrors and locally packaged builds can
 be tested with `--release-base-url <url>` or `SCORPIO_RELEASE_BASE_URL`; the
 mirror layout is `<base>/<version>/scorpiofs-<version>-<target>.tar.gz` plus its
 `.sha256` file.
