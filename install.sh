@@ -782,7 +782,7 @@ configure_interactively() {
     fi
 
     validate_bind "$HTTP_ADDR"
-    if ! is_loopback_host "$BIND_HOST"; then
+    if ! is_loopback_host "$BIND_HOST" && [ "$ALLOW_PUBLIC_API" -ne 1 ]; then
         warn "${HTTP_ADDR} is not loopback. ScorpioFS has no HTTP authentication."
         prompt_yes_no PUBLIC_API_OK "Continue with an externally reachable API only behind a firewall/auth proxy" "n"
         if [ "$PUBLIC_API_OK" -eq 1 ]; then ALLOW_PUBLIC_API=1; else HTTP_ADDR="127.0.0.1:2725"; fi

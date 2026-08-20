@@ -42,6 +42,30 @@ bash "$installer" "${common[@]}" \
     --lfs-url 'http://[::1]:8000/lfs' \
     --http-addr '[::1]:2725' >/dev/null
 
+interactive_public=(
+    --version v0.0.0-test
+    --dry-run
+    --no-deps
+    --no-service
+    --no-user-allow-other
+    --yes
+    --allow-public-api
+    --base-url https://mega.example.com
+    --lfs-url https://mega.example.com/lfs
+    --prefix "$test_root/interactive-prefix"
+    --config-dir "$test_root/interactive-etc"
+    --data-root "$test_root/interactive-data"
+    --workspace "$test_root/interactive-data/mount"
+    --store-path "$test_root/interactive-data/store"
+    --http-addr 192.168.1.10:2725
+)
+interactive_command="$(printf '%q ' bash "$installer" "${interactive_public[@]}")"
+output="$(script -qec "$interactive_command" /dev/null)"
+if [[ "$output" != *"health: curl http://192.168.1.10:2725/health"* ]]; then
+    printf 'interactive --allow-public-api did not preserve the explicit bind:\n%s\n' "$output" >&2
+    exit 1
+fi
+
 expect_failure "missing URL host" "must include a host" "${common[@]}" --base-url http://
 expect_failure "URL port overflow" "between 1 and 65535" "${common[@]}" --lfs-url http://host:99999
 expect_failure "bind port overflow" "between 1 and 65535" "${common[@]}" --http-addr 127.0.0.1:99999
