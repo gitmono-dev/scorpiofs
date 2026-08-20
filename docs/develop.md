@@ -15,14 +15,15 @@ sudo apt update
 sudo apt install build-essential pkg-config libfuse3-dev libssl-dev
 ```
 
-## Optional `allow_other` support
+## Required `allow_other` support for unprivileged runs
 
-Only when mounts must be accessible to users other than the process owner,
-uncomment or add this exact line in `/etc/fuse.conf`:
+ScorpioFS requests the `allow_other` mount option for its FUSE mounts. Before
+running it as a non-root user, uncomment or add this exact line in
+`/etc/fuse.conf`:
 
 ```text
 user_allow_other
 ```
 
 This setting permits FUSE filesystems to use the `allow_other` mount option.
-Leave it disabled when that access is not required.
+The interactive installer can enable it with `--enable-user-allow-other`.
