@@ -251,4 +251,4 @@ jobs:
           sudo bash script/test_installer_systemd.sh \
             "${version}" \
             http://127.0.0.1:18080 \
-            "${RUNNER_TEMP}/scorpiofs-systemd-test"
+            "/tmp/scorpiofs-systemd-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
