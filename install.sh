@@ -1161,6 +1161,7 @@ validate_service_config_traversal() {
 }
 
 prepare_directories() {
+    local path parent
     local -a directories
     if [ "$SETUP_SERVICE" -eq 1 ]; then
         TARGET_USER="$SERVICE_USER"
@@ -1184,6 +1185,15 @@ prepare_directories() {
         "$DATA_ROOT" "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"
         "$(dirname -- "$CONFIG_FILE")" "$(dirname -- "$ANTARES_STATE_FILE")"
     )
+    for path in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" \
+        "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
+        parent="$(dirname -- "$path")"
+        while [[ "$parent" == "$DATA_ROOT"/* ]]; do
+            directories+=("$parent")
+            [ "$parent" = "$DATA_ROOT" ] && break
+            parent="$(dirname -- "$parent")"
+        done
+    done
     if ! path_is_mount_target "$WORKSPACE"; then directories+=("$WORKSPACE"); fi
     if ! path_is_mount_target "$ANTARES_MOUNT_ROOT"; then directories+=("$ANTARES_MOUNT_ROOT"); fi
     # mkdir preserves modes on existing directories; install -d would reset
@@ -1267,6 +1277,13 @@ recover_stale_runtime_mounts() {
         probe=(timeout 15 bash -c 'stat -L -- "$1" >/dev/null 2>&1' bash "$mount_root")
         if [ -n "$EXISTING_SERVICE_USER" ]; then
             probe=(runuser -u "$EXISTING_SERVICE_USER" -- "${probe[@]}")
+            if [ "$DRY_RUN" -eq 1 ] && [ "$(id -u)" -ne 0 ] && [ -z "$SUDO_BIN" ]; then
+                command -v sudo >/dev/null 2>&1 || \
+                    die "sudo is required to inspect managed FUSE mounts during dry-run"
+                sudo -n -v || \
+                    die "could not obtain non-interactive sudo privileges to inspect managed FUSE mounts"
+                probe=(sudo -n "${probe[@]}")
+            fi
         fi
         # Mount health is a read-only check, so dry-runs must execute it to
         # preserve the same stale-versus-active decision as a real install.
@@ -1329,7 +1346,7 @@ reconcile_runtime_directories() {
     # intentionally excluded because they may currently be FUSE mountpoints.
     validate_runtime_migration_mounts
     for runtime_dir in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"; do
-        if [ -d "$runtime_dir" ]; then
+        if run_readonly test -d "$runtime_dir"; then
             run_root chown -R -h -P "$TARGET_USER:$TARGET_GROUP" -- "$runtime_dir"
         fi
     done
@@ -1338,7 +1355,7 @@ reconcile_runtime_directories() {
 reconcile_runtime_files() {
     local runtime_file
     for runtime_file in "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
-        if [ -e "$runtime_file" ]; then
+        if run_readonly test -e "$runtime_file"; then
             run_root chown "$TARGET_USER:$TARGET_GROUP" "$runtime_file"
         fi
     done

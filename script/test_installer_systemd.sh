@@ -572,6 +572,25 @@ grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${migrated_data_root}/mount" 
     "$unit_capture"
 grep -Fq "workspace = \"${migrated_data_root}/mount\"" "${test_root}/etc/scorpio.toml"
 
+nested_runtime_root="${test_root}/nested-runtime"
+SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --overwrite-config \
+    --no-service \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://nested.example.com \
+    --lfs-url https://nested.example.com/lfs \
+    --prefix "${nested_runtime_root}/prefix" \
+    --config-dir "${nested_runtime_root}/etc" \
+    --data-root "${nested_runtime_root}/data" \
+    --workspace "${nested_runtime_root}/data/mount" \
+    --store-path "${nested_runtime_root}/data/private/store" \
+    --http-addr 127.0.0.1:2925
+test "$(stat -c '%U' "${nested_runtime_root}/data/private")" = nobody
+
 relative_root="${test_root}/relative-config"
 mkdir -p "${relative_root}/etc" "${relative_root}/data"
 cp "${test_root}/etc/scorpio.toml" "${relative_root}/etc/scorpio.toml"
