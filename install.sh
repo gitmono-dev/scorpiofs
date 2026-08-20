@@ -348,6 +348,36 @@ validate_runtime_paths() {
     done
     [ ! -L "$CONFIG_FILE" ] || die "runtime state file must not be a symbolic link: $CONFIG_FILE"
     [ ! -L "$ANTARES_STATE_FILE" ] || die "runtime state file must not be a symbolic link: $ANTARES_STATE_FILE"
+    validate_runtime_path_separation
+}
+
+paths_overlap() {
+    local left="$1" right="$2"
+    case "$left" in "$right"|"$right"/*) return 0 ;; esac
+    case "$right" in "$left"|"$left"/*) return 0 ;; esac
+    return 1
+}
+
+validate_runtime_path_separation() {
+    local mount_field mount_path persistent_field persistent_path i j
+    local -a mount_fields=(workspace antares-mount-root)
+    local -a mount_paths=("$WORKSPACE" "$ANTARES_MOUNT_ROOT")
+    local -a persistent_fields=(store-path config-file antares-upper-root antares-cl-root antares-state-file)
+    local -a persistent_paths=("$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_STATE_FILE")
+    for ((i = 0; i < ${#mount_fields[@]}; i++)); do
+        mount_field="${mount_fields[$i]}"
+        mount_path="${mount_paths[$i]}"
+        for ((j = 0; j < ${#persistent_fields[@]}; j++)); do
+            persistent_field="${persistent_fields[$j]}"
+            persistent_path="${persistent_paths[$j]}"
+            if paths_overlap "$mount_path" "$persistent_path"; then
+                die "$mount_field must not overlap $persistent_field: $mount_path and $persistent_path"
+            fi
+        done
+    done
+    if paths_overlap "$WORKSPACE" "$ANTARES_MOUNT_ROOT"; then
+        die "workspace must not overlap antares-mount-root: $WORKSPACE and $ANTARES_MOUNT_ROOT"
+    fi
 }
 
 normalize_runtime_paths() {
@@ -422,7 +452,7 @@ set_generated_runtime_paths() {
 }
 
 run_scorpio_config_without_overrides() {
-    local binary="$1" variable
+    local binary="$1" variable config_path="${CONFDIR}/scorpio.toml"
     shift
     local -a command=(env)
     while IFS= read -r variable; do
@@ -431,7 +461,20 @@ run_scorpio_config_without_overrides() {
         esac
     done < <(compgen -e)
     if [ "$DRY_RUN" -eq 1 ]; then
-        "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
+        if [ "$(id -u)" -eq 0 ] || [ -r "${CONFDIR}/scorpio.toml" ]; then
+            "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
+        else
+            command -v sudo >/dev/null 2>&1 || \
+                die "sudo is required to read protected retained config during dry-run"
+            sudo -v || die "could not obtain read access for retained config during dry-run"
+            config_path="${WORKDIR}/retained-config.toml"
+            (umask 077; : >"$config_path") || \
+                die "could not create a protected config copy for retained dry-run"
+            if ! sudo cat -- "${CONFDIR}/scorpio.toml" | tee "$config_path" >/dev/null; then
+                die "could not read protected retained config during dry-run: ${CONFDIR}/scorpio.toml"
+            fi
+            "${command[@]}" "$binary" --config-path "$config_path" config "$@"
+        fi
     else
         run_root "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
     fi
@@ -757,6 +800,7 @@ validate_inputs() {
     validate_service_manager
     detect_existing_service_user
     validate_data_paths
+    validate_runtime_paths
     validate_bind "$HTTP_ADDR"
     is_loopback_host "$BIND_HOST" || [ "$ALLOW_PUBLIC_API" -eq 1 ] || \
         die "refusing non-loopback HTTP bind without --allow-public-api"

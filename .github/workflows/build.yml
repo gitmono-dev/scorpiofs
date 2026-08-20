@@ -121,7 +121,7 @@ jobs:
           sudo install -d -o nobody -g nogroup "${install_root}/data/store/content.db"
           sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/store/content.db/LOCK"
 
-          sudo bash install.sh \
+          bash install.sh \
             --version "${version}" \
             --release-base-url http://127.0.0.1:18080 \
             --non-interactive \
@@ -140,6 +140,30 @@ jobs:
             "${RUNNER_TEMP}/retained-dry-run.log"
           grep -F "[dry-run] chown -R -h -P ${USER}:${USER}" \
             "${RUNNER_TEMP}/retained-dry-run.log"
+
+          sudo sed -i \
+            "s|^workspace = .*|workspace = \"${install_root}/data/store\"|" \
+            "${install_root}/etc/scorpio.toml"
+          if bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --dry-run \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --http-addr 127.0.0.1:2825 >"${RUNNER_TEMP}/overlap-path.log" 2>&1; then
+            echo "installer accepted overlapping retained workspace/store paths" >&2
+            exit 1
+          fi
+          grep -F 'workspace must not overlap store-path' "${RUNNER_TEMP}/overlap-path.log"
+          sudo sed -i \
+            "s|^workspace = .*|workspace = \"${install_root}/data/mount\"|" \
+            "${install_root}/etc/scorpio.toml"
 
           unrelated_root="${install_root}/unrelated-data"
           sudo install -d -o root -g root "${unrelated_root}"

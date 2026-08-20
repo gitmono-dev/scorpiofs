@@ -162,10 +162,14 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
   retained file is validated exactly as the generated systemd unit will load it.
 - A retained-config `--dry-run` resolves effective paths with the already
   installed `scorpio` binary. It fails explicitly when that binary is missing,
-  because the preview could not otherwise validate the real upgrade paths.
+  because the preview could not otherwise validate the real upgrade paths. A
+  non-root preview may request sudo only to read a protected mode-0640 config.
 - `--workspace` and `--store-path` must be children of the dedicated
   `--data-root`; filesystem roots, symlink escapes, shell metacharacters, and
   nonempty directories without an existing ScorpioFS config are rejected.
+- FUSE workspace/Antares mount roots must not equal, contain, or sit inside
+  persistent store, config, upper, CL, or state paths; mount roots also may not
+  overlap each other.
 - `--release-base-url` (or `SCORPIO_RELEASE_BASE_URL`) points the installer at
   a mirror or local HTTP server using the same `<base>/<version>/<asset>`
   layout as GitHub releases. The PR build uses this to exercise a complete

@@ -54,6 +54,8 @@ expect_failure "broad /var/lib data path" "data-root is too broad" \
     "${common[@]}" --data-root /var/lib --workspace /var/lib/mount --store-path /var/lib/store
 expect_failure "workspace outside data root" "workspace must be inside data-root" \
     "${common[@]}" --workspace /home
+expect_failure "workspace overlaps store" "workspace must not overlap store-path" \
+    "${common[@]}" --store-path "$test_root/data/mount"
 expect_failure "systemd path specifier" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio%Q" \
     --workspace "$test_root/scorpio%Q/mount" --store-path "$test_root/scorpio%Q/store"

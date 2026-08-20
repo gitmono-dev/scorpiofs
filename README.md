@@ -304,7 +304,9 @@ mounts; `--no-service` preserves the configured user of an existing unit.
 Service setup fails before installation when systemd is unavailable. Retained
 config validation ignores ambient `SCORPIO_*` overrides so it matches the unit's
 runtime environment; a retained-config `--dry-run` uses the installed binary to
-resolve the same paths as a real upgrade. Active services are stopped before a
+resolve the same paths as a real upgrade, requesting sudo only when its protected
+config needs read access. Mount roots may not overlap persistent runtime paths.
+Active services are stopped before a
 service-user ownership migration and started under the new account. Mirrors and
 locally packaged builds can
 be tested with `--release-base-url <url>` or `SCORPIO_RELEASE_BASE_URL`; the
