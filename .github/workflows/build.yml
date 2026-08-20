@@ -90,7 +90,7 @@ jobs:
             --non-interactive \
             --no-deps \
             --no-service \
-            --no-user-allow-other \
+            --enable-user-allow-other \
             --base-url https://mega.example.com \
             --lfs-url https://mega.example.com/lfs \
             --prefix "${install_root}/prefix" \
