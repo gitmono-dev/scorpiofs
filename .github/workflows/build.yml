@@ -106,9 +106,43 @@ jobs:
             --config-path "${install_root}/etc/scorpio.toml" config validate
           grep -F 'git_author = "DOMAIN\\Bob \"Builder\""' "${install_root}/etc/scorpio.toml"
 
+          custom_config="${install_root}/data/custom-state/scorpio.toml"
+          custom_antares_state="${install_root}/data/custom-state/antares.toml"
+          sudo install -d "${install_root}/data/custom-state"
+          sudo sed -i \
+            -e "s|^config_file = .*|config_file = \"${custom_config}\"|" \
+            -e "s|^antares_state_file = .*|antares_state_file = \"${custom_antares_state}\"|" \
+            "${install_root}/etc/scorpio.toml"
           sudo chown nobody:nogroup "${install_root}/etc/scorpio.toml"
           sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/config.toml"
           sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/antares/state.toml"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${custom_config}"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${custom_antares_state}"
+
+          unrelated_root="${install_root}/unrelated-data"
+          sudo install -d -o root -g root "${unrelated_root}"
+          sudo touch "${unrelated_root}/unrelated-file"
+          if sudo bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --data-root "${unrelated_root}" \
+            --workspace "${unrelated_root}/mount" \
+            --store-path "${unrelated_root}/store" \
+            --http-addr 127.0.0.1:2825 >"${RUNNER_TEMP}/unrelated-root.log" 2>&1; then
+            echo "installer accepted an unrelated nonempty data root" >&2
+            exit 1
+          fi
+          grep -F 'must be inside data-root' "${RUNNER_TEMP}/unrelated-root.log"
+          test "$(stat -c '%U' "${unrelated_root}")" = root
+
           sudo bash install.sh \
             --version "${version}" \
             --release-base-url http://127.0.0.1:18080 \
@@ -120,13 +154,12 @@ jobs:
             --lfs-url https://ignored.example.com/lfs \
             --prefix "${install_root}/prefix" \
             --config-dir "${install_root}/etc" \
-            --data-root "${install_root}/data" \
-            --workspace "${install_root}/data/mount" \
-            --store-path "${install_root}/data/store" \
             --http-addr 127.0.0.1:2825
           test "$(stat -c '%U' "${install_root}/etc/scorpio.toml")" = "${USER}"
-          test "$(stat -c '%U' "${install_root}/data/config.toml")" = "${USER}"
-          test "$(stat -c '%U' "${install_root}/data/antares/state.toml")" = "${USER}"
+          test "$(stat -c '%U' "${custom_config}")" = "${USER}"
+          test "$(stat -c '%U' "${custom_antares_state}")" = "${USER}"
+          test "$(stat -c '%U' "${install_root}/data/config.toml")" = nobody
+          test "$(stat -c '%U' "${install_root}/data/antares/state.toml")" = nobody
           grep -F 'base_url = "https://mega.example.com"' "${install_root}/etc/scorpio.toml"
 
           sudo bash install.sh \

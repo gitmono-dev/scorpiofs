@@ -103,6 +103,9 @@ enum ConfigAction {
     Validate,
     /// Print the effective (merged) configuration.
     Show,
+    /// Emit runtime paths for the release installer.
+    #[command(hide = true)]
+    InstallerPaths,
 }
 
 #[tokio::main]
@@ -134,6 +137,14 @@ async fn main() {
         }) => {
             std::process::exit(cli::config_validate(&cli.config_path, overrides.clone()));
         }
+        Some(Commands::Config {
+            action: ConfigAction::InstallerPaths,
+        }) => {
+            std::process::exit(cli::config_installer_paths(
+                &cli.config_path,
+                overrides.clone(),
+            ));
+        }
         _ => {}
     }
 
@@ -164,7 +175,7 @@ async fn main() {
             action: ConfigAction::Show,
         }) => cli::config_show(),
         Some(Commands::Config { .. }) => {
-            unreachable!("config init/validate handled before config init")
+            unreachable!("config init/validate/installer-paths handled before config init")
         }
         Some(Commands::Doctor) => doctor::run().await,
         Some(Commands::Completions { .. }) => unreachable!("handled before config init"),
