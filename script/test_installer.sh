@@ -67,6 +67,8 @@ if [[ "$output" != *"health: curl http://192.168.1.10:2725/health"* ]]; then
 fi
 
 expect_failure "missing URL host" "must include a host" "${common[@]}" --base-url http://
+expect_failure "URL control character" "base_url must not contain control characters" \
+    "${common[@]}" --base-url $'https://mega.example.com/a\bpath'
 expect_failure "URL port overflow" "between 1 and 65535" "${common[@]}" --lfs-url http://host:99999
 expect_failure "bind port overflow" "between 1 and 65535" "${common[@]}" --http-addr 127.0.0.1:99999
 expect_failure "unbracketed IPv6 bind" "IPv4:port or [IPv6]:port" "${common[@]}" --http-addr ::1:2725

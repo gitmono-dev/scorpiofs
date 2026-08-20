@@ -185,6 +185,7 @@ prompt_yes_no() {
 
 validate_url() {
     local field="$1" value="$2"
+    validate_toml_text "$field" "$value"
     case "$value" in
         http://*|https://*) ;;
         *) die "$field must start with http:// or https:// (got: $value)" ;;
@@ -739,6 +740,8 @@ pkg_install() {
 
 check_runtime_tools() {
     command -v findmnt >/dev/null 2>&1 || die "findmnt is required (install util-linux)"
+    command -v runuser >/dev/null 2>&1 || die "runuser is required (install util-linux)"
+    command -v timeout >/dev/null 2>&1 || die "timeout is required (install coreutils)"
 }
 
 check_fuse() {
@@ -909,6 +912,7 @@ ensure_service_account() {
 }
 
 prepare_directories() {
+    local -a directories
     if [ "$SETUP_SERVICE" -eq 1 ]; then
         TARGET_USER="$SERVICE_USER"
         if [ "$DRY_RUN" -eq 0 ]; then
@@ -927,11 +931,57 @@ prepare_directories() {
             TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || id -gn)"
         fi
     fi
-    run_root install -d -o "$TARGET_USER" -g "$TARGET_GROUP" \
-        "$DATA_ROOT" "$WORKSPACE" "$STORE_PATH" \
-        "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" \
+    directories=(
+        "$DATA_ROOT" "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"
         "$(dirname -- "$CONFIG_FILE")" "$(dirname -- "$ANTARES_STATE_FILE")"
+    )
+    if ! path_is_mount_target "$WORKSPACE"; then directories+=("$WORKSPACE"); fi
+    if ! path_is_mount_target "$ANTARES_MOUNT_ROOT"; then directories+=("$ANTARES_MOUNT_ROOT"); fi
+    run_root install -d -o "$TARGET_USER" -g "$TARGET_GROUP" "${directories[@]}"
     run_root install -d "$CONFDIR"
+}
+
+path_is_mount_target() {
+    local path="$1" mount_target mount_targets
+    mount_targets="$(findmnt --noheadings --raw --output TARGET)" || \
+        die "could not inspect FUSE mount roots"
+    while IFS= read -r mount_target; do
+        [ "$mount_target" = "$path" ] && return 0
+    done <<<"$mount_targets"
+    return 1
+}
+
+recover_stale_runtime_mounts() {
+    local mount_field mount_root i
+    local -a mount_fields=(workspace antares-mount-root)
+    local -a mount_roots=("$WORKSPACE" "$ANTARES_MOUNT_ROOT")
+    local -a probe
+    for ((i = 0; i < ${#mount_fields[@]}; i++)); do
+        mount_field="${mount_fields[$i]}"
+        mount_root="${mount_roots[$i]}"
+        path_is_mount_target "$mount_root" || continue
+        # $1 is intentionally expanded by the probe shell.
+        # shellcheck disable=SC2016
+        probe=(timeout 15 bash -c 'stat -L -- "$1" >/dev/null 2>&1' bash "$mount_root")
+        if [ -n "$EXISTING_SERVICE_USER" ]; then
+            probe=(runuser -u "$EXISTING_SERVICE_USER" -- "${probe[@]}")
+        fi
+        if run_root "${probe[@]}"; then
+            note "$mount_field is actively mounted; leaving the mount root unchanged during directory preparation"
+            continue
+        fi
+        warn "detaching inaccessible FUSE mount at $mount_root before installation"
+        if command -v fusermount3 >/dev/null 2>&1; then
+            run_root fusermount3 -u -z "$mount_root" || \
+                run_root umount -l "$mount_root" || \
+                die "could not detach stale $mount_field at $mount_root; unmount it and retry"
+        else
+            run_root umount -l "$mount_root" || \
+                die "could not detach stale $mount_field at $mount_root; install fuse3 or unmount it manually"
+        fi
+        path_is_mount_target "$mount_root" && \
+            die "stale $mount_field is still mounted at $mount_root; unmount it and retry"
+    done
 }
 
 validate_runtime_migration_mounts() {
@@ -1151,6 +1201,7 @@ main() {
     validate_runtime_migration_mounts
     ensure_service_account
     stop_active_service_for_user_migration
+    recover_stale_runtime_mounts
     prepare_directories
     reconcile_runtime_directories
     reconcile_runtime_files

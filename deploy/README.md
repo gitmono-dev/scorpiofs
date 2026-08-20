@@ -172,7 +172,10 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
   overlap each other. Installed binaries and the main `scorpio.toml` must also
   remain outside both mount roots.
 - Git author/email values may contain tabs, which are escaped in TOML; other
-  control characters are rejected before installation begins.
+  control characters are rejected from every generated TOML string before
+  installation begins.
+- Inaccessible stale FUSE workspace/Antares mounts are lazily detached before
+  directory preparation; accessible active mount roots are not chowned.
 - `--release-base-url` (or `SCORPIO_RELEASE_BASE_URL`) points the installer at
   a mirror or local HTTP server using the same `<base>/<version>/<asset>`
   layout as GitHub releases. The PR build uses this to exercise a complete

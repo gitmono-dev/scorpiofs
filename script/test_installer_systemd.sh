@@ -15,6 +15,7 @@ service_user="${SUDO_USER:-root}"
 unit_capture="${test_root}/scorpiofs.service"
 systemctl_log="${test_root}/systemctl.log"
 mock_service_active=1
+mock_stale_detached=0
 
 mkdir -p "$test_root"
 : >"$systemctl_log"
@@ -45,8 +46,26 @@ systemctl() {
 }
 
 findmnt() {
+    if [ -n "${MOCK_STALE_MOUNT:-}" ] && [ "$mock_stale_detached" -eq 0 ]; then
+        printf '%s\n' "$MOCK_STALE_MOUNT"
+    fi
     if [ -n "${MOCK_NESTED_MOUNT:-}" ]; then
         printf '%s\n' "$MOCK_NESTED_MOUNT"
+    fi
+}
+
+stat() {
+    if [ -n "${MOCK_STALE_MOUNT:-}" ] && [ "${*: -1}" = "$MOCK_STALE_MOUNT" ] && \
+        [ "$mock_stale_detached" -eq 0 ]; then
+        return 1
+    fi
+    command /usr/bin/stat "$@"
+}
+
+fusermount3() {
+    printf 'fusermount3 %s\n' "$*" >>"$systemctl_log"
+    if [ -n "${MOCK_STALE_MOUNT:-}" ] && [ "${*: -1}" = "$MOCK_STALE_MOUNT" ]; then
+        mock_stale_detached=1
     fi
 }
 
@@ -54,9 +73,10 @@ usermod() {
     return 0
 }
 
-export -f install systemctl findmnt usermod
-export unit_capture systemctl_log service_user mock_service_active
+export -f install systemctl findmnt stat fusermount3 usermod
+export unit_capture systemctl_log service_user mock_service_active mock_stale_detached
 
+MOCK_STALE_MOUNT="${test_root}/data/mount" \
 SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --version "$version" \
     --release-base-url "$release_base_url" \
@@ -79,6 +99,7 @@ grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${test_root}/data/mount" "$un
 grep -Fxq 'enable scorpiofs.service' "$systemctl_log"
 grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
 grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
+grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
 
 SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
     --version "$version" \
