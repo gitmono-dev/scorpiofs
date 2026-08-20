@@ -65,6 +65,11 @@ HAD_OLD_CONFIG=0
 HAD_OLD_UNIT=0
 PREVIOUS_WORKSPACE=""
 PREVIOUS_ANTARES_MOUNT_ROOT=""
+PREVIOUS_STORE_PATH=""
+PREVIOUS_ANTARES_UPPER_ROOT=""
+PREVIOUS_ANTARES_CL_ROOT=""
+PREVIOUS_CONFIG_FILE=""
+PREVIOUS_ANTARES_STATE_FILE=""
 EXTRACTED_RELEASE=""
 REQUESTED_WORKSPACE=""
 REQUESTED_STORE_PATH=""
@@ -88,6 +93,9 @@ cleanup() {
             if ! restore_upgrade_artifacts; then
                 warn "could not restore all previous ScorpioFS artifacts"
             fi
+        fi
+        if ! restore_runtime_ownership; then
+            warn "could not restore runtime ownership for the previous service user"
         fi
         warn "installation failed after stopping scorpiofs.service; attempting to restore the managed service"
         if ! run_root systemctl start scorpiofs.service; then
@@ -594,6 +602,11 @@ prepare_effective_runtime_paths() {
         validate_runtime_paths
         PREVIOUS_WORKSPACE="$WORKSPACE"
         PREVIOUS_ANTARES_MOUNT_ROOT="$ANTARES_MOUNT_ROOT"
+        PREVIOUS_STORE_PATH="$STORE_PATH"
+        PREVIOUS_ANTARES_UPPER_ROOT="$ANTARES_UPPER_ROOT"
+        PREVIOUS_ANTARES_CL_ROOT="$ANTARES_CL_ROOT"
+        PREVIOUS_CONFIG_FILE="$CONFIG_FILE"
+        PREVIOUS_ANTARES_STATE_FILE="$ANTARES_STATE_FILE"
     fi
 
     if [ "$RETAIN_CONFIG" -eq 1 ]; then
@@ -1059,6 +1072,30 @@ restore_upgrade_artifacts() {
     if [ "$HAD_OLD_UNIT" -eq 1 ]; then
         run_root systemctl daemon-reload || restore_failed=1
     fi
+    [ "$restore_failed" -eq 0 ]
+}
+
+restore_runtime_ownership() {
+    [ -n "$EXISTING_SERVICE_USER" ] || return 0
+    [ "$EXISTING_SERVICE_USER" = "$SERVICE_USER" ] && return 0
+
+    local previous_group runtime_dir runtime_file restore_failed=0
+    previous_group="$(id -gn "$EXISTING_SERVICE_USER")" || return 1
+    for runtime_dir in "$PREVIOUS_STORE_PATH" "$PREVIOUS_ANTARES_UPPER_ROOT" \
+        "$PREVIOUS_ANTARES_CL_ROOT"; do
+        [ -n "$runtime_dir" ] || continue
+        if run_root test -d "$runtime_dir" && ! run_root chown -R -h -P \
+            "$EXISTING_SERVICE_USER:$previous_group" -- "$runtime_dir"; then
+            restore_failed=1
+        fi
+    done
+    for runtime_file in "$PREVIOUS_CONFIG_FILE" "$PREVIOUS_ANTARES_STATE_FILE"; do
+        [ -n "$runtime_file" ] || continue
+        if run_root test -e "$runtime_file" && ! run_root chown \
+            "$EXISTING_SERVICE_USER:$previous_group" -- "$runtime_file"; then
+            restore_failed=1
+        fi
+    done
     [ "$restore_failed" -eq 0 ]
 }
 

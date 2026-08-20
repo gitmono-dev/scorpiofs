@@ -298,6 +298,9 @@ grep -Fq 'restoring ScorpioFS artifacts from before the failed upgrade' \
     "${test_root}/health-failure.log"
 cmp "${test_root}/config-before-health-failure.toml" "${test_root}/etc/scorpio.toml"
 tail -c 17 "${test_root}/prefix/bin/scorpio" | grep -Fxq 'old-binary-marker'
+test "$(stat -c '%U' "${test_root}/data/store")" = "$service_user"
+test "$(stat -c '%U' "${test_root}/data/antares/upper")" = "$service_user"
+test "$(stat -c '%U' "${test_root}/data/antares/cl")" = "$service_user"
 test "$(grep -Fc 'start scorpiofs.service' "$systemctl_log")" -ge 2
 : >"$systemctl_log"
 
