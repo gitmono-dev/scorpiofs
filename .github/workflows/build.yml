@@ -107,6 +107,8 @@ jobs:
           grep -F 'git_author = "DOMAIN\\Bob \"Builder\""' "${install_root}/etc/scorpio.toml"
 
           sudo chown nobody:nogroup "${install_root}/etc/scorpio.toml"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/config.toml"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/antares/state.toml"
           sudo bash install.sh \
             --version "${version}" \
             --release-base-url http://127.0.0.1:18080 \
@@ -123,6 +125,8 @@ jobs:
             --store-path "${install_root}/data/store" \
             --http-addr 127.0.0.1:2825
           test "$(stat -c '%U' "${install_root}/etc/scorpio.toml")" = "${USER}"
+          test "$(stat -c '%U' "${install_root}/data/config.toml")" = "${USER}"
+          test "$(stat -c '%U' "${install_root}/data/antares/state.toml")" = "${USER}"
           grep -F 'base_url = "https://mega.example.com"' "${install_root}/etc/scorpio.toml"
 
           sudo bash install.sh \

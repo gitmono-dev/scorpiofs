@@ -146,7 +146,8 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
   automated upgrade should replace an existing `scorpio.toml`; otherwise its
   contents are retained while ownership is reconciled with the service user.
 - `--workspace` and `--store-path` must be children of the dedicated
-  `--data-root`; filesystem roots and broad system directories are rejected.
+  `--data-root`; filesystem roots, symlink escapes, shell metacharacters, and
+  nonempty directories without an existing ScorpioFS config are rejected.
 - `--release-base-url` (or `SCORPIO_RELEASE_BASE_URL`) points the installer at
   a mirror or local HTTP server using the same `<base>/<version>/<asset>`
   layout as GitHub releases. The PR build uses this to exercise a complete

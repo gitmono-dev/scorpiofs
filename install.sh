@@ -254,14 +254,21 @@ validate_path() {
     [[ "$value" == /* ]] || die "$field must be an absolute path: $value"
     [[ "$value" != *[[:space:]]* ]] || die "$field must not contain whitespace"
     [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "$field must not contain a newline"
-    [[ "$value" != *'"'* && "$value" != *"'"* && "$value" != *'`'* && \
-        "$value" != *'$'* && "$value" != *\\* && "$value" != *'%'* ]] || \
+    [[ "$value" =~ ^/[A-Za-z0-9._+:/-]*$ ]] || \
         die "$field contains a character unsafe for shell or systemd use"
     [[ "$value" != *'//'* ]] || die "$field must not contain repeated slashes"
     case "/${value#/}/" in
         *'/../'*|*'/./'*) die "$field must not contain . or .. path components" ;;
     esac
     [ ! -L "$value" ] || die "$field must not be a symbolic link: $value"
+}
+
+canonicalize_paths() {
+    PREFIX="$(realpath -m -- "$PREFIX")"
+    CONFDIR="$(realpath -m -- "$CONFDIR")"
+    DATA_ROOT="$(realpath -m -- "$DATA_ROOT")"
+    WORKSPACE="$(realpath -m -- "$WORKSPACE")"
+    STORE_PATH="$(realpath -m -- "$STORE_PATH")"
 }
 
 validate_data_paths() {
@@ -278,6 +285,15 @@ validate_data_paths() {
         "$DATA_ROOT"/*) ;;
         *) die "store-path must be inside data-root ($DATA_ROOT): $STORE_PATH" ;;
     esac
+    local runtime_file
+    for runtime_file in "$DATA_ROOT/config.toml" "$DATA_ROOT/antares/state.toml"; do
+        [ ! -L "$runtime_file" ] || die "runtime state file must not be a symbolic link: $runtime_file"
+    done
+    [ ! -L "$CONFDIR/scorpio.toml" ] || die "config file must not be a symbolic link: $CONFDIR/scorpio.toml"
+    if [ -d "$DATA_ROOT" ] && [ ! -f "$CONFDIR/scorpio.toml" ] && \
+        [ -n "$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+        die "refusing to change ownership of a nonempty data-root without an existing ScorpioFS config: $DATA_ROOT"
+    fi
 }
 
 validate_bind() {
@@ -383,6 +399,8 @@ check_tools() {
         die "curl or wget is required"
     fi
     command -v tar >/dev/null 2>&1 || die "tar is required"
+    command -v realpath >/dev/null 2>&1 || die "realpath is required"
+    command -v find >/dev/null 2>&1 || die "find is required"
 }
 
 fetch() {
@@ -480,6 +498,12 @@ validate_inputs() {
     validate_url base_url "$BASE_URL"
     validate_url lfs_url "$LFS_URL"
     validate_url release-base-url "$RELEASE_BASE_URL"
+    validate_path prefix "$PREFIX"
+    validate_path config-dir "$CONFDIR"
+    validate_path data-root "$DATA_ROOT"
+    validate_path workspace "$WORKSPACE"
+    validate_path store-path "$STORE_PATH"
+    canonicalize_paths
     validate_path prefix "$PREFIX"
     validate_path config-dir "$CONFDIR"
     validate_path data-root "$DATA_ROOT"
@@ -583,6 +607,15 @@ prepare_directories() {
         "$DATA_ROOT/antares" "$DATA_ROOT/antares/upper" \
         "$DATA_ROOT/antares/cl" "$DATA_ROOT/antares/mnt"
     run_root install -d "$CONFDIR"
+}
+
+reconcile_runtime_files() {
+    local runtime_file
+    for runtime_file in "$DATA_ROOT/config.toml" "$DATA_ROOT/antares/state.toml"; do
+        if [ -e "$runtime_file" ]; then
+            run_root chown "$TARGET_USER:$TARGET_GROUP" "$runtime_file"
+        fi
+    done
 }
 
 toml_escape() {
@@ -749,6 +782,7 @@ main() {
     install_binaries
     ensure_service_account
     prepare_directories
+    reconcile_runtime_files
     write_config
     validate_installed_config
     enable_user_allow_other

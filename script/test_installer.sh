@@ -57,6 +57,20 @@ expect_failure "workspace outside data root" "workspace must be inside data-root
 expect_failure "systemd path specifier" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio%Q" \
     --workspace "$test_root/scorpio%Q/mount" --store-path "$test_root/scorpio%Q/store"
+expect_failure "cleanup shell metacharacter" "unsafe for shell or systemd" \
+    "${common[@]}" --data-root "$test_root/scorpio;false" \
+    --workspace "$test_root/scorpio;false/mount" --store-path "$test_root/scorpio;false/store"
+
+ln -s / "$test_root/root-link"
+expect_failure "symlinked ancestor to broad root" "data-root is too broad" \
+    "${common[@]}" --data-root "$test_root/root-link/home" \
+    --workspace "$test_root/root-link/home/mount" --store-path "$test_root/root-link/home/store"
+
+mkdir -p "$test_root/existing-data"
+: >"$test_root/existing-data/unrelated-file"
+expect_failure "nonempty unowned data root" "refusing to change ownership of a nonempty data-root" \
+    "${common[@]}" --data-root "$test_root/existing-data" \
+    --workspace "$test_root/existing-data/mount" --store-path "$test_root/existing-data/store"
 
 if command -v setsid >/dev/null 2>&1; then
     if output="$(setsid bash "$installer" --version v0.0.0-test --dry-run </dev/null 2>&1)"; then
