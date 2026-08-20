@@ -196,12 +196,13 @@ test ! -e "${unmanaged_root}/prefix/bin/scorpio"
 
 if [ "$service_user" != root ]; then
     inaccessible_root="${test_root}/inaccessible-data"
+    inaccessible_user=nobody
     mkdir -p "${inaccessible_root}/etc" "${inaccessible_root}/data"
-    chown "$service_user" "${inaccessible_root}/etc"
+    chown "$inaccessible_user" "${inaccessible_root}/etc"
     chmod 0711 "${inaccessible_root}/data"
     : >"${inaccessible_root}/data/sentinel"
     chown root:root "${inaccessible_root}/data/sentinel"
-    if inaccessible_output="$(sudo -u "$service_user" -H env -u SUDO_USER \
+    if inaccessible_output="$(sudo -u "$inaccessible_user" -H env -u SUDO_USER \
         bash "${repo_root}/install.sh" \
             --version "$version" \
             --release-base-url "$release_base_url" \
