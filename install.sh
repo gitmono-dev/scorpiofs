@@ -54,7 +54,10 @@ STORE_PATH_SET=0
 EXISTING_CONFIG=0
 RETAIN_CONFIG=0
 EXISTING_SERVICE_USER=""
-SERVICE_STOPPED_FOR_MIGRATION=0
+SERVICE_STOPPED_FOR_UPGRADE=0
+PREVIOUS_WORKSPACE=""
+PREVIOUS_ANTARES_MOUNT_ROOT=""
+EXTRACTED_RELEASE=""
 REQUESTED_WORKSPACE=""
 REQUESTED_STORE_PATH=""
 WORKDIR=""
@@ -538,6 +541,8 @@ prepare_effective_runtime_paths() {
         if [ "$DATA_ROOT_SET" -eq 0 ]; then infer_data_root; fi
         resolve_relative_runtime_paths
         validate_runtime_paths
+        PREVIOUS_WORKSPACE="$WORKSPACE"
+        PREVIOUS_ANTARES_MOUNT_ROOT="$ANTARES_MOUNT_ROOT"
     fi
 
     if [ "$RETAIN_CONFIG" -eq 1 ]; then
@@ -566,16 +571,15 @@ detect_existing_service_user() {
     EXISTING_SERVICE_USER="$candidate"
 }
 
-stop_active_service_for_user_migration() {
+stop_active_service_for_upgrade() {
     [ "$SETUP_SERVICE" -eq 1 ] || return 0
     [ -n "$EXISTING_SERVICE_USER" ] || return 0
-    [ "$EXISTING_SERVICE_USER" != "$SERVICE_USER" ] || return 0
     if run_root systemctl is-active --quiet scorpiofs.service; then
-        note "stopping the active service before migrating data from $EXISTING_SERVICE_USER to $SERVICE_USER"
+        note "stopping the active service before replacing its binary, config, or unit"
         if ! run_root systemctl stop scorpiofs.service; then
-            die "could not stop scorpiofs.service before changing its service user"
+            die "could not stop scorpiofs.service before upgrading it"
         fi
-        SERVICE_STOPPED_FOR_MIGRATION=1
+        SERVICE_STOPPED_FOR_UPGRADE=1
     fi
 }
 
@@ -833,7 +837,7 @@ validate_inputs() {
     [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid service user: $SERVICE_USER"
 }
 
-install_binaries() {
+prepare_release_binaries() {
     local target tarball base url sumurl extracted installed_binary
     target="$(detect_target)"
     tarball="scorpiofs-${VERSION}-${target}.tar.gz"
@@ -871,7 +875,7 @@ install_binaries() {
         die "sha256sum or shasum is required for checksum verification"
     fi
 
-    note "extracting and installing to ${PREFIX}/bin"
+    note "extracting and checking release binaries"
     tar -xzf "${WORKDIR}/${tarball}" -C "$WORKDIR"
     extracted="${WORKDIR}/scorpiofs-${VERSION}-${target}"
     if [ ! -x "${extracted}/scorpio" ] || [ ! -x "${extracted}/antares" ]; then
@@ -885,9 +889,18 @@ install_binaries() {
         die "downloaded antares cannot run on this host: ${smoke_output}. Install a release built for this Linux distribution"
     fi
     prepare_effective_runtime_paths "${extracted}/scorpio"
+    EXTRACTED_RELEASE="$extracted"
+}
+
+install_release_binaries() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
+    [ -n "$EXTRACTED_RELEASE" ] || die "internal error: release binaries were not prepared"
+    note "installing release binaries to ${PREFIX}/bin"
     run_root install -d "${PREFIX}/bin"
-    run_root install -m 0755 "${extracted}/scorpio" "${PREFIX}/bin/scorpio"
-    run_root install -m 0755 "${extracted}/antares" "${PREFIX}/bin/antares"
+    run_root install -m 0755 "${EXTRACTED_RELEASE}/scorpio" "${PREFIX}/bin/scorpio"
+    run_root install -m 0755 "${EXTRACTED_RELEASE}/antares" "${PREFIX}/bin/antares"
 }
 
 ensure_service_account() {
@@ -941,36 +954,69 @@ prepare_directories() {
     run_root install -d "$CONFDIR"
 }
 
-path_is_mount_target() {
-    local path="$1" mount_target mount_targets
-    mount_targets="$(findmnt --noheadings --raw --output TARGET)" || \
+find_mount_fstype() {
+    local path="$1" mount_target mount_fstype mount_entries
+    MOUNT_FSTYPE=""
+    mount_entries="$(findmnt --noheadings --raw --output TARGET,FSTYPE)" || \
         die "could not inspect FUSE mount roots"
-    while IFS= read -r mount_target; do
-        [ "$mount_target" = "$path" ] && return 0
-    done <<<"$mount_targets"
+    while read -r mount_target mount_fstype; do
+        if [ "$mount_target" = "$path" ]; then
+            MOUNT_FSTYPE="$mount_fstype"
+            return 0
+        fi
+    done <<<"$mount_entries"
     return 1
 }
 
+path_is_mount_target() {
+    find_mount_fstype "$1"
+}
+
 recover_stale_runtime_mounts() {
-    local mount_field mount_root i
-    local -a mount_fields=(workspace antares-mount-root)
-    local -a mount_roots=("$WORKSPACE" "$ANTARES_MOUNT_ROOT")
+    local detach_managed_mounts="${1:-0}" mount_field mount_root i j duplicate
+    local -a candidate_fields=(previous-workspace previous-antares-mount-root workspace antares-mount-root)
+    local -a candidate_roots=("$PREVIOUS_WORKSPACE" "$PREVIOUS_ANTARES_MOUNT_ROOT" "$WORKSPACE" "$ANTARES_MOUNT_ROOT")
+    local -a mount_fields=() mount_roots=()
     local -a probe
-    for ((i = 0; i < ${#mount_fields[@]}; i++)); do
+    for ((i = 0; i < ${#candidate_fields[@]}; i++)); do
+        mount_root="${candidate_roots[$i]}"
+        [ -n "$mount_root" ] || continue
+        duplicate=0
+        for ((j = 0; j < ${#mount_roots[@]}; j++)); do
+            if [ "${mount_roots[$j]}" = "$mount_root" ]; then duplicate=1; break; fi
+        done
+        [ "$duplicate" -eq 1 ] && continue
+        mount_fields+=("${candidate_fields[$i]}")
+        mount_roots+=("$mount_root")
+    done
+    for ((i = 0; i < ${#mount_roots[@]}; i++)); do
         mount_field="${mount_fields[$i]}"
         mount_root="${mount_roots[$i]}"
-        path_is_mount_target "$mount_root" || continue
+        find_mount_fstype "$mount_root" || continue
+        case "$MOUNT_FSTYPE" in
+            fuse|fuse.*) ;;
+            *)
+                die "$mount_field is mounted with non-FUSE filesystem type ${MOUNT_FSTYPE:-unknown} at $mount_root; unmount it manually and retry"
+                ;;
+        esac
         # $1 is intentionally expanded by the probe shell.
         # shellcheck disable=SC2016
         probe=(timeout 15 bash -c 'stat -L -- "$1" >/dev/null 2>&1' bash "$mount_root")
         if [ -n "$EXISTING_SERVICE_USER" ]; then
             probe=(runuser -u "$EXISTING_SERVICE_USER" -- "${probe[@]}")
         fi
-        if run_root "${probe[@]}"; then
+        if run_root "${probe[@]}" && [ "$detach_managed_mounts" -ne 1 ]; then
+            if [ "$SETUP_SERVICE" -eq 1 ] && [ -z "$EXISTING_SERVICE_USER" ]; then
+                die "$mount_field is actively mounted at $mount_root by an unmanaged process; stop the ScorpioFS daemon, unmount this path, and retry"
+            fi
             note "$mount_field is actively mounted; leaving the mount root unchanged during directory preparation"
             continue
         fi
-        warn "detaching inaccessible FUSE mount at $mount_root before installation"
+        if [ "$detach_managed_mounts" -eq 1 ]; then
+            warn "detaching FUSE mount left by the stopped service at $mount_root"
+        else
+            warn "detaching inaccessible FUSE mount at $mount_root before installation"
+        fi
         if command -v fusermount3 >/dev/null 2>&1; then
             run_root fusermount3 -u -z "$mount_root" || \
                 run_root umount -l "$mount_root" || \
@@ -1151,8 +1197,8 @@ EOF
         die "could not enable scorpiofs.service; inspect: systemctl status scorpiofs"
     fi
     local service_action="start"
-    if [ "$SERVICE_STOPPED_FOR_MIGRATION" -eq 1 ]; then
-        note "starting ScorpioFS with the new service user"
+    if [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ]; then
+        note "starting ScorpioFS after the managed upgrade"
     elif run_root systemctl is-active --quiet scorpiofs.service; then
         service_action="restart"
         note "restarting the active ScorpioFS service to load the new binary and config"
@@ -1197,11 +1243,13 @@ main() {
     pkg_install
     check_runtime_tools
     check_fuse
-    install_binaries
+    prepare_release_binaries
+    recover_stale_runtime_mounts
     validate_runtime_migration_mounts
     ensure_service_account
-    stop_active_service_for_user_migration
-    recover_stale_runtime_mounts
+    stop_active_service_for_upgrade
+    recover_stale_runtime_mounts "$SERVICE_STOPPED_FOR_UPGRADE"
+    install_release_binaries
     prepare_directories
     reconcile_runtime_directories
     reconcile_runtime_files

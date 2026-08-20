@@ -151,8 +151,8 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 - Retained upgrades recursively reconcile ownership for the local store and
   Antares upper/CL data. FUSE workspace and mount roots are not traversed, and
   an upgrade is rejected until any nested mount below a migrated tree is
-  unmounted. When the service user changes, an active unit is stopped before
-  this migration and started under the new account afterward.
+  unmounted. A managed active unit is stopped before its binary, config, or unit
+  is replaced and then started under the configured account.
 - On an existing systemd installation, `--no-service` leaves the unit untouched
   and preserves ownership for its configured `User` rather than reassigning the
   config and data to the invoking sudo user.
@@ -175,7 +175,12 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
   control characters are rejected from every generated TOML string before
   installation begins.
 - Inaccessible stale FUSE workspace/Antares mounts are lazily detached before
-  directory preparation; accessible active mount roots are not chowned.
+  directory preparation. A non-FUSE mount at either configured root is rejected
+  and never detached. Service setup rejects an accessible mount not owned by an
+  existing managed unit; stop the user-run daemon and unmount it before retrying.
+  Managed upgrades retain the old configured mount paths until the active unit
+  is stopped, then clean any FUSE roots it leaves behind before installing the
+  new binary, config, and unit.
 - `--release-base-url` (or `SCORPIO_RELEASE_BASE_URL`) points the installer at
   a mirror or local HTTP server using the same `<base>/<version>/<asset>`
   layout as GitHub releases. The PR build uses this to exercise a complete

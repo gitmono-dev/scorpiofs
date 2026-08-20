@@ -39,18 +39,42 @@ systemctl() {
             fi
             ;;
         is-active) [ "$mock_service_active" -eq 1 ] ;;
-        stop) mock_service_active=0 ;;
+        stop)
+            mock_service_active=0
+            if [ -n "${MOCK_STALE_AFTER_STOP:-}" ]; then
+                MOCK_ACTIVE_MOUNT=""
+                MOCK_STALE_MOUNT="$MOCK_STALE_AFTER_STOP"
+                mock_stale_detached=0
+            fi
+            ;;
         start|restart) mock_service_active=1 ;;
         *) return 0 ;;
     esac
 }
 
 findmnt() {
+    local include_fstype=0 fstype="${MOCK_MOUNT_FSTYPE:-fuse.scorpiofs}"
+    case " $* " in *' TARGET,FSTYPE '*) include_fstype=1 ;; esac
     if [ -n "${MOCK_STALE_MOUNT:-}" ] && [ "$mock_stale_detached" -eq 0 ]; then
-        printf '%s\n' "$MOCK_STALE_MOUNT"
+        if [ "$include_fstype" -eq 1 ]; then
+            printf '%s %s\n' "$MOCK_STALE_MOUNT" "$fstype"
+        else
+            printf '%s\n' "$MOCK_STALE_MOUNT"
+        fi
+    fi
+    if [ -n "${MOCK_ACTIVE_MOUNT:-}" ]; then
+        if [ "$include_fstype" -eq 1 ]; then
+            printf '%s %s\n' "$MOCK_ACTIVE_MOUNT" "$fstype"
+        else
+            printf '%s\n' "$MOCK_ACTIVE_MOUNT"
+        fi
     fi
     if [ -n "${MOCK_NESTED_MOUNT:-}" ]; then
-        printf '%s\n' "$MOCK_NESTED_MOUNT"
+        if [ "$include_fstype" -eq 1 ]; then
+            printf '%s ext4\n' "$MOCK_NESTED_MOUNT"
+        else
+            printf '%s\n' "$MOCK_NESTED_MOUNT"
+        fi
     fi
 }
 
@@ -58,6 +82,9 @@ stat() {
     if [ -n "${MOCK_STALE_MOUNT:-}" ] && [ "${*: -1}" = "$MOCK_STALE_MOUNT" ] && \
         [ "$mock_stale_detached" -eq 0 ]; then
         return 1
+    fi
+    if [ -n "${MOCK_ACTIVE_MOUNT:-}" ] && [ "${*: -1}" = "$MOCK_ACTIVE_MOUNT" ]; then
+        return 0
     fi
     command /usr/bin/stat "$@"
 }
@@ -69,12 +96,71 @@ fusermount3() {
     fi
 }
 
+umount() {
+    printf 'umount %s\n' "$*" >>"$systemctl_log"
+    return 0
+}
+
 usermod() {
     return 0
 }
 
-export -f install systemctl findmnt stat fusermount3 usermod
+export -f install systemctl findmnt stat fusermount3 umount usermod
 export unit_capture systemctl_log service_user mock_service_active mock_stale_detached
+
+non_fuse_root="${test_root}/non-fuse"
+mkdir -p "$non_fuse_root"
+if MOCK_STALE_MOUNT="${non_fuse_root}/data/mount" MOCK_MOUNT_FSTYPE=nfs \
+    SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+        --version "$version" \
+        --release-base-url "$release_base_url" \
+        --non-interactive \
+        --overwrite-config \
+        --no-deps \
+        --no-user-allow-other \
+        --base-url https://mega.example.com \
+        --lfs-url https://mega.example.com/lfs \
+        --prefix "${non_fuse_root}/prefix" \
+        --config-dir "${non_fuse_root}/etc" \
+        --data-root "${non_fuse_root}/data" \
+        --workspace "${non_fuse_root}/data/mount" \
+        --store-path "${non_fuse_root}/data/store" \
+        --http-addr 127.0.0.1:2925 >"${non_fuse_root}/install.log" 2>&1; then
+    printf 'installer detached a non-FUSE mount\n' >&2
+    exit 1
+fi
+grep -Fq 'mounted with non-FUSE filesystem type nfs' "${non_fuse_root}/install.log"
+if grep -Eq '^(fusermount3|umount) ' "$systemctl_log"; then
+    printf 'installer invoked an unmount helper for a non-FUSE mount\n' >&2
+    exit 1
+fi
+test ! -e "${non_fuse_root}/prefix/bin/scorpio"
+
+unmanaged_root="${test_root}/unmanaged"
+mkdir -p "$unmanaged_root"
+if MOCK_ACTIVE_MOUNT="${unmanaged_root}/data/mount" \
+    SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+        --version "$version" \
+        --release-base-url "$release_base_url" \
+        --non-interactive \
+        --overwrite-config \
+        --no-deps \
+        --no-user-allow-other \
+        --base-url https://mega.example.com \
+        --lfs-url https://mega.example.com/lfs \
+        --prefix "${unmanaged_root}/prefix" \
+        --config-dir "${unmanaged_root}/etc" \
+        --data-root "${unmanaged_root}/data" \
+        --workspace "${unmanaged_root}/data/mount" \
+        --store-path "${unmanaged_root}/data/store" \
+        --http-addr 127.0.0.1:2925 >"${unmanaged_root}/install.log" 2>&1; then
+    printf 'installer accepted an unmanaged active FUSE mount\n' >&2
+    exit 1
+fi
+grep -Fq 'stop the ScorpioFS daemon, unmount this path, and retry' \
+    "${unmanaged_root}/install.log"
+test ! -e "${unmanaged_root}/prefix/bin/scorpio"
+: >"$systemctl_log"
 
 MOCK_STALE_MOUNT="${test_root}/data/mount" \
 SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
@@ -100,6 +186,30 @@ grep -Fxq 'enable scorpiofs.service' "$systemctl_log"
 grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
 grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
 grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
+
+: >"$systemctl_log"
+new_workspace="${test_root}/data/mount-new"
+MOCK_ACTIVE_MOUNT="${test_root}/data/mount" \
+MOCK_STALE_AFTER_STOP="${test_root}/data/mount" \
+SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --overwrite-config \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://mega.example.com \
+    --lfs-url https://mega.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "${test_root}/data" \
+    --workspace "$new_workspace" \
+    --store-path "${test_root}/data/store" \
+    --http-addr 127.0.0.1:2925
+grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
+grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
+grep -Fxq 'start scorpiofs.service' "$systemctl_log"
+grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${new_workspace}" "$unit_capture"
 
 SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
     --version "$version" \

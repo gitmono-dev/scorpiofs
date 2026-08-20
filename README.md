@@ -302,8 +302,10 @@ directories. Installed binaries and the main config must remain outside the
 FUSE workspace and Antares mount roots. Git author/email values may contain
 tabs, but other TOML control characters are rejected in every generated string.
 Inaccessible stale FUSE mounts are lazily detached before directory preparation;
-active mount roots are left unchanged. Retained upgrades resolve relative
-runtime paths against the data root and migrate persistent store/overlay
+non-FUSE mounts at configured mount roots are rejected and never detached.
+Service setup also rejects an accessible mount when no managed unit owns it:
+stop the user-run daemon and unmount it before retrying. Retained upgrades resolve
+relative runtime paths against the data root and migrate persistent store/overlay
 ownership after rejecting nested mounts; `--no-service` preserves the configured
 user of an existing unit.
 Service setup fails before installation when systemd is unavailable. Retained
@@ -311,9 +313,10 @@ config validation ignores ambient `SCORPIO_*` overrides so it matches the unit's
 runtime environment; a retained-config `--dry-run` uses the installed binary to
 resolve the same paths as a real upgrade, requesting sudo only when its protected
 config needs read access. Mount roots may not overlap persistent runtime paths.
-Active services are stopped before a
-service-user ownership migration and started under the new account. Mirrors and
-locally packaged builds can
+Managed active services are stopped before the binary, config, or unit is
+replaced. Any old configured FUSE roots left mounted after that stop are cleaned
+before the upgraded service starts, including when `--overwrite-config` changes
+a mount path. Mirrors and locally packaged builds can
 be tested with `--release-base-url <url>` or `SCORPIO_RELEASE_BASE_URL`; the
 mirror layout is `<base>/<version>/scorpiofs-<version>-<target>.tar.gz` plus its
 `.sha256` file.
