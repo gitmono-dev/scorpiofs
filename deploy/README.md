@@ -142,6 +142,10 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 - System packages are installed via apt/dnf/pacman (skip with `--no-deps`).
 - `--uninstall` removes the binaries and service unit and leaves config/data in
   place.
+- `--release-base-url` (or `SCORPIO_RELEASE_BASE_URL`) points the installer at
+  a mirror or local HTTP server using the same `<base>/<version>/<asset>`
+  layout as GitHub releases. The PR build uses this to exercise a complete
+  local package/checksum/install/config-validation flow.
 
 ```bash
 bash install.sh                                      # interactive install

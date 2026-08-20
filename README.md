@@ -279,7 +279,10 @@ Non-loopback HTTP binds require the explicit `--allow-public-api` flag and
 must be protected by a firewall or an authenticating reverse proxy. The script
 never edits `/etc/fuse.conf` unless the interactive prompt is accepted or
 `--enable-user-allow-other` is passed. `--uninstall` removes binaries and the
-unit but keeps configuration and data.
+unit but keeps configuration and data. Mirrors and locally packaged builds can
+be tested with `--release-base-url <url>` or `SCORPIO_RELEASE_BASE_URL`; the
+mirror layout is `<base>/<version>/scorpiofs-<version>-<target>.tar.gz` plus its
+`.sha256` file.
 
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which builds the binaries, produces `scorpiofs-<version>-<target>.tar.gz` +

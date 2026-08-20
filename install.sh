@@ -18,6 +18,7 @@ set -euo pipefail
 
 REPO="gitmono-dev/scorpiofs"
 VERSION="${SCORPIO_VERSION:-}"
+RELEASE_BASE_URL="${SCORPIO_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/download}"
 PREFIX="${SCORPIO_PREFIX:-/usr/local}"
 CONFDIR="${SCORPIO_CONFDIR:-/etc/scorpiofs}"
 DATA_ROOT="${SCORPIO_DATA_ROOT:-/var/lib/scorpiofs}"
@@ -62,6 +63,7 @@ HTTP bind address, FUSE permission, and whether to install a systemd service.
 
 Options:
   --version <vX.Y.Z>        Release tag (default: latest GitHub release).
+  --release-base-url <url>  Release mirror root (default: GitHub releases).
   --prefix <dir>            Binary prefix (default: /usr/local).
   --config-dir <dir>        Config directory (default: /etc/scorpiofs).
   --data-root <dir>         Runtime/data root (default: /var/lib/scorpiofs).
@@ -198,6 +200,7 @@ parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --version) [ "$#" -ge 2 ] || die "--version needs a value"; VERSION="$2"; shift 2 ;;
+            --release-base-url) [ "$#" -ge 2 ] || die "--release-base-url needs a value"; RELEASE_BASE_URL="$2"; shift 2 ;;
             --prefix) [ "$#" -ge 2 ] || die "--prefix needs a value"; PREFIX="$2"; shift 2 ;;
             --config-dir) [ "$#" -ge 2 ] || die "--config-dir needs a value"; CONFDIR="$2"; shift 2 ;;
             --data-root) [ "$#" -ge 2 ] || die "--data-root needs a value"; DATA_ROOT="$2"; shift 2 ;;
@@ -331,6 +334,7 @@ validate_inputs() {
     LFS_URL="$(normalize_url "$LFS_URL")"
     validate_url base_url "$BASE_URL"
     validate_url lfs_url "$LFS_URL"
+    validate_url release-base-url "$RELEASE_BASE_URL"
     validate_path prefix "$PREFIX"
     validate_path config-dir "$CONFDIR"
     validate_path data-root "$DATA_ROOT"
@@ -350,7 +354,7 @@ install_binaries() {
     local target tarball base url sumurl extracted
     target="$(detect_target)"
     tarball="scorpiofs-${VERSION}-${target}.tar.gz"
-    base="https://github.com/${REPO}/releases/download/${VERSION}"
+    base="${RELEASE_BASE_URL%/}/${VERSION}"
     url="${base}/${tarball}"
     sumurl="${url}.sha256"
 
