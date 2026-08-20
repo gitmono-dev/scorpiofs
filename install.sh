@@ -420,18 +420,22 @@ set_generated_runtime_paths() {
     ANTARES_STATE_FILE="$DATA_ROOT/antares/state.toml"
 }
 
+run_scorpio_config_without_overrides() {
+    local binary="$1" variable
+    shift
+    local -a command=(env)
+    while IFS= read -r variable; do
+        case "$variable" in
+            SCORPIO_*) command+=(-u "$variable") ;;
+        esac
+    done < <(compgen -e)
+    run_root "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
+}
+
 load_configured_runtime_paths() {
     local binary="$1" output_file="${WORKDIR}/installer-paths"
     local -a paths=()
-    if ! run_root env \
-        -u SCORPIO_WORKSPACE \
-        -u SCORPIO_STORE_PATH \
-        -u SCORPIO_CONFIG_FILE \
-        -u SCORPIO_ANTARES_UPPER_ROOT \
-        -u SCORPIO_ANTARES_CL_ROOT \
-        -u SCORPIO_ANTARES_MOUNT_ROOT \
-        -u SCORPIO_ANTARES_STATE_FILE \
-        "$binary" --config-path "${CONFDIR}/scorpio.toml" config installer-paths >"$output_file"; then
+    if ! run_scorpio_config_without_overrides "$binary" installer-paths >"$output_file"; then
         die "could not safely resolve runtime paths from retained config: ${CONFDIR}/scorpio.toml"
     fi
     mapfile -d '' -t paths <"$output_file"
@@ -493,6 +497,15 @@ detect_existing_service_user() {
     getent passwd "$candidate" >/dev/null 2>&1 || \
         die "existing scorpiofs.service user does not exist: $candidate"
     EXISTING_SERVICE_USER="$candidate"
+}
+
+validate_service_manager() {
+    [ "$SETUP_SERVICE" -eq 1 ] || return 0
+    command -v systemctl >/dev/null 2>&1 || \
+        die "systemctl is required for service setup; pass --no-service for a user-run installation"
+    if [ "$DRY_RUN" -eq 0 ] && ! systemctl show-environment >/dev/null 2>&1; then
+        die "systemd is not running or cannot be reached; pass --no-service for a user-run installation"
+    fi
 }
 
 validate_bind() {
@@ -635,14 +648,18 @@ pkg_install() {
     [ "$INSTALL_DEPS" -eq 1 ] || { note "skipping dependency installation (--no-deps)"; return 0; }
     if command -v apt-get >/dev/null 2>&1; then
         run_root apt-get update
-        run_root apt-get install -y --no-install-recommends fuse3 openssl ca-certificates
+        run_root apt-get install -y --no-install-recommends fuse3 openssl ca-certificates util-linux
     elif command -v dnf >/dev/null 2>&1; then
-        run_root dnf install -y fuse3 openssl ca-certificates
+        run_root dnf install -y fuse3 openssl ca-certificates util-linux
     elif command -v pacman >/dev/null 2>&1; then
-        run_root pacman -Sy --noconfirm fuse3 openssl ca-certificates
+        run_root pacman -Sy --noconfirm fuse3 openssl ca-certificates util-linux
     else
-        warn "no supported package manager found; install fuse3, openssl, and ca-certificates manually"
+        warn "no supported package manager found; install fuse3, openssl, ca-certificates, and util-linux manually"
     fi
+}
+
+check_runtime_tools() {
+    command -v findmnt >/dev/null 2>&1 || die "findmnt is required (install util-linux)"
 }
 
 check_fuse() {
@@ -720,6 +737,7 @@ validate_inputs() {
         EXISTING_CONFIG=1
         if [ "$OVERWRITE_CONFIG" -ne 1 ]; then RETAIN_CONFIG=1; fi
     fi
+    validate_service_manager
     detect_existing_service_user
     validate_data_paths
     validate_bind "$HTTP_ADDR"
@@ -830,11 +848,20 @@ prepare_directories() {
 }
 
 reconcile_runtime_directories() {
-    local runtime_dir
+    local runtime_dir mount_target mount_targets
     # These are persistent local data trees. Workspace and mount roots are
     # intentionally excluded because they may currently be FUSE mountpoints.
     for runtime_dir in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"; do
         if [ -d "$runtime_dir" ]; then
+            mount_targets="$(findmnt --list --noheadings --raw --output TARGET)" || \
+                die "could not inspect mounts before migrating ownership under $runtime_dir"
+            while IFS= read -r mount_target; do
+                case "$mount_target" in
+                    "$runtime_dir"/*)
+                        die "refusing ownership migration across nested mount $mount_target under $runtime_dir; unmount it and retry"
+                        ;;
+                esac
+            done <<<"$mount_targets"
             run_root chown -R -h -P "$TARGET_USER:$TARGET_GROUP" -- "$runtime_dir"
         fi
     done
@@ -905,7 +932,7 @@ EOF
 
 validate_installed_config() {
     [ "$DRY_RUN" -eq 0 ] || return 0
-    if ! run_root "${PREFIX}/bin/scorpio" --config-path "${CONFDIR}/scorpio.toml" config validate; then
+    if ! run_scorpio_config_without_overrides "${PREFIX}/bin/scorpio" validate; then
         die "generated or retained config is invalid: ${CONFDIR}/scorpio.toml"
     fi
 }
@@ -926,10 +953,6 @@ enable_user_allow_other() {
 
 install_systemd_service() {
     [ "$SETUP_SERVICE" -eq 1 ] || return 0
-    if ! command -v systemctl >/dev/null 2>&1; then
-        warn "systemctl is unavailable; binaries and config were installed without a service"
-        return 0
-    fi
     if [ "$DRY_RUN" -eq 1 ]; then
         note "would install /etc/systemd/system/scorpiofs.service and enable it"
         return 0
@@ -1016,6 +1039,7 @@ main() {
 
     note "installing ScorpioFS ${VERSION} for $(detect_target)"
     pkg_install
+    check_runtime_tools
     check_fuse
     install_binaries
     ensure_service_account

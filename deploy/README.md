@@ -11,6 +11,8 @@ need:
 
 - the `fuse` kernel module loaded and the `/dev/fuse` device present;
 - the `fuse3` userspace package (provides the setuid `fusermount3` helper);
+- `findmnt` from `util-linux`, used to prevent ownership migration across nested
+  mounts during upgrades;
 - permission to mount — either `CAP_SYS_ADMIN`, or unprivileged mounting via
   `fusermount3` (the `rfuse3` `unprivileged` feature is enabled in this build).
 
@@ -147,10 +149,16 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
   contents are retained. Relative runtime paths in retained configs are resolved
   against the explicit or inferred data root.
 - Retained upgrades recursively reconcile ownership for the local store and
-  Antares upper/CL data. FUSE workspace and mount roots are not traversed.
+  Antares upper/CL data. FUSE workspace and mount roots are not traversed, and
+  an upgrade is rejected until any nested mount below a migrated tree is
+  unmounted.
 - On an existing systemd installation, `--no-service` leaves the unit untouched
   and preserves ownership for its configured `User` rather than reassigning the
   config and data to the invoking sudo user.
+- Service setup verifies that systemd is reachable before creating the service
+  account or changing ownership. Use `--no-service` on hosts without systemd.
+- Installer config checks clear ambient `SCORPIO_*` daemon overrides so a
+  retained file is validated exactly as the generated systemd unit will load it.
 - `--workspace` and `--store-path` must be children of the dedicated
   `--data-root`; filesystem roots, symlink escapes, shell metacharacters, and
   nonempty directories without an existing ScorpioFS config are rejected.

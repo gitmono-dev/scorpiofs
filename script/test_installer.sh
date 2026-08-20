@@ -61,6 +61,33 @@ expect_failure "cleanup shell metacharacter" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio;false" \
     --workspace "$test_root/scorpio;false/mount" --store-path "$test_root/scorpio;false/store"
 
+no_systemctl_bin="$test_root/no-systemctl-bin"
+mkdir -p "$no_systemctl_bin"
+for tool in curl tar realpath find findmnt; do
+    ln -s "$(command -v "$tool")" "$no_systemctl_bin/$tool"
+done
+if output="$(PATH="$no_systemctl_bin" /bin/bash "$installer" \
+    --version v0.0.0-test \
+    --non-interactive \
+    --dry-run \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://mega.example.com \
+    --lfs-url https://mega.example.com/lfs \
+    --prefix "$test_root/service-prefix" \
+    --config-dir "$test_root/service-etc" \
+    --data-root "$test_root/service-data" \
+    --workspace "$test_root/service-data/mount" \
+    --store-path "$test_root/service-data/store" \
+    --http-addr 127.0.0.1:2725 2>&1)"; then
+    printf 'expected failure without systemctl\n' >&2
+    exit 1
+fi
+if [[ "$output" != *"systemctl is required for service setup"* ]]; then
+    printf 'unexpected missing-systemctl error:\n%s\n' "$output" >&2
+    exit 1
+fi
+
 ln -s / "$test_root/root-link"
 expect_failure "symlinked ancestor to broad root" "data-root is too broad" \
     "${common[@]}" --data-root "$test_root/root-link/home" \

@@ -165,6 +165,27 @@ jobs:
           test "$(stat -c '%U' "${install_root}/data/antares/state.toml")" = nobody
           grep -F 'base_url = "https://mega.example.com"' "${install_root}/etc/scorpio.toml"
 
+          printf '%s\n' 'load_dir_depth = "invalid"' | \
+            sudo tee -a "${install_root}/etc/scorpio.toml" >/dev/null
+          if sudo env SCORPIO_LOAD_DIR_DEPTH=3 bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --http-addr 127.0.0.1:2825 >"${RUNNER_TEMP}/config-env-override.log" 2>&1; then
+            echo "installer accepted an invalid retained config through an environment override" >&2
+            exit 1
+          fi
+          grep -F 'could not safely resolve runtime paths from retained config' \
+            "${RUNNER_TEMP}/config-env-override.log"
+          sudo sed -i '/^load_dir_depth = "invalid"$/d' "${install_root}/etc/scorpio.toml"
+
           sudo bash install.sh \
             --version "${version}" \
             --release-base-url http://127.0.0.1:18080 \
