@@ -277,7 +277,11 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --data-root "${test_root}/data" \
     --workspace "${test_root}/data/mount" \
     --store-path "${test_root}/data/store" \
-    --http-addr 127.0.0.1:2925 >"${test_root}/antares-child-mount.log"
+    --http-addr 127.0.0.1:2925 >"${test_root}/antares-child-mount.log" 2>&1 || {
+        printf 'Antares child-mount installer invocation failed:\n' >&2
+        cat "${test_root}/antares-child-mount.log" >&2
+        exit 1
+    }
 assert_systemctl_log_line "fusermount3 -u -z ${antares_job_mount}"
 
 assert_unit_contains 'ExecStopPost=-/bin/sh -c'
