@@ -12,7 +12,7 @@ common=(
     --dry-run
     --no-deps
     --no-service
-    --no-user-allow-other
+    --enable-user-allow-other
     --base-url https://mega.example.com
     --lfs-url https://mega.example.com/lfs
     --prefix "$test_root/prefix"
@@ -48,7 +48,7 @@ grep() {
 }
 export -f grep
 expect_failure "dry-run without user_allow_other" "user_allow_other is required" \
-    "${common[@]}"
+    "${common[@]}" --no-user-allow-other
 unset -f grep
 
 interactive_public=(
@@ -56,7 +56,7 @@ interactive_public=(
     --dry-run
     --no-deps
     --no-service
-    --no-user-allow-other
+    --enable-user-allow-other
     --yes
     --allow-public-api
     --base-url https://mega.example.com
