@@ -57,6 +57,12 @@ EXISTING_SERVICE_USER=""
 EXISTING_SERVICE_ACTIVE=0
 SERVICE_STOPPED_FOR_UPGRADE=0
 SERVICE_HEALTH_CONFIRMED=0
+ARTIFACT_BACKUP_DIR=""
+ARTIFACT_BACKUP_READY=0
+HAD_OLD_SCORPIO=0
+HAD_OLD_ANTARES=0
+HAD_OLD_CONFIG=0
+HAD_OLD_UNIT=0
 PREVIOUS_WORKSPACE=""
 PREVIOUS_ANTARES_MOUNT_ROOT=""
 EXTRACTED_RELEASE=""
@@ -78,6 +84,11 @@ cleanup() {
     local exit_status=$?
     if [ "$exit_status" -ne 0 ] && [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] && \
         [ "$SERVICE_HEALTH_CONFIRMED" -ne 1 ] && command -v systemctl >/dev/null 2>&1; then
+        if [ "$ARTIFACT_BACKUP_READY" -eq 1 ]; then
+            if ! restore_upgrade_artifacts; then
+                warn "could not restore all previous ScorpioFS artifacts"
+            fi
+        fi
         warn "installation failed after stopping scorpiofs.service; attempting to restore the managed service"
         if ! run_root systemctl start scorpiofs.service; then
             warn "could not restore scorpiofs.service; inspect: systemctl status scorpiofs"
@@ -924,7 +935,7 @@ validate_inputs() {
 }
 
 prepare_release_binaries() {
-    local target tarball base url sumurl extracted installed_binary
+    local target tarball base url sumurl
     target="$(detect_target)"
     tarball="scorpiofs-${VERSION}-${target}.tar.gz"
     base="${RELEASE_BASE_URL%/}/${VERSION}"
@@ -933,18 +944,27 @@ prepare_release_binaries() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ "$EXISTING_CONFIG" -eq 1 ]; then
-            installed_binary="${PREFIX}/bin/scorpio"
-            [ -x "$installed_binary" ] || \
-                die "dry-run cannot faithfully resolve retained config without $installed_binary"
-            WORKDIR="$(mktemp -d)"
-            prepare_effective_runtime_paths "$installed_binary"
+            prepare_release_archive
+            prepare_effective_runtime_paths "${EXTRACTED_RELEASE}/scorpio"
+        else
+            note "would download ${url}"
+            note "would verify ${sumurl} with SHA256"
         fi
-        note "would download ${url}"
-        note "would verify ${sumurl} with SHA256"
         note "would install ${PREFIX}/bin/scorpio and ${PREFIX}/bin/antares"
         return 0
     fi
 
+    prepare_release_archive
+    prepare_effective_runtime_paths "${EXTRACTED_RELEASE}/scorpio"
+}
+
+prepare_release_archive() {
+    local target tarball base url sumurl extracted
+    target="$(detect_target)"
+    tarball="scorpiofs-${VERSION}-${target}.tar.gz"
+    base="${RELEASE_BASE_URL%/}/${VERSION}"
+    url="${base}/${tarball}"
+    sumurl="${url}.sha256"
     WORKDIR="$(mktemp -d)"
     note "downloading ${tarball}"
     fetch "$url" "${WORKDIR}/${tarball}" || die "release asset unavailable for ${target} and ${VERSION}"
@@ -974,7 +994,6 @@ prepare_release_binaries() {
     if ! smoke_output="$("${extracted}/antares" --version 2>&1)"; then
         die "downloaded antares cannot run on this host: ${smoke_output}. Install a release built for this Linux distribution"
     fi
-    prepare_effective_runtime_paths "${extracted}/scorpio"
     EXTRACTED_RELEASE="$extracted"
 }
 
@@ -987,6 +1006,60 @@ install_release_binaries() {
     run_root install -d "${PREFIX}/bin"
     run_root install -m 0755 "${EXTRACTED_RELEASE}/scorpio" "${PREFIX}/bin/scorpio"
     run_root install -m 0755 "${EXTRACTED_RELEASE}/antares" "${PREFIX}/bin/antares"
+}
+
+backup_upgrade_artifacts() {
+    [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] || return 0
+    [ -n "$WORKDIR" ] || die "internal error: upgrade backup requires a working directory"
+    ARTIFACT_BACKUP_DIR="${WORKDIR}/previous-install"
+    mkdir -m 0700 -- "$ARTIFACT_BACKUP_DIR"
+    if run_root test -e "${PREFIX}/bin/scorpio"; then
+        HAD_OLD_SCORPIO=1
+        run_root cp -a -- "${PREFIX}/bin/scorpio" "${ARTIFACT_BACKUP_DIR}/scorpio"
+    fi
+    if run_root test -e "${PREFIX}/bin/antares"; then
+        HAD_OLD_ANTARES=1
+        run_root cp -a -- "${PREFIX}/bin/antares" "${ARTIFACT_BACKUP_DIR}/antares"
+    fi
+    if run_root test -e "${CONFDIR}/scorpio.toml"; then
+        HAD_OLD_CONFIG=1
+        run_root cp -a -- "${CONFDIR}/scorpio.toml" "${ARTIFACT_BACKUP_DIR}/scorpio.toml"
+    fi
+    if run_root test -e /etc/systemd/system/scorpiofs.service; then
+        HAD_OLD_UNIT=1
+        run_root cp -a -- /etc/systemd/system/scorpiofs.service \
+            "${ARTIFACT_BACKUP_DIR}/scorpiofs.service"
+    fi
+    ARTIFACT_BACKUP_READY=1
+}
+
+restore_upgrade_artifact() {
+    local had_old="$1" backup="$2" target="$3"
+    if ! run_root rm -f -- "$target"; then
+        return 1
+    fi
+    if [ "$had_old" -eq 1 ]; then
+        run_root test -f "$backup" || return 1
+        run_root cp -a -- "$backup" "$target"
+    fi
+}
+
+restore_upgrade_artifacts() {
+    local restore_failed=0
+    warn "restoring ScorpioFS artifacts from before the failed upgrade"
+    restore_upgrade_artifact "$HAD_OLD_SCORPIO" \
+        "${ARTIFACT_BACKUP_DIR}/scorpio" "${PREFIX}/bin/scorpio" || restore_failed=1
+    restore_upgrade_artifact "$HAD_OLD_ANTARES" \
+        "${ARTIFACT_BACKUP_DIR}/antares" "${PREFIX}/bin/antares" || restore_failed=1
+    restore_upgrade_artifact "$HAD_OLD_CONFIG" \
+        "${ARTIFACT_BACKUP_DIR}/scorpio.toml" "${CONFDIR}/scorpio.toml" || restore_failed=1
+    restore_upgrade_artifact "$HAD_OLD_UNIT" \
+        "${ARTIFACT_BACKUP_DIR}/scorpiofs.service" \
+        /etc/systemd/system/scorpiofs.service || restore_failed=1
+    if [ "$HAD_OLD_UNIT" -eq 1 ]; then
+        run_root systemctl daemon-reload || restore_failed=1
+    fi
+    [ "$restore_failed" -eq 0 ]
 }
 
 ensure_service_account() {
@@ -1007,6 +1080,15 @@ ensure_service_account() {
         run_root usermod -aG fuse "$SERVICE_USER"
     else
         warn "fuse group does not exist; the service may not be able to access /dev/fuse"
+    fi
+}
+
+validate_service_config_traversal() {
+    [ "$SETUP_SERVICE" -eq 1 ] || return 0
+    [ "$EXISTING_CONFIG" -eq 1 ] || return 0
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    if ! run_root runuser -u "$SERVICE_USER" -- test -x "$CONFDIR"; then
+        die "service user $SERVICE_USER cannot traverse config-dir $CONFDIR; grant directory execute access before changing service users"
     fi
 }
 
@@ -1265,7 +1347,14 @@ validate_installed_config() {
 
 validate_user_allow_other() {
     [ "$ENABLE_USER_ALLOW_OTHER" -eq 1 ] && return 0
-    if run_root grep -qE '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf 2>/dev/null; then
+    if [ "$DRY_RUN" -eq 1 ] && [ "$(id -u)" -ne 0 ] && \
+        [ -e /etc/fuse.conf ] && [ ! -r /etc/fuse.conf ]; then
+        command -v sudo >/dev/null 2>&1 || \
+            die "sudo is required to inspect protected /etc/fuse.conf during dry-run"
+        sudo -v || die "could not obtain read access for /etc/fuse.conf during dry-run"
+        SUDO_BIN="sudo"
+    fi
+    if run_readonly grep -qE '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf 2>/dev/null; then
         note "using the existing user_allow_other setting in /etc/fuse.conf"
         return 0
     fi
@@ -1409,8 +1498,10 @@ main() {
     recover_stale_runtime_mounts
     validate_runtime_migration_mounts
     ensure_service_account
+    validate_service_config_traversal
     stop_active_service_for_upgrade
     recover_stale_runtime_mounts "$SERVICE_STOPPED_FOR_UPGRADE"
+    backup_upgrade_artifacts
     install_release_binaries
     prepare_directories
     reconcile_runtime_directories

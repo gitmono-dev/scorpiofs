@@ -102,9 +102,11 @@ umount() {
 }
 
 curl() {
-    local arg
+    local arg saw_noproxy=0
     for arg in "$@"; do
+        [ "$arg" = "--noproxy" ] && saw_noproxy=1
         if [[ "$arg" == */health ]]; then
+            [ "$saw_noproxy" -eq 1 ] || return 64
             [ "${MOCK_HEALTH_FAIL:-0}" -eq 0 ] || return 7
             printf 'ok\n'
             return 0
@@ -221,6 +223,27 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925
 
+cp "${test_root}/prefix/bin/scorpio" "${test_root}/installed-scorpio"
+rm -f "${test_root}/prefix/bin/scorpio"
+printf '#!/usr/bin/env bash\nexit 64\n' >"${test_root}/prefix/bin/scorpio"
+chmod 0755 "${test_root}/prefix/bin/scorpio"
+SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --dry-run \
+    --no-service \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --http-addr 127.0.0.1:2925 >"${test_root}/old-binary-dry-run.log"
+grep -Fq "using runtime paths from retained ${test_root}/etc/scorpio.toml" \
+    "${test_root}/old-binary-dry-run.log"
+mv "${test_root}/installed-scorpio" "${test_root}/prefix/bin/scorpio"
+
 antares_job_mount="${test_root}/data/antares/mnt/job-1"
 MOCK_STALE_MOUNT="$antares_job_mount" \
 SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
@@ -248,6 +271,10 @@ grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
 grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
 : >"$systemctl_log"
 
+cp "${test_root}/prefix/bin/scorpio" "${test_root}/marked-scorpio"
+printf 'old-binary-marker' >>"${test_root}/marked-scorpio"
+mv "${test_root}/marked-scorpio" "${test_root}/prefix/bin/scorpio"
+cp "${test_root}/etc/scorpio.toml" "${test_root}/config-before-health-failure.toml"
 if MOCK_HEALTH_FAIL=1 SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
     --version "$version" \
     --release-base-url "$release_base_url" \
@@ -267,8 +294,35 @@ if MOCK_HEALTH_FAIL=1 SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh"
     exit 1
 fi
 grep -Fq 'did not become healthy' "${test_root}/health-failure.log"
+grep -Fq 'restoring ScorpioFS artifacts from before the failed upgrade' \
+    "${test_root}/health-failure.log"
+cmp "${test_root}/config-before-health-failure.toml" "${test_root}/etc/scorpio.toml"
+tail -c 17 "${test_root}/prefix/bin/scorpio" | grep -Fxq 'old-binary-marker'
 test "$(grep -Fc 'start scorpiofs.service' "$systemctl_log")" -ge 2
 : >"$systemctl_log"
+
+sed -i 's/^User=.*/User=root/' "$unit_capture"
+chmod 0750 "${test_root}/etc"
+if SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --http-addr 127.0.0.1:2925 >"${test_root}/config-traversal.log" 2>&1; then
+    printf 'installer accepted a config directory inaccessible to the new service user\n' >&2
+    exit 1
+fi
+grep -Fq 'cannot traverse config-dir' "${test_root}/config-traversal.log"
+if grep -Fxq 'stop scorpiofs.service' "$systemctl_log"; then
+    printf 'installer stopped the service before validating config traversal\n' >&2
+    exit 1
+fi
+chmod 0755 "${test_root}/etc"
 
 inactive_root="${test_root}/inactive-service"
 mkdir -p "${inactive_root}/data"

@@ -135,9 +135,10 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 
 When a systemd service is selected, the installer waits for the configured
 `/health` endpoint before reporting success. During an upgrade, a failure after
-stopping the existing service triggers a best-effort service restart. Existing
-data-directory permissions are preserved; only newly created directories use
-the installer's default `0755` mode.
+stopping the existing service restores the previous binaries, config, and unit
+before attempting to restart it. Existing data-directory permissions are
+preserved; only newly created directories use the installer's default `0755`
+mode.
 
 - Run `sudo bash install.sh` for the interactive flow. It supports `curl | bash`
   because prompts are read from a verified controlling terminal.

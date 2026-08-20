@@ -42,6 +42,15 @@ bash "$installer" "${common[@]}" \
     --lfs-url 'http://[::1]:8000/lfs' \
     --http-addr '[::1]:2725' >/dev/null
 
+grep() {
+    if [[ " $* " == *" /etc/fuse.conf "* ]]; then return 1; fi
+    command grep "$@"
+}
+export -f grep
+expect_failure "dry-run without user_allow_other" "user_allow_other is required" \
+    "${common[@]}"
+unset -f grep
+
 interactive_public=(
     --version v0.0.0-test
     --dry-run
@@ -125,8 +134,8 @@ fi
 
 mkdir -p "$test_root/missing-bin-etc"
 : >"$test_root/missing-bin-etc/scorpio.toml"
-expect_failure "retained dry-run without installed binary" \
-    "dry-run cannot faithfully resolve retained config" \
+expect_failure "retained dry-run without target release" \
+    "release asset unavailable" \
     "${common[@]}" \
     --prefix "$test_root/missing-bin-prefix" \
     --config-dir "$test_root/missing-bin-etc"
