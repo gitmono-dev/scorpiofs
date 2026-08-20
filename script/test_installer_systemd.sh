@@ -122,6 +122,24 @@ usermod() {
 export -f install systemctl findmnt stat fusermount3 umount usermod curl
 export unit_capture systemctl_log service_user mock_service_active mock_stale_detached
 
+assert_systemctl_log_line() {
+    local expected="$1"
+    if ! grep -Fxq "$expected" "$systemctl_log"; then
+        printf 'missing systemctl mock log entry: %s\nactual log:\n' "$expected" >&2
+        cat "$systemctl_log" >&2
+        exit 1
+    fi
+}
+
+assert_unit_contains() {
+    local expected="$1"
+    if ! grep -Fq "$expected" "$unit_capture"; then
+        printf 'missing generated unit entry: %s\nactual unit:\n' "$expected" >&2
+        cat "$unit_capture" >&2
+        exit 1
+    fi
+}
+
 non_fuse_root="${test_root}/non-fuse"
 mkdir -p "$non_fuse_root"
 if MOCK_STALE_MOUNT="${non_fuse_root}/data/mount" MOCK_MOUNT_FSTYPE=nfs \
@@ -260,15 +278,15 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --workspace "${test_root}/data/mount" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925 >"${test_root}/antares-child-mount.log"
-grep -Fxq "fusermount3 -u -z ${antares_job_mount}" "$systemctl_log"
+assert_systemctl_log_line "fusermount3 -u -z ${antares_job_mount}"
 
-grep -Fq 'ExecStopPost=-/bin/sh -c' "$unit_capture"
-grep -Fq 'findmnt -rno TARGET 2>/dev/null | sort -r' "$unit_capture"
-grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${test_root}/data/mount" "$unit_capture"
-grep -Fxq 'enable scorpiofs.service' "$systemctl_log"
-grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
-grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
-grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
+assert_unit_contains 'ExecStopPost=-/bin/sh -c'
+assert_unit_contains 'findmnt -rno TARGET 2>/dev/null | sort -r'
+assert_unit_contains "ExecStopPost=-/usr/bin/fusermount3 -u -z ${test_root}/data/mount"
+assert_systemctl_log_line 'enable scorpiofs.service'
+assert_systemctl_log_line 'is-active --quiet scorpiofs.service'
+assert_systemctl_log_line 'restart scorpiofs.service'
+assert_systemctl_log_line "fusermount3 -u -z ${test_root}/data/mount"
 : >"$systemctl_log"
 
 cp "${test_root}/prefix/bin/scorpio" "${test_root}/marked-scorpio"
