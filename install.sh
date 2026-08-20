@@ -1049,14 +1049,38 @@ path_is_mount_target() {
 }
 
 recover_stale_runtime_mounts() {
-    local detach_managed_mounts="${1:-0}" mount_field mount_root i j duplicate
+    local detach_managed_mounts="${1:-0}" mount_field mount_root mount_target candidate_field
+    local mount_entries found i j duplicate
     local -a candidate_fields=(previous-workspace previous-antares-mount-root workspace antares-mount-root)
     local -a candidate_roots=("$PREVIOUS_WORKSPACE" "$PREVIOUS_ANTARES_MOUNT_ROOT" "$WORKSPACE" "$ANTARES_MOUNT_ROOT")
     local -a mount_fields=() mount_roots=()
     local -a probe
     for ((i = 0; i < ${#candidate_fields[@]}; i++)); do
+        candidate_field="${candidate_fields[$i]}"
         mount_root="${candidate_roots[$i]}"
         [ -n "$mount_root" ] || continue
+        if [[ "$candidate_field" == *antares-mount-root ]]; then
+            mount_entries="$(findmnt --noheadings --raw --output TARGET)" || \
+                die "could not inspect Antares mounts"
+            found=0
+            while IFS= read -r mount_target; do
+                case "$mount_target" in
+                    "$mount_root"|"$mount_root"/*)
+                        found=1
+                        duplicate=0
+                        for ((j = 0; j < ${#mount_roots[@]}; j++)); do
+                            if [ "${mount_roots[$j]}" = "$mount_target" ]; then duplicate=1; break; fi
+                        done
+                        if [ "$duplicate" -eq 0 ]; then
+                            mount_fields+=("$candidate_field")
+                            mount_roots+=("$mount_target")
+                        fi
+                        ;;
+                esac
+            done <<<"$mount_entries"
+            [ "$found" -eq 1 ] || continue
+            continue
+        fi
         duplicate=0
         for ((j = 0; j < ${#mount_roots[@]}; j++)); do
             if [ "${mount_roots[$j]}" = "$mount_root" ]; then duplicate=1; break; fi
@@ -1109,9 +1133,11 @@ recover_stale_runtime_mounts() {
                 die "could not detach stale $mount_field at $mount_root; install fuse3 or unmount it manually"
         fi
         [ "$DRY_RUN" -eq 1 ] && continue
-        path_is_mount_target "$mount_root" && \
+        if path_is_mount_target "$mount_root"; then
             die "stale $mount_field is still mounted at $mount_root; unmount it and retry"
+        fi
     done
+    return 0
 }
 
 validate_runtime_migration_mounts() {
@@ -1122,6 +1148,9 @@ validate_runtime_migration_mounts() {
         if [ -d "$runtime_dir" ]; then
             while IFS= read -r mount_target; do
                 case "$mount_target" in
+                    "$runtime_dir")
+                        die "refusing ownership migration across mount $mount_target at runtime directory; unmount it and retry"
+                        ;;
                     "$runtime_dir"/*)
                         die "refusing ownership migration across nested mount $mount_target under $runtime_dir; unmount it and retry"
                         ;;

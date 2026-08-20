@@ -209,6 +209,24 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925
 
+antares_job_mount="${test_root}/data/antares/mnt/job-1"
+MOCK_STALE_MOUNT="$antares_job_mount" \
+SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "${test_root}/data" \
+    --workspace "${test_root}/data/mount" \
+    --store-path "${test_root}/data/store" \
+    --http-addr 127.0.0.1:2925 >"${test_root}/antares-child-mount.log"
+grep -Fxq "fusermount3 -u -z ${antares_job_mount}" "$systemctl_log"
+
 grep -Fq 'ExecStopPost=-/bin/sh -c' "$unit_capture"
 grep -Fq 'findmnt -rno TARGET 2>/dev/null | sort -r' "$unit_capture"
 grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${test_root}/data/mount" "$unit_capture"
@@ -216,6 +234,7 @@ grep -Fxq 'enable scorpiofs.service' "$systemctl_log"
 grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
 grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
 grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
+: >"$systemctl_log"
 
 inactive_root="${test_root}/inactive-service"
 mkdir -p "${inactive_root}/data"
@@ -386,6 +405,29 @@ if MOCK_NESTED_MOUNT="$nested_mount" bash "${repo_root}/install.sh" \
 fi
 grep -Fq "refusing ownership migration across nested mount ${nested_mount}" \
     "${test_root}/nested-mount.log"
+
+runtime_mount="${test_root}/data/store"
+if MOCK_NESTED_MOUNT="$runtime_mount" SCORPIO_SERVICE_USER=nobody \
+    bash "${repo_root}/install.sh" \
+        --version "$version" \
+        --release-base-url "$release_base_url" \
+        --non-interactive \
+        --no-service \
+        --no-deps \
+        --no-user-allow-other \
+        --base-url https://ignored.example.com \
+        --lfs-url https://ignored.example.com/lfs \
+        --prefix "${test_root}/prefix" \
+        --config-dir "${test_root}/etc" \
+        --data-root "${test_root}/data" \
+        --workspace "${test_root}/data/mount" \
+        --store-path "${test_root}/data/store" \
+        --http-addr 127.0.0.1:2925 >"${test_root}/runtime-root-mount.log" 2>&1; then
+    printf 'installer accepted a mount at a persistent runtime root\n' >&2
+    exit 1
+fi
+grep -Fq "refusing ownership migration across mount ${runtime_mount} at runtime directory" \
+    "${test_root}/runtime-root-mount.log"
 
 : >"$systemctl_log"
 migrated_data_root="${test_root}/migrated-data"
