@@ -1163,14 +1163,21 @@ restore_runtime_ownership() {
         ! run_root chown "$EXISTING_SERVICE_USER:$previous_group" -- "$PREVIOUS_DATA_ROOT"; then
         restore_failed=1
     fi
-    for runtime_dir in "$PREVIOUS_STORE_PATH" "$PREVIOUS_ANTARES_UPPER_ROOT" \
-        "$PREVIOUS_ANTARES_CL_ROOT"; do
-        [ -n "$runtime_dir" ] || continue
-        if run_root test -d "$runtime_dir" && ! run_root chown -R -h -P \
-            "$EXISTING_SERVICE_USER:$previous_group" -- "$runtime_dir"; then
-            restore_failed=1
-        fi
-    done
+    local -a previous_runtime_dirs=(
+        "$PREVIOUS_STORE_PATH" "$PREVIOUS_ANTARES_UPPER_ROOT" "$PREVIOUS_ANTARES_CL_ROOT"
+    )
+    if ! validate_mount_targets "${previous_runtime_dirs[@]}"; then
+        warn "${MOUNT_VALIDATION_ERROR}; skipping recursive ownership restore"
+        restore_failed=1
+    else
+        for runtime_dir in "${previous_runtime_dirs[@]}"; do
+            [ -n "$runtime_dir" ] || continue
+            if run_root test -d "$runtime_dir" && ! run_root chown -R -h -P \
+                "$EXISTING_SERVICE_USER:$previous_group" -- "$runtime_dir"; then
+                restore_failed=1
+            fi
+        done
+    fi
     for runtime_file in "$PREVIOUS_CONFIG_FILE" "$PREVIOUS_ANTARES_STATE_FILE"; do
         [ -n "$runtime_file" ] || continue
         if run_root test -e "$runtime_file" && ! run_root chown \
@@ -1377,8 +1384,35 @@ recover_stale_runtime_mounts() {
     return 0
 }
 
+validate_mount_targets() {
+    local runtime_dir mount_target mount_targets
+    MOUNT_VALIDATION_ERROR=""
+    mount_targets="$(run_readonly findmnt --noheadings --raw --output TARGET)" || {
+        MOUNT_VALIDATION_ERROR="could not inspect mounts before migrating runtime ownership"
+        return 1
+    }
+    for runtime_dir in "$@"; do
+        [ -n "$runtime_dir" ] || continue
+        if run_readonly test -d "$runtime_dir"; then
+            while IFS= read -r mount_target; do
+                case "$mount_target" in
+                    "$runtime_dir")
+                        MOUNT_VALIDATION_ERROR="refusing ownership migration across mount $mount_target at runtime directory; unmount it and retry"
+                        return 1
+                        ;;
+                    "$runtime_dir"/*)
+                        MOUNT_VALIDATION_ERROR="refusing ownership migration across nested mount $mount_target under $runtime_dir; unmount it and retry"
+                        return 1
+                        ;;
+                esac
+            done <<<"$mount_targets"
+        fi
+    done
+    return 0
+}
+
 validate_runtime_migration_mounts() {
-    local runtime_dir mount_target mount_targets path parent
+    local path parent
     local -a runtime_dirs=(
         "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"
     )
@@ -1389,22 +1423,7 @@ validate_runtime_migration_mounts() {
             parent="$(dirname -- "$parent")"
         done
     done
-    mount_targets="$(run_readonly findmnt --noheadings --raw --output TARGET)" || \
-        die "could not inspect mounts before migrating runtime ownership"
-    for runtime_dir in "${runtime_dirs[@]}"; do
-        if run_readonly test -d "$runtime_dir"; then
-            while IFS= read -r mount_target; do
-                case "$mount_target" in
-                    "$runtime_dir")
-                        die "refusing ownership migration across mount $mount_target at runtime directory; unmount it and retry"
-                        ;;
-                    "$runtime_dir"/*)
-                        die "refusing ownership migration across nested mount $mount_target under $runtime_dir; unmount it and retry"
-                        ;;
-                esac
-            done <<<"$mount_targets"
-        fi
-    done
+    validate_mount_targets "${runtime_dirs[@]}" || die "$MOUNT_VALIDATION_ERROR"
 }
 
 reconcile_runtime_directories() {
@@ -1627,7 +1646,18 @@ wait_for_service_health() {
 uninstall() {
     require_privileges
     if command -v systemctl >/dev/null 2>&1; then
-        run_root systemctl disable --now scorpiofs.service 2>/dev/null || true
+        if run_readonly test -e /etc/systemd/system/scorpiofs.service || \
+            run_root systemctl is-active --quiet scorpiofs.service; then
+            if ! run_root systemctl disable --now scorpiofs.service 2>/dev/null; then
+                if run_root systemctl is-active --quiet scorpiofs.service; then
+                    die "could not stop scorpiofs.service; refusing to remove its unit or binaries"
+                fi
+                warn "systemd did not report a successful stop; service is inactive, continuing uninstall"
+            fi
+            if run_root systemctl is-active --quiet scorpiofs.service; then
+                die "scorpiofs.service is still active; refusing to remove its unit or binaries"
+            fi
+        fi
         run_root rm -f /etc/systemd/system/scorpiofs.service
         run_root systemctl daemon-reload 2>/dev/null || true
     fi
