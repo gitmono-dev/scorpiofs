@@ -117,7 +117,7 @@ Options:
   --uninstall               Stop/remove binaries and the systemd unit; keep data.
   --no-deps                 Skip system package installation.
   --enable-user-allow-other Enable user_allow_other in /etc/fuse.conf.
-  --no-user-allow-other     Do not change /etc/fuse.conf.
+  --no-user-allow-other     Do not change /etc/fuse.conf (it must already enable user_allow_other).
   -h, --help                Show this help message.
 
 Examples:
@@ -1263,6 +1263,15 @@ validate_installed_config() {
     fi
 }
 
+validate_user_allow_other() {
+    [ "$ENABLE_USER_ALLOW_OTHER" -eq 1 ] && return 0
+    if run_root grep -qE '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf 2>/dev/null; then
+        note "using the existing user_allow_other setting in /etc/fuse.conf"
+        return 0
+    fi
+    die "user_allow_other is required because ScorpioFS uses allow_other FUSE mounts; rerun with --enable-user-allow-other"
+}
+
 enable_user_allow_other() {
     [ "$ENABLE_USER_ALLOW_OTHER" -eq 1 ] || { note "leaving /etc/fuse.conf unchanged"; return 0; }
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -1345,12 +1354,12 @@ wait_for_service_health() {
             die "scorpiofs.service is not active after starting; inspect: systemctl status scorpiofs"
         fi
         if [ "$DOWNLOADER" = "curl" ]; then
-            if curl -fsS --connect-timeout 2 --max-time 5 "$endpoint" >/dev/null 2>&1; then
+            if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$endpoint" >/dev/null 2>&1; then
                 SERVICE_HEALTH_CONFIRMED=1
                 note "scorpiofs.service is healthy at ${endpoint}"
                 return 0
             fi
-        elif wget -q --timeout=2 --tries=1 -O /dev/null "$endpoint"; then
+        elif wget -q --no-proxy --timeout=2 --tries=1 -O /dev/null "$endpoint"; then
             SERVICE_HEALTH_CONFIRMED=1
             note "scorpiofs.service is healthy at ${endpoint}"
             return 0
@@ -1390,6 +1399,7 @@ main() {
     set_generated_runtime_paths
     validate_inputs
     require_privileges
+    validate_user_allow_other
 
     note "installing ScorpioFS ${VERSION} for $(detect_target)"
     pkg_install

@@ -212,8 +212,13 @@ curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.
     --lfs-url https://mega.example.com/lfs \
     --http-addr 127.0.0.1:2725
 
-# Install binaries and config without systemd or /etc/fuse.conf changes.
+# Keep /etc/fuse.conf unchanged when user_allow_other is already enabled.
 sudo bash install.sh --non-interactive --no-service --no-user-allow-other \
+  --base-url https://mega.example.com \
+  --lfs-url https://mega.example.com/lfs
+
+# On a host without user_allow_other, use this instead of the command above.
+sudo bash install.sh --non-interactive --no-service --enable-user-allow-other \
   --base-url https://mega.example.com \
   --lfs-url https://mega.example.com/lfs
 

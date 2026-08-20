@@ -295,7 +295,10 @@ curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.
 Non-loopback HTTP binds require the explicit `--allow-public-api` flag and
 must be protected by a firewall or an authenticating reverse proxy. The script
 never edits `/etc/fuse.conf` unless the interactive prompt is accepted or
-`--enable-user-allow-other` is passed. `--uninstall` removes binaries and the
+`--enable-user-allow-other` is passed. Because ScorpioFS uses `allow_other`
+FUSE mounts, an installation that declines the change is accepted only when
+`/etc/fuse.conf` already contains `user_allow_other`; otherwise the installer
+stops with an actionable error. `--uninstall` removes binaries and the
 unit but keeps configuration and data. `--workspace` and `--store-path` must be
 inside the dedicated `--data-root`, preventing ownership changes to broad host
 directories. Installed binaries and the main config must remain outside the
