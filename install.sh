@@ -71,6 +71,7 @@ PREVIOUS_ANTARES_UPPER_ROOT=""
 PREVIOUS_ANTARES_CL_ROOT=""
 PREVIOUS_CONFIG_FILE=""
 PREVIOUS_ANTARES_STATE_FILE=""
+PREVIOUS_RUNTIME_PARENT_DIRS=()
 EXTRACTED_RELEASE=""
 REQUESTED_WORKSPACE=""
 REQUESTED_STORE_PATH=""
@@ -180,6 +181,20 @@ run_readonly() {
     else
         "$@"
     fi
+}
+
+run_as_existing_service_user() {
+    [ -n "$EXISTING_SERVICE_USER" ] || { "$@"; return; }
+    [ "$EXISTING_SERVICE_USER" = "$(id -un)" ] && { "$@"; return; }
+    if [ "$(id -u)" -eq 0 ]; then
+        runuser -u "$EXISTING_SERVICE_USER" -- "$@"
+        return
+    fi
+    command -v sudo >/dev/null 2>&1 || \
+        die "sudo is required to resolve retained runtime paths as $EXISTING_SERVICE_USER"
+    sudo -n -v || \
+        die "could not obtain non-interactive sudo privileges to resolve retained runtime paths as $EXISTING_SERVICE_USER"
+    sudo -n -u "$EXISTING_SERVICE_USER" -- "$@"
 }
 
 require_privileges() {
@@ -553,6 +568,7 @@ set_generated_runtime_paths() {
 
 run_scorpio_config_without_overrides() {
     local binary="$1" variable config_path="${CONFDIR}/scorpio.toml"
+    local effective_binary="$binary" temporary_binary="" temporary_config="" status=0
     shift
     local -a command=(env)
     while IFS= read -r variable; do
@@ -560,24 +576,50 @@ run_scorpio_config_without_overrides() {
             SCORPIO_*) command+=(-u "$variable") ;;
         esac
     done < <(compgen -e)
-    if [ "$DRY_RUN" -eq 1 ]; then
-        if [ "$(id -u)" -eq 0 ] || [ -r "${CONFDIR}/scorpio.toml" ]; then
-            "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
-        else
-            command -v sudo >/dev/null 2>&1 || \
-                die "sudo is required to read protected retained config during dry-run"
-            sudo -v || die "could not obtain read access for retained config during dry-run"
-            config_path="${WORKDIR}/retained-config.toml"
-            (umask 077; : >"$config_path") || \
-                die "could not create a protected config copy for retained dry-run"
-            if ! sudo cat -- "${CONFDIR}/scorpio.toml" | tee "$config_path" >/dev/null; then
-                die "could not read protected retained config during dry-run: ${CONFDIR}/scorpio.toml"
-            fi
-            "${command[@]}" "$binary" --config-path "$config_path" config "$@"
-        fi
-    else
-        run_root "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
+
+    if [ -n "$EXISTING_SERVICE_USER" ]; then
+        temporary_binary="$(mktemp /tmp/scorpiofs-installer-scorpio.XXXXXX)" || \
+            die "could not create a temporary ScorpioFS binary for retained path resolution"
+        cp -- "$binary" "$temporary_binary" || {
+            rm -f -- "$temporary_binary"
+            die "could not stage ScorpioFS binary for retained path resolution"
+        }
+        chmod 0755 "$temporary_binary" || {
+            rm -f -- "$temporary_binary"
+            die "could not make the temporary ScorpioFS binary executable"
+        }
+        effective_binary="$temporary_binary"
     fi
+
+    if ! run_as_existing_service_user test -r "${CONFDIR}/scorpio.toml"; then
+        local -a read_config=(cat)
+        if [ "$(id -u)" -ne 0 ]; then
+            command -v sudo >/dev/null 2>&1 || \
+                die "sudo is required to read protected retained config"
+            [ "$DRY_RUN" -eq 0 ] || \
+                sudo -v || die "could not obtain read access for retained config during dry-run"
+            read_config=(sudo cat)
+        fi
+        temporary_config="$(run_as_existing_service_user mktemp /tmp/scorpiofs-installer-config.XXXXXX)" || \
+            die "could not create a protected retained config copy"
+        config_path="$temporary_config"
+        if ! "${read_config[@]}" -- "${CONFDIR}/scorpio.toml" | \
+            run_as_existing_service_user tee "$config_path" >/dev/null; then
+            rm -f -- "$temporary_config"
+            [ -n "$temporary_binary" ] && rm -f -- "$temporary_binary"
+            die "could not read protected retained config: ${CONFDIR}/scorpio.toml"
+        fi
+    fi
+
+    if run_as_existing_service_user "${command[@]}" "$effective_binary" \
+        --config-path "$config_path" config "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+    [ -n "$temporary_config" ] && rm -f -- "$temporary_config"
+    [ -n "$temporary_binary" ] && rm -f -- "$temporary_binary"
+    return "$status"
 }
 
 load_configured_runtime_paths() {
@@ -634,6 +676,15 @@ prepare_effective_runtime_paths() {
         PREVIOUS_ANTARES_CL_ROOT="$ANTARES_CL_ROOT"
         PREVIOUS_CONFIG_FILE="$CONFIG_FILE"
         PREVIOUS_ANTARES_STATE_FILE="$ANTARES_STATE_FILE"
+        PREVIOUS_RUNTIME_PARENT_DIRS=()
+        local previous_path previous_parent
+        for previous_path in "$PREVIOUS_CONFIG_FILE" "$PREVIOUS_ANTARES_STATE_FILE"; do
+            previous_parent="$(dirname -- "$previous_path")"
+            while [[ "$previous_parent" == "$PREVIOUS_DATA_ROOT"/* ]]; do
+                PREVIOUS_RUNTIME_PARENT_DIRS+=("$previous_parent")
+                previous_parent="$(dirname -- "$previous_parent")"
+            done
+        done
     fi
 
     if [ "$RETAIN_CONFIG" -eq 1 ]; then
@@ -1127,6 +1178,12 @@ restore_runtime_ownership() {
             restore_failed=1
         fi
     done
+    for runtime_dir in "${PREVIOUS_RUNTIME_PARENT_DIRS[@]}"; do
+        if run_root test -d "$runtime_dir" && ! run_root chown \
+            "$EXISTING_SERVICE_USER:$previous_group" -- "$runtime_dir"; then
+            restore_failed=1
+        fi
+    done
     [ "$restore_failed" -eq 0 ]
 }
 
@@ -1321,11 +1378,21 @@ recover_stale_runtime_mounts() {
 }
 
 validate_runtime_migration_mounts() {
-    local runtime_dir mount_target mount_targets
-    mount_targets="$(findmnt --noheadings --raw --output TARGET)" || \
+    local runtime_dir mount_target mount_targets path parent
+    local -a runtime_dirs=(
+        "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"
+    )
+    for path in "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
+        parent="$(dirname -- "$path")"
+        while [[ "$parent" == "$DATA_ROOT"/* ]]; do
+            runtime_dirs+=("$parent")
+            parent="$(dirname -- "$parent")"
+        done
+    done
+    mount_targets="$(run_readonly findmnt --noheadings --raw --output TARGET)" || \
         die "could not inspect mounts before migrating runtime ownership"
-    for runtime_dir in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"; do
-        if [ -d "$runtime_dir" ]; then
+    for runtime_dir in "${runtime_dirs[@]}"; do
+        if run_readonly test -d "$runtime_dir"; then
             while IFS= read -r mount_target; do
                 case "$mount_target" in
                     "$runtime_dir")
@@ -1425,9 +1492,15 @@ EOF
 
 validate_installed_config() {
     [ "$DRY_RUN" -eq 0 ] || return 0
+    local previous_service_user="$EXISTING_SERVICE_USER"
+    if [ "$SETUP_SERVICE" -eq 1 ]; then
+        EXISTING_SERVICE_USER="$SERVICE_USER"
+    fi
     if ! run_scorpio_config_without_overrides "${PREFIX}/bin/scorpio" validate; then
+        EXISTING_SERVICE_USER="$previous_service_user"
         die "generated or retained config is invalid: ${CONFDIR}/scorpio.toml"
     fi
+    EXISTING_SERVICE_USER="$previous_service_user"
 }
 
 validate_user_allow_other() {
