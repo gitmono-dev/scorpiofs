@@ -231,7 +231,7 @@ grep -Fxq 'start scorpiofs.service' "$systemctl_log"
 grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${new_workspace}" "$unit_capture"
 
 if [ "$service_user" != root ] && \
-    sudo -u "$service_user" -H env -u SUDO_USER sudo -n -v; then
+    sudo -u "$service_user" -H env -u SUDO_USER sudo -n -v 2>/dev/null; then
     protected_root="${test_root}/protected-config"
     SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
         --version "$version" \
@@ -330,5 +330,29 @@ if MOCK_NESTED_MOUNT="$nested_mount" bash "${repo_root}/install.sh" \
 fi
 grep -Fq "refusing ownership migration across nested mount ${nested_mount}" \
     "${test_root}/nested-mount.log"
+
+: >"$systemctl_log"
+migrated_data_root="${test_root}/migrated-data"
+MOCK_ACTIVE_MOUNT="$new_workspace" \
+MOCK_STALE_AFTER_STOP="$new_workspace" \
+SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --overwrite-config \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://migrated.example.com \
+    --lfs-url https://migrated.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "$migrated_data_root" \
+    --http-addr 127.0.0.1:2925
+grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
+grep -Fxq "fusermount3 -u -z ${new_workspace}" "$systemctl_log"
+grep -Fxq 'start scorpiofs.service' "$systemctl_log"
+grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${migrated_data_root}/mount" \
+    "$unit_capture"
+grep -Fq "workspace = \"${migrated_data_root}/mount\"" "${test_root}/etc/scorpio.toml"
 
 printf 'installer systemd generation and restart test passed\n'

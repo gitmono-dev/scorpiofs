@@ -318,7 +318,9 @@ config needs read access. Mount roots may not overlap persistent runtime paths.
 Managed active services are stopped before the binary, config, or unit is
 replaced. Any old configured FUSE roots left mounted after that stop are cleaned
 before the upgraded service starts, including when `--overwrite-config` changes
-a mount path. Mirrors and locally packaged builds can
+a mount path or migrates to a new data root. An all-relative old config cannot
+be migrated to an empty new root until its old mounts are manually unmounted.
+Mirrors and locally packaged builds can
 be tested with `--release-base-url <url>` or `SCORPIO_RELEASE_BASE_URL`; the
 mirror layout is `<base>/<version>/scorpiofs-<version>-<target>.tar.gz` plus its
 `.sha256` file.

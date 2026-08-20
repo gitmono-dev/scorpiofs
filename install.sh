@@ -439,6 +439,8 @@ common_path_ancestor() {
 }
 
 infer_data_root() {
+    local failure_message="${1:-cannot infer data-root from an all-relative retained config; pass --data-root}"
+    local root_label="${2:-data-root}"
     local value
     local -a anchors=()
     for value in "$WORKSPACE" "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT"; do
@@ -447,10 +449,9 @@ infer_data_root() {
     for value in "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
         if [[ "$value" == /* ]]; then anchors+=("$(dirname -- "$value")"); fi
     done
-    [ "${#anchors[@]}" -gt 0 ] || \
-        die "cannot infer data-root from an all-relative retained config; pass --data-root"
+    [ "${#anchors[@]}" -gt 0 ] || die "$failure_message"
     DATA_ROOT="$(common_path_ancestor "${anchors[@]}")"
-    note "using data-root inferred from retained config: $DATA_ROOT"
+    note "using $root_label inferred from retained config: $DATA_ROOT"
 }
 
 resolve_relative_runtime_paths() {
@@ -521,24 +522,23 @@ load_configured_runtime_paths() {
 }
 
 prepare_effective_runtime_paths() {
-    local binary="$1" selected_root_nonempty=0 load_existing_paths=0
+    local binary="$1" selected_root_nonempty=0 target_data_root="$DATA_ROOT"
     if [ -d "$DATA_ROOT" ] && [ -n "$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
         selected_root_nonempty=1
     fi
 
-    if [ "$RETAIN_CONFIG" -eq 1 ]; then
-        load_existing_paths=1
-    elif [ "$EXISTING_CONFIG" -eq 1 ] && \
-        { [ "$DATA_ROOT_SET" -eq 0 ] || [ "$selected_root_nonempty" -eq 1 ]; }; then
-        # Before overwriting a nonempty root, prove that the old config belongs
-        # to it. An unspecified root is inferred from that same old config.
-        load_existing_paths=1
-    fi
-
-    if [ "$load_existing_paths" -eq 1 ]; then
+    if [ "$EXISTING_CONFIG" -eq 1 ]; then
         load_configured_runtime_paths "$binary"
         normalize_runtime_paths
-        if [ "$DATA_ROOT_SET" -eq 0 ]; then infer_data_root; fi
+        if [ "$DATA_ROOT_SET" -eq 0 ]; then
+            infer_data_root
+        elif [ "$RETAIN_CONFIG" -eq 1 ] || [ "$selected_root_nonempty" -eq 1 ]; then
+            DATA_ROOT="$target_data_root"
+        else
+            infer_data_root \
+                "cannot resolve previous mount paths from an all-relative config while changing to an empty data-root; rerun with the previous data-root or unmount the old paths manually" \
+                "previous data-root"
+        fi
         resolve_relative_runtime_paths
         validate_runtime_paths
         PREVIOUS_WORKSPACE="$WORKSPACE"
@@ -550,6 +550,7 @@ prepare_effective_runtime_paths() {
         return 0
     fi
 
+    DATA_ROOT="$target_data_root"
     set_generated_runtime_paths
     canonicalize_runtime_paths
     validate_runtime_paths

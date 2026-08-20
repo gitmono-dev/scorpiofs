@@ -182,7 +182,9 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
   existing managed unit; stop the user-run daemon and unmount it before retrying.
   Managed upgrades retain the old configured mount paths until the active unit
   is stopped, then clean any FUSE roots it leaves behind before installing the
-  new binary, config, and unit.
+  new binary, config, and unit. This also applies when `--overwrite-config`
+  migrates to an empty new data root; all-relative old configs are rejected in
+  that case because their previous mount locations cannot be inferred safely.
 - `--release-base-url` (or `SCORPIO_RELEASE_BASE_URL`) points the installer at
   a mirror or local HTTP server using the same `<base>/<version>/<asset>`
   layout as GitHub releases. The PR build uses this to exercise a complete
