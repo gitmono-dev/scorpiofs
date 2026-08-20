@@ -133,6 +133,12 @@ tarball, **verifies its SHA256 checksum**, installs `scorpio`/`antares`, creates
 the `scorpiofs` service user, prepares the FUSE group and data directories, and
 generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 
+When a systemd service is selected, the installer waits for the configured
+`/health` endpoint before reporting success. During an upgrade, a failure after
+stopping the existing service triggers a best-effort service restart. Existing
+data-directory permissions are preserved; only newly created directories use
+the installer's default `0755` mode.
+
 - Run `sudo bash install.sh` for the interactive flow. It supports `curl | bash`
   because prompts are read from a verified controlling terminal.
 - The API defaults to `127.0.0.1:2725` because it has no authentication. A

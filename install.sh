@@ -56,6 +56,7 @@ RETAIN_CONFIG=0
 EXISTING_SERVICE_USER=""
 EXISTING_SERVICE_ACTIVE=0
 SERVICE_STOPPED_FOR_UPGRADE=0
+SERVICE_HEALTH_CONFIRMED=0
 PREVIOUS_WORKSPACE=""
 PREVIOUS_ANTARES_MOUNT_ROOT=""
 EXTRACTED_RELEASE=""
@@ -74,9 +75,18 @@ BIND_PORT=""
 [ -z "${SCORPIO_STORE_PATH:-}" ] || STORE_PATH_SET=1
 
 cleanup() {
+    local exit_status=$?
+    if [ "$exit_status" -ne 0 ] && [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] && \
+        [ "$SERVICE_HEALTH_CONFIRMED" -ne 1 ] && command -v systemctl >/dev/null 2>&1; then
+        warn "installation failed after stopping scorpiofs.service; attempting to restore the managed service"
+        if ! run_root systemctl start scorpiofs.service; then
+            warn "could not restore scorpiofs.service; inspect: systemctl status scorpiofs"
+        fi
+    fi
     if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ]; then
         rm -rf "$WORKDIR"
     fi
+    return "$exit_status"
 }
 trap cleanup EXIT
 
@@ -1026,8 +1036,11 @@ prepare_directories() {
     )
     if ! path_is_mount_target "$WORKSPACE"; then directories+=("$WORKSPACE"); fi
     if ! path_is_mount_target "$ANTARES_MOUNT_ROOT"; then directories+=("$ANTARES_MOUNT_ROOT"); fi
-    run_root install -d -o "$TARGET_USER" -g "$TARGET_GROUP" "${directories[@]}"
-    run_root install -d "$CONFDIR"
+    # mkdir preserves modes on existing directories; install -d would reset
+    # hardened data directories to its 0755 default during every upgrade.
+    run_root mkdir -p -m 0755 -- "${directories[@]}"
+    run_root chown "$TARGET_USER:$TARGET_GROUP" "${directories[@]}"
+    run_root mkdir -p -m 0755 -- "$CONFDIR"
 }
 
 find_mount_fstype() {
@@ -1321,6 +1334,30 @@ EOF
     if ! run_root systemctl "$service_action" scorpiofs.service; then
         die "systemd unit could not ${service_action}; inspect: systemctl status scorpiofs"
     fi
+    wait_for_service_health
+}
+
+wait_for_service_health() {
+    local endpoint attempt
+    endpoint="$(health_endpoint)"
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if ! run_root systemctl is-active --quiet scorpiofs.service; then
+            die "scorpiofs.service is not active after starting; inspect: systemctl status scorpiofs"
+        fi
+        if [ "$DOWNLOADER" = "curl" ]; then
+            if curl -fsS --connect-timeout 2 --max-time 5 "$endpoint" >/dev/null 2>&1; then
+                SERVICE_HEALTH_CONFIRMED=1
+                note "scorpiofs.service is healthy at ${endpoint}"
+                return 0
+            fi
+        elif wget -q --timeout=2 --tries=1 -O /dev/null "$endpoint"; then
+            SERVICE_HEALTH_CONFIRMED=1
+            note "scorpiofs.service is healthy at ${endpoint}"
+            return 0
+        fi
+        sleep 1
+    done
+    die "scorpiofs.service did not become healthy at ${endpoint}; inspect: systemctl status scorpiofs"
 }
 
 uninstall() {

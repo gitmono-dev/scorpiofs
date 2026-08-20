@@ -101,11 +101,23 @@ umount() {
     return 0
 }
 
+curl() {
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == */health ]]; then
+            [ "${MOCK_HEALTH_FAIL:-0}" -eq 0 ] || return 7
+            printf 'ok\n'
+            return 0
+        fi
+    done
+    command curl "$@"
+}
+
 usermod() {
     return 0
 }
 
-export -f install systemctl findmnt stat fusermount3 umount usermod
+export -f install systemctl findmnt stat fusermount3 umount usermod curl
 export unit_capture systemctl_log service_user mock_service_active mock_stale_detached
 
 non_fuse_root="${test_root}/non-fuse"
@@ -234,6 +246,28 @@ grep -Fxq 'enable scorpiofs.service' "$systemctl_log"
 grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
 grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
 grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
+: >"$systemctl_log"
+
+if MOCK_HEALTH_FAIL=1 SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --overwrite-config \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://unhealthy.example.com \
+    --lfs-url https://unhealthy.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "${test_root}/data" \
+    --workspace "${test_root}/data/mount" \
+    --store-path "${test_root}/data/store" \
+    --http-addr 127.0.0.1:2925 >"${test_root}/health-failure.log" 2>&1; then
+    printf 'installer accepted a service that failed its health check\n' >&2
+    exit 1
+fi
+grep -Fq 'did not become healthy' "${test_root}/health-failure.log"
+test "$(grep -Fc 'start scorpiofs.service' "$systemctl_log")" -ge 2
 : >"$systemctl_log"
 
 inactive_root="${test_root}/inactive-service"
@@ -367,6 +401,7 @@ grep -Fxq 'start scorpiofs.service' "$systemctl_log"
 grep -Fxq 'User=nobody' "$unit_capture"
 test "$(stat -c '%U' "${test_root}/etc/scorpio.toml")" = nobody
 
+chmod 0700 "${test_root}/data/store"
 SUDO_USER=daemon bash "${repo_root}/install.sh" \
     --version "$version" \
     --release-base-url "$release_base_url" \
@@ -383,6 +418,7 @@ SUDO_USER=daemon bash "${repo_root}/install.sh" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925
 test "$(stat -c '%U' "${test_root}/etc/scorpio.toml")" = nobody
+test "$(stat -c '%a' "${test_root}/data/store")" = 700
 
 nested_mount="${test_root}/data/store/external-mount"
 if MOCK_NESTED_MOUNT="$nested_mount" bash "${repo_root}/install.sh" \
