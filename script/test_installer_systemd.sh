@@ -20,6 +20,19 @@ mock_stale_detached=0
 mkdir -p "$test_root"
 : >"$systemctl_log"
 
+report_test_failure() {
+    local status=$?
+    printf 'installer systemd test failed at line %s: %s\n' \
+        "${BASH_LINENO[0]}" "$BASH_COMMAND" >&2
+    for log in "$test_root"/*/install.log "$test_root"/*.log; do
+        [ -f "$log" ] || continue
+        printf '%s:\n' "$log" >&2
+        tail -20 "$log" >&2
+    done
+    exit "$status"
+}
+trap report_test_failure ERR
+
 install() {
     local destination="${*: -1}"
     if [ "$destination" = "/etc/systemd/system/scorpiofs.service" ]; then
