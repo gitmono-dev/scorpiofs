@@ -853,7 +853,7 @@ reconcile_runtime_directories() {
     # intentionally excluded because they may currently be FUSE mountpoints.
     for runtime_dir in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"; do
         if [ -d "$runtime_dir" ]; then
-            mount_targets="$(findmnt --list --noheadings --raw --output TARGET)" || \
+            mount_targets="$(findmnt --noheadings --raw --output TARGET)" || \
                 die "could not inspect mounts before migrating ownership under $runtime_dir"
             while IFS= read -r mount_target; do
                 case "$mount_target" in
