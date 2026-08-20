@@ -217,6 +217,32 @@ grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
 grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
 grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
 
+inactive_root="${test_root}/inactive-service"
+mkdir -p "${inactive_root}/data"
+mock_service_active=0
+if MOCK_ACTIVE_MOUNT="${inactive_root}/data/mount" \
+    SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+        --version "$version" \
+        --release-base-url "$release_base_url" \
+        --non-interactive \
+        --overwrite-config \
+        --no-deps \
+        --no-user-allow-other \
+        --base-url https://ignored.example.com \
+        --lfs-url https://ignored.example.com/lfs \
+        --prefix "${test_root}/prefix" \
+        --config-dir "${test_root}/etc" \
+        --data-root "${inactive_root}/data" \
+        --workspace "${inactive_root}/data/mount" \
+        --store-path "${inactive_root}/data/store" \
+        --http-addr 127.0.0.1:2925 >"${inactive_root}/install.log" 2>&1; then
+    printf 'installer accepted an active mount while the existing service was inactive\n' >&2
+    exit 1
+fi
+grep -Fq 'stop the ScorpioFS daemon, unmount this path, and retry' \
+    "${inactive_root}/install.log"
+mock_service_active=1
+
 MOCK_STALE_MOUNT="${test_root}/data/mount" \
 SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --version "$version" \
@@ -384,6 +410,39 @@ grep -Fxq 'start scorpiofs.service' "$systemctl_log"
 grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${migrated_data_root}/mount" \
     "$unit_capture"
 grep -Fq "workspace = \"${migrated_data_root}/mount\"" "${test_root}/etc/scorpio.toml"
+
+relative_root="${test_root}/relative-config"
+mkdir -p "${relative_root}/etc" "${relative_root}/data"
+cp "${test_root}/etc/scorpio.toml" "${relative_root}/etc/scorpio.toml"
+sed -i \
+    -e 's|^workspace = .*|workspace = "mount"|' \
+    -e 's|^store_path = .*|store_path = "store"|' \
+    -e 's|^config_file = .*|config_file = "config.toml"|' \
+    -e 's|^antares_upper_root = .*|antares_upper_root = "antares/upper"|' \
+    -e 's|^antares_cl_root = .*|antares_cl_root = "antares/cl"|' \
+    -e 's|^antares_mount_root = .*|antares_mount_root = "antares/mnt"|' \
+    -e 's|^antares_state_file = .*|antares_state_file = "antares/state.toml"|' \
+    "${relative_root}/etc/scorpio.toml"
+: >"${relative_root}/data/sentinel"
+if SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --overwrite-config \
+    --no-service \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${relative_root}/etc" \
+    --data-root "${relative_root}/data" \
+    --http-addr 127.0.0.1:2925 >"${relative_root}/install.log" 2>&1; then
+    printf 'installer accepted an ambiguous all-relative config migration\n' >&2
+    exit 1
+fi
+grep -Fq 'cannot safely use a nonempty data-root with an all-relative retained config' \
+    "${relative_root}/install.log"
 
 symlinked_data_root="${test_root}/data-link"
 ln -s "$migrated_data_root" "$symlinked_data_root"

@@ -54,6 +54,7 @@ STORE_PATH_SET=0
 EXISTING_CONFIG=0
 RETAIN_CONFIG=0
 EXISTING_SERVICE_USER=""
+EXISTING_SERVICE_ACTIVE=0
 SERVICE_STOPPED_FOR_UPGRADE=0
 PREVIOUS_WORKSPACE=""
 PREVIOUS_ANTARES_MOUNT_ROOT=""
@@ -309,6 +310,15 @@ validate_data_root() {
     esac
 }
 
+data_root_is_nonempty() {
+    [ -d "$DATA_ROOT" ] || return 1
+    local data_root_entry
+    if ! data_root_entry="$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
+        die "could not inspect data-root; refusing to change ownership without verifying it is empty: $DATA_ROOT"
+    fi
+    [ -n "$data_root_entry" ]
+}
+
 require_path_in_data_root() {
     local field="$1" value="$2"
     case "$value" in
@@ -326,13 +336,8 @@ validate_data_paths() {
         [ ! -L "$runtime_file" ] || die "runtime state file must not be a symbolic link: $runtime_file"
     done
     [ ! -L "$CONFDIR/scorpio.toml" ] || die "config file must not be a symbolic link: $CONFDIR/scorpio.toml"
-    if [ -d "$DATA_ROOT" ] && [ "$EXISTING_CONFIG" -eq 0 ]; then
-        local data_root_entry
-        if ! data_root_entry="$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
-            die "could not inspect data-root; refusing to change ownership without verifying it is empty: $DATA_ROOT"
-        fi
-        [ -z "$data_root_entry" ] || \
-            die "refusing to change ownership of a nonempty data-root without an existing ScorpioFS config: $DATA_ROOT"
+    if [ "$EXISTING_CONFIG" -eq 0 ] && data_root_is_nonempty; then
+        die "refusing to change ownership of a nonempty data-root without an existing ScorpioFS config: $DATA_ROOT"
     fi
 }
 
@@ -466,6 +471,15 @@ infer_data_root() {
     note "using $root_label inferred from retained config: $DATA_ROOT"
 }
 
+retained_config_has_absolute_anchor() {
+    local value
+    for value in "$WORKSPACE" "$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" \
+        "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" "$ANTARES_STATE_FILE"; do
+        [[ "$value" == /* ]] && return 0
+    done
+    return 1
+}
+
 resolve_relative_runtime_paths() {
     if [[ "$WORKSPACE" != /* ]]; then WORKSPACE="$DATA_ROOT/$WORKSPACE"; fi
     if [[ "$STORE_PATH" != /* ]]; then STORE_PATH="$DATA_ROOT/$STORE_PATH"; fi
@@ -535,7 +549,7 @@ load_configured_runtime_paths() {
 
 prepare_effective_runtime_paths() {
     local binary="$1" selected_root_nonempty=0 target_data_root="$DATA_ROOT"
-    if [ -d "$DATA_ROOT" ] && [ -n "$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    if data_root_is_nonempty; then
         selected_root_nonempty=1
     fi
 
@@ -544,7 +558,11 @@ prepare_effective_runtime_paths() {
         normalize_runtime_paths
         if [ "$DATA_ROOT_SET" -eq 0 ]; then
             infer_data_root
-        elif [ "$RETAIN_CONFIG" -eq 1 ] || [ "$selected_root_nonempty" -eq 1 ]; then
+        elif [ "$selected_root_nonempty" -eq 1 ]; then
+            retained_config_has_absolute_anchor || \
+                die "cannot safely use a nonempty data-root with an all-relative retained config; pass the previous data-root or empty the new root"
+            DATA_ROOT="$target_data_root"
+        elif [ "$RETAIN_CONFIG" -eq 1 ]; then
             DATA_ROOT="$target_data_root"
         else
             infer_data_root \
@@ -582,6 +600,10 @@ detect_existing_service_user() {
     getent passwd "$candidate" >/dev/null 2>&1 || \
         die "existing scorpiofs.service user does not exist: $candidate"
     EXISTING_SERVICE_USER="$candidate"
+    if command -v systemctl >/dev/null 2>&1 && \
+        systemctl is-active --quiet scorpiofs.service 2>/dev/null; then
+        EXISTING_SERVICE_ACTIVE=1
+    fi
 }
 
 stop_active_service_for_upgrade() {
@@ -1066,7 +1088,8 @@ recover_stale_runtime_mounts() {
             probe_succeeded=1
         fi
         if [ "$probe_succeeded" -eq 1 ] && [ "$detach_managed_mounts" -ne 1 ]; then
-            if [ "$SETUP_SERVICE" -eq 1 ] && [ -z "$EXISTING_SERVICE_USER" ]; then
+            if [ "$SETUP_SERVICE" -eq 1 ] && \
+                { [ -z "$EXISTING_SERVICE_USER" ] || [ "$EXISTING_SERVICE_ACTIVE" -ne 1 ]; }; then
                 die "$mount_field is actively mounted at $mount_root by an unmanaged process; stop the ScorpioFS daemon, unmount this path, and retry"
             fi
             note "$mount_field is actively mounted; leaving the mount root unchanged during directory preparation"
