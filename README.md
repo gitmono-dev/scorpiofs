@@ -55,7 +55,10 @@ https://crates.io/crates/scorpiofs
 
 ### How to Use?
 
-**Prerequisites:** Linux with FUSE enabled, `libfuse-dev`, and a running Mega/monorepo server. See [docs/develop.md](docs/develop.md) for system setup (may require `sudo` for FUSE).
+**Prerequisites:** Linux with FUSE enabled, the FUSE 3 development library
+(`libfuse3-dev` on Ubuntu), and a running Mega/monorepo server. See
+[docs/develop.md](docs/develop.md) for system setup (may require `sudo` for
+FUSE).
 
 1. Start the mono server (e.g. `http://localhost:8000`).
 2. Edit **`scorpio.toml`** (not `config.toml`): set `base_url`, `workspace`, and `store_path`. The `config.toml` file is a **runtime state file** (tracks mounted workspaces), created automatically on first run.
