@@ -450,7 +450,7 @@ infer_data_root() {
         if [[ "$value" == /* ]]; then anchors+=("$(dirname -- "$value")"); fi
     done
     [ "${#anchors[@]}" -gt 0 ] || die "$failure_message"
-    DATA_ROOT="$(common_path_ancestor "${anchors[@]}")"
+    DATA_ROOT="$(realpath -m -- "$(common_path_ancestor "${anchors[@]}")")"
     note "using $root_label inferred from retained config: $DATA_ROOT"
 }
 
@@ -1047,7 +1047,15 @@ recover_stale_runtime_mounts() {
         if [ -n "$EXISTING_SERVICE_USER" ]; then
             probe=(runuser -u "$EXISTING_SERVICE_USER" -- "${probe[@]}")
         fi
-        if run_root "${probe[@]}" && [ "$detach_managed_mounts" -ne 1 ]; then
+        # Mount health is a read-only check, so dry-runs must execute it to
+        # preserve the same stale-versus-active decision as a real install.
+        local probe_succeeded=0
+        if [ "$DRY_RUN" -eq 1 ]; then
+            if "${probe[@]}"; then probe_succeeded=1; fi
+        elif run_root "${probe[@]}"; then
+            probe_succeeded=1
+        fi
+        if [ "$probe_succeeded" -eq 1 ] && [ "$detach_managed_mounts" -ne 1 ]; then
             if [ "$SETUP_SERVICE" -eq 1 ] && [ -z "$EXISTING_SERVICE_USER" ]; then
                 die "$mount_field is actively mounted at $mount_root by an unmanaged process; stop the ScorpioFS daemon, unmount this path, and retry"
             fi

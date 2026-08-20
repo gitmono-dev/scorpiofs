@@ -355,4 +355,22 @@ grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${migrated_data_root}/mount" 
     "$unit_capture"
 grep -Fq "workspace = \"${migrated_data_root}/mount\"" "${test_root}/etc/scorpio.toml"
 
+symlinked_data_root="${test_root}/data-link"
+ln -s "$migrated_data_root" "$symlinked_data_root"
+sed -i "s|${migrated_data_root}|${symlinked_data_root}|g" "${test_root}/etc/scorpio.toml"
+SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --no-service \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --http-addr 127.0.0.1:2925 >"${test_root}/symlinked-root.log"
+grep -Fq "using data-root inferred from retained config: ${migrated_data_root}" \
+    "${test_root}/symlinked-root.log"
+
 printf 'installer systemd generation and restart test passed\n'
