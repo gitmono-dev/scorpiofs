@@ -65,6 +65,7 @@ HAD_OLD_CONFIG=0
 HAD_OLD_UNIT=0
 PREVIOUS_WORKSPACE=""
 PREVIOUS_ANTARES_MOUNT_ROOT=""
+PREVIOUS_DATA_ROOT=""
 PREVIOUS_STORE_PATH=""
 PREVIOUS_ANTARES_UPPER_ROOT=""
 PREVIOUS_ANTARES_CL_ROOT=""
@@ -89,6 +90,12 @@ cleanup() {
     local exit_status=$?
     if [ "$exit_status" -ne 0 ] && [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] && \
         [ "$SERVICE_HEALTH_CONFIRMED" -ne 1 ] && command -v systemctl >/dev/null 2>&1; then
+        if run_root systemctl is-active --quiet scorpiofs.service; then
+            warn "stopping the failed replacement service before rollback"
+            if ! run_root systemctl stop scorpiofs.service; then
+                warn "could not stop the failed replacement service before rollback"
+            fi
+        fi
         if [ "$ARTIFACT_BACKUP_READY" -eq 1 ]; then
             if ! restore_upgrade_artifacts; then
                 warn "could not restore all previous ScorpioFS artifacts"
@@ -182,7 +189,11 @@ require_privileges() {
         return 0
     fi
     command -v sudo >/dev/null 2>&1 || die "root privileges are required; install sudo or run as root"
-    sudo -v || die "could not obtain sudo privileges"
+    if [ "$INTERACTIVE" -eq 1 ]; then
+        sudo -v || die "could not obtain sudo privileges"
+    else
+        sudo -n -v || die "could not obtain non-interactive sudo privileges; run as root or pre-authorize sudo"
+    fi
     SUDO_BIN="sudo"
 }
 
@@ -342,8 +353,18 @@ validate_data_root() {
 data_root_is_nonempty() {
     [ -d "$DATA_ROOT" ] || return 1
     local data_root_entry
-    if ! data_root_entry="$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
-        die "could not inspect data-root; refusing to change ownership without verifying it is empty: $DATA_ROOT"
+    if ! data_root_entry="$(run_readonly find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
+        if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO_BIN" ]; then
+            command -v sudo >/dev/null 2>&1 || \
+                die "could not inspect data-root; refusing to change ownership without verifying it is empty: $DATA_ROOT"
+            sudo -n -v || \
+                die "could not inspect data-root; refusing to change ownership without verifying it is empty: $DATA_ROOT"
+            SUDO_BIN="sudo"
+            data_root_entry="$(run_readonly find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" || \
+                die "could not inspect data-root; refusing to change ownership without verifying it is empty: $DATA_ROOT"
+        else
+            die "could not inspect data-root; refusing to change ownership without verifying it is empty: $DATA_ROOT"
+        fi
     fi
     [ -n "$data_root_entry" ]
 }
@@ -592,6 +613,8 @@ prepare_effective_runtime_paths() {
                 die "cannot safely use a nonempty data-root with an all-relative retained config; pass the previous data-root or empty the new root"
             DATA_ROOT="$target_data_root"
         elif [ "$RETAIN_CONFIG" -eq 1 ]; then
+            retained_config_has_absolute_anchor || \
+                die "cannot safely use an empty data-root with an all-relative retained config; pass --overwrite-config or use the previous data-root"
             DATA_ROOT="$target_data_root"
         else
             infer_data_root \
@@ -602,6 +625,10 @@ prepare_effective_runtime_paths() {
         validate_runtime_paths
         PREVIOUS_WORKSPACE="$WORKSPACE"
         PREVIOUS_ANTARES_MOUNT_ROOT="$ANTARES_MOUNT_ROOT"
+        PREVIOUS_DATA_ROOT="$(common_path_ancestor \
+            "$(dirname -- "$WORKSPACE")" "$(dirname -- "$STORE_PATH")" \
+            "$(dirname -- "$CONFIG_FILE")" "$(dirname -- "$ANTARES_UPPER_ROOT")" \
+            "$(dirname -- "$ANTARES_CL_ROOT")" "$(dirname -- "$ANTARES_STATE_FILE")")"
         PREVIOUS_STORE_PATH="$STORE_PATH"
         PREVIOUS_ANTARES_UPPER_ROOT="$ANTARES_UPPER_ROOT"
         PREVIOUS_ANTARES_CL_ROOT="$ANTARES_CL_ROOT"
@@ -1081,6 +1108,10 @@ restore_runtime_ownership() {
 
     local previous_group runtime_dir runtime_file restore_failed=0
     previous_group="$(id -gn "$EXISTING_SERVICE_USER")" || return 1
+    if [ -n "$PREVIOUS_DATA_ROOT" ] && run_root test -d "$PREVIOUS_DATA_ROOT" && \
+        ! run_root chown "$EXISTING_SERVICE_USER:$previous_group" -- "$PREVIOUS_DATA_ROOT"; then
+        restore_failed=1
+    fi
     for runtime_dir in "$PREVIOUS_STORE_PATH" "$PREVIOUS_ANTARES_UPPER_ROOT" \
         "$PREVIOUS_ANTARES_CL_ROOT"; do
         [ -n "$runtime_dir" ] || continue
@@ -1480,15 +1511,23 @@ wait_for_service_health() {
             die "scorpiofs.service is not active after starting; inspect: systemctl status scorpiofs"
         fi
         if [ "$DOWNLOADER" = "curl" ]; then
-            if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$endpoint" >/dev/null 2>&1; then
+            if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$endpoint" >/dev/null 2>&1 && \
+                run_root systemctl is-active --quiet scorpiofs.service; then
+                sleep 1
+                if run_root systemctl is-active --quiet scorpiofs.service; then
+                    SERVICE_HEALTH_CONFIRMED=1
+                    note "scorpiofs.service is healthy at ${endpoint}"
+                    return 0
+                fi
+            fi
+        elif wget -q --no-proxy --timeout=2 --tries=1 -O /dev/null "$endpoint" && \
+            run_root systemctl is-active --quiet scorpiofs.service; then
+            sleep 1
+            if run_root systemctl is-active --quiet scorpiofs.service; then
                 SERVICE_HEALTH_CONFIRMED=1
                 note "scorpiofs.service is healthy at ${endpoint}"
                 return 0
             fi
-        elif wget -q --no-proxy --timeout=2 --tries=1 -O /dev/null "$endpoint"; then
-            SERVICE_HEALTH_CONFIRMED=1
-            note "scorpiofs.service is healthy at ${endpoint}"
-            return 0
         fi
         sleep 1
     done
@@ -1523,8 +1562,8 @@ main() {
     REQUESTED_WORKSPACE="$WORKSPACE"
     REQUESTED_STORE_PATH="$STORE_PATH"
     set_generated_runtime_paths
-    validate_inputs
     require_privileges
+    validate_inputs
     validate_user_allow_other
 
     note "installing ScorpioFS ${VERSION} for $(detect_target)"

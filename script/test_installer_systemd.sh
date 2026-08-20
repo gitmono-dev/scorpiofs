@@ -206,6 +206,7 @@ if [ "$service_user" != root ]; then
             --version "$version" \
             --release-base-url "$release_base_url" \
             --non-interactive \
+            --dry-run \
             --overwrite-config \
             --no-service \
             --no-deps \
@@ -323,6 +324,8 @@ tail -c 17 "${test_root}/prefix/bin/scorpio" | grep -Fxq 'old-binary-marker'
 test "$(stat -c '%U' "${test_root}/data/store")" = "$service_user"
 test "$(stat -c '%U' "${test_root}/data/antares/upper")" = "$service_user"
 test "$(stat -c '%U' "${test_root}/data/antares/cl")" = "$service_user"
+test "$(stat -c '%U' "${test_root}/data")" = "$service_user"
+grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
 test "$(grep -Fc 'start scorpiofs.service' "$systemctl_log")" -ge 2
 : >"$systemctl_log"
 
@@ -600,6 +603,28 @@ if SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
 fi
 grep -Fq 'cannot safely use a nonempty data-root with an all-relative retained config' \
     "${relative_root}/install.log"
+
+relative_empty_root="${test_root}/relative-empty"
+mkdir -p "${relative_empty_root}/etc" "${relative_empty_root}/data"
+cp "${relative_root}/etc/scorpio.toml" "${relative_empty_root}/etc/scorpio.toml"
+if SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --no-service \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${relative_empty_root}/etc" \
+    --data-root "${relative_empty_root}/data" \
+    --http-addr 127.0.0.1:2925 >"${relative_empty_root}/install.log" 2>&1; then
+    printf 'installer accepted an empty data-root with an all-relative retained config\n' >&2
+    exit 1
+fi
+grep -Fq 'cannot safely use an empty data-root with an all-relative retained config' \
+    "${relative_empty_root}/install.log"
 
 symlinked_data_root="${test_root}/data-link"
 ln -s "$migrated_data_root" "$symlinked_data_root"
