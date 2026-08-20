@@ -298,9 +298,12 @@ never edits `/etc/fuse.conf` unless the interactive prompt is accepted or
 `--enable-user-allow-other` is passed. `--uninstall` removes binaries and the
 unit but keeps configuration and data. `--workspace` and `--store-path` must be
 inside the dedicated `--data-root`, preventing ownership changes to broad host
-directories. Retained upgrades resolve relative runtime paths against the data
-root and migrate persistent store/overlay ownership after rejecting nested
-mounts; `--no-service` preserves the configured user of an existing unit.
+directories. Installed binaries and the main config must remain outside the
+FUSE workspace and Antares mount roots. Git author/email values may contain
+tabs, but other TOML control characters are rejected. Retained upgrades resolve
+relative runtime paths against the data root and migrate persistent
+store/overlay ownership after rejecting nested mounts; `--no-service` preserves
+the configured user of an existing unit.
 Service setup fails before installation when systemd is unavailable. Retained
 config validation ignores ambient `SCORPIO_*` overrides so it matches the unit's
 runtime environment; a retained-config `--dry-run` uses the installed binary to

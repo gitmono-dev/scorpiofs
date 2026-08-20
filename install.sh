@@ -358,12 +358,24 @@ paths_overlap() {
     return 1
 }
 
+path_is_at_or_below() {
+    local path="$1" parent="$2"
+    case "$path" in "$parent"|"$parent"/*) return 0 ;; esac
+    return 1
+}
+
 validate_runtime_path_separation() {
-    local mount_field mount_path persistent_field persistent_path i j
+    local mount_field mount_path persistent_field persistent_path installer_field installer_path i j
     local -a mount_fields=(workspace antares-mount-root)
     local -a mount_paths=("$WORKSPACE" "$ANTARES_MOUNT_ROOT")
     local -a persistent_fields=(store-path config-file antares-upper-root antares-cl-root antares-state-file)
     local -a persistent_paths=("$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_STATE_FILE")
+    local -a installer_fields=(scorpio-binary antares-binary main-config)
+    local -a installer_paths=(
+        "$(realpath -m -- "${PREFIX}/bin/scorpio")"
+        "$(realpath -m -- "${PREFIX}/bin/antares")"
+        "$(realpath -m -- "${CONFDIR}/scorpio.toml")"
+    )
     for ((i = 0; i < ${#mount_fields[@]}; i++)); do
         mount_field="${mount_fields[$i]}"
         mount_path="${mount_paths[$i]}"
@@ -372,6 +384,13 @@ validate_runtime_path_separation() {
             persistent_path="${persistent_paths[$j]}"
             if paths_overlap "$mount_path" "$persistent_path"; then
                 die "$mount_field must not overlap $persistent_field: $mount_path and $persistent_path"
+            fi
+        done
+        for ((j = 0; j < ${#installer_fields[@]}; j++)); do
+            installer_field="${installer_fields[$j]}"
+            installer_path="${installer_paths[$j]}"
+            if path_is_at_or_below "$installer_path" "$mount_path"; then
+                die "$mount_field must not contain $installer_field: $installer_path"
             fi
         done
     done
@@ -804,8 +823,8 @@ validate_inputs() {
     validate_bind "$HTTP_ADDR"
     is_loopback_host "$BIND_HOST" || [ "$ALLOW_PUBLIC_API" -eq 1 ] || \
         die "refusing non-loopback HTTP bind without --allow-public-api"
-    [[ "$GIT_AUTHOR" != *$'\n'* && "$GIT_AUTHOR" != *$'\r'* ]] || die "git author contains a newline"
-    [[ "$GIT_EMAIL" != *$'\n'* && "$GIT_EMAIL" != *$'\r'* ]] || die "git email contains a newline"
+    validate_toml_text "git author" "$GIT_AUTHOR"
+    validate_toml_text "git email" "$GIT_EMAIL"
     [ -n "$GIT_AUTHOR" ] || die "git author must not be empty"
     [ -n "$GIT_EMAIL" ] || die "git email must not be empty"
     [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid service user: $SERVICE_USER"
@@ -959,6 +978,14 @@ toml_escape() {
     value="${value//\"/\\\"}"
     value="${value//$'\t'/\\t}"
     printf '%s' "$value"
+}
+
+validate_toml_text() {
+    local field="$1" value_without_tabs="${2//$'\t'/}"
+    local LC_ALL=C
+    if [[ "$value_without_tabs" =~ [[:cntrl:]] ]]; then
+        die "$field must not contain control characters other than tab"
+    fi
 }
 
 write_config() {

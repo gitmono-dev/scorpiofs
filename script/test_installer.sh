@@ -56,12 +56,19 @@ expect_failure "workspace outside data root" "workspace must be inside data-root
     "${common[@]}" --workspace /home
 expect_failure "workspace overlaps store" "workspace must not overlap store-path" \
     "${common[@]}" --store-path "$test_root/data/mount"
+expect_failure "workspace contains installed binary" "workspace must not contain scorpio-binary" \
+    "${common[@]}" --prefix "$test_root/data/mount/tools"
+expect_failure "Antares mount root contains main config" "antares-mount-root must not contain main-config" \
+    "${common[@]}" --config-dir "$test_root/data/antares/mnt/config"
 expect_failure "systemd path specifier" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio%Q" \
     --workspace "$test_root/scorpio%Q/mount" --store-path "$test_root/scorpio%Q/store"
 expect_failure "cleanup shell metacharacter" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio;false" \
     --workspace "$test_root/scorpio;false/mount" --store-path "$test_root/scorpio;false/store"
+SCORPIO_GIT_AUTHOR=$'Bob\bBuilder' expect_failure \
+    "TOML author control character" "git author must not contain control characters" \
+    "${common[@]}"
 
 no_systemctl_bin="$test_root/no-systemctl-bin"
 mkdir -p "$no_systemctl_bin"
