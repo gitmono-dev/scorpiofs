@@ -54,6 +54,7 @@ STORE_PATH_SET=0
 EXISTING_CONFIG=0
 RETAIN_CONFIG=0
 EXISTING_SERVICE_USER=""
+SERVICE_STOPPED_FOR_MIGRATION=0
 REQUESTED_WORKSPACE=""
 REQUESTED_STORE_PATH=""
 WORKDIR=""
@@ -429,7 +430,11 @@ run_scorpio_config_without_overrides() {
             SCORPIO_*) command+=(-u "$variable") ;;
         esac
     done < <(compgen -e)
-    run_root "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
+    else
+        run_root "${command[@]}" "$binary" --config-path "${CONFDIR}/scorpio.toml" config "$@"
+    fi
 }
 
 load_configured_runtime_paths() {
@@ -483,7 +488,6 @@ prepare_effective_runtime_paths() {
 }
 
 detect_existing_service_user() {
-    [ "$SETUP_SERVICE" -eq 0 ] && [ "$EXISTING_CONFIG" -eq 1 ] || return 0
     local candidate=""
     if command -v systemctl >/dev/null 2>&1; then
         candidate="$(systemctl show --property=User --value scorpiofs.service 2>/dev/null || true)"
@@ -497,6 +501,19 @@ detect_existing_service_user() {
     getent passwd "$candidate" >/dev/null 2>&1 || \
         die "existing scorpiofs.service user does not exist: $candidate"
     EXISTING_SERVICE_USER="$candidate"
+}
+
+stop_active_service_for_user_migration() {
+    [ "$SETUP_SERVICE" -eq 1 ] || return 0
+    [ -n "$EXISTING_SERVICE_USER" ] || return 0
+    [ "$EXISTING_SERVICE_USER" != "$SERVICE_USER" ] || return 0
+    if run_root systemctl is-active --quiet scorpiofs.service; then
+        note "stopping the active service before migrating data from $EXISTING_SERVICE_USER to $SERVICE_USER"
+        if ! run_root systemctl stop scorpiofs.service; then
+            die "could not stop scorpiofs.service before changing its service user"
+        fi
+        SERVICE_STOPPED_FOR_MIGRATION=1
+    fi
 }
 
 validate_service_manager() {
@@ -751,7 +768,7 @@ validate_inputs() {
 }
 
 install_binaries() {
-    local target tarball base url sumurl extracted
+    local target tarball base url sumurl extracted installed_binary
     target="$(detect_target)"
     tarball="scorpiofs-${VERSION}-${target}.tar.gz"
     base="${RELEASE_BASE_URL%/}/${VERSION}"
@@ -759,6 +776,13 @@ install_binaries() {
     sumurl="${url}.sha256"
 
     if [ "$DRY_RUN" -eq 1 ]; then
+        if [ "$EXISTING_CONFIG" -eq 1 ]; then
+            installed_binary="${PREFIX}/bin/scorpio"
+            [ -x "$installed_binary" ] || \
+                die "dry-run cannot faithfully resolve retained config without $installed_binary"
+            WORKDIR="$(mktemp -d)"
+            prepare_effective_runtime_paths "$installed_binary"
+        fi
         note "would download ${url}"
         note "would verify ${sumurl} with SHA256"
         note "would install ${PREFIX}/bin/scorpio and ${PREFIX}/bin/antares"
@@ -847,14 +871,12 @@ prepare_directories() {
     run_root install -d "$CONFDIR"
 }
 
-reconcile_runtime_directories() {
+validate_runtime_migration_mounts() {
     local runtime_dir mount_target mount_targets
-    # These are persistent local data trees. Workspace and mount roots are
-    # intentionally excluded because they may currently be FUSE mountpoints.
+    mount_targets="$(findmnt --noheadings --raw --output TARGET)" || \
+        die "could not inspect mounts before migrating runtime ownership"
     for runtime_dir in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"; do
         if [ -d "$runtime_dir" ]; then
-            mount_targets="$(findmnt --noheadings --raw --output TARGET)" || \
-                die "could not inspect mounts before migrating ownership under $runtime_dir"
             while IFS= read -r mount_target; do
                 case "$mount_target" in
                     "$runtime_dir"/*)
@@ -862,6 +884,17 @@ reconcile_runtime_directories() {
                         ;;
                 esac
             done <<<"$mount_targets"
+        fi
+    done
+}
+
+reconcile_runtime_directories() {
+    local runtime_dir
+    # These are persistent local data trees. Workspace and mount roots are
+    # intentionally excluded because they may currently be FUSE mountpoints.
+    validate_runtime_migration_mounts
+    for runtime_dir in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"; do
+        if [ -d "$runtime_dir" ]; then
             run_root chown -R -h -P "$TARGET_USER:$TARGET_GROUP" -- "$runtime_dir"
         fi
     done
@@ -997,7 +1030,9 @@ EOF
         die "could not enable scorpiofs.service; inspect: systemctl status scorpiofs"
     fi
     local service_action="start"
-    if run_root systemctl is-active --quiet scorpiofs.service; then
+    if [ "$SERVICE_STOPPED_FOR_MIGRATION" -eq 1 ]; then
+        note "starting ScorpioFS with the new service user"
+    elif run_root systemctl is-active --quiet scorpiofs.service; then
         service_action="restart"
         note "restarting the active ScorpioFS service to load the new binary and config"
     fi
@@ -1042,7 +1077,9 @@ main() {
     check_runtime_tools
     check_fuse
     install_binaries
+    validate_runtime_migration_mounts
     ensure_service_account
+    stop_active_service_for_user_migration
     prepare_directories
     reconcile_runtime_directories
     reconcile_runtime_files

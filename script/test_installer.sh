@@ -88,6 +88,14 @@ if [[ "$output" != *"systemctl is required for service setup"* ]]; then
     exit 1
 fi
 
+mkdir -p "$test_root/missing-bin-etc"
+: >"$test_root/missing-bin-etc/scorpio.toml"
+expect_failure "retained dry-run without installed binary" \
+    "dry-run cannot faithfully resolve retained config" \
+    "${common[@]}" \
+    --prefix "$test_root/missing-bin-prefix" \
+    --config-dir "$test_root/missing-bin-etc"
+
 ln -s / "$test_root/root-link"
 expect_failure "symlinked ancestor to broad root" "data-root is too broad" \
     "${common[@]}" --data-root "$test_root/root-link/home" \

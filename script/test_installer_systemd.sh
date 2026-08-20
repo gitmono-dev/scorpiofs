@@ -14,6 +14,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 service_user="${SUDO_USER:-root}"
 unit_capture="${test_root}/scorpiofs.service"
 systemctl_log="${test_root}/systemctl.log"
+mock_service_active=1
 
 mkdir -p "$test_root"
 : >"$systemctl_log"
@@ -30,10 +31,17 @@ install() {
 
 systemctl() {
     printf '%s\n' "$*" >>"$systemctl_log"
-    if [ "${1:-}" = "show" ]; then
-        printf '%s\n' "$service_user"
-    fi
-    return 0
+    case "${1:-}" in
+        show)
+            if [ -r "$unit_capture" ]; then
+                awk -F= '$1 == "User" { print $2; exit }' "$unit_capture"
+            fi
+            ;;
+        is-active) [ "$mock_service_active" -eq 1 ] ;;
+        stop) mock_service_active=0 ;;
+        start|restart) mock_service_active=1 ;;
+        *) return 0 ;;
+    esac
 }
 
 findmnt() {
@@ -47,7 +55,7 @@ usermod() {
 }
 
 export -f install systemctl findmnt usermod
-export unit_capture systemctl_log service_user
+export unit_capture systemctl_log service_user mock_service_active
 
 SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --version "$version" \
@@ -72,7 +80,26 @@ grep -Fxq 'enable scorpiofs.service' "$systemctl_log"
 grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
 grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
 
-SUDO_USER=nobody bash "${repo_root}/install.sh" \
+SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "${test_root}/data" \
+    --workspace "${test_root}/data/mount" \
+    --store-path "${test_root}/data/store" \
+    --http-addr 127.0.0.1:2925
+grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
+grep -Fxq 'start scorpiofs.service' "$systemctl_log"
+grep -Fxq 'User=nobody' "$unit_capture"
+test "$(stat -c '%U' "${test_root}/etc/scorpio.toml")" = nobody
+
+SUDO_USER=daemon bash "${repo_root}/install.sh" \
     --version "$version" \
     --release-base-url "$release_base_url" \
     --non-interactive \
@@ -87,7 +114,7 @@ SUDO_USER=nobody bash "${repo_root}/install.sh" \
     --workspace "${test_root}/data/mount" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925
-test "$(stat -c '%U' "${test_root}/etc/scorpio.toml")" = "$service_user"
+test "$(stat -c '%U' "${test_root}/etc/scorpio.toml")" = nobody
 
 nested_mount="${test_root}/data/store/external-mount"
 if MOCK_NESTED_MOUNT="$nested_mount" bash "${repo_root}/install.sh" \

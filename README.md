@@ -303,7 +303,10 @@ root and migrate persistent store/overlay ownership after rejecting nested
 mounts; `--no-service` preserves the configured user of an existing unit.
 Service setup fails before installation when systemd is unavailable. Retained
 config validation ignores ambient `SCORPIO_*` overrides so it matches the unit's
-runtime environment. Mirrors and locally packaged builds can
+runtime environment; a retained-config `--dry-run` uses the installed binary to
+resolve the same paths as a real upgrade. Active services are stopped before a
+service-user ownership migration and started under the new account. Mirrors and
+locally packaged builds can
 be tested with `--release-base-url <url>` or `SCORPIO_RELEASE_BASE_URL`; the
 mirror layout is `<base>/<version>/scorpiofs-<version>-<target>.tar.gz` plus its
 `.sha256` file.

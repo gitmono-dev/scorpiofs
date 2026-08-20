@@ -151,7 +151,8 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 - Retained upgrades recursively reconcile ownership for the local store and
   Antares upper/CL data. FUSE workspace and mount roots are not traversed, and
   an upgrade is rejected until any nested mount below a migrated tree is
-  unmounted.
+  unmounted. When the service user changes, an active unit is stopped before
+  this migration and started under the new account afterward.
 - On an existing systemd installation, `--no-service` leaves the unit untouched
   and preserves ownership for its configured `User` rather than reassigning the
   config and data to the invoking sudo user.
@@ -159,6 +160,9 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
   account or changing ownership. Use `--no-service` on hosts without systemd.
 - Installer config checks clear ambient `SCORPIO_*` daemon overrides so a
   retained file is validated exactly as the generated systemd unit will load it.
+- A retained-config `--dry-run` resolves effective paths with the already
+  installed `scorpio` binary. It fails explicitly when that binary is missing,
+  because the preview could not otherwise validate the real upgrade paths.
 - `--workspace` and `--store-path` must be children of the dedicated
   `--data-root`; filesystem roots, symlink escapes, shell metacharacters, and
   nonempty directories without an existing ScorpioFS config are rejected.
