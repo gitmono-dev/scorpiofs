@@ -55,7 +55,10 @@ https://crates.io/crates/scorpiofs
 
 ### How to Use?
 
-**Prerequisites:** Linux with FUSE enabled, `libfuse-dev`, and a running Mega/monorepo server. See [docs/develop.md](docs/develop.md) for system setup (may require `sudo` for FUSE).
+**Prerequisites:** Linux with FUSE enabled, the FUSE 3 development library
+(`libfuse3-dev` on Ubuntu), and a running Mega/monorepo server. See
+[docs/develop.md](docs/develop.md) for system setup (may require `sudo` for
+FUSE).
 
 1. Start the mono server (e.g. `http://localhost:8000`).
 2. Edit **`scorpio.toml`** (not `config.toml`): set `base_url`, `workspace`, and `store_path`. The `config.toml` file is a **runtime state file** (tracks mounted workspaces), created automatically on first run.
@@ -261,15 +264,69 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
 (`Type=simple`, `AmbientCapabilities=CAP_SYS_ADMIN`, `TimeoutStopSec=45`,
 loopback bind by default, journald logging).
 
-**install.sh** — [`install.sh`](install.sh) downloads a release tarball,
-**verifies its SHA256 checksum**, and installs the binaries + a generated config.
-It supports `--dry-run`, `--uninstall`, and never edits `/etc/fuse.conf` unless
-you pass `--enable-user-allow-other`:
+**install.sh** — [`install.sh`](install.sh) is an interactive installer. It
+asks for `base_url`, `lfs_url`, local paths, the HTTP bind address, FUSE
+permissions, and whether to create a systemd service. It downloads a release
+tarball, **verifies its SHA256 checksum**, creates the dedicated `scorpiofs`
+service user, and generates a config with absolute runtime paths. The HTTP API
+defaults to loopback because it has no authentication:
 
 ```bash
-bash install.sh --version v0.3.0 --dry-run   # preview
-sudo bash install.sh --version v0.3.0        # install
+# Recommended: download, inspect, then run interactively.
+curl -fsSLO https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh
+less install.sh
+sudo bash install.sh
+
+# One-line interactive install.
+curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh | sudo bash
 ```
+
+The installer resolves the latest release by default. For automation, pass
+arguments after `bash -s --`; use `--overwrite-config` only when the supplied
+values should replace an existing installation:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh | \
+  sudo bash -s -- --non-interactive --overwrite-config \
+    --base-url https://mega.example.com \
+    --lfs-url https://mega.example.com/lfs
+```
+
+Non-loopback HTTP binds require the explicit `--allow-public-api` flag and
+must be protected by a firewall or an authenticating reverse proxy. The script
+never edits `/etc/fuse.conf` unless the interactive prompt is accepted or
+`--enable-user-allow-other` is passed. Because ScorpioFS uses `allow_other`
+FUSE mounts, an installation that declines the change is accepted only when
+`/etc/fuse.conf` already contains `user_allow_other`; otherwise the installer
+stops with an actionable error. `--uninstall` removes binaries and the
+unit but keeps configuration and data. `--workspace` and `--store-path` must be
+inside the dedicated `--data-root`, preventing ownership changes to broad host
+directories. Installed binaries and the main config must remain outside the
+FUSE workspace and Antares mount roots. Git author/email values may contain
+tabs, but other TOML control characters are rejected in every generated string.
+Inaccessible stale FUSE mounts are lazily detached before directory preparation;
+non-FUSE mounts at configured mount roots are rejected and never detached.
+Service setup also rejects an accessible mount when no managed unit owns it:
+stop the user-run daemon and unmount it before retrying. Retained upgrades resolve
+relative runtime paths against the data root and migrate persistent store/overlay
+ownership after rejecting nested mounts; `--no-service` preserves the configured
+user of an existing unit. Non-root installs use elevated lookup when the config
+directory is not searchable, so a protected existing config is still retained
+unless `--overwrite-config` is explicit.
+Service setup fails before installation when systemd is unavailable. Retained
+config validation ignores ambient `SCORPIO_*` overrides so it matches the unit's
+runtime environment; a retained-config `--dry-run` uses the installed binary to
+resolve the same paths as a real upgrade, requesting sudo only when its protected
+config needs read access. Mount roots may not overlap persistent runtime paths.
+Managed active services are stopped before the binary, config, or unit is
+replaced. Any old configured FUSE roots left mounted after that stop are cleaned
+before the upgraded service starts, including when `--overwrite-config` changes
+a mount path or migrates to a new data root. An all-relative old config cannot
+be migrated to an empty new root until its old mounts are manually unmounted.
+Mirrors and locally packaged builds can
+be tested with `--release-base-url <url>` or `SCORPIO_RELEASE_BASE_URL`; the
+mirror layout is `<base>/<version>/scorpiofs-<version>-<target>.tar.gz` plus its
+`.sha256` file.
 
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which builds the binaries, produces `scorpiofs-<version>-<target>.tar.gz` +

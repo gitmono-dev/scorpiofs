@@ -12,7 +12,9 @@ env:
 jobs:
   build:
     name: Build
-    runs-on: ubuntu-latest
+    # Match the oldest supported GNU release baseline so PR builds catch
+    # accidental dependencies on newer glibc versions before a tag is cut.
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         rust: [stable, beta]
@@ -41,10 +43,212 @@ jobs:
         uses: actions/cache@v6
         with:
           path: target
-          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-ubuntu-22.04-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Build debug
         run: cargo build --verbose
       
       - name: Build release
         run: cargo build --release --verbose
+
+      - name: Test installer validation
+        if: matrix.rust == 'stable'
+        run: bash script/test_installer.sh
+
+      - name: Exercise installer with local release
+        if: matrix.rust == 'stable'
+        run: |
+          set -euo pipefail
+          version="v0.0.0-local"
+          target="x86_64-unknown-linux-gnu"
+          asset_root="${RUNNER_TEMP}/scorpiofs-installer-assets"
+          dist="scorpiofs-${version}-${target}"
+          install_root="${RUNNER_TEMP}/scorpiofs-installed"
+
+          mkdir -p "${asset_root}/${version}/${dist}"
+          cp target/release/scorpio target/release/antares "${asset_root}/${version}/${dist}/"
+          tar -C "${asset_root}/${version}" -czf "${asset_root}/${version}/${dist}.tar.gz" "${dist}"
+          (
+            cd "${asset_root}/${version}"
+            sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256"
+          )
+
+          python3 -m http.server 18080 --bind 127.0.0.1 --directory "${asset_root}" \
+            >"${RUNNER_TEMP}/scorpiofs-installer-http.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "${server_pid}" 2>/dev/null || true' EXIT
+          for _ in {1..20}; do
+            if curl -fsS "http://127.0.0.1:18080/${version}/${dist}.tar.gz.sha256" >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+
+          sudo env 'SCORPIO_GIT_AUTHOR=DOMAIN\Bob "Builder"' bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --no-deps \
+            --no-service \
+            --enable-user-allow-other \
+            --base-url https://mega.example.com \
+            --lfs-url https://mega.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --data-root "${install_root}/data" \
+            --workspace "${install_root}/data/mount" \
+            --store-path "${install_root}/data/store" \
+            --http-addr 127.0.0.1:2825
+
+          "${install_root}/prefix/bin/scorpio" --version
+          "${install_root}/prefix/bin/antares" --version
+          "${install_root}/prefix/bin/scorpio" \
+            --config-path "${install_root}/etc/scorpio.toml" config validate
+          grep -F 'git_author = "DOMAIN\\Bob \"Builder\""' "${install_root}/etc/scorpio.toml"
+
+          custom_config="${install_root}/data/custom-state/scorpio.toml"
+          custom_antares_state="${install_root}/data/custom-state/antares.toml"
+          sudo install -d "${install_root}/data/custom-state"
+          sudo sed -i \
+            -e 's|^config_file = .*|config_file = "custom-state/scorpio.toml"|' \
+            -e 's|^antares_state_file = .*|antares_state_file = "custom-state/antares.toml"|' \
+            "${install_root}/etc/scorpio.toml"
+          sudo chown nobody:nogroup "${install_root}/etc/scorpio.toml"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/config.toml"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/antares/state.toml"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${custom_config}"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${custom_antares_state}"
+          sudo install -d -o nobody -g nogroup "${install_root}/data/store/content.db"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/store/content.db/LOCK"
+
+          bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --dry-run \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --http-addr 127.0.0.1:2825 >"${RUNNER_TEMP}/retained-dry-run.log"
+          grep -F "using data-root inferred from retained config: ${install_root}/data" \
+            "${RUNNER_TEMP}/retained-dry-run.log"
+          grep -F "using runtime paths from retained ${install_root}/etc/scorpio.toml" \
+            "${RUNNER_TEMP}/retained-dry-run.log"
+          grep -F "[dry-run] chown -R -h -P ${USER}:${USER}" \
+            "${RUNNER_TEMP}/retained-dry-run.log"
+
+          sudo sed -i \
+            "s|^workspace = .*|workspace = \"${install_root}/data/store\"|" \
+            "${install_root}/etc/scorpio.toml"
+          if bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --dry-run \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --http-addr 127.0.0.1:2825 >"${RUNNER_TEMP}/overlap-path.log" 2>&1; then
+            echo "installer accepted overlapping retained workspace/store paths" >&2
+            exit 1
+          fi
+          grep -F 'workspace must not overlap store-path' "${RUNNER_TEMP}/overlap-path.log"
+          sudo sed -i \
+            "s|^workspace = .*|workspace = \"${install_root}/data/mount\"|" \
+            "${install_root}/etc/scorpio.toml"
+
+          unrelated_root="${install_root}/unrelated-data"
+          sudo install -d -o root -g root "${unrelated_root}"
+          sudo touch "${unrelated_root}/unrelated-file"
+          if sudo bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --data-root "${unrelated_root}" \
+            --workspace "${unrelated_root}/mount" \
+            --store-path "${unrelated_root}/store" \
+            --http-addr 127.0.0.1:2825 >"${RUNNER_TEMP}/unrelated-root.log" 2>&1; then
+            echo "installer accepted an unrelated nonempty data root" >&2
+            exit 1
+          fi
+          grep -F 'must be inside data-root' "${RUNNER_TEMP}/unrelated-root.log"
+          test "$(stat -c '%U' "${unrelated_root}")" = root
+
+          sudo bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --http-addr 127.0.0.1:2825
+          test "$(stat -c '%U' "${install_root}/etc/scorpio.toml")" = "${USER}"
+          test "$(stat -c '%U' "${custom_config}")" = "${USER}"
+          test "$(stat -c '%U' "${custom_antares_state}")" = "${USER}"
+          test "$(stat -c '%U' "${install_root}/data/store/content.db/LOCK")" = "${USER}"
+          test "$(stat -c '%U' "${install_root}/data/config.toml")" = nobody
+          test "$(stat -c '%U' "${install_root}/data/antares/state.toml")" = nobody
+          grep -F 'base_url = "https://mega.example.com"' "${install_root}/etc/scorpio.toml"
+
+          printf '%s\n' 'load_dir_depth = "invalid"' | \
+            sudo tee -a "${install_root}/etc/scorpio.toml" >/dev/null
+          if sudo env SCORPIO_LOAD_DIR_DEPTH=3 bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --http-addr 127.0.0.1:2825 >"${RUNNER_TEMP}/config-env-override.log" 2>&1; then
+            echo "installer accepted an invalid retained config through an environment override" >&2
+            exit 1
+          fi
+          grep -F 'could not safely resolve runtime paths from retained config' \
+            "${RUNNER_TEMP}/config-env-override.log"
+          sudo sed -i '/^load_dir_depth = "invalid"$/d' "${install_root}/etc/scorpio.toml"
+
+          sudo bash install.sh \
+            --version "${version}" \
+            --release-base-url http://127.0.0.1:18080 \
+            --non-interactive \
+            --overwrite-config \
+            --no-deps \
+            --no-service \
+            --no-user-allow-other \
+            --base-url https://new-mega.example.com \
+            --lfs-url https://new-mega.example.com/lfs \
+            --prefix "${install_root}/prefix" \
+            --config-dir "${install_root}/etc" \
+            --data-root "${install_root}/data" \
+            --workspace "${install_root}/data/mount" \
+            --store-path "${install_root}/data/store" \
+            --http-addr 127.0.0.1:2825
+          grep -F 'base_url = "https://new-mega.example.com"' "${install_root}/etc/scorpio.toml"
+
+          sudo bash script/test_installer_systemd.sh \
+            "${version}" \
+            http://127.0.0.1:18080 \
+            "/tmp/scorpiofs-systemd-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"

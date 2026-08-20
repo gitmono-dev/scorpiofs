@@ -49,6 +49,21 @@ pub struct ScorpioConfig {
     pub antares_state_file: String,
 }
 
+/// Filesystem paths the installer must prepare for the effective config.
+///
+/// Resolving this separately from [`init_config_with`] lets the installer
+/// validate retained configuration before making any ownership changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePaths {
+    pub workspace: String,
+    pub store_path: String,
+    pub config_file: String,
+    pub antares_upper_root: String,
+    pub antares_cl_root: String,
+    pub antares_mount_root: String,
+    pub antares_state_file: String,
+}
+
 const DEFAULT_LOAD_DIR_DEPTH: usize = 3;
 const DEFAULT_FETCH_FILE_THREAD: usize = 10;
 const DEFAULT_ANTARES_SUBDIR: &str = "antares";
@@ -1030,6 +1045,23 @@ pub fn effective_config_dump() -> String {
     format!("{:#?}", get_config())
 }
 
+/// Resolve runtime paths without creating directories or state files.
+pub fn resolve_runtime_paths(
+    path: &str,
+    cli_overrides: HashMap<String, String>,
+) -> ConfigResult<RuntimePaths> {
+    let cfg = parse_config(path, cli_overrides)?;
+    Ok(RuntimePaths {
+        workspace: cfg.workspace,
+        store_path: cfg.store_path,
+        config_file: cfg.config_file,
+        antares_upper_root: cfg.antares_upper_root,
+        antares_cl_root: cfg.antares_cl_root,
+        antares_mount_root: cfg.antares_mount_root,
+        antares_state_file: cfg.antares_state_file,
+    })
+}
+
 /// Create the runtime directories and ensure the state file exists.
 ///
 /// Unlike the previous implementation, this never rewrites the user's main
@@ -1100,19 +1132,20 @@ pub fn init_config_with(path: &str, cli_overrides: HashMap<String, String>) -> C
         return Err("Configuration already initialized".to_string());
     }
 
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("Config file not found at '{path}': {e}"))?;
-
-    let file: toml::Table =
-        toml::from_str(&content).map_err(|e| format!("Invalid config format in '{path}': {e}"))?;
-
-    let resolver = RawResolver::new(file, cli_overrides);
-    let cfg = build_config(&resolver)?;
+    let cfg = parse_config(path, cli_overrides)?;
     ensure_runtime_paths(&cfg)?;
 
     SCORPIO_CONFIG
         .set(cfg)
         .map_err(|_| "Configuration already initialized".to_string())
+}
+
+fn parse_config(path: &str, cli_overrides: HashMap<String, String>) -> ConfigResult<ScorpioConfig> {
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Config file not found at '{path}': {e}"))?;
+    let file: toml::Table =
+        toml::from_str(&content).map_err(|e| format!("Invalid config format in '{path}': {e}"))?;
+    build_config(&RawResolver::new(file, cli_overrides))
 }
 
 /// Get reference to global configuration.
@@ -1544,5 +1577,40 @@ mod tests {
         std::fs::write(&path, ok).unwrap();
         assert!(validate_file(&path, HashMap::new()).is_ok());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_runtime_paths_has_no_filesystem_side_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = temp.path().join("runtime");
+        let runtime_config_value = runtime.to_string_lossy().replace('\\', "/");
+        let config_path = temp.path().join("scorpio.toml");
+        let config = format!(
+            r#"
+            base_url = "http://example.com"
+            lfs_url = "http://example.com/lfs"
+            workspace = "{0}/mount"
+            store_path = "{0}/store"
+            config_file = "{0}/state/config.toml"
+            antares_upper_root = "{0}/antares/upper"
+            antares_cl_root = "{0}/antares/cl"
+            antares_mount_root = "{0}/antares/mnt"
+            antares_state_file = "{0}/antares/state.toml"
+            "#,
+            runtime_config_value
+        );
+        std::fs::write(&config_path, config).expect("write config");
+
+        let paths = resolve_runtime_paths(
+            config_path.to_str().expect("UTF-8 config path"),
+            HashMap::new(),
+        )
+        .expect("resolve runtime paths");
+
+        assert_eq!(paths.workspace, format!("{runtime_config_value}/mount"));
+        assert!(
+            !runtime.exists(),
+            "path resolution must not create runtime data"
+        );
     }
 }

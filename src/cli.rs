@@ -6,7 +6,13 @@
 //! HTTP.
 
 use std::{
-    collections::HashMap, ffi::OsStr, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+    collections::HashMap,
+    ffi::OsStr,
+    io::{self, Write},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 
 use asyncfuse::raw::logfs::LoggingFileSystem;
@@ -351,6 +357,44 @@ pub fn config_validate(config_path: &str, overrides: HashMap<String, String>) ->
 /// [`init`] has already loaded configuration.
 pub fn config_show() -> i32 {
     println!("{}", config::effective_config_dump());
+    exit::SUCCESS
+}
+
+/// Emit effective runtime paths as NUL-delimited records for `install.sh`.
+///
+/// This deliberately avoids global config initialization because initialization
+/// creates runtime directories, which would be unsafe during installer checks.
+pub fn config_installer_paths(config_path: &str, overrides: HashMap<String, String>) -> i32 {
+    let paths = match config::resolve_runtime_paths(config_path, overrides) {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("failed to resolve runtime paths from '{config_path}': {e}");
+            return exit::CONFIG;
+        }
+    };
+    let values = [
+        paths.workspace,
+        paths.store_path,
+        paths.config_file,
+        paths.antares_upper_root,
+        paths.antares_cl_root,
+        paths.antares_mount_root,
+        paths.antares_state_file,
+    ];
+    let mut stdout = io::stdout().lock();
+    for value in values {
+        if value.as_bytes().contains(&0) {
+            eprintln!("runtime path contains a NUL byte and cannot be installed");
+            return exit::CONFIG;
+        }
+        if let Err(e) = stdout
+            .write_all(value.as_bytes())
+            .and_then(|_| stdout.write_all(&[0]))
+        {
+            eprintln!("failed to write installer runtime paths: {e}");
+            return exit::INTERNAL;
+        }
+    }
     exit::SUCCESS
 }
 

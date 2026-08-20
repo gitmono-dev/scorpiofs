@@ -15,7 +15,9 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    # Keep GNU release binaries compatible with Ubuntu 22.04 (glibc 2.35).
+    # Building on ubuntu-latest can silently raise the minimum glibc version.
+    runs-on: ubuntu-22.04
     # aarch64 (musl) is best-effort; a failure there must not block the x86_64 release.
     continue-on-error: ${{ matrix.best_effort }}
     strategy:
