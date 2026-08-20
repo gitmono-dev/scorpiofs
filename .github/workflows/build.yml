@@ -110,14 +110,16 @@ jobs:
           custom_antares_state="${install_root}/data/custom-state/antares.toml"
           sudo install -d "${install_root}/data/custom-state"
           sudo sed -i \
-            -e "s|^config_file = .*|config_file = \"${custom_config}\"|" \
-            -e "s|^antares_state_file = .*|antares_state_file = \"${custom_antares_state}\"|" \
+            -e 's|^config_file = .*|config_file = "custom-state/scorpio.toml"|' \
+            -e 's|^antares_state_file = .*|antares_state_file = "custom-state/antares.toml"|' \
             "${install_root}/etc/scorpio.toml"
           sudo chown nobody:nogroup "${install_root}/etc/scorpio.toml"
           sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/config.toml"
           sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/antares/state.toml"
           sudo install -m 0644 -o nobody -g nogroup /dev/null "${custom_config}"
           sudo install -m 0644 -o nobody -g nogroup /dev/null "${custom_antares_state}"
+          sudo install -d -o nobody -g nogroup "${install_root}/data/store/content.db"
+          sudo install -m 0644 -o nobody -g nogroup /dev/null "${install_root}/data/store/content.db/LOCK"
 
           unrelated_root="${install_root}/unrelated-data"
           sudo install -d -o root -g root "${unrelated_root}"
@@ -158,6 +160,7 @@ jobs:
           test "$(stat -c '%U' "${install_root}/etc/scorpio.toml")" = "${USER}"
           test "$(stat -c '%U' "${custom_config}")" = "${USER}"
           test "$(stat -c '%U' "${custom_antares_state}")" = "${USER}"
+          test "$(stat -c '%U' "${install_root}/data/store/content.db/LOCK")" = "${USER}"
           test "$(stat -c '%U' "${install_root}/data/config.toml")" = nobody
           test "$(stat -c '%U' "${install_root}/data/antares/state.toml")" = nobody
           grep -F 'base_url = "https://mega.example.com"' "${install_root}/etc/scorpio.toml"

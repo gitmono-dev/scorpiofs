@@ -30,6 +30,9 @@ install() {
 
 systemctl() {
     printf '%s\n' "$*" >>"$systemctl_log"
+    if [ "${1:-}" = "show" ]; then
+        printf '%s\n' "$service_user"
+    fi
     return 0
 }
 
@@ -38,7 +41,7 @@ usermod() {
 }
 
 export -f install systemctl usermod
-export unit_capture systemctl_log
+export unit_capture systemctl_log service_user
 
 SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --version "$version" \
@@ -62,5 +65,22 @@ grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${test_root}/data/mount" "$un
 grep -Fxq 'enable scorpiofs.service' "$systemctl_log"
 grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
 grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
+
+SUDO_USER=nobody bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --no-service \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "${test_root}/data" \
+    --workspace "${test_root}/data/mount" \
+    --store-path "${test_root}/data/store" \
+    --http-addr 127.0.0.1:2925
+test "$(stat -c '%U' "${test_root}/etc/scorpio.toml")" = "$service_user"
 
 printf 'installer systemd generation and restart test passed\n'

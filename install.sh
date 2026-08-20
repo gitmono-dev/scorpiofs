@@ -53,6 +53,7 @@ WORKSPACE_SET=0
 STORE_PATH_SET=0
 EXISTING_CONFIG=0
 RETAIN_CONFIG=0
+EXISTING_SERVICE_USER=""
 REQUESTED_WORKSPACE=""
 REQUESTED_STORE_PATH=""
 WORKDIR=""
@@ -353,9 +354,20 @@ normalize_runtime_paths() {
     local -a fields=(workspace store-path config-file antares-upper-root antares-cl-root antares-mount-root antares-state-file)
     local -a values=("$WORKSPACE" "$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" "$ANTARES_STATE_FILE")
     for ((i = 0; i < ${#fields[@]}; i++)); do
-        validate_path "${fields[$i]}" "${values[$i]}"
+        validate_runtime_path_value "${fields[$i]}" "${values[$i]}"
     done
-    canonicalize_runtime_paths
+}
+
+validate_runtime_path_value() {
+    local field="$1" value="$2"
+    [ -n "$value" ] || die "$field must not be empty"
+    [[ "$value" != *[[:space:]]* ]] || die "$field must not contain whitespace"
+    [[ "$value" =~ ^/?[A-Za-z0-9._+:/-]+$ ]] || \
+        die "$field contains a character unsafe for shell or systemd use"
+    [[ "$value" != *'//'* ]] || die "$field must not contain repeated slashes"
+    case "/${value#/}/" in
+        *'/../'*|*'/./'*) die "$field must not contain . or .. path components" ;;
+    esac
 }
 
 common_path_ancestor() {
@@ -373,12 +385,29 @@ common_path_ancestor() {
 }
 
 infer_data_root() {
-    DATA_ROOT="$(common_path_ancestor \
-        "$WORKSPACE" "$STORE_PATH" \
-        "$(dirname -- "$CONFIG_FILE")" \
-        "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" \
-        "$(dirname -- "$ANTARES_STATE_FILE")")"
+    local value
+    local -a anchors=()
+    for value in "$WORKSPACE" "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT"; do
+        if [[ "$value" == /* ]]; then anchors+=("$(dirname -- "$value")"); fi
+    done
+    for value in "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
+        if [[ "$value" == /* ]]; then anchors+=("$(dirname -- "$value")"); fi
+    done
+    [ "${#anchors[@]}" -gt 0 ] || \
+        die "cannot infer data-root from an all-relative retained config; pass --data-root"
+    DATA_ROOT="$(common_path_ancestor "${anchors[@]}")"
     note "using data-root inferred from retained config: $DATA_ROOT"
+}
+
+resolve_relative_runtime_paths() {
+    if [[ "$WORKSPACE" != /* ]]; then WORKSPACE="$DATA_ROOT/$WORKSPACE"; fi
+    if [[ "$STORE_PATH" != /* ]]; then STORE_PATH="$DATA_ROOT/$STORE_PATH"; fi
+    if [[ "$CONFIG_FILE" != /* ]]; then CONFIG_FILE="$DATA_ROOT/$CONFIG_FILE"; fi
+    if [[ "$ANTARES_UPPER_ROOT" != /* ]]; then ANTARES_UPPER_ROOT="$DATA_ROOT/$ANTARES_UPPER_ROOT"; fi
+    if [[ "$ANTARES_CL_ROOT" != /* ]]; then ANTARES_CL_ROOT="$DATA_ROOT/$ANTARES_CL_ROOT"; fi
+    if [[ "$ANTARES_MOUNT_ROOT" != /* ]]; then ANTARES_MOUNT_ROOT="$DATA_ROOT/$ANTARES_MOUNT_ROOT"; fi
+    if [[ "$ANTARES_STATE_FILE" != /* ]]; then ANTARES_STATE_FILE="$DATA_ROOT/$ANTARES_STATE_FILE"; fi
+    canonicalize_runtime_paths
 }
 
 set_generated_runtime_paths() {
@@ -435,6 +464,7 @@ prepare_effective_runtime_paths() {
         load_configured_runtime_paths "$binary"
         normalize_runtime_paths
         if [ "$DATA_ROOT_SET" -eq 0 ]; then infer_data_root; fi
+        resolve_relative_runtime_paths
         validate_runtime_paths
     fi
 
@@ -446,6 +476,23 @@ prepare_effective_runtime_paths() {
     set_generated_runtime_paths
     canonicalize_runtime_paths
     validate_runtime_paths
+}
+
+detect_existing_service_user() {
+    [ "$SETUP_SERVICE" -eq 0 ] && [ "$EXISTING_CONFIG" -eq 1 ] || return 0
+    local candidate=""
+    if command -v systemctl >/dev/null 2>&1; then
+        candidate="$(systemctl show --property=User --value scorpiofs.service 2>/dev/null || true)"
+    fi
+    if [ -z "$candidate" ] && [ -r /etc/systemd/system/scorpiofs.service ]; then
+        candidate="$(awk -F= '$1 == "User" { print $2; exit }' /etc/systemd/system/scorpiofs.service)"
+    fi
+    [ -n "$candidate" ] || return 0
+    [[ "$candidate" =~ ^([a-z_][a-z0-9_-]{0,31}|[0-9]+)$ ]] || \
+        die "existing scorpiofs.service has an unsupported User value: $candidate"
+    getent passwd "$candidate" >/dev/null 2>&1 || \
+        die "existing scorpiofs.service user does not exist: $candidate"
+    EXISTING_SERVICE_USER="$candidate"
 }
 
 validate_bind() {
@@ -673,6 +720,7 @@ validate_inputs() {
         EXISTING_CONFIG=1
         if [ "$OVERWRITE_CONFIG" -ne 1 ]; then RETAIN_CONFIG=1; fi
     fi
+    detect_existing_service_user
     validate_data_paths
     validate_bind "$HTTP_ADDR"
     is_loopback_host "$BIND_HOST" || [ "$ALLOW_PUBLIC_API" -eq 1 ] || \
@@ -764,14 +812,32 @@ prepare_directories() {
             TARGET_GROUP="$SERVICE_USER"
         fi
     else
-        TARGET_USER="${SUDO_USER:-$(id -un)}"
-        TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || id -gn)"
+        if [ -n "$EXISTING_SERVICE_USER" ]; then
+            TARGET_USER="$EXISTING_SERVICE_USER"
+            TARGET_GROUP="$(id -gn "$TARGET_USER")" || \
+                die "could not determine the primary group for existing service user $TARGET_USER"
+            note "preserving ownership for existing scorpiofs.service user: $TARGET_USER"
+        else
+            TARGET_USER="${SUDO_USER:-$(id -un)}"
+            TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || id -gn)"
+        fi
     fi
     run_root install -d -o "$TARGET_USER" -g "$TARGET_GROUP" \
         "$DATA_ROOT" "$WORKSPACE" "$STORE_PATH" \
         "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" \
         "$(dirname -- "$CONFIG_FILE")" "$(dirname -- "$ANTARES_STATE_FILE")"
     run_root install -d "$CONFDIR"
+}
+
+reconcile_runtime_directories() {
+    local runtime_dir
+    # These are persistent local data trees. Workspace and mount roots are
+    # intentionally excluded because they may currently be FUSE mountpoints.
+    for runtime_dir in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"; do
+        if [ -d "$runtime_dir" ]; then
+            run_root chown -R -h -P "$TARGET_USER:$TARGET_GROUP" -- "$runtime_dir"
+        fi
+    done
 }
 
 reconcile_runtime_files() {
@@ -954,6 +1020,7 @@ main() {
     install_binaries
     ensure_service_account
     prepare_directories
+    reconcile_runtime_directories
     reconcile_runtime_files
     write_config
     validate_installed_config
@@ -967,7 +1034,7 @@ main() {
     if [ "$SETUP_SERVICE" -eq 1 ]; then
         note "logs:   journalctl -u scorpiofs -f"
     else
-        note "run:    ${PREFIX}/bin/scorpio --config-path ${CONFDIR}/scorpio.toml serve --http-addr ${HTTP_ADDR}"
+        note "run:    cd ${DATA_ROOT} && ${PREFIX}/bin/scorpio --config-path ${CONFDIR}/scorpio.toml serve --http-addr ${HTTP_ADDR}"
     fi
 }
 

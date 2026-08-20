@@ -298,7 +298,9 @@ never edits `/etc/fuse.conf` unless the interactive prompt is accepted or
 `--enable-user-allow-other` is passed. `--uninstall` removes binaries and the
 unit but keeps configuration and data. `--workspace` and `--store-path` must be
 inside the dedicated `--data-root`, preventing ownership changes to broad host
-directories. Mirrors and locally packaged builds can
+directories. Retained upgrades resolve relative runtime paths against the data
+root and migrate persistent store/overlay ownership; `--no-service` preserves
+the configured user of an existing unit. Mirrors and locally packaged builds can
 be tested with `--release-base-url <url>` or `SCORPIO_RELEASE_BASE_URL`; the
 mirror layout is `<base>/<version>/scorpiofs-<version>-<target>.tar.gz` plus its
 `.sha256` file.

@@ -144,7 +144,13 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
   place.
 - `--overwrite-config` (or `SCORPIO_OVERWRITE_CONFIG=1`) is required when an
   automated upgrade should replace an existing `scorpio.toml`; otherwise its
-  contents are retained while ownership is reconciled with the service user.
+  contents are retained. Relative runtime paths in retained configs are resolved
+  against the explicit or inferred data root.
+- Retained upgrades recursively reconcile ownership for the local store and
+  Antares upper/CL data. FUSE workspace and mount roots are not traversed.
+- On an existing systemd installation, `--no-service` leaves the unit untouched
+  and preserves ownership for its configured `User` rather than reassigning the
+  config and data to the invoking sudo user.
 - `--workspace` and `--store-path` must be children of the dedicated
   `--data-root`; filesystem roots, symlink escapes, shell metacharacters, and
   nonempty directories without an existing ScorpioFS config are rejected.
