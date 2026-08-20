@@ -236,7 +236,11 @@ if [ "$service_user" != root ]; then
         printf 'installer accepted an inaccessible nonempty data-root\n' >&2
         exit 1
     fi
-    grep -Fq 'could not inspect data-root; refusing to change ownership' <<<"$inaccessible_output"
+    if ! grep -Eq 'could not inspect data-root; refusing to change ownership|could not obtain non-interactive sudo privileges' \
+        <<<"$inaccessible_output"; then
+        printf 'unexpected inaccessible data-root error:\n%s\n' "$inaccessible_output" >&2
+        exit 1
+    fi
 fi
 
 MOCK_STALE_MOUNT="${test_root}/data/mount" \
