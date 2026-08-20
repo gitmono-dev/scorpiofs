@@ -163,7 +163,9 @@ generates `/etc/scorpiofs/scorpio.toml` with absolute runtime paths.
 - A retained-config `--dry-run` resolves effective paths with the already
   installed `scorpio` binary. It fails explicitly when that binary is missing,
   because the preview could not otherwise validate the real upgrade paths. A
-  non-root preview may request sudo only to read a protected mode-0640 config.
+  non-root preview may request sudo to detect and read a protected config;
+  real non-root installs use the same elevated existence check rather than
+  treating an unsearchable config directory as an absent configuration.
 - `--workspace` and `--store-path` must be children of the dedicated
   `--data-root`; filesystem roots, symlink escapes, shell metacharacters, and
   nonempty directories without an existing ScorpioFS config are rejected.

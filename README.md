@@ -307,7 +307,9 @@ Service setup also rejects an accessible mount when no managed unit owns it:
 stop the user-run daemon and unmount it before retrying. Retained upgrades resolve
 relative runtime paths against the data root and migrate persistent store/overlay
 ownership after rejecting nested mounts; `--no-service` preserves the configured
-user of an existing unit.
+user of an existing unit. Non-root installs use elevated lookup when the config
+directory is not searchable, so a protected existing config is still retained
+unless `--overwrite-config` is explicit.
 Service setup fails before installation when systemd is unavailable. Retained
 config validation ignores ambient `SCORPIO_*` overrides so it matches the unit's
 runtime environment; a retained-config `--dry-run` uses the installed binary to

@@ -796,6 +796,50 @@ configure_interactively() {
     fi
 }
 
+current_user_can_search_config_dir() {
+    local directory="$CONFDIR" parent
+    while [ ! -e "$directory" ] && [ "$directory" != / ]; do
+        parent="${directory%/*}"
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$directory" ] || break
+        directory="$parent"
+    done
+    [ -d "$directory" ] && [ -x "$directory" ]
+}
+
+detect_existing_config() {
+    local config_path="${CONFDIR}/scorpio.toml"
+    local -a privileged_test
+    if [ -L "$config_path" ]; then
+        die "config file must not be a symbolic link: $config_path"
+    elif [ -f "$config_path" ]; then
+        EXISTING_CONFIG=1
+    elif [ -e "$config_path" ]; then
+        die "config path exists but is not a regular file: $config_path"
+    elif current_user_can_search_config_dir; then
+        return 0
+    else
+        if [ "$(id -u)" -eq 0 ]; then
+            return 0
+        fi
+        command -v sudo >/dev/null 2>&1 || \
+            die "cannot inspect protected config path without sudo: $config_path"
+        sudo -v || die "could not obtain permission to inspect protected config path: $config_path"
+        SUDO_BIN="sudo"
+        privileged_test=(sudo test)
+        if "${privileged_test[@]}" -L "$config_path"; then
+            die "config file must not be a symbolic link: $config_path"
+        elif "${privileged_test[@]}" -f "$config_path"; then
+            EXISTING_CONFIG=1
+        elif "${privileged_test[@]}" -e "$config_path"; then
+            die "config path exists but is not a regular file: $config_path"
+        else
+            return 0
+        fi
+    fi
+    if [ "$OVERWRITE_CONFIG" -ne 1 ]; then RETAIN_CONFIG=1; fi
+}
+
 validate_inputs() {
     BASE_URL="$(normalize_url "$BASE_URL")"
     LFS_URL="$(normalize_url "$LFS_URL")"
@@ -819,10 +863,7 @@ validate_inputs() {
     validate_path data-root "$DATA_ROOT"
     validate_path workspace "$WORKSPACE"
     validate_path store-path "$STORE_PATH"
-    if [ -f "${CONFDIR}/scorpio.toml" ]; then
-        EXISTING_CONFIG=1
-        if [ "$OVERWRITE_CONFIG" -ne 1 ]; then RETAIN_CONFIG=1; fi
-    fi
+    detect_existing_config
     validate_service_manager
     detect_existing_service_user
     validate_data_paths
@@ -1025,6 +1066,7 @@ recover_stale_runtime_mounts() {
             run_root umount -l "$mount_root" || \
                 die "could not detach stale $mount_field at $mount_root; install fuse3 or unmount it manually"
         fi
+        [ "$DRY_RUN" -eq 1 ] && continue
         path_is_mount_target "$mount_root" && \
             die "stale $mount_field is still mounted at $mount_root; unmount it and retry"
     done
@@ -1086,7 +1128,7 @@ validate_toml_text() {
 
 write_config() {
     local config_tmp="${WORKDIR:-${TMPDIR:-/tmp}}/scorpio.toml"
-    if [ -f "${CONFDIR}/scorpio.toml" ] && [ "$OVERWRITE_CONFIG" -ne 1 ]; then
+    if [ "$RETAIN_CONFIG" -eq 1 ]; then
         warn "${CONFDIR}/scorpio.toml already exists; leaving its contents unchanged"
         run_root chown "$TARGET_USER:$TARGET_GROUP" "${CONFDIR}/scorpio.toml"
         run_root chmod 0640 "${CONFDIR}/scorpio.toml"

@@ -187,6 +187,25 @@ grep -Fxq 'is-active --quiet scorpiofs.service' "$systemctl_log"
 grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
 grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
 
+MOCK_STALE_MOUNT="${test_root}/data/mount" \
+SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --dry-run \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "${test_root}/data" \
+    --workspace "${test_root}/data/mount" \
+    --store-path "${test_root}/data/store" \
+    --http-addr 127.0.0.1:2925 >"${test_root}/mounted-dry-run.log"
+grep -Fq "[dry-run] fusermount3 -u -z ${test_root}/data/mount" \
+    "${test_root}/mounted-dry-run.log"
+
 : >"$systemctl_log"
 new_workspace="${test_root}/data/mount-new"
 MOCK_ACTIVE_MOUNT="${test_root}/data/mount" \
@@ -210,6 +229,49 @@ grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
 grep -Fxq "fusermount3 -u -z ${test_root}/data/mount" "$systemctl_log"
 grep -Fxq 'start scorpiofs.service' "$systemctl_log"
 grep -Fq "ExecStopPost=-/usr/bin/fusermount3 -u -z ${new_workspace}" "$unit_capture"
+
+if [ "$service_user" != root ] && \
+    sudo -u "$service_user" -H env -u SUDO_USER sudo -n -v; then
+    protected_root="${test_root}/protected-config"
+    SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+        --version "$version" \
+        --release-base-url "$release_base_url" \
+        --non-interactive \
+        --overwrite-config \
+        --no-service \
+        --no-deps \
+        --no-user-allow-other \
+        --base-url https://protected.example.com \
+        --lfs-url https://protected.example.com/lfs \
+        --prefix "${protected_root}/prefix" \
+        --config-dir "${protected_root}/etc" \
+        --data-root "${protected_root}/data" \
+        --workspace "${protected_root}/data/mount" \
+        --store-path "${protected_root}/data/store" \
+        --http-addr 127.0.0.1:2925
+    chown root:root "${protected_root}/etc"
+    chmod 0750 "${protected_root}/etc"
+    protected_upgrade_output="$(sudo -u "$service_user" -H env -u SUDO_USER \
+        bash "${repo_root}/install.sh" \
+            --version "$version" \
+            --release-base-url "$release_base_url" \
+            --non-interactive \
+            --no-service \
+            --no-deps \
+            --no-user-allow-other \
+            --base-url https://ignored.example.com \
+            --lfs-url https://ignored.example.com/lfs \
+            --prefix "${protected_root}/prefix" \
+            --config-dir "${protected_root}/etc" \
+            --data-root "${protected_root}/data" \
+            --workspace "${protected_root}/data/mount" \
+            --store-path "${protected_root}/data/store" \
+            --http-addr 127.0.0.1:2925)"
+    grep -Fq "using runtime paths from retained ${protected_root}/etc/scorpio.toml" \
+        <<<"$protected_upgrade_output"
+    grep -Fq 'base_url = "https://protected.example.com"' \
+        "${protected_root}/etc/scorpio.toml"
+fi
 
 SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
     --version "$version" \
