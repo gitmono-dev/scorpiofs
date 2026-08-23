@@ -108,7 +108,7 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
             let root = remote_root.to_string_lossy();
             run_checked(
                 vm,
-                "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash coreutils curl findutils python3 sudo tar util-linux",
+                "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash coreutils curl findutils fuse3 python3 sudo tar util-linux && (grep -qxF user_allow_other /etc/fuse.conf || printf 'user_allow_other\\n' >>/etc/fuse.conf)",
             )
             .await?;
             run_checked(
@@ -135,7 +135,7 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
             run_checked(
                 vm,
                 &format!(
-                    "python3 -m http.server 18080 --bind 127.0.0.1 --directory {root}/release >/tmp/scorpiofs-qlean-http.log 2>&1 & server_pid=$!; trap 'kill $server_pid 2>/dev/null || true' EXIT; curl --fail --retry 20 --retry-delay 1 http://127.0.0.1:18080/{VERSION}/scorpiofs-{VERSION}-{TARGET}.tar.gz.sha256 >/dev/null; SUDO_USER=nobody bash {root}/script/test_installer_systemd.sh {VERSION} http://127.0.0.1:18080 /tmp/scorpiofs-qlean-systemd"
+                    "set -euo pipefail; nohup python3 -m http.server 18080 --bind 0.0.0.0 --directory {root}/release >/tmp/scorpiofs-qlean-http.log 2>&1 </dev/null & server_pid=$!; sleep 1; if ! kill -0 $server_pid 2>/dev/null; then cat /tmp/scorpiofs-qlean-http.log >&2; exit 1; fi; trap 'kill $server_pid 2>/dev/null || true' EXIT; curl --fail --retry 20 --retry-delay 1 http://127.0.0.1:18080/{VERSION}/scorpiofs-{VERSION}-{TARGET}.tar.gz.sha256 >/dev/null; SUDO_USER=nobody bash {root}/script/test_installer_systemd.sh {VERSION} http://127.0.0.1:18080 /tmp/scorpiofs-qlean-systemd"
                 ),
             )
             .await?;
