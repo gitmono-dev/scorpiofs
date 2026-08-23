@@ -1,19 +1,44 @@
-#![cfg(all(feature = "qlean-ci", target_os = "linux"))]
+#![cfg(all(feature = "qlean-ci", target_os = "linux", target_arch = "x86_64"))]
 
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{bail, Context, Result};
 use qlean::{with_machine, Image, ImageConfig, MachineConfig};
+use serde_json::Value;
 use tempfile::tempdir;
 
 const VERSION: &str = "v0.0.0-qlean";
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 
+fn cargo_target_dir(repo_root: &Path) -> Result<PathBuf> {
+    let output = Command::new("cargo")
+        .current_dir(repo_root)
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()
+        .context("could not query Cargo for its active target directory")?;
+    if !output.status.success() {
+        bail!(
+            "Cargo metadata failed while resolving the target directory:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let metadata: Value = serde_json::from_slice(&output.stdout)
+        .context("Cargo returned invalid metadata while resolving the target directory")?;
+    metadata
+        .get("target_directory")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("Cargo metadata did not include target_directory")
+}
+
 fn stage_fixture() -> Result<tempfile::TempDir> {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let target_dir = cargo_target_dir(repo_root)?;
     let staging = tempdir().context("could not create the Qlean fixture directory")?;
     fs::create_dir_all(staging.path().join("script"))?;
 
@@ -28,7 +53,7 @@ fn stage_fixture() -> Result<tempfile::TempDir> {
     }
 
     for binary in ["scorpio", "antares"] {
-        let source = repo_root.join("target/release").join(binary);
+        let source = target_dir.join("release").join(binary);
         let destination = staging.path().join(binary);
         if !source.is_file() {
             bail!("missing {source:?}; build the release binaries before running the Qlean test");
