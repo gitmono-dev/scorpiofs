@@ -348,7 +348,8 @@ the read benchmark `cargo run --release --example fs_read_perf -- <dir>`.
 The optional `qlean-ci` test runs the installer validation, systemd/permission
 checks, and a real ScorpioFS FUSE mount inside a disposable Debian VM. The
 guest loads its own `fuse` kernel module and the test verifies the
-FUSE mount with `findmnt`, `stat`, and `ls`. It requires a Linux host with QEMU,
+FUSE mount with `findmnt` and `stat`, then verifies that it is unmounted during
+cleanup. It requires a Linux host with QEMU,
 libvirt, `xorriso`, and `/dev/vhost-vsock`; see the [Qlean setup guide](https://github.com/buck2hub/qlean#host-setup)
 for host configuration. Build the release fixture first, then run:
 
