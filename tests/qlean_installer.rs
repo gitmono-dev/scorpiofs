@@ -135,25 +135,10 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
             run_checked(
                 vm,
                 &format!(
-                    "nohup python3 -m http.server 18080 --bind 127.0.0.1 --directory {root}/release >/tmp/scorpiofs-qlean-http.log 2>&1 </dev/null & echo $! >/tmp/scorpiofs-qlean-http.pid"
+                    "python3 -m http.server 18080 --bind 127.0.0.1 --directory {root}/release >/tmp/scorpiofs-qlean-http.log 2>&1 & server_pid=$!; trap 'kill $server_pid 2>/dev/null || true' EXIT; curl --fail --retry 20 --retry-delay 1 http://127.0.0.1:18080/{VERSION}/scorpiofs-{VERSION}-{TARGET}.tar.gz.sha256 >/dev/null; bash {root}/script/test_installer_systemd.sh {VERSION} http://127.0.0.1:18080 /tmp/scorpiofs-qlean-systemd"
                 ),
             )
             .await?;
-            run_checked(
-                vm,
-                &format!(
-                    "curl --fail --retry 20 --retry-delay 1 http://127.0.0.1:18080/{VERSION}/scorpiofs-{VERSION}-{TARGET}.tar.gz.sha256 >/dev/null"
-                ),
-            )
-            .await?;
-            run_checked(
-                vm,
-                &format!(
-                    "bash {root}/script/test_installer_systemd.sh {VERSION} http://127.0.0.1:18080 /tmp/scorpiofs-qlean-systemd"
-                ),
-            )
-            .await?;
-            run_checked(vm, "kill \"$(cat /tmp/scorpiofs-qlean-http.pid)\"").await?;
             Ok(())
         })
     })
