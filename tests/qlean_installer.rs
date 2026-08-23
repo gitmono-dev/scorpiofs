@@ -108,7 +108,7 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
             let root = remote_root.to_string_lossy();
             run_checked(
                 vm,
-                "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash coreutils curl findutils fuse3 python3 sudo tar util-linux && (grep -qxF user_allow_other /etc/fuse.conf || printf 'user_allow_other\\n' >>/etc/fuse.conf)",
+                "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash coreutils curl findutils fuse3 kmod python3 sudo tar util-linux && (grep -qxF user_allow_other /etc/fuse.conf || printf 'user_allow_other\\n' >>/etc/fuse.conf)",
             )
             .await?;
             run_checked(
@@ -136,6 +136,13 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
                 vm,
                 &format!(
                     "set -euo pipefail; nohup python3 -m http.server 18080 --bind 0.0.0.0 --directory {root}/release >/tmp/scorpiofs-qlean-http.log 2>&1 </dev/null & server_pid=$!; sleep 1; if ! kill -0 $server_pid 2>/dev/null; then cat /tmp/scorpiofs-qlean-http.log >&2; exit 1; fi; trap 'kill $server_pid 2>/dev/null || true' EXIT; curl --fail --retry 20 --retry-delay 1 --retry-connrefused http://127.0.0.1:18080/{VERSION}/scorpiofs-{VERSION}-{TARGET}.tar.gz.sha256 >/dev/null; SUDO_USER=nobody bash {root}/script/test_installer_systemd.sh {VERSION} http://127.0.0.1:18080 /tmp/scorpiofs-qlean-systemd"
+                ),
+            )
+            .await?;
+            run_checked(
+                vm,
+                &format!(
+                    "set -euo pipefail; runtime={root}/real-fuse-runtime; mountpoint=$runtime/mount; mkdir -p $runtime/store $mountpoint; test -c /dev/fuse || modprobe fuse; test -c /dev/fuse || {{ echo '/dev/fuse is unavailable after loading the guest fuse module' >&2; exit 1; }}; printf '%s\\n' 'base_url = \"http://127.0.0.1:9\"' 'lfs_url = \"http://127.0.0.1:9/lfs\"' \"workspace = \\\"$mountpoint\\\"\" \"store_path = \\\"$runtime/store\\\"\" \"config_file = \\\"$runtime/state.toml\\\"\" 'git_author = \"Qlean\"' 'git_email = \"qlean@example.invalid\"' >$runtime/scorpio.toml; printf '%s\\n' 'works = []' >$runtime/state.toml; server_log=$runtime/scorpio.log; $root/scorpio --config-path $runtime/scorpio.toml --http-addr 127.0.0.1:2726 serve >$server_log 2>&1 & server_pid=$!; cleanup() {{ if findmnt --mountpoint $mountpoint --noheadings >/dev/null 2>&1; then fusermount3 -u -z $mountpoint || true; fi; kill $server_pid 2>/dev/null || true; wait $server_pid 2>/dev/null || true; }}; trap cleanup EXIT; mounted=0; for attempt in $(seq 1 30); do if findmnt --mountpoint $mountpoint --noheadings >/dev/null 2>&1; then mounted=1; break; fi; if ! kill -0 $server_pid 2>/dev/null; then cat $server_log >&2; exit 1; fi; sleep 1; done; if [ $mounted -ne 1 ]; then cat $server_log >&2; echo 'ScorpioFS did not create a FUSE mount' >&2; exit 1; fi; findmnt --mountpoint $mountpoint --noheadings --output FSTYPE | grep -E '^fuse([.]|$)'; test -d $mountpoint; stat $mountpoint >/dev/null; ls -la $mountpoint >/dev/null; kill $server_pid; wait $server_pid || true; test -z \"$(findmnt --mountpoint $mountpoint --noheadings 2>/dev/null || true)\"; trap - EXIT"
                 ),
             )
             .await?;
