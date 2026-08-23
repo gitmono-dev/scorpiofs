@@ -67,8 +67,10 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [features]
 async-io = []
+qlean-ci = []
 
 [dev-dependencies]
+anyhow = "1.0.104"
 tempfile = "3.24.0"
 serial_test = "3.3.1"
 lazy_static = "1.5.0"
@@ -81,6 +83,14 @@ testcontainers = { version = "0.26.3", features = [
 reqwest = { version = "0.13.1", features = ["blocking"] }
 http = "1.4.0"
 tower = "0.5.3"
+
+[[test]]
+name = "qlean_installer"
+path = "tests/qlean_installer.rs"
+required-features = ["qlean-ci"]
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+qlean = "0.3.1"
 
 [package.metadata.docs.rs]
 all-features = true
