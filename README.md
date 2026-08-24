@@ -343,6 +343,26 @@ Contributions are welcome! Please follow these steps:
 For local load/performance testing, see [script/README.md](script/README.md) and
 the read benchmark `cargo run --release --example fs_read_perf -- <dir>`.
 
+### Isolated installer validation
+
+The optional `qlean-ci` test runs the installer validation, systemd/permission
+checks, and a real ScorpioFS FUSE mount inside a disposable Debian VM. The
+guest loads its own `fuse` kernel module and the test verifies the
+FUSE mount with `findmnt` and `stat`, then verifies that it is unmounted during
+cleanup. It requires a Linux host with QEMU,
+libvirt, `xorriso`, and `/dev/vhost-vsock`; see the [Qlean setup guide](https://github.com/buck2hub/qlean#host-setup)
+for host configuration. Build the release fixture first, then run:
+
+```bash
+cargo build --release --locked --bin scorpio --bin antares
+QLEAN_QEMU_TIMEOUT_SECS=1200 \
+  cargo test --locked --features qlean-ci --test qlean_installer \
+    -- --ignored --nocapture
+```
+
+GitHub Actions runs the same test in [`.github/workflows/qlean.yml`](.github/workflows/qlean.yml).
+The default test suite does not start a VM; this slower isolated test is opt-in.
+
 ### Reference
 [1] Rachel Potvin and Josh Levenberg. 2016. Why Google stores billions of lines of code in a single repository. Commun. ACM 59, 7 (July 2016), 78–87. https://doi.org/10.1145/2854146
 [2] Nicolas Brousse. 2019. The issue of monorepo and polyrepo in large enterprises. In Companion Proceedings of the 3rd International Conference on the Art, Science, and Engineering of Programming (Programming '19). Association for Computing Machinery, New York, NY, USA, Article 2, 1–4. https://doi.org/10.1145/3328433.3328435

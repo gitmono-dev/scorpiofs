@@ -1,0 +1,71 @@
+name: Qlean isolated CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  installer:
+    name: Isolated installer validation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Qlean host prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dnsmasq kmod \
+            libvirt-clients libvirt-daemon-driver-qemu libvirt-daemon-system \
+            qemu-system-x86 qemu-utils xorriso
+          sudo modprobe vhost_vsock
+          test -e /dev/vhost-vsock
+          helper="$(find /usr -type f -name qemu-bridge-helper -print -quit)"
+          test -n "${helper}"
+          sudo chmod u-s "${helper}"
+          sudo setcap cap_net_admin+ep "${helper}"
+          sudo install -d -m 0755 /etc/qemu
+          printf 'allow qlbr0\n' | sudo tee /etc/qemu/bridge.conf >/dev/null
+          sudo chmod 0644 /etc/qemu/bridge.conf
+          sudo systemctl start libvirtd 2>/dev/null || true
+          if ! sudo virsh -c qemu:///system list --all >/dev/null 2>&1; then
+            sudo libvirtd --daemon 2>/dev/null || sudo virtqemud --daemon
+          fi
+          for _ in {1..20}; do
+            sudo virsh -c qemu:///system list --all >/dev/null 2>&1 && break
+            sleep 1
+          done
+          sudo virsh -c qemu:///system list --all >/dev/null
+          sudo usermod -aG libvirt,kvm "${USER}"
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-qlean-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release fixture
+        run: cargo build --release --locked --bin scorpio --bin antares
+
+      - name: Run installer inside Qlean VM
+        env:
+          QLEAN_QEMU_TIMEOUT_SECS: 1200
+        run: |
+          set -euo pipefail
+          sg libvirt -c "sg kvm -c 'cargo test --locked --features qlean-ci --test qlean_installer -- --ignored --nocapture'"
