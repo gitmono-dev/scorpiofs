@@ -76,7 +76,7 @@ serial_test = "3.3.1"
 lazy_static = "1.5.0"
 assert_cmd = "2.1.2"
 scopeguard = "1.2.0"
-testcontainers = { version = "0.26.3", features = [
+testcontainers = { version = "0.28.0", features = [
     "http_wait",
     "reusable-containers",
 ] }
