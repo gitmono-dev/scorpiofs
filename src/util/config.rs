@@ -140,7 +140,7 @@ pub enum DicfuseStatMode {
 /// Built-in defaults used when a config field is absent/empty, and as the whole
 /// configuration in the pre-`init_config` fallback path.
 fn defaults() -> ScorpioConfig {
-    let username = whoami::username();
+    let username = whoami::username().unwrap_or_else(|_| "unknown".to_string());
     // Prefer a writable, container-friendly default. Users can still override via scorpio.toml.
     let base_path = format!("/tmp/megadir-{username}");
     ScorpioConfig {
@@ -1341,11 +1341,17 @@ mod tests {
                 assert_eq!(base_url(), "http://localhost:8000");
                 assert_eq!(
                     workspace(),
-                    format!("/tmp/megadir-{}/mount", whoami::username())
+                    format!(
+                        "/tmp/megadir-{}/mount",
+                        whoami::username().unwrap_or_else(|_| "unknown".to_string())
+                    )
                 );
                 assert_eq!(
                     store_path(),
-                    format!("/tmp/megadir-{}/store", whoami::username())
+                    format!(
+                        "/tmp/megadir-{}/store",
+                        whoami::username().unwrap_or_else(|_| "unknown".to_string())
+                    )
                 );
                 assert_eq!(git_author(), "MEGA");
                 assert_eq!(git_email(), "admin@mega.org");
