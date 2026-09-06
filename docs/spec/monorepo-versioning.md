@@ -1,5 +1,7 @@
 # Mega 命名空间版本与 Dicfuse 不可变视图 Spec
 
+> 第一次阅读请从 [ScorpioFS 的版本化只读层设计](../versioned-readonly-layer-design.md) 开始；本文保留实现级协议和验收细节。
+
 状态：Draft v0.4，2026-09-06。D1（完整 native + import 原子组合视图）、D2（显式 release 目录发布后不可变）与 D4（安全启用门槛）已获用户确认；D3 待确认（§12）。文中的 MUST 是目标协议要求，不代表现有实现。命名空间协议由 [#55](https://github.com/gitmono-dev/scorpiofs/issues/55) 跟踪，本文细化 [#42](https://github.com/gitmono-dev/scorpiofs/issues/42)，约束 #43、#44、#49、#50、#51、#53。总路线见 [system-paper-spec.md](system-paper-spec.md)。Mega 侧配套实施草案位于该仓库的 `docs/spec/namespace-snapshot-spec.md`，细化 G01–G06 与 MG01–MG17；两仓共享且已验证的内容身份编码见 [namespace-manifest-v1](namespace-manifest-v1.md)，它不等于已实现实际挂载或原子发布。
 
 当前实现进度：已增加严格 source identity、不可变 SourceReader 库层和 source-aware HTTP 客户端适配器，跨仓黄金向量、固定对象读取及本机 HTTP 测试见 [source-snapshot-v1.md](source-snapshot-v1.md)。尚未接入实际 Mega snapshot HTTP 服务、Dicfuse/Antares 挂载、lease/CAS 或工作区切换；现有挂载因此仍不具备本文承诺的版本隔离。完整 namespace 发布及所有写入者覆盖同样尚未完成。
