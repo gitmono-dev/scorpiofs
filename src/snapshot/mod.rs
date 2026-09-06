@@ -2,4 +2,5 @@
 //! or claim a server-published namespace until the backend advertises it.
 
 pub mod backend;
+pub mod http;
 pub mod identity;

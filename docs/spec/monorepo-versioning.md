@@ -1,8 +1,8 @@
 # Mega 命名空间版本与 Dicfuse 不可变视图 Spec
 
-状态：Draft v0.3，2026-09-06。三项产品决策待用户确认（§12）；文中的 MUST 是目标协议要求，不代表现有实现。命名空间协议由 [#55](https://github.com/gitmono-dev/scorpiofs/issues/55) 跟踪，本文细化 [#42](https://github.com/gitmono-dev/scorpiofs/issues/42)，约束 #43、#44、#49、#50、#51、#53。总路线见 [system-paper-spec.md](system-paper-spec.md)。Mega 侧配套实施草案位于该仓库的 `docs/spec/namespace-snapshot-spec.md`，细化 G01–G06 与 MG01–MG17；两仓 spec 已提交到工作分支。
+状态：Draft v0.3，2026-09-06。D1（完整 native + import 原子组合视图）与 D4（安全启用门槛）已获用户确认；D2/D3 待确认（§12）。文中的 MUST 是目标协议要求，不代表现有实现。命名空间协议由 [#55](https://github.com/gitmono-dev/scorpiofs/issues/55) 跟踪，本文细化 [#42](https://github.com/gitmono-dev/scorpiofs/issues/42)，约束 #43、#44、#49、#50、#51、#53。总路线见 [system-paper-spec.md](system-paper-spec.md)。Mega 侧配套实施草案位于该仓库的 `docs/spec/namespace-snapshot-spec.md`，细化 G01–G06 与 MG01–MG17；两仓 spec 已提交到工作分支。
 
-当前实现进度：已增加严格 source identity 与不可变 SourceReader 库层，跨仓黄金向量和固定对象读取测试见 [source-snapshot-v1.md](source-snapshot-v1.md)。尚未接入实际 Dicfuse/Antares 挂载、HTTP 对象后端、lease/CAS 或工作区切换；现有挂载因此仍不具备本文承诺的版本隔离。完整 namespace 发布及所有写入者覆盖同样尚未完成。
+当前实现进度：已增加严格 source identity、不可变 SourceReader 库层和 source-aware HTTP 客户端适配器，跨仓黄金向量、固定对象读取及本机 HTTP 测试见 [source-snapshot-v1.md](source-snapshot-v1.md)。尚未接入实际 Mega snapshot HTTP 服务、Dicfuse/Antares 挂载、lease/CAS 或工作区切换；现有挂载因此仍不具备本文承诺的版本隔离。完整 namespace 发布及所有写入者覆盖同样尚未完成。
 
 ## 1. 问题与事实基线
 
@@ -55,7 +55,7 @@ WorkspaceGeneration  工作区使用的 view、delta 序号与切换事务
 // 协议草图；ObjectId/SourceId 均为有验证器的类型，不接受任意字符串。
 struct SourceSnapshot {
     source_id: SourceId,       // persistent UUID mapped to instance/backend/repo
-    scope_path: RepoPath,      // commit.tree 对应的命名空间位置
+    scope_path: RepoPath,      // 已验证的投影根对应的命名空间位置
     commit_oid: ObjectId,
     root_tree_oid: ObjectId,   // commit 的 tree；scope 映射经服务端验证
     object_format: ObjectFormat,
@@ -63,6 +63,8 @@ struct SourceSnapshot {
 ```
 
 `/project/a` 的 scope commit，其 tree 根已经是 `a/` 的内容；读取 `src/lib.rs` 时不能再向它附加 `project/a/`。全库 root commit 的同一路径则要从 `/` 遍历。服务端 MUST 返回并验证 scope，不能仅凭一个存在的 commit OID 猜测。
+
+若服务端从已证明的 native source 派生子目录 descriptor，commit_oid 保留 base commit provenance，root_tree_oid 是从固定 base tree 验证得到的 subtree，不要求再次等于 commit.tree。它与直接 scope commit 的证明类型不同；两者即使投影内容相同，provenance identity 也可能不同。
 
 Mega 当前 `mega_commit` 没有 scope 字段，因此需要持久化 `(source_id, scope_path, commit_oid) → root_tree_oid + proof`；同一 commit 可有多个有效 scope，不设唯一反向映射。子 scope ref 被清理不能丢失历史证明；存量 commit 没有证明时返回 `SOURCE_SCOPE_UNVERIFIED`，不能默认它属于 `/`。clone 派生 scope commit/证明本身不代表全库可见树变化。
 
@@ -331,7 +333,7 @@ oracle 用公开 fixture 的 Git object tree + 独立实现的 binding compositi
 | 工作包 | 仓库/现有 issue | 交付物 | 前置与退出条件 |
 | --- | --- | --- | --- |
 | V0 | ScorpioFS / #55，#42 前置协议追踪 | 目录分类、capabilities、descriptor、公开 fixture | D1 确认；V02/V07/V17 的预期结果冻结 |
-| V1 | Mega G01/G02（仅 spec，业务代码未改） | Import 按 commit 读；scope proof、scope-aware tree/blob、共享 fixture | source-snapshot.v1；V01–V03/V09、MG01–MG04/MG13 通过 |
+| V1 | Mega G01/G02（基础已实现，读服务未接通） | Import 按 commit 读；scope proof、scope-aware tree/blob、共享 fixture | source-snapshot.v1；V01–V03/V09、MG01–MG04/MG13 通过 |
 | V2 | Mega G03–G05（拟议） | bounded bindings index、全部 writer 的 publication transaction、leases/迁移 | D1/D2 确认；V04–V07/V14/V15、MG05–MG17 相关门槛通过 |
 | V3 | ScorpioFS / #42、#43 | ViewResolver、immutable Dicfuse、CAS/schema 隔离 | 可先接 fake backend；V01–V09 通过后接真实 Mega |
 | V4 | ScorpioFS / #44、#49 | refresh journal、upper manifest、受控切换 | D3 确认；V10–V12/V16 通过 |
@@ -342,10 +344,14 @@ M0 观测/benchmark 与 V0/V1 并行。不要等待全部观测实现才能开�
 
 ## 12. 待确认决策与明确假设
 
-| 决策 | 推荐方案（尚未确认） | 另一选择及成本 |
+持续审阅：[Mega Draft PR #2181](https://github.com/gitmono-dev/mega/pull/2181)、[ScorpioFS Draft PR #56](https://github.com/gitmono-dev/scorpiofs/pull/56)。两者仍是基础实现检查点，不表示下列完整目标已经交付。
+
+| 决策 | 方案及确认状态 | 另一选择及成本 |
 | --- | --- | --- |
-| D1 全库版本边界 | Mega 发布 native root + 固定 import bindings 的组合 view，允许规划服务端协议改造 | 首期只做 source snapshot；全库原子一致性延期，lock 只能标注显式组合 |
+| D1 全库版本边界 | **已确认（2026-09-06）**：Mega 原子发布 native root + 固定 import bindings 的组合 view，ScorpioFS 固定该 view 读取 | 未选：首期只做 source snapshot 并延期全库原子一致性；单 source 仅作中间工作包 |
 | D2 版本号路径策略 | 显式标记为发布版本的目录首次发布后不可变，新内容使用新版本路径；不靠数字目录名推断；普通 import branch 仍可演进 | 可原地替换，但每次发布产生新绑定，旧对象必须按历史策略保留 |
 | D3 工作区更新体验 | 运行任务固定旧 view；新任务用新 view；现有 mount 暂停/检查后显式切换 | 要求透明运行中切换，必须扩展 handle/mmap/cwd/upper generation 协议 |
+
+**D4 已于 2026-09-06 获用户确认**：Mega snapshot 读 API 默认关闭，仅在显式配置 source/scope 读授权与对象保留策略后启用。配置缺失/无效或后端门槛未满足时，ScorpioFS 不得静默转用 legacy latest。Mega 当前开发期通用 guard 不能替代 source/path 授权；当前基础代码尚未开放新 HTTP 路由。
 
 其他暂定项：M1 支持现有 Mega SHA-1 并显式拒绝不支持的格式；不自动 hydrate LFS/submodule；GC 保留期、部署内核和 import 实际拓扑需在实施前填入环境 manifest。本文不把 A/B 架构选择当成已获确认的决策。
