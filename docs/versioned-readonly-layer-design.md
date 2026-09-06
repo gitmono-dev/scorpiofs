@@ -61,13 +61,15 @@ build-new → workspace B → V101
 
 固定版本之后，ScorpioFS 先取得目录条目的准确大小和 blob ID，再检查本地内容缓存。并发读取缺少的小文件时，将它们组成一个请求，让 Mega 返回 tar + zstd 小包；热点目录也可选择服务端已经准备好的包。
 
-例如 1,000 个 8 KiB 源码文件，全部缺失时可以按 128 个文件一包请求 8 个包。V101 只改了其中 10 个时，就只请求这 10 个，继续使用已验证的 990 个缓存对象。目录分页另计，包数不是构建加速比。
+例如 1,000 个 8 KiB 源码文件，全部缺失且需求已知/足够并发时，可以按 128 个文件一包请求 8 个包。纯按需 FUSE 可能逐个暴露需求，不保证这个包数。V101 只改了其中 10 个时，就只请求这 10 个，继续使用已验证的 990 个缓存对象。目录分页另计，包数不是构建加速比。
 
 包内逐个对象进行 Git 哈希验证并写入对象缓存，不直接解包到 workspace。缓存以文件为单位，包布局变化不会让已有内容失效。一次只打开一个文件时立即读取；预取和批量聚合均有时间、内存和带宽上限。
 
 超过阈值的大文件使用受认证 Mega 生成的分块表，按 read(offset, length) 获取并校验所需块。用户已确认信任 Mega 校验整文件后建立的 blob 与分块表关系；局部块校验与完整 Git blob 校验明确区分。
 
 协议提案及两端职责见 Mega 的 [通俗设计](https://github.com/gitmono-dev/mega/blob/codex/namespace-snapshot-spec/docs/scorpiofs-transfer-design.md) 和 [传输 Spec](https://github.com/gitmono-dev/mega/blob/codex/namespace-snapshot-spec/docs/spec/scorpiofs-transfer-v1.md)。两仓实现使用同一契约和 fixtures，ScorpioFS 不维护第二套有分歧的服务端字段定义。本节是待实现设计，不表示当前 lower 已支持批量、分块或受控版本切换。
+
+论文需要把并发单文件、固定批量和按缓存/成本选择的策略公平对比。tar.zstd、CAS 或按需加载本身不作为新颖性结论；正确性、服务端构包成本、真实构建时间和失败区间共同验证。详见 Mega 的 [研究设计](https://github.com/gitmono-dev/mega/blob/codex/namespace-snapshot-spec/docs/spec/scorpiofs-transfer-research.md)。
 
 ## Dicfuse、Antares 与 Libra
 

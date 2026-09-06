@@ -10,7 +10,7 @@
 
 版本协议是第一前置：Mega 原生目录、scope clone、import 仓库和聚合目录需要共同组成可重放视图。详见 [monorepo-versioning.md](monorepo-versioning.md)，该文件规定 source/view/generation、服务端接口、更新及错误语义。
 
-Mega 已在独立 WSL checkout 核对，基线 `c4c79bc195541a13ac1505b94728c81a8ff3d603`；配套服务端草案为 Mega `docs/spec/namespace-snapshot-spec.md`。新增 G01–G06 实施包、MG01–MG17 验收组，覆盖 scope proof、同库 publication txn、push/网页编辑写入口、初始回填与保留。两仓目前只有 spec 变更，不宣称协议或 MG 测试已经实现。
+Mega 已在独立 WSL checkout 核对，基线 `c4c79bc195541a13ac1505b94728c81a8ff3d603`；配套服务端草案为 Mega `docs/spec/namespace-snapshot-spec.md`。新增 G01–G06 实施包、MG01–MG17 验收组，覆盖 scope proof、同库 publication txn、push/网页编辑写入口、初始回填与保留。后续两仓已加入固定 source reader、共享 codec、服务端索引及事务存储基础；完整 writer/HTTP/FUSE 链路和论文实验仍未完成，具体证据见两仓 Draft PR。
 
 约束：
 
@@ -104,6 +104,10 @@ single-flight state：Absent→Queued→InFlight→Published/Failed；每个 wai
 
 验收 F01：64 同对象冷读一次后端请求；F02：取消一个 waiter 不影响其余；F03：retry 和 publish 幂等；F04：队列和内存硬上限；F05：noisy neighbor 下有进展及 demand 延迟报告。用可确定性 fake backend 控制完成顺序与失败点。
 
+传输子课题使用 Mega 的 [研究设计](https://github.com/gitmono-dev/mega/blob/codex/namespace-snapshot-spec/docs/spec/scorpiofs-transfer-research.md) 和 [协议 Spec](https://github.com/gitmono-dev/mega/blob/codex/namespace-snapshot-spec/docs/spec/scorpiofs-transfer-v1.md)。它补充三类动作：并发单对象、精确缺失包、服务端缓存包。先以固定策略建立实测基线，再决定是否实现按缓存和成本选择的算法；不将 tar.zstd、CAS 或固定包大小本身作为论文创新。
+
+H1/H2/H3 分别检验传输选择、跨版本复用和多 workspace 共享。每项都要求正确性及成本分解；REAPI 批量 CAS、工作集聚合和版本化惰性文件系统是必须核对的先例。未运行实际实现时只做机制比较，不宣称胜过原系统。
+
 ### 5.2 A/B/C 架构 bakeoff
 
 三个方案定义见 [版本 spec §9](monorepo-versioning.md#9-架构-adr先验证再选择共享挂载方案)。先在 C 上提供正确性基线；A/B 的首轮原型时间箱暂定各 3–5 人日（工程估算，不是排期承诺）。到期产出 ADR：可以进入生产、继续调查或淘汰；没有功能/隔离/恢复证据不扩展为生产重构。
@@ -131,6 +135,8 @@ Libra attach 传入 scope commit 或 published view；Mega 提供验证后的 im
 workload 至少覆盖 Buck2、Bazel、Cargo、CMake/Ninja、百万文件 sparse 合成、scripted agent、parallel patch。每个真实仓库先 smoke，再固定公开 commit/target/toolchain。M0 用小 fixture 启动，完整矩阵在机制通过正确性后展开。
 
 每个 claim 对应 experiment ID、原始文件、聚合脚本和图表；预注册 outlier/失败处理，报告绝对值、相对值、median/tail/CI 和失败率。agent 同时报告任务成功率。存储报告 resident/cached/upper/object logical/physical，root-trie 创建成本和服务器租约/GC 成本单列。
+
+传输实验额外控制 Mega 包缓存与客户端对象/kernel cache 的冷热；统计构包 CPU、后端 IO、首次对象完成和整个构建时间。纯按需、执行前已有提示、完整未来 trace 的 offline oracle 分开；按项目及时间切分调优/测试数据，不能用本次测试访问记录预先生成自己的包。既有 1,000 文件/8 包数字只适用于需求已知且可按 128 个聚合的示例，不是在线访问保证。
 
 artifact 包含一键 smoke、fake backend、固定 namespace fixtures、环境 manifest、故障矩阵、raw JSONL/CSV 和画图脚本。需要 FUSE/mount namespace 的测试在具备条件的 runner 中执行，普通 CI 运行无 FUSE 的协议/schema/调度/恢复模型测试。
 
