@@ -188,6 +188,7 @@ pub mod doctor;
 pub mod fuse;
 pub mod manager;
 pub mod server;
+pub mod snapshot;
 pub mod util;
 
 /// Commonly used types and traits for working with Antares.

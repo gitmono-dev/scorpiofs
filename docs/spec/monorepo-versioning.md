@@ -1,6 +1,8 @@
 # Mega 命名空间版本与 Dicfuse 不可变视图 Spec
 
-状态：Draft v0.2，2026-09-06。三项产品决策待用户确认（§12）；文中的 MUST 是拟议协议要求，不代表现有实现。命名空间协议由 [#55](https://github.com/gitmono-dev/scorpiofs/issues/55) 跟踪，本文细化 [#42](https://github.com/gitmono-dev/scorpiofs/issues/42)，约束 #43、#44、#49、#50、#51、#53。总路线见 [system-paper-spec.md](system-paper-spec.md)。Mega 侧配套实施草案位于该仓库的 `docs/spec/namespace-snapshot-spec.md`，细化 G01–G06 与 MG01–MG17；目前两仓 spec 均未提交。
+状态：Draft v0.3，2026-09-06。三项产品决策待用户确认（§12）；文中的 MUST 是目标协议要求，不代表现有实现。命名空间协议由 [#55](https://github.com/gitmono-dev/scorpiofs/issues/55) 跟踪，本文细化 [#42](https://github.com/gitmono-dev/scorpiofs/issues/42)，约束 #43、#44、#49、#50、#51、#53。总路线见 [system-paper-spec.md](system-paper-spec.md)。Mega 侧配套实施草案位于该仓库的 `docs/spec/namespace-snapshot-spec.md`，细化 G01–G06 与 MG01–MG17；两仓 spec 已提交到工作分支。
+
+当前实现进度：已增加严格 source identity 与不可变 SourceReader 库层，跨仓黄金向量和固定对象读取测试见 [source-snapshot-v1.md](source-snapshot-v1.md)。尚未接入实际 Dicfuse/Antares 挂载、HTTP 对象后端、lease/CAS 或工作区切换；现有挂载因此仍不具备本文承诺的版本隔离。完整 namespace 发布及所有写入者覆盖同样尚未完成。
 
 ## 1. 问题与事实基线
 
@@ -52,7 +54,7 @@ WorkspaceGeneration  工作区使用的 view、delta 序号与切换事务
 ```rust
 // 协议草图；ObjectId/SourceId 均为有验证器的类型，不接受任意字符串。
 struct SourceSnapshot {
-    source_id: SourceId,       // instance UUID + backend kind + stable repo ID
+    source_id: SourceId,       // persistent UUID mapped to instance/backend/repo
     scope_path: RepoPath,      // commit.tree 对应的命名空间位置
     commit_oid: ObjectId,
     root_tree_oid: ObjectId,   // commit 的 tree；scope 映射经服务端验证
@@ -65,6 +67,8 @@ struct SourceSnapshot {
 Mega 当前 `mega_commit` 没有 scope 字段，因此需要持久化 `(source_id, scope_path, commit_oid) → root_tree_oid + proof`；同一 commit 可有多个有效 scope，不设唯一反向映射。子 scope ref 被清理不能丢失历史证明；存量 commit 没有证明时返回 `SOURCE_SCOPE_UNVERIFIED`，不能默认它属于 `/`。clone 派生 scope commit/证明本身不代表全库可见树变化。
 
 revision selector 使用带类型联合：`published_view`、`source_commit`、`source_ref`。branch/tag 解析结果带完整 ref 名和最终 commit；裸 tree 请求必须显式声明 `tree` 类型，不能伪装成 commit。当前 Mega 的 SHA-1 限制作为 capability 返回；协议保留 SHA-256 类型但不得提前宣称支持。
+
+单 source 的 v1 校验器和 canonical 编码现已落地，详见 [source-snapshot-v1.md](source-snapshot-v1.md)。该基础实现不等于 namespace 发布、leases 或 FUSE 集成已完成；view/index 的编码仍在各自实施闸门内。
 
 ### 3.2 NamespaceView
 
