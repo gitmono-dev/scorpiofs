@@ -175,6 +175,8 @@ ScorpioFS 持有 active workspace、open handle、refresh prepare 的引用；�
 
 ### 6.1 Mega：发现、固定与读取
 
+新增传输提案见 Mega 的 [文件传输协议 v1](https://github.com/gitmono-dev/mega/blob/codex/namespace-snapshot-spec/docs/spec/scorpiofs-transfer-v1.md)：准确目录元数据、按需 tar + zstd 小包、热点包和大文件分块。ScorpioFS 对接同一协议，在既有 SourceReader 之外增加批量调度及 range reader；完整对象接口不得返回部分内容。分块表的服务端信任方式已确认，协议本身尚未实现。
+
 | API | 请求关键字段 | 响应/约束 |
 | --- | --- | --- |
 | `GET /api/v1/snapshots/capabilities` | 服务端发现 | instance/schema/算法/路径编码、source/namespace readiness、retention 限制 |
