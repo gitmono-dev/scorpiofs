@@ -1,6 +1,6 @@
 # Mega 命名空间版本与 Dicfuse 不可变视图 Spec
 
-状态：Draft v0.3，2026-09-06。D1（完整 native + import 原子组合视图）与 D4（安全启用门槛）已获用户确认；D2/D3 待确认（§12）。文中的 MUST 是目标协议要求，不代表现有实现。命名空间协议由 [#55](https://github.com/gitmono-dev/scorpiofs/issues/55) 跟踪，本文细化 [#42](https://github.com/gitmono-dev/scorpiofs/issues/42)，约束 #43、#44、#49、#50、#51、#53。总路线见 [system-paper-spec.md](system-paper-spec.md)。Mega 侧配套实施草案位于该仓库的 `docs/spec/namespace-snapshot-spec.md`，细化 G01–G06 与 MG01–MG17；两仓 spec 已提交到工作分支。
+状态：Draft v0.4，2026-09-06。D1（完整 native + import 原子组合视图）、D2（显式 release 目录发布后不可变）与 D4（安全启用门槛）已获用户确认；D3 待确认（§12）。文中的 MUST 是目标协议要求，不代表现有实现。命名空间协议由 [#55](https://github.com/gitmono-dev/scorpiofs/issues/55) 跟踪，本文细化 [#42](https://github.com/gitmono-dev/scorpiofs/issues/42)，约束 #43、#44、#49、#50、#51、#53。总路线见 [system-paper-spec.md](system-paper-spec.md)。Mega 侧配套实施草案位于该仓库的 `docs/spec/namespace-snapshot-spec.md`，细化 G01–G06 与 MG01–MG17；两仓共享且已验证的内容身份编码见 [namespace-manifest-v1](namespace-manifest-v1.md)，它不等于已实现实际挂载或原子发布。
 
 当前实现进度：已增加严格 source identity、不可变 SourceReader 库层和 source-aware HTTP 客户端适配器，跨仓黄金向量、固定对象读取及本机 HTTP 测试见 [source-snapshot-v1.md](source-snapshot-v1.md)。尚未接入实际 Mega snapshot HTTP 服务、Dicfuse/Antares 挂载、lease/CAS 或工作区切换；现有挂载因此仍不具备本文承诺的版本隔离。完整 namespace 发布及所有写入者覆盖同样尚未完成。
 
@@ -349,7 +349,7 @@ M0 观测/benchmark 与 V0/V1 并行。不要等待全部观测实现才能开�
 | 决策 | 方案及确认状态 | 另一选择及成本 |
 | --- | --- | --- |
 | D1 全库版本边界 | **已确认（2026-09-06）**：Mega 原子发布 native root + 固定 import bindings 的组合 view，ScorpioFS 固定该 view 读取 | 未选：首期只做 source snapshot 并延期全库原子一致性；单 source 仅作中间工作包 |
-| D2 版本号路径策略 | 显式标记为发布版本的目录首次发布后不可变，新内容使用新版本路径；不靠数字目录名推断；普通 import branch 仍可演进 | 可原地替换，但每次发布产生新绑定，旧对象必须按历史策略保留 |
+| D2 版本号路径策略 | **已确认（2026-09-06）**：显式标记为 release 的目录首次发布后不可变，新内容使用新版本路径；不靠数字目录名推断；普通 import 开发 branch 仍可演进 | 未选：release 原地替换；所有写入口必须拒绝内容变更与 policy 降级绕过 |
 | D3 工作区更新体验 | 运行任务固定旧 view；新任务用新 view；现有 mount 暂停/检查后显式切换 | 要求透明运行中切换，必须扩展 handle/mmap/cwd/upper generation 协议 |
 
 **D4 已于 2026-09-06 获用户确认**：Mega snapshot 读 API 默认关闭，仅在显式配置 source/scope 读授权与对象保留策略后启用。配置缺失/无效或后端门槛未满足时，ScorpioFS 不得静默转用 legacy latest。Mega 当前开发期通用 guard 不能替代 source/path 授权；当前基础代码尚未开放新 HTTP 路由。
