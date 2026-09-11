@@ -5,12 +5,18 @@ use asyncfuse::{
     FileType, Timestamp,
 };
 
+fn default_owner() -> (u32, u32) {
+    let owner = crate::server::fuse_owner();
+    (owner.uid, owner.gid)
+}
+
 /// Placeholder TTL for default entries.
 /// Callers (Dicfuse::get_stat / get_stat_fast / readdirplus) always override
 /// this with the mount-appropriate value via `Dicfuse::reply_ttl()`.
 const DEFAULT_ENTRY_TTL: Duration = Duration::ZERO;
 
 pub fn default_file_entry(inode: u64) -> ReplyEntry {
+    let (uid, gid) = default_owner();
     ReplyEntry {
         ttl: DEFAULT_ENTRY_TTL,
         attr: FileAttr {
@@ -23,8 +29,8 @@ pub fn default_file_entry(inode: u64) -> ReplyEntry {
             kind: FileType::RegularFile,
             perm: 0o755,
             nlink: 0,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             rdev: 0,
             blksize: 0,
         },
@@ -33,6 +39,7 @@ pub fn default_file_entry(inode: u64) -> ReplyEntry {
 }
 
 pub fn default_dic_entry(inode: u64) -> ReplyEntry {
+    let (uid, gid) = default_owner();
     ReplyEntry {
         ttl: DEFAULT_ENTRY_TTL,
         attr: FileAttr {
@@ -45,8 +52,8 @@ pub fn default_dic_entry(inode: u64) -> ReplyEntry {
             kind: FileType::Directory,
             perm: 0o755,
             nlink: 0,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             rdev: 0,
             blksize: 0,
         },

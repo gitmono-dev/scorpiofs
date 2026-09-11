@@ -48,6 +48,14 @@ impl AntaresFuse {
         std::fs::create_dir_all(&upper_dir)?;
         std::fs::create_dir_all(&mountpoint)?;
 
+        // A root daemon must still expose its per-job writable paths to the agent UID/GID that
+        // invoked it through sudo. Align the real upper/mount directories before constructing
+        // the passthrough layer; otherwise the kernel may allow the FUSE mount while the
+        // passthrough layer rejects create/copy-up with EACCES.
+        let owner = crate::server::fuse_owner();
+        crate::server::align_directory_owner(&upper_dir, owner)?;
+        crate::server::align_directory_owner(&mountpoint, owner)?;
+
         Ok(Self {
             mountpoint,
             upper_dir,
