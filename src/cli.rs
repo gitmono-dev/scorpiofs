@@ -20,8 +20,10 @@ use tokio::sync::oneshot;
 
 use crate::{
     antares::{AntaresManager, AntaresPaths},
-    daemon::{antares::AntaresServiceImpl, daemon_main},
-    fuse::MegaFuse,
+    daemon::{antares::AntaresServiceImpl, daemon_main_with_profile},
+    fuse::{
+        logfuse::LogFuse, profile::start_profile_writer, profile::FuseProfileOptions, MegaFuse,
+    },
     manager::{fetch::CheckHash, ScorpioManager},
     server::mount_filesystem,
     util::{config, logging},
@@ -63,6 +65,40 @@ pub fn antares_overrides(
     overrides
 }
 
+/// Build config overrides for the FUSE profile CLI flags.
+pub fn fuse_profile_overrides(
+    enabled: bool,
+    path: Option<PathBuf>,
+    agent: Option<String>,
+    task: Option<String>,
+    capacity: Option<usize>,
+    flush_interval_ms: Option<u64>,
+) -> HashMap<String, String> {
+    let mut overrides = HashMap::new();
+    if enabled {
+        overrides.insert("fuse_profile_enabled".to_string(), "true".to_string());
+    }
+    if let Some(path) = path {
+        overrides.insert("fuse_profile_path".to_string(), path.display().to_string());
+    }
+    if let Some(agent) = agent {
+        overrides.insert("fuse_profile_agent".to_string(), agent);
+    }
+    if let Some(task) = task {
+        overrides.insert("fuse_profile_task".to_string(), task);
+    }
+    if let Some(capacity) = capacity {
+        overrides.insert("fuse_profile_capacity".to_string(), capacity.to_string());
+    }
+    if let Some(interval) = flush_interval_ms {
+        overrides.insert(
+            "fuse_profile_flush_interval_ms".to_string(),
+            interval.to_string(),
+        );
+    }
+    overrides
+}
+
 /// Load configuration (with CLI overrides) and initialize logging.
 ///
 /// Must be called exactly once, before dispatching a command. Returns the
@@ -96,11 +132,38 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
 
     let fuse_interface = MegaFuse::new_from_manager(&manager).await;
     let mountpoint = OsStr::new(config::workspace());
-    let lgfs = LoggingFileSystem::new(fuse_interface.clone());
-    let mut mount_handle = match mount_filesystem(lgfs, mountpoint).await {
+    let mut profile_writer = None;
+    let mut profile_context = None;
+    let mount_result = if config::fuse_profile_enabled() {
+        let options = FuseProfileOptions {
+            path: config::fuse_profile_path().to_string(),
+            mount_id: uuid::Uuid::new_v4().to_string(),
+            agent: config::fuse_profile_agent().to_string(),
+            task: config::fuse_profile_task().to_string(),
+            capacity: config::fuse_profile_capacity(),
+            flush_interval: Duration::from_millis(config::fuse_profile_flush_interval_ms()),
+        };
+        match start_profile_writer(options) {
+            Ok((context, writer)) => {
+                profile_context = Some(context.clone());
+                profile_writer = Some(writer);
+                mount_filesystem(LogFuse::new(fuse_interface.clone(), context), mountpoint).await
+            }
+            Err(e) => {
+                tracing::error!("failed to start FUSE profile writer: {e}");
+                return exit::CONFIG;
+            }
+        }
+    } else {
+        mount_filesystem(LoggingFileSystem::new(fuse_interface.clone()), mountpoint).await
+    };
+    let mut mount_handle = match mount_result {
         Ok(h) => h,
         Err(e) => {
             tracing::error!("failed to mount workspace at {:?}: {e}", mountpoint);
+            if let Some(writer) = profile_writer {
+                let _ = writer.shutdown().await;
+            }
             return exit::MOUNT;
         }
     };
@@ -112,17 +175,21 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
         Err(e) => {
             tracing::error!("failed to bind HTTP address {http_addr}: {e}");
             let _ = mount_handle.unmount().await;
+            if let Some(writer) = profile_writer {
+                let _ = writer.shutdown().await;
+            }
             return exit::BIND;
         }
     };
     tracing::info!("server running on {http_addr}");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let mut daemon_task = tokio::spawn(daemon_main(
+    let mut daemon_task = tokio::spawn(daemon_main_with_profile(
         Arc::new(fuse_interface),
         manager,
         shutdown_rx,
         listener,
+        profile_context,
     ));
 
     let mut exit_code = exit::SUCCESS;
@@ -181,6 +248,12 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
     if !mount_finished {
         tracing::info!("unmounting workspace filesystem");
         let _ = mount_handle.unmount().await;
+    }
+    if let Some(writer) = profile_writer {
+        if let Err(e) = writer.shutdown().await {
+            tracing::error!("failed to flush FUSE profile: {e}");
+            exit_code = exit::INTERNAL;
+        }
     }
     exit_code
 }
@@ -413,6 +486,14 @@ antares_upper_root = "/tmp/scorpio-megadir/antares/upper"
 antares_cl_root = "/tmp/scorpio-megadir/antares/cl"
 antares_mount_root = "/tmp/scorpio-megadir/antares/mnt"
 antares_state_file = "/tmp/scorpio-megadir/antares/state.toml"
+
+[fuse_profile]
+enabled = false
+path = "/tmp/scorpiofs-fuse-profile.tsv"
+agent = "unlabeled"
+task = ""
+capacity = 262144
+flush_interval_ms = 10
 "#;
 
 /// Wait for SIGTERM/SIGINT (Unix) or Ctrl-C (other platforms).

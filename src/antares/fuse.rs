@@ -6,7 +6,10 @@ use libfuse_fs::{
 };
 use tokio::task::JoinHandle;
 
-use crate::server::mount_filesystem_with_antares_cache;
+use crate::{
+    fuse::{logfuse::LogFuse, profile::FuseProfileContext},
+    server::mount_filesystem_with_antares_cache,
+};
 
 /// Antares union-fs wrapper: dicfuse lower + passthrough upper/CL.
 pub struct AntaresFuse {
@@ -14,6 +17,8 @@ pub struct AntaresFuse {
     pub upper_dir: PathBuf,
     pub dic: Arc<crate::dicfuse::Dicfuse>,
     pub cl_dir: Option<PathBuf>,
+    /// Optional profile sink shared with the daemon's workspace mount.
+    profile: Option<Arc<FuseProfileContext>>,
     /// Background task running the FUSE session.
     fuse_task: Option<JoinHandle<()>>,
 }
@@ -26,6 +31,17 @@ impl AntaresFuse {
         upper_dir: PathBuf,
         cl_dir: Option<PathBuf>,
     ) -> std::io::Result<Self> {
+        Self::new_with_profile(mountpoint, dic, upper_dir, cl_dir, None).await
+    }
+
+    /// Build an Antares FUSE instance with an optional operation profile.
+    pub async fn new_with_profile(
+        mountpoint: PathBuf,
+        dic: Arc<crate::dicfuse::Dicfuse>,
+        upper_dir: PathBuf,
+        cl_dir: Option<PathBuf>,
+        profile: Option<Arc<FuseProfileContext>>,
+    ) -> std::io::Result<Self> {
         if let Some(cl) = &cl_dir {
             std::fs::create_dir_all(cl)?;
         }
@@ -37,6 +53,7 @@ impl AntaresFuse {
             upper_dir,
             dic,
             cl_dir,
+            profile,
             fuse_task: None,
         })
     }
@@ -83,13 +100,21 @@ impl AntaresFuse {
         // transiently while Dicfuse is still loading.
         std::fs::metadata(&self.mountpoint)?;
 
-        let overlay = self.build_overlay().await?;
-        let logfs = LoggingFileSystem::new(overlay);
         // Keep Antares mounts on the safer non-writeback path for now.
         // With writeback cache enabled, reopening an existing file in append mode
         // can fail inside libfuse-fs passthrough I/O with EBADF.
-        let handle =
-            mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), false).await?;
+        let overlay = self.build_overlay().await?;
+        let handle = if let Some(profile) = self.profile.clone() {
+            mount_filesystem_with_antares_cache(
+                LogFuse::new(overlay, profile),
+                self.mountpoint.as_os_str(),
+                false,
+            )
+            .await?
+        } else {
+            let logfs = LoggingFileSystem::new(overlay);
+            mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), false).await?
+        };
 
         // Spawn background task to run the FUSE session
         let fuse_task = tokio::spawn(async move {

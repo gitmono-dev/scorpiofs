@@ -21,6 +21,8 @@ use crate::{
 
 mod async_io;
 mod inode_alloc;
+pub mod logfuse;
+pub mod profile;
 
 /// A struct representing the MegaFuse system, which handles the creation
 /// and management of overlay filesystems (OverlayFs). This includes

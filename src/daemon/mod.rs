@@ -14,7 +14,7 @@ use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::{
-    fuse::MegaFuse,
+    fuse::{profile::FuseProfileContext, MegaFuse},
     manager::{fetch::fetch, ScorpioManager, WorkDir},
     util::{config, GPath},
 };
@@ -190,6 +190,18 @@ pub async fn daemon_main(
     shutdown_rx: oneshot::Receiver<()>,
     listener: tokio::net::TcpListener,
 ) -> std::io::Result<()> {
+    daemon_main_with_profile(fuse, manager, shutdown_rx, listener, None).await
+}
+
+/// Run the HTTP daemon and optionally propagate the profile sink to every
+/// Antares overlay mount created through its API.
+pub async fn daemon_main_with_profile(
+    fuse: Arc<MegaFuse>,
+    manager: ScorpioManager,
+    shutdown_rx: oneshot::Receiver<()>,
+    listener: tokio::net::TcpListener,
+    profile: Option<Arc<FuseProfileContext>>,
+) -> std::io::Result<()> {
     let inner = ScoState {
         fuse,
         manager: Arc::new(Mutex::new(manager)),
@@ -213,13 +225,14 @@ pub async fn daemon_main(
         // router returned by `daemon::git::router()` into this `app`.
         .layer(axum::middleware::from_fn(deprecation_middleware));
 
-    let mut app = Router::new()
+    let app = Router::new()
         .route("/health", get(health_handler))
         .merge(deprecated)
         .with_state(inner);
 
     // Antares route - create service with new Dicfuse instance
-    let antares_service = Arc::new(antares::AntaresServiceImpl::new(None).await);
+    let antares_service =
+        Arc::new(antares::AntaresServiceImpl::new_with_profile(None, profile).await);
     let antares_service_for_shutdown = antares_service.clone();
     let antares_daemon = antares::AntaresDaemon::new(antares_service);
     let antares_router = antares_daemon.router();

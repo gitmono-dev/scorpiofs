@@ -39,6 +39,7 @@ use uuid::Uuid;
 use crate::{
     antares::fuse::AntaresFuse,
     dicfuse::{Dicfuse, DicfuseManager},
+    fuse::profile::FuseProfileContext,
 };
 
 /// High-level HTTP daemon that exposes Antares orchestration capabilities.
@@ -964,6 +965,8 @@ pub struct AntaresServiceImpl {
     state_file: PathBuf,
     /// Durable state owner. External controllers must remain the sole writer.
     state_ownership: StateOwnership,
+    /// Optional profiler shared by all Antares mounts created by this daemon.
+    profile: Option<Arc<FuseProfileContext>>,
 }
 
 impl AntaresServiceImpl {
@@ -975,18 +978,27 @@ impl AntaresServiceImpl {
     /// # Note
     /// Requires config to be initialized via `config::init_config()` before calling.
     pub async fn new(dicfuse: Option<Arc<Dicfuse>>) -> Self {
-        Self::new_with_state_ownership(dicfuse, StateOwnership::ScorpioFs).await
+        Self::new_with_state_ownership(dicfuse, StateOwnership::ScorpioFs, None).await
+    }
+
+    /// Create a service whose Antares mounts emit events to a shared profile.
+    pub async fn new_with_profile(
+        dicfuse: Option<Arc<Dicfuse>>,
+        profile: Option<Arc<FuseProfileContext>>,
+    ) -> Self {
+        Self::new_with_state_ownership(dicfuse, StateOwnership::ScorpioFs, profile).await
     }
 
     /// Create a service whose durable desired state is owned by the embedding
     /// controller. The service never writes or recovers `antares_state_file`.
     pub async fn new_external_state(dicfuse: Option<Arc<Dicfuse>>) -> Self {
-        Self::new_with_state_ownership(dicfuse, StateOwnership::External).await
+        Self::new_with_state_ownership(dicfuse, StateOwnership::External, None).await
     }
 
     async fn new_with_state_ownership(
         dicfuse: Option<Arc<Dicfuse>>,
         state_ownership: StateOwnership,
+        profile: Option<Arc<FuseProfileContext>>,
     ) -> Self {
         let dic = match dicfuse {
             Some(d) => d,
@@ -1005,6 +1017,7 @@ impl AntaresServiceImpl {
             start_time: Instant::now(),
             state_file,
             state_ownership,
+            profile,
         }
     }
 
@@ -1017,6 +1030,16 @@ impl AntaresServiceImpl {
     /// Requires config to be initialized via `config::init_config()` before calling.
     pub async fn new_with_recovery(dicfuse: Option<Arc<Dicfuse>>) -> Self {
         let instance = Self::new(dicfuse).await;
+        instance.recover_mounts().await;
+        instance
+    }
+
+    /// Create a profiled service and recover persisted Antares mounts.
+    pub async fn new_with_recovery_profile(
+        dicfuse: Option<Arc<Dicfuse>>,
+        profile: Option<Arc<FuseProfileContext>>,
+    ) -> Self {
+        let instance = Self::new_with_profile(dicfuse, profile).await;
         instance.recover_mounts().await;
         instance
     }
@@ -1599,7 +1622,15 @@ impl AntaresServiceImpl {
             let cl_dir = persisted.cl_dir.as_ref().map(PathBuf::from);
 
             // Try to create and mount AntaresFuse
-            match AntaresFuse::new(mountpoint.clone(), dicfuse, upper_dir, cl_dir.clone()).await {
+            match AntaresFuse::new_with_profile(
+                mountpoint.clone(),
+                dicfuse,
+                upper_dir,
+                cl_dir.clone(),
+                self.profile.clone(),
+            )
+            .await
+            {
                 Ok(mut fuse) => {
                     if let Err(e) = fuse.mount().await {
                         tracing::warn!(
@@ -1880,9 +1911,15 @@ impl AntaresService for AntaresServiceImpl {
         let dicfuse = self.get_or_create_dicfuse(&request.path).await?;
 
         // 6. Create AntaresFuse instance (may take time, not holding lock)
-        let mut fuse = AntaresFuse::new(mountpoint, dicfuse, upper_dir, cl_dir)
-            .await
-            .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
+        let mut fuse = AntaresFuse::new_with_profile(
+            mountpoint,
+            dicfuse,
+            upper_dir,
+            cl_dir,
+            self.profile.clone(),
+        )
+        .await
+        .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
 
         // 7. Mount the filesystem
         fuse.mount()
@@ -2485,11 +2522,12 @@ impl AntaresService for AntaresServiceImpl {
             return Err(e);
         }
 
-        let mut new_fuse = AntaresFuse::new(
+        let mut new_fuse = AntaresFuse::new_with_profile(
             mountpoint.clone(),
             dicfuse,
             upper_dir.clone(),
             Some(cl_dir_path.clone()),
+            self.profile.clone(),
         )
         .await
         .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
@@ -2651,9 +2689,15 @@ impl AntaresService for AntaresServiceImpl {
             }
         }
 
-        let mut new_fuse = AntaresFuse::new(mountpoint.clone(), dicfuse, upper_dir.clone(), None)
-            .await
-            .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
+        let mut new_fuse = AntaresFuse::new_with_profile(
+            mountpoint.clone(),
+            dicfuse,
+            upper_dir.clone(),
+            None,
+            self.profile.clone(),
+        )
+        .await
+        .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
         if let Err(e) = new_fuse.mount().await {
             tracing::error!("Failed to remount {} without CL: {}", mount_id, e);
             let remount_result = old_fuse.mount().await;

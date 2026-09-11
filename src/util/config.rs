@@ -25,6 +25,12 @@ pub struct ScorpioConfig {
     /// Default tracing filter directive (e.g. "info", "scorpio=debug"). Used by
     /// the binaries when no CLI flag / `SCORPIO_LOG` / `RUST_LOG` is set.
     pub log_level: String,
+    pub fuse_profile_enabled: bool,
+    pub fuse_profile_path: String,
+    pub fuse_profile_agent: String,
+    pub fuse_profile_task: String,
+    pub fuse_profile_capacity: usize,
+    pub fuse_profile_flush_interval_ms: u64,
     pub dicfuse_readable: bool,
     pub load_dir_depth: usize,
     pub fetch_file_thread: usize,
@@ -152,6 +158,12 @@ fn defaults() -> ScorpioConfig {
         config_file: "config.toml".to_string(),
         lfs_url: "http://localhost:8000/lfs".to_string(),
         log_level: "info".to_string(),
+        fuse_profile_enabled: false,
+        fuse_profile_path: "/tmp/scorpiofs-fuse-profile.tsv".to_string(),
+        fuse_profile_agent: "unlabeled".to_string(),
+        fuse_profile_task: String::new(),
+        fuse_profile_capacity: 262_144,
+        fuse_profile_flush_interval_ms: 10,
         dicfuse_readable: true,
         load_dir_depth: DEFAULT_LOAD_DIR_DEPTH,
         fetch_file_thread: DEFAULT_FETCH_FILE_THREAD,
@@ -382,6 +394,48 @@ fn build_config(r: &RawResolver) -> ConfigResult<ScorpioConfig> {
         git_email: optional_string(r, "git_email", "server", "git_email", d.git_email)?,
         config_file: optional_string(r, "config_file", "server", "config_file", d.config_file)?,
         log_level: optional_string(r, "log_level", "server", "log_level", d.log_level)?,
+        fuse_profile_enabled: parse_bool(
+            r,
+            "fuse_profile_enabled",
+            "fuse_profile",
+            "enabled",
+            d.fuse_profile_enabled,
+        )?,
+        fuse_profile_path: optional_string(
+            r,
+            "fuse_profile_path",
+            "fuse_profile",
+            "path",
+            d.fuse_profile_path,
+        )?,
+        fuse_profile_agent: optional_string(
+            r,
+            "fuse_profile_agent",
+            "fuse_profile",
+            "agent",
+            d.fuse_profile_agent,
+        )?,
+        fuse_profile_task: optional_string(
+            r,
+            "fuse_profile_task",
+            "fuse_profile",
+            "task",
+            d.fuse_profile_task,
+        )?,
+        fuse_profile_capacity: parse_number(
+            r,
+            "fuse_profile_capacity",
+            "fuse_profile",
+            "capacity",
+            d.fuse_profile_capacity,
+        )?,
+        fuse_profile_flush_interval_ms: parse_number(
+            r,
+            "fuse_profile_flush_interval_ms",
+            "fuse_profile",
+            "flush_interval_ms",
+            d.fuse_profile_flush_interval_ms,
+        )?,
         dicfuse_readable: parse_bool(
             r,
             "dicfuse_readable",
@@ -567,6 +621,22 @@ fn validate_url(field: &str, value: &str) -> ConfigResult<()> {
 fn validate(cfg: &ScorpioConfig) -> ConfigResult<()> {
     validate_url("base_url", &cfg.base_url)?;
     validate_url("lfs_url", &cfg.lfs_url)?;
+
+    if cfg.fuse_profile_enabled && cfg.fuse_profile_path.trim().is_empty() {
+        return Err("Missing or empty required config: fuse_profile_path".to_string());
+    }
+    if cfg.fuse_profile_capacity < 1 {
+        return Err(format!(
+            "Invalid config 'fuse_profile_capacity': must be >= 1, got {}",
+            cfg.fuse_profile_capacity
+        ));
+    }
+    if cfg.fuse_profile_flush_interval_ms < 1 {
+        return Err(format!(
+            "Invalid config 'fuse_profile_flush_interval_ms': must be >= 1, got {}",
+            cfg.fuse_profile_flush_interval_ms
+        ));
+    }
 
     let required_paths = [
         ("workspace", &cfg.workspace),
@@ -789,6 +859,54 @@ pub fn validate_file(
         &d.log_level,
         &mut errs,
     );
+    let fuse_profile_enabled = collect_bool(
+        &r,
+        "fuse_profile_enabled",
+        "fuse_profile",
+        "enabled",
+        d.fuse_profile_enabled,
+        &mut errs,
+    );
+    let fuse_profile_path = collect_str(
+        &r,
+        "fuse_profile_path",
+        "fuse_profile",
+        "path",
+        &d.fuse_profile_path,
+        &mut errs,
+    );
+    let _fuse_profile_agent = collect_str(
+        &r,
+        "fuse_profile_agent",
+        "fuse_profile",
+        "agent",
+        &d.fuse_profile_agent,
+        &mut errs,
+    );
+    let _fuse_profile_task = collect_str(
+        &r,
+        "fuse_profile_task",
+        "fuse_profile",
+        "task",
+        &d.fuse_profile_task,
+        &mut errs,
+    );
+    let fuse_profile_capacity = collect_num(
+        &r,
+        "fuse_profile_capacity",
+        "fuse_profile",
+        "capacity",
+        d.fuse_profile_capacity,
+        &mut errs,
+    );
+    let fuse_profile_flush_interval_ms = collect_num(
+        &r,
+        "fuse_profile_flush_interval_ms",
+        "fuse_profile",
+        "flush_interval_ms",
+        d.fuse_profile_flush_interval_ms,
+        &mut errs,
+    );
     let _readable = collect_bool(
         &r,
         "dicfuse_readable",
@@ -975,6 +1093,19 @@ pub fn validate_file(
     }
     if let Err(e) = validate_url("lfs_url", &lfs_url) {
         errs.push(e);
+    }
+    if fuse_profile_enabled && fuse_profile_path.trim().is_empty() {
+        errs.push("Missing or empty required config: fuse_profile_path".to_string());
+    }
+    if fuse_profile_capacity < 1 {
+        errs.push(format!(
+            "Invalid config 'fuse_profile_capacity': must be >= 1, got {fuse_profile_capacity}"
+        ));
+    }
+    if fuse_profile_flush_interval_ms < 1 {
+        errs.push(format!(
+            "Invalid config 'fuse_profile_flush_interval_ms': must be >= 1, got {fuse_profile_flush_interval_ms}"
+        ));
     }
 
     // Required non-empty fields.
@@ -1215,6 +1346,29 @@ pub fn lfs_url() -> &'static str {
 }
 pub fn log_level() -> &'static str {
     get_config().log_level.as_str()
+}
+pub fn fuse_profile_enabled() -> bool {
+    get_config().fuse_profile_enabled
+}
+
+pub fn fuse_profile_path() -> &'static str {
+    get_config().fuse_profile_path.as_str()
+}
+
+pub fn fuse_profile_agent() -> &'static str {
+    get_config().fuse_profile_agent.as_str()
+}
+
+pub fn fuse_profile_task() -> &'static str {
+    get_config().fuse_profile_task.as_str()
+}
+
+pub fn fuse_profile_capacity() -> usize {
+    get_config().fuse_profile_capacity
+}
+
+pub fn fuse_profile_flush_interval_ms() -> u64 {
+    get_config().fuse_profile_flush_interval_ms
 }
 pub fn dicfuse_readable() -> bool {
     get_config().dicfuse_readable

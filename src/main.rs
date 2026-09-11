@@ -37,6 +37,25 @@ struct Cli {
     #[arg(long, global = true)]
     state_file: Option<PathBuf>,
 
+    /// Enable FUSE operation profiling for this daemon.
+    #[arg(long, global = true)]
+    fuse_profile: bool,
+    /// FUSE profile output path (TSV).
+    #[arg(long, global = true)]
+    fuse_profile_path: Option<PathBuf>,
+    /// Agent label stored in the profile header.
+    #[arg(long, global = true)]
+    fuse_profile_agent: Option<String>,
+    /// Task label stored in the profile header.
+    #[arg(long, global = true)]
+    fuse_profile_task: Option<String>,
+    /// Bounded profile event queue capacity.
+    #[arg(long, global = true)]
+    fuse_profile_capacity: Option<usize>,
+    /// Profile writer flush interval in milliseconds.
+    #[arg(long, global = true)]
+    fuse_profile_flush_interval_ms: Option<u64>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -112,12 +131,20 @@ enum ConfigAction {
 async fn main() {
     let cli = Cli::parse();
 
-    let overrides = cli::antares_overrides(
+    let mut overrides = cli::antares_overrides(
         cli.upper_root.clone(),
         cli.cl_root.clone(),
         cli.mount_root.clone(),
         cli.state_file.clone(),
     );
+    overrides.extend(cli::fuse_profile_overrides(
+        cli.fuse_profile,
+        cli.fuse_profile_path.clone(),
+        cli.fuse_profile_agent.clone(),
+        cli.fuse_profile_task.clone(),
+        cli.fuse_profile_capacity,
+        cli.fuse_profile_flush_interval_ms,
+    ));
 
     // These commands need neither a loaded config nor logging; handle them
     // before `cli::init` so they work even when the config is missing/invalid.
