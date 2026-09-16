@@ -12,7 +12,7 @@ use crate::snapshot::{
 };
 
 /// One resolved file in the fixed view.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotFile {
     /// Scope-relative path, leading `/` stripped.
     pub rel_path: String,

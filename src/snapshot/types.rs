@@ -29,6 +29,9 @@ pub enum SnapshotErrorCode {
     DigestMismatch,
     RangeNotSupported,
     SymlinkTraversal,
+    /// A durable local store already holds a different fixed view; hydration
+    /// refuses rather than mixing two views in one store.
+    DurableViewConflict,
     Internal,
 }
 
