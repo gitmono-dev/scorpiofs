@@ -62,7 +62,7 @@ async fn resolve_walk_and_read_verified() {
         std::env::var("MST2_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:19700".into()),
     );
     let err = bad_client
-        .directory("sha256:" + &"1".repeat(64), "/", 256, None)
+        .directory(&("sha256:".to_string() + &"1".repeat(64)), "/", 256, None)
         .await
         .expect_err("unknown snapshot must error");
     assert_eq!(err.code, scorpiofs::snapshot::SnapshotErrorCode::SnapshotUnknown);
