@@ -51,7 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let snapshot_id = reader.snapshot_id().to_string();
             eprintln!("snapshot {snapshot_id}");
 
-            let dir = DurableStore::path_for(std::path::Path::new(&store_root), &scope, &snapshot_id);
+            let dir =
+                DurableStore::path_for(std::path::Path::new(&store_root), &scope, &snapshot_id);
             let store = Arc::new(DurableStore::open(&dir)?);
             let was_complete = store.is_complete()?;
             let report = store.hydrate(&reader).await?;

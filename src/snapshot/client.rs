@@ -11,12 +11,12 @@ use std::sync::Arc;
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use crate::snapshot::types::{
-    Capabilities, DirectoryResponse, LookupResponse, ResolveResponse,
-    SnapshotError, SnapshotErrorCode,
-};
 #[allow(unused_imports)]
 use crate::snapshot::types::Descriptor;
+use crate::snapshot::types::{
+    Capabilities, DirectoryResponse, LookupResponse, ResolveResponse, SnapshotError,
+    SnapshotErrorCode,
+};
 
 /// Client for one deployment's MST/2 surface. Cheap to clone (shares the
 /// underlying connection pool).

@@ -16,6 +16,6 @@ pub use client::Mst2Client;
 pub use durable::{DurableStore, HydrateReport, ViewMeta};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use types::{
-    Capabilities, Descriptor, DirectoryResponse, DirEntry, LookupResult, SnapshotError,
+    Capabilities, Descriptor, DirEntry, DirectoryResponse, LookupResult, SnapshotError,
     SnapshotErrorCode,
 };

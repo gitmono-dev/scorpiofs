@@ -37,7 +37,11 @@ pub enum SnapshotErrorCode {
 
 impl SnapshotError {
     pub fn new(code: SnapshotErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), http_status: 0 }
+        Self {
+            code,
+            message: message.into(),
+            http_status: 0,
+        }
     }
 }
 

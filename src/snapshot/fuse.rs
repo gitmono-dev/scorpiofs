@@ -111,17 +111,31 @@ impl Mst2Fuse {
         };
         state.nodes.insert(
             ROOT_INODE,
-            Node::Dir(DirNode { path: String::new(), children: HashMap::new(), parent: ROOT_INODE }),
+            Node::Dir(DirNode {
+                path: String::new(),
+                children: HashMap::new(),
+                parent: ROOT_INODE,
+            }),
         );
         for f in manifest {
             let parts: Vec<&str> = f.rel_path.split('/').filter(|s| !s.is_empty()).collect();
             let mut parent = ROOT_INODE;
             for (depth, part) in parts.iter().enumerate() {
                 let is_file = depth + 1 == parts.len();
-                parent = ensure_child(&mut state, parent, part, is_file, if is_file { Some(&f) } else { None });
+                parent = ensure_child(
+                    &mut state,
+                    parent,
+                    part,
+                    is_file,
+                    if is_file { Some(&f) } else { None },
+                );
             }
         }
-        Mst2Fuse { reader, store, state: StdMutex::new(state) }
+        Mst2Fuse {
+            reader,
+            store,
+            state: StdMutex::new(state),
+        }
     }
 
     /// The snapshot this mount is pinned to, when resolved from a live view.
@@ -154,15 +168,30 @@ impl Mst2Fuse {
 
         let mut out = Vec::new();
         if offset < 1 {
-            out.push(ListEntry { inode, kind: FileType::Directory, name: ".".into(), offset: 1 });
+            out.push(ListEntry {
+                inode,
+                kind: FileType::Directory,
+                name: ".".into(),
+                offset: 1,
+            });
         }
         if offset < 2 {
-            out.push(ListEntry { inode: parent, kind: FileType::Directory, name: "..".into(), offset: 2 });
+            out.push(ListEntry {
+                inode: parent,
+                kind: FileType::Directory,
+                name: "..".into(),
+                offset: 2,
+            });
         }
         for (i, (ino, kind, name)) in children.into_iter().enumerate() {
             let off = (i + 3) as i64;
             if off > offset {
-                out.push(ListEntry { inode: ino, kind, name, offset: off });
+                out.push(ListEntry {
+                    inode: ino,
+                    kind,
+                    name,
+                    offset: off,
+                });
             }
         }
         Ok(out)
@@ -229,7 +258,11 @@ fn ensure_child(
             digest: f.content_digest.clone(),
         })
     } else {
-        Node::Dir(DirNode { path: full, children: HashMap::new(), parent: parent_inode })
+        Node::Dir(DirNode {
+            path: full,
+            children: HashMap::new(),
+            parent: parent_inode,
+        })
     };
     state.nodes.insert(inode, node);
     if let Node::Dir(d) = state.nodes.get_mut(&parent_inode).expect("parent exists") {
@@ -265,7 +298,11 @@ fn file_attr(inode: u64, f: &FileNode) -> FileAttr {
         mtime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
         ctime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
         kind: FileType::RegularFile,
-        perm: if f.fs_kind == "executable" { 0o755 } else { 0o644 },
+        perm: if f.fs_kind == "executable" {
+            0o755
+        } else {
+            0o644
+        },
         nlink: 1,
         uid: 0,
         gid: 0,
@@ -276,7 +313,9 @@ fn file_attr(inode: u64, f: &FileNode) -> FileAttr {
 
 impl Filesystem for Mst2Fuse {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
-        Ok(ReplyInit { max_write: std::num::NonZeroU32::new(128 * 1024).unwrap() })
+        Ok(ReplyInit {
+            max_write: std::num::NonZeroU32::new(128 * 1024).unwrap(),
+        })
     }
 
     async fn destroy(&self, _req: Request) {}
@@ -293,7 +332,7 @@ impl Filesystem for Mst2Fuse {
         let node = self.node(inode)?;
         let attr = match &node {
             Node::Dir(_) => dir_attr(inode),
-            Node::File(f) => file_attr(inode, &f),
+            Node::File(f) => file_attr(inode, f),
         };
         Ok(ReplyAttr { attr, ttl: TTL })
     }
@@ -311,9 +350,13 @@ impl Filesystem for Mst2Fuse {
         let node = self.node(inode)?;
         let attr = match &node {
             Node::Dir(_) => dir_attr(inode),
-            Node::File(f) => file_attr(inode, &f),
+            Node::File(f) => file_attr(inode, f),
         };
-        Ok(ReplyEntry { attr, ttl: TTL, generation: 0 })
+        Ok(ReplyEntry {
+            attr,
+            ttl: TTL,
+            generation: 0,
+        })
     }
 
     async fn readdir<'a>(
@@ -336,7 +379,9 @@ impl Filesystem for Mst2Fuse {
                 })
             })
             .collect();
-        Ok(ReplyDirectory { entries: iter(entries) })
+        Ok(ReplyDirectory {
+            entries: iter(entries),
+        })
     }
 
     /// The kernel negotiates `READDIRPLUS` whenever it is offered, so this is
@@ -349,8 +394,9 @@ impl Filesystem for Mst2Fuse {
         _fh: u64,
         offset: u64,
         _lock_owner: u64,
-    ) -> Result<ReplyDirectoryPlus<impl futures::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>>
-    {
+    ) -> Result<
+        ReplyDirectoryPlus<impl futures::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>,
+    > {
         let listing = self.listing(inode, offset as i64)?;
         let mut entries: Vec<Result<DirectoryEntryPlus>> = Vec::with_capacity(listing.len());
         for e in listing {
@@ -372,14 +418,19 @@ impl Filesystem for Mst2Fuse {
                 attr_ttl: TTL,
             }));
         }
-        Ok(ReplyDirectoryPlus { entries: iter(entries) })
+        Ok(ReplyDirectoryPlus {
+            entries: iter(entries),
+        })
     }
 
     async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
         // Handle needed only so the kernel's directory-open round trip
         // succeeds; the read-only tree needs no per-handle state.
         match self.node(inode)? {
-            Node::Dir(_) => Ok(ReplyOpen { fh: inode, flags: 0 }),
+            Node::Dir(_) => Ok(ReplyOpen {
+                fh: inode,
+                flags: 0,
+            }),
             Node::File(_) => Err(Errno::from(libc::ENOTDIR)),
         }
     }
@@ -391,7 +442,11 @@ impl Filesystem for Mst2Fuse {
     async fn statfs(&self, _req: Request, _inode: Inode) -> Result<ReplyStatFs> {
         // Read-only view: report the snapshot's shape, not a device's usage.
         let state = self.state.lock().unwrap();
-        let files = state.nodes.values().filter(|n| matches!(n, Node::File(_))).count() as u64;
+        let files = state
+            .nodes
+            .values()
+            .filter(|n| matches!(n, Node::File(_)))
+            .count() as u64;
         Ok(ReplyStatFs {
             blocks: 0,
             bfree: 0,
@@ -413,12 +468,22 @@ impl Filesystem for Mst2Fuse {
         {
             let state = self.state.lock().unwrap();
             if state.contents.contains_key(&inode) {
-                return Ok(ReplyOpen { fh: inode, flags: 0 });
+                return Ok(ReplyOpen {
+                    fh: inode,
+                    flags: 0,
+                });
             }
         }
         let bytes = self.fetch_content(&f).await?;
-        self.state.lock().unwrap().contents.insert(inode, Arc::new(bytes));
-        Ok(ReplyOpen { fh: inode, flags: 0 })
+        self.state
+            .lock()
+            .unwrap()
+            .contents
+            .insert(inode, Arc::new(bytes));
+        Ok(ReplyOpen {
+            fh: inode,
+            flags: 0,
+        })
     }
 
     async fn read(
@@ -440,7 +505,9 @@ impl Filesystem for Mst2Fuse {
         };
         let start = (offset as usize).min(bytes.len());
         let end = (start + size as usize).min(bytes.len());
-        Ok(ReplyData { data: Bytes::copy_from_slice(&bytes[start..end]) })
+        Ok(ReplyData {
+            data: Bytes::copy_from_slice(&bytes[start..end]),
+        })
     }
 
     async fn getlk(
@@ -454,7 +521,12 @@ impl Filesystem for Mst2Fuse {
         _type: u32,
         _pid: u32,
     ) -> Result<ReplyLock> {
-        Ok(ReplyLock { start, end, r#type: libc::F_UNLCK as u32, pid: 0 })
+        Ok(ReplyLock {
+            start,
+            end,
+            r#type: libc::F_UNLCK as u32,
+            pid: 0,
+        })
     }
 
     async fn setlk(

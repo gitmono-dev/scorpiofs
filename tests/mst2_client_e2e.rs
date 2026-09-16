@@ -20,7 +20,9 @@ async fn resolve_walk_and_read_verified() {
     assert!(caps.features.resolve && caps.features.directory);
 
     // resolve once; the view is pinned
-    let reader = SnapshotReader::resolve(client, SCOPE, 600).await.expect("resolve");
+    let reader = SnapshotReader::resolve(client, SCOPE, 600)
+        .await
+        .expect("resolve");
     assert!(reader.snapshot_id().starts_with("sha256:"));
     assert_eq!(reader.descriptor.scope, SCOPE);
     let snapshot_id = reader.snapshot_id().to_string();
@@ -40,10 +42,11 @@ async fn resolve_walk_and_read_verified() {
     assert_eq!(bytes.len() as u64, f.size);
 
     // lookup four-state outcomes
-    let results = reader
-        .lookup(&vec![format!("/{}", f.rel_path), "/definitely-missing-xyz".to_string()])
-        .await
-        .expect("lookup");
+    let paths = [
+        format!("/{}", f.rel_path),
+        "/definitely-missing-xyz".to_string(),
+    ];
+    let results = reader.lookup(&paths).await.expect("lookup");
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].status, "found");
     assert_eq!(results[1].status, "absent");
@@ -65,7 +68,10 @@ async fn resolve_walk_and_read_verified() {
         .directory(&("sha256:".to_string() + &"1".repeat(64)), "/", 256, None)
         .await
         .expect_err("unknown snapshot must error");
-    assert_eq!(err.code, scorpiofs::snapshot::SnapshotErrorCode::SnapshotUnknown);
+    assert_eq!(
+        err.code,
+        scorpiofs::snapshot::SnapshotErrorCode::SnapshotUnknown
+    );
 
     let _ = snapshot_id;
 }

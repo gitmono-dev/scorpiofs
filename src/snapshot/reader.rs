@@ -61,15 +61,8 @@ impl SnapshotReader {
     }
 
     /// Batch lookup of scope-relative paths.
-    pub async fn lookup(
-        &self,
-        paths: &[String],
-    ) -> Result<Vec<LookupResult>, SnapshotError> {
-        Ok(self
-            .client
-            .lookup(self.snapshot_id(), paths)
-            .await?
-            .results)
+    pub async fn lookup(&self, paths: &[String]) -> Result<Vec<LookupResult>, SnapshotError> {
+        Ok(self.client.lookup(self.snapshot_id(), paths).await?.results)
     }
 
     /// Fetch one file's verified bytes (digest checked on both server and
@@ -97,11 +90,7 @@ impl SnapshotReader {
         Ok(out)
     }
 
-    async fn walk_dir(
-        &self,
-        dir: &str,
-        out: &mut Vec<SnapshotFile>,
-    ) -> Result<(), SnapshotError> {
+    async fn walk_dir(&self, dir: &str, out: &mut Vec<SnapshotFile>) -> Result<(), SnapshotError> {
         let mut cursor: Option<String> = None;
         loop {
             let page = self

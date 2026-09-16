@@ -309,7 +309,11 @@ impl DurableStore {
                     ),
                 ));
             }
-            write_atomic(&self.root.join(BLOB_DIR), &blob_name(&f.content_digest), &bytes)?;
+            write_atomic(
+                &self.root.join(BLOB_DIR),
+                &blob_name(&f.content_digest),
+                &bytes,
+            )?;
             self.append_journal(&FileRecord {
                 rel_path: f.rel_path.clone(),
                 digest: f.content_digest.clone(),
@@ -575,7 +579,9 @@ mod tests {
         let store = DurableStore::open(tmp.path()).unwrap();
 
         let calls = RefCell::new(Vec::new());
-        let first = hydrate_counted(&store, &manifest, &content, &calls).await.unwrap();
+        let first = hydrate_counted(&store, &manifest, &content, &calls)
+            .await
+            .unwrap();
         assert_eq!(first.fetched, 3);
         assert_eq!(first.resumed, 0);
         assert!(first.complete);
@@ -585,7 +591,9 @@ mod tests {
         // Re-open: journal + re-hash verification means zero network traffic.
         let store2 = DurableStore::open(tmp.path()).unwrap();
         let calls2 = RefCell::new(Vec::new());
-        let second = hydrate_counted(&store2, &manifest, &content, &calls2).await.unwrap();
+        let second = hydrate_counted(&store2, &manifest, &content, &calls2)
+            .await
+            .unwrap();
         assert_eq!(second.fetched, 0);
         assert_eq!(second.resumed, 3);
         assert_eq!(second.repaired, 0);
@@ -599,7 +607,9 @@ mod tests {
         let (manifest, content) = manifest_fixture();
         let store = DurableStore::open(tmp.path()).unwrap();
         let calls = RefCell::new(Vec::new());
-        hydrate_counted(&store, &manifest, &content, &calls).await.unwrap();
+        hydrate_counted(&store, &manifest, &content, &calls)
+            .await
+            .unwrap();
 
         // Simulate a torn write: blob loses its tail but the journal still
         // claims the file is hydrated.
@@ -608,8 +618,11 @@ mod tests {
 
         let store2 = DurableStore::open(tmp.path()).unwrap();
         let calls2 = RefCell::new(Vec::new());
-        let report = hydrate_counted(&store2, &manifest, &content, &calls2).await.unwrap();
-        assert_eq!(calls2.borrow().as_slice(), &[victim.rel_path.clone()]);
+        let report = hydrate_counted(&store2, &manifest, &content, &calls2)
+            .await
+            .unwrap();
+        assert_eq!(calls2.borrow().len(), 1, "only the torn file is refetched");
+        assert_eq!(calls2.borrow()[0], victim.rel_path);
         assert_eq!(report.repaired, 1);
         assert_eq!(report.fetched, 1);
         assert_eq!(report.resumed, 2);
@@ -628,7 +641,10 @@ mod tests {
             .await;
         let err = report.expect_err("digest mismatch must fail the hydration");
         assert_eq!(err.code, SnapshotErrorCode::DigestMismatch);
-        assert!(!store.is_complete().unwrap(), "no marker after a failed pass");
+        assert!(
+            !store.is_complete().unwrap(),
+            "no marker after a failed pass"
+        );
         assert!(!tmp.path().join(COMPLETE_MARKER).exists());
     }
 
@@ -638,9 +654,14 @@ mod tests {
         let (manifest, content) = manifest_fixture();
         let store = DurableStore::open(tmp.path()).unwrap();
         let calls = RefCell::new(Vec::new());
-        hydrate_counted(&store, &manifest, &content, &calls).await.unwrap();
+        hydrate_counted(&store, &manifest, &content, &calls)
+            .await
+            .unwrap();
 
-        let other = ViewMeta { snapshot_id: "sha256:other".to_string(), ..meta("x") };
+        let other = ViewMeta {
+            snapshot_id: "sha256:other".to_string(),
+            ..meta("x")
+        };
         let err = store
             .hydrate_with(&other, &manifest, |_f| async { Ok(Vec::new()) })
             .await
@@ -655,13 +676,17 @@ mod tests {
         let (manifest, content) = manifest_fixture();
         let store = DurableStore::open(tmp.path()).unwrap();
         let calls = RefCell::new(Vec::new());
-        hydrate_counted(&store, &manifest, &content, &calls).await.unwrap();
+        hydrate_counted(&store, &manifest, &content, &calls)
+            .await
+            .unwrap();
 
         // Blob survives but the journal record for it is gone (crash between
         // rename and journal append).
         std::fs::remove_file(tmp.path().join(JOURNAL_FILE)).unwrap();
         let calls2 = RefCell::new(Vec::new());
-        let report = hydrate_counted(&store, &manifest, &content, &calls2).await.unwrap();
+        let report = hydrate_counted(&store, &manifest, &content, &calls2)
+            .await
+            .unwrap();
         assert_eq!(report.fetched, 3, "no journal means no resume credit");
         assert_eq!(report.resumed, 0);
     }
@@ -678,7 +703,9 @@ mod tests {
         assert_eq!(err.code, SnapshotErrorCode::SnapshotNotReady);
 
         let calls = RefCell::new(Vec::new());
-        hydrate_counted(&store, &manifest, &content, &calls).await.unwrap();
+        hydrate_counted(&store, &manifest, &content, &calls)
+            .await
+            .unwrap();
         store.pin(&meta("sha256:snap")).unwrap();
         assert!(store.is_pinned().unwrap());
         assert!(tmp.path().join(PIN_FILE).metadata().unwrap().len() > 0);
