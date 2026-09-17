@@ -142,9 +142,19 @@ impl DurableStore {
         &self.root
     }
 
-    fn blob_path(&self, digest: &str) -> PathBuf {
+    /// Path of one CAS object. The digest is validated as `sha256:<64 hex>`
+    /// before it is ever turned into a path: it comes from server responses
+    /// and the manifest file, and a crafted value (`../`, absolute, non-hex)
+    /// must not be able to address a file outside the content directory.
+    fn blob_path(&self, digest: &str) -> Result<PathBuf, SnapshotError> {
         let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
-        self.content.join(hex)
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!("malformed digest {digest:?}"),
+            ));
+        }
+        Ok(self.content.join(hex))
     }
 
     /// True only when the marker exists *and* names this view. A marker that
@@ -314,9 +324,9 @@ impl DurableStore {
                     continue;
                 }
                 Ok(false) => {
-                    if self.blob_path(&f.content_digest).exists() {
+                    if self.blob_path(&f.content_digest)?.exists() {
                         // Present but wrong: drop it and refetch.
-                        let _ = fs::remove_file(self.blob_path(&f.content_digest));
+                        let _ = fs::remove_file(self.blob_path(&f.content_digest)?);
                         repaired += 1;
                     }
                 }
@@ -344,11 +354,7 @@ impl DurableStore {
                     ),
                 ));
             }
-            write_atomic(
-                &self.root.join(BLOB_DIR),
-                &blob_name(&f.content_digest),
-                &bytes,
-            )?;
+            write_atomic(&self.content, &blob_name(&f.content_digest), &bytes)?;
             self.append_journal(&FileRecord {
                 rel_path: f.rel_path.clone(),
                 digest: f.content_digest.clone(),
@@ -427,9 +433,9 @@ impl DurableStore {
                         bytes_total.fetch_add(f.size, Relaxed);
                         return Ok(());
                     }
-                    if store.blob_path(&f.content_digest).exists() {
+                    if store.blob_path(&f.content_digest)?.exists() {
                         // Present but wrong: drop it and refetch.
-                        let _ = fs::remove_file(store.blob_path(&f.content_digest));
+                        let _ = fs::remove_file(store.blob_path(&f.content_digest)?);
                         repaired.fetch_add(1, Relaxed);
                     }
                     let bytes: std::sync::Arc<Vec<u8>> = fetch(f.clone()).await?;
@@ -533,6 +539,37 @@ impl DurableStore {
         })
     }
 
+    /// Bounded range read of one CAS object: `None` when the object is not in
+    /// the store, `Some(bytes)` (exactly `len`, clamped to EOF) when it is.
+    ///
+    /// This is what keeps a hydrated large file from being materialised whole
+    /// on every FUSE read (spec 07 §6 / BODY-12): the digest is validated
+    /// before it becomes a path, and the read is a bounded `pread`.
+    pub fn pread_blob(
+        &self,
+        digest: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Vec<u8>>, SnapshotError> {
+        let path = self.blob_path(digest)?;
+        let mut f = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(e)),
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        let file_len = f.metadata().map_err(io_err)?.len();
+        if offset >= file_len {
+            return Ok(Some(Vec::new()));
+        }
+        let avail = (file_len - offset) as usize;
+        let want = len.min(avail);
+        f.seek(SeekFrom::Start(offset)).map_err(io_err)?;
+        let mut buf = vec![0u8; want];
+        f.read_exact(&mut buf).map_err(io_err)?;
+        Ok(Some(buf))
+    }
+
     /// Re-verify every blob of `manifest` against its digest. Full re-hash —
     /// this is the durability check, not a fast path.
     pub fn verify_all(&self, manifest: &[SnapshotFile]) -> Result<u64, SnapshotError> {
@@ -551,7 +588,7 @@ impl DurableStore {
 
     /// Read a hydrated file by CAS digest, re-verifying before returning it.
     pub fn read_blob(&self, digest: &str, expected_size: u64) -> Result<Vec<u8>, SnapshotError> {
-        let path = self.blob_path(digest);
+        let path = self.blob_path(digest)?;
         let bytes = fs::read(&path).map_err(|e| {
             SnapshotError::new(
                 SnapshotErrorCode::PathNotFound,
@@ -569,7 +606,7 @@ impl DurableStore {
 
     /// True when the blob exists, has the advertised size and hashes correctly.
     fn verify_blob(&self, digest: &str, expected_size: u64) -> Result<bool, SnapshotError> {
-        let path = self.blob_path(digest);
+        let path = self.blob_path(digest)?;
         let meta = match fs::metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -780,7 +817,7 @@ mod tests {
         // Simulate a torn write: blob loses its tail but the journal still
         // claims the file is hydrated.
         let victim = &manifest[1];
-        std::fs::write(store.blob_path(&victim.content_digest), b"fn main").unwrap();
+        std::fs::write(store.blob_path(&victim.content_digest).unwrap(), b"fn main").unwrap();
 
         let store2 = DurableStore::open(tmp.path()).unwrap();
         let calls2 = RefCell::new(Vec::new());
@@ -837,6 +874,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_digest_is_rejected_not_treated_as_a_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(tmp.path()).unwrap();
+        // A crafted digest must never address a file outside the store: the
+        // rejection happens before any filesystem call.
+        for bad in [
+            "sha256:../../victim.bin",
+            "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",   // non-hex
+            "sha256:abcd",                // too short
+            "/etc/passwd",                // no prefix, not hex
+        ] {
+            let err = store
+                .verify_blob(bad, 0)
+                .expect_err("malformed digest must be rejected");
+            assert_eq!(err.code, SnapshotErrorCode::DigestMismatch, "{bad}");
+        }
+        // The canary outside the store was never created: the rejection
+        // happened at digest validation, before any filesystem call.
+        assert!(!tmp.path().join("victim.bin").exists());
+        assert!(!store.content_dir().join("../../victim.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn hydrate_with_writes_where_reads_look() {
+        // The documented layout: per-view metadata under `root`, shared
+        // content in a separate directory. A hydration into that layout must
+        // be readable through the same store (regression: the sequential
+        // core once wrote to root/blobs while reads used the content dir).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("view");
+        let content = tmp.path().join("shared-blobs");
+        let store = DurableStore::open_with_content(&root, &content).unwrap();
+        let (manifest, content_map) = manifest_fixture();
+        let calls = RefCell::new(Vec::new());
+        let report = hydrate_counted(&store, &manifest, &content_map, &calls)
+            .await
+            .unwrap();
+        assert!(report.complete);
+        // Every blob must be readable through the store's own content dir.
+        store.verify_all(&manifest).unwrap();
+        for f in &manifest {
+            assert!(
+                content.join(blob_name(&f.content_digest)).exists(),
+                "blob for {} missing from the shared content dir",
+                f.rel_path
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn reuse_is_content_addressed_not_journal_dependent() {
         let tmp = tempfile::tempdir().unwrap();
         let (manifest, content) = manifest_fixture();
@@ -861,7 +948,7 @@ mod tests {
         // What *does* force a refetch is the content itself going away:
         // only the missing object is fetched, and the journal is rebuilt.
         let victim = &manifest[1];
-        std::fs::remove_file(store.blob_path(&victim.content_digest)).unwrap();
+        std::fs::remove_file(store.blob_path(&victim.content_digest).unwrap()).unwrap();
         let calls3 = RefCell::new(Vec::new());
         let report = hydrate_counted(&store, &manifest, &content, &calls3)
             .await
@@ -910,7 +997,7 @@ mod tests {
         write_atomic(&store.root.join(BLOB_DIR), &blob_name(&digest), body).unwrap();
         assert_eq!(store.read_blob(&digest, body.len() as u64).unwrap(), body);
 
-        std::fs::write(store.blob_path(&digest), b"hello durab1e").unwrap();
+        std::fs::write(store.blob_path(&digest).unwrap(), b"hello durab1e").unwrap();
         let err = store
             .read_blob(&digest, body.len() as u64)
             .expect_err("tampered blob must not be served");

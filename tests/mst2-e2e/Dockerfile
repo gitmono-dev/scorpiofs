@@ -1,8 +1,8 @@
 # MST/2 acceptance image: the scorpiofs MST/2 binaries plus the tools the
 # end-to-end checks need (git for the truth comparison, fuse3 to mount).
 #
-# Build context is the scorpiofs checkout; the shared codec arrives as a named
-# build context (`mst2codec`) because it is a path dependency.
+# Build context is the scorpiofs checkout alone: the shared codec is a pinned
+# git dependency (see Cargo.toml), so `git` in the builder fetches it.
 FROM rust:1.97-bookworm AS build
 
 RUN apt-get update \
@@ -14,7 +14,6 @@ WORKDIR /src/scorpiofs
 COPY . /src/scorpiofs
 # Dev-only sources the production context excludes.
 COPY --from=examplesctx ./ /src/scorpiofs/examples/
-COPY --from=mst2codec ./ /src/mst2-codec/
 
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=scorpiofs-cargo-registry-${TARGETARCH},sharing=locked \

@@ -98,7 +98,7 @@ impl Mst2Fuse {
         reader: SnapshotReader,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         let manifest = reader.file_manifest().await?;
-        Ok(Self::build(Some(reader), None, manifest))
+        Self::build(Some(reader), None, manifest)
     }
 
     /// Build over a reader *and* a durable store: content is served from the
@@ -108,7 +108,7 @@ impl Mst2Fuse {
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         let manifest = reader.file_manifest().await?;
-        Ok(Self::build(Some(reader), Some(store), manifest))
+        Self::build(Some(reader), Some(store), manifest)
     }
 
     /// Build over a reader, a store and an already-computed manifest (the
@@ -117,7 +117,7 @@ impl Mst2Fuse {
         reader: SnapshotReader,
         store: Arc<DurableStore>,
         manifest: Vec<SnapshotFile>,
-    ) -> Self {
+    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         Self::build(Some(reader), Some(store), manifest)
     }
 
@@ -128,14 +128,14 @@ impl Mst2Fuse {
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         let manifest = store.manifest()?;
-        Ok(Self::build(None, Some(store), manifest))
+        Self::build(None, Some(store), manifest)
     }
 
     fn build(
         reader: Option<SnapshotReader>,
         store: Option<Arc<DurableStore>>,
         manifest: Vec<SnapshotFile>,
-    ) -> Self {
+    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
@@ -161,14 +161,14 @@ impl Mst2Fuse {
                     part,
                     is_file,
                     if is_file { Some(&f) } else { None },
-                );
+                )?;
             }
         }
-        Mst2Fuse {
+        Ok(Mst2Fuse {
             reader,
             store,
             state: StdMutex::new(state),
-        }
+        })
     }
 
     /// The snapshot this mount is pinned to, when resolved from a live view.
@@ -260,23 +260,49 @@ impl Mst2Fuse {
     }
 }
 
+type EnsureResult = std::result::Result<u64, crate::snapshot::SnapshotError>;
+
 fn ensure_child(
     state: &mut State,
     parent_inode: u64,
     name: &str,
     is_file: bool,
     file: Option<&SnapshotFile>,
-) -> u64 {
-    if let Node::Dir(d) = state.nodes.get(&parent_inode).expect("parent exists") {
+) -> EnsureResult {
+    match state.nodes.get(&parent_inode) {
+        None => {
+            return Err(crate::snapshot::SnapshotError::new(
+                crate::snapshot::SnapshotErrorCode::Internal,
+                format!("manifest parent inode {parent_inode} missing"),
+            ))
+        }
+        // A manifest where one path is a file and another uses that file as a
+        // directory (`a` and `a/b`) is contradictory; that is a server/manifest
+        // defect, and panicking the mount thread would take the whole
+        // filesystem down. Typed error instead.
+        Some(Node::File(_)) => {
+            return Err(crate::snapshot::SnapshotError::new(
+                crate::snapshot::SnapshotErrorCode::Internal,
+                format!("manifest uses file {parent_inode} as a directory (entry {name:?})"),
+            ))
+        }
+        Some(Node::Dir(_)) => {}
+    }
+    if let Node::Dir(d) = state.nodes.get(&parent_inode).expect("checked above") {
         if let Some(existing) = d.children.get(name) {
-            return *existing;
+            return Ok(*existing);
         }
     }
     let inode = state.next_inode + 1;
     state.next_inode = inode;
-    let parent_path = match state.nodes.get(&parent_inode).expect("parent exists") {
-        Node::Dir(d) => d.path.clone(),
-        Node::File(_) => panic!("file cannot be a parent"),
+    let parent_path = match state.nodes.get(&parent_inode) {
+        Some(Node::Dir(d)) => d.path.clone(),
+        _ => {
+            return Err(crate::snapshot::SnapshotError::new(
+                crate::snapshot::SnapshotErrorCode::Internal,
+                format!("manifest parent inode {parent_inode} vanished"),
+            ))
+        }
     };
     let full = if parent_path.is_empty() {
         name.to_string()
@@ -299,10 +325,10 @@ fn ensure_child(
         })
     };
     state.nodes.insert(inode, node);
-    if let Node::Dir(d) = state.nodes.get_mut(&parent_inode).expect("parent exists") {
+    if let Some(Node::Dir(d)) = state.nodes.get_mut(&parent_inode) {
         d.children.insert(name.to_string(), inode);
     }
-    inode
+    Ok(inode)
 }
 
 fn dir_attr(inode: u64) -> FileAttr {
@@ -553,21 +579,20 @@ impl Filesystem for Mst2Fuse {
             });
         }
 
-        // 2. Local CAS: verified at hydration, so slicing it serves the range
-        //    without any network transfer. Cached for later reads.
-        if let Some(store) = &self.store {
-            if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
-                let arc = Arc::new(bytes);
-                let start = (offset as usize).min(arc.len());
-                let stop = (end as usize).min(arc.len());
-                let out = Bytes::copy_from_slice(&arc[start..stop]);
-                self.state.lock().unwrap().contents.insert(inode, arc);
-                return Ok(ReplyData { data: out });
-            }
-        }
-
-        // 3. Small file over the network: OBJECT frames carry it whole.
+        // 2. Small file: whole content (CAS when hydrated, OBJECT frames
+        //    otherwise), cached in memory — a small file's whole bytes are
+        //    cheap and repeats are common.
         if f.size <= crate::snapshot::range::OBJECT_CAP {
+            if let Some(store) = &self.store {
+                if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
+                    let arc = Arc::new(bytes);
+                    let start = (offset as usize).min(arc.len());
+                    let stop = (end as usize).min(arc.len());
+                    let out = Bytes::copy_from_slice(&arc[start..stop]);
+                    self.state.lock().unwrap().contents.insert(inode, arc);
+                    return Ok(ReplyData { data: out });
+                }
+            }
             let bytes = Arc::new(self.fetch_content(&f).await?);
             let start = (offset as usize).min(bytes.len());
             let stop = (end as usize).min(bytes.len());
@@ -576,7 +601,22 @@ impl Filesystem for Mst2Fuse {
             return Ok(ReplyData { data: out });
         }
 
-        // 4. Large file: verified chunk reader, transferred range only.
+        // 3. Large file: serve the requested range only (spec 07 §6, BODY-12).
+        //    A hydrated store is the offline-safe source — a bounded `pread`
+        //    that never loads the file whole. The verified chunk reader is the
+        //    live-transport path when the CAS does not hold the file.
+        if let Some(store) = &self.store {
+            if let Some(bytes) = store
+                .pread_blob(&f.digest, offset, (end - offset) as usize)
+                .map_err(io_err)?
+            {
+                return Ok(ReplyData {
+                    data: Bytes::from(bytes),
+                });
+            }
+        }
+
+        // 4. Large file online: verified chunk reader, transferred range only.
         let reader = self
             .reader
             .as_ref()

@@ -65,9 +65,10 @@ url = "2.5"
 async-trait = "0.1.92"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# Shared MST/2 byte codec (sibling crate; CI needs the sibling checkout, as
-# monoengine does). Pure codec only — no HTTP/DB/FUSE types leak through it.
-mst2-codec = { path = "../mst2-codec", features = ["zstd"] }
+# Shared MST/2 byte codec (specs 03/05/06/07), published to crates.io. Pure
+# codec only — no HTTP/DB/FUSE types leak through it. `zstd` enables the
+# optional strict single-frame frame encoding (spec 06 §3), added in 0.2.0.
+mst2-codec = { version = "0.2", features = ["zstd"] }
 
 
 [features]

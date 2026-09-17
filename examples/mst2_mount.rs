@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.repaired,
                 report.bytes_total,
             );
-            Mst2Fuse::from_manifest(reader, store, manifest)
+            Mst2Fuse::from_manifest(reader, store, manifest)?
         }
     };
 

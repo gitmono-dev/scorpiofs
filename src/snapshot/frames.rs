@@ -144,10 +144,19 @@ impl Mst2Client {
             .await?;
         let frames = mst2_codec::treeframe::parse_stream(&raw)
             .map_err(|e| frame_err("metadata/pages stream", e))?;
+        // A terminated-with-ERROR stream is a failure, not an empty page set
+        // (spec 04 §5: a failed directory load must never read as "no entries").
         let mut out = Vec::new();
         for f in frames {
-            if let Frame::Meta(m) = f {
-                out.extend(m.pages);
+            match f {
+                Frame::Meta(m) => out.extend(m.pages),
+                Frame::Error(e) => {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        format!("server rejected metadata/pages: {} (request_id {})", e.code, e.request_id),
+                    ))
+                }
+                _ => {}
             }
         }
         Ok(out)
@@ -211,6 +220,21 @@ impl Mst2Client {
         ));
         let v: serde_json::Value = self.get_json(&url).await?;
         let file_content_id = parse_digest(v["file_content_id"].as_str().unwrap_or(""))?;
+        // Bind the map to the file the view named (spec 07 §3, BODY-07): a
+        // server returning a well-formed map for a *different* content id
+        // must be rejected, never silently accepted.
+        if let Ok(want) = parse_digest(expected_digest) {
+            if file_content_id != want {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    format!(
+                        "chunk map binds content {}, the view named {}",
+                        hex32(&file_content_id),
+                        hex32(&want)
+                    ),
+                ));
+            }
+        }
         let pages_root = parse_digest(v["pages_root"].as_str().unwrap_or(""))?;
         let map_id_want = parse_digest(v["map_id"].as_str().unwrap_or(""))?;
         let file_size = parse_count(v["file_size"].as_str().unwrap_or(""), "file_size")?;

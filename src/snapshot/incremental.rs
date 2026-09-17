@@ -187,7 +187,18 @@ impl ScopeCache {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(e)),
         };
-        if mst2_codec::metapage::page_id(&bytes) != parse_page_id(page_id)? {
+        let want = match parse_page_id(page_id) {
+            Ok(w) => w,
+            // A record entry that is not a valid page id means the record is
+            // corrupt: drop the object so the next sync refetches instead of
+            // aborting the whole sync (spec 11 §10.3 — fallback is the
+            // correct path, not an error).
+            Err(_) => {
+                let _ = fs::remove_file(&path);
+                return Ok(None);
+            }
+        };
+        if mst2_codec::metapage::page_id(&bytes) != want {
             // Corrupt: remove so a later sync re-fetches instead of re-reading.
             let _ = fs::remove_file(&path);
             return Ok(None);
@@ -414,6 +425,23 @@ impl<'a> IncrementalSync<'a> {
                     )
                     .await?;
                 self.meters.fetched_pages += pages.len() as u64;
+                // The root response must contain the page the walk named: a
+                // server answering with different ids is not the view we
+                // resolved, and filing a record under a root the response
+                // never delivered would make reuse self-referential.
+                if route.is_empty()
+                    && !pages.iter().any(|(pid, _)| {
+                        format!("sha256:{}", crate::snapshot::frames::hex32(pid)) == root_page_id
+                    })
+                {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        format!(
+                            "metadata/pages did not return the requested root page {}",
+                            root_page_id
+                        ),
+                    ));
+                }
                 for (pid, bytes) in pages {
                     let id = format!("sha256:{}", crate::snapshot::frames::hex32(&pid));
                     if page_ids.contains(&id) {

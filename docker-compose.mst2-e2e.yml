@@ -25,9 +25,6 @@ services:
       # monoengine is the sibling checkout; this file lives in scorpiofs.
       context: ../monoengine
       dockerfile: Dockerfile.mst2
-      additional_contexts:
-        # The shared codec is a path dependency of monoengine.
-        mst2codec: ../mst2-codec
     environment:
       # The MST/2 surface stays off unless explicitly enabled, and every
       # capability is only advertised once it has been accepted.
@@ -60,9 +57,6 @@ services:
       context: .
       dockerfile: tests/mst2-e2e/Dockerfile
       additional_contexts:
-        # The MST/2 acceptance image bakes the example binaries, which need
-        # the same sibling codec the crate depends on.
-        mst2codec: ../mst2-codec
         # `tests/` and `examples/` are excluded from the main build context
         # by .dockerignore (the production image does not need them), so the
         # acceptance script and the example binaries arrive as their own

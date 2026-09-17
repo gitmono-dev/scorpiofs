@@ -117,8 +117,10 @@ STORE_DIR=$(grep -o 'store=[^ ]*' "$WORK/mount.log" | head -1 | cut -d= -f2)
 [ -n "$STORE_DIR" ]; check $? "mount reported its store directory"
 
 # Truth: a plain checkout of the same commit, compared file by file.
+rm -rf "$WORK/truth"
 git clone --quiet "$M2_BASE$M2_REPO_PATH" "$WORK/truth" \
-  && git -C "$WORK/truth" checkout --quiet "$TIP_BEFORE"
+  && git -C "$WORK/truth" checkout --quiet "$TIP_BEFORE" \
+  || { fail "truth clone/checkout failed"; exit 1; }
 ( cd "$WORK/truth" && find . -path ./.git -prune -o -type f -print0 | sort -z | xargs -0 -r sha256sum ) > "$WORK/truth.sha"
 listing "$MNT" > "$WORK/mount.sha"
 diffcheck "$WORK/truth.sha" "$WORK/mount.sha" "mounted bytes == git checkout ($(wc -l < "$WORK/mount.sha") files)"
@@ -176,6 +178,10 @@ import json, sys
 line = [l for l in open(sys.argv[1]).read().strip().splitlines() if l.startswith("{")][-1]
 m = json.loads(line)
 assert m["files"] > 0, "second version reported no files"
+# The reuse claim is asserted, not just reported: the second version must
+# have reused at least one verified subtree and skipped at least one page.
+assert m["reused_subtrees"] > 0, "no subtree was reused (incremental sync degenerated to a full walk)"
+assert m["reused_pages"] > 0, "no page was reused"
 print(
     "PASS: second version meters — traversal_nodes=%d fetched_pages=%d "
     "reused_pages=%d reused_subtrees=%d hydrate_fetched=%d hydrate_resumed=%d"
