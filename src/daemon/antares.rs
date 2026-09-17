@@ -803,6 +803,7 @@ const OCI_WHITEOUT_PREFIX: &str = ".wh.";
 /// OCI opaque-directory marker; not a per-file delete.
 const OCI_OPAQUE_MARKER: &str = ".wh..wh..opq";
 
+#[cfg(any(test, target_os = "macos"))]
 fn oci_whiteout_path(path: &Path) -> PathBuf {
     let name = path.file_name().unwrap_or_default();
     let mut marked = OsString::from(OCI_WHITEOUT_PREFIX);

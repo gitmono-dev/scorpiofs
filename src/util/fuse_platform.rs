@@ -219,6 +219,7 @@ fn mount_path_candidates(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Parse BSD / macOS `mount` output (`DEVICE on TARGET (opts)`).
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn mount_line_target(line: &str) -> Option<&str> {
     let rest = line.split_once(" on ")?.1;
     Some(
@@ -229,6 +230,7 @@ pub(crate) fn mount_line_target(line: &str) -> Option<&str> {
     )
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn mount_table_contains(stdout: &str, candidates: &[PathBuf]) -> bool {
     stdout.lines().any(|line| {
         let Some(target) = mount_line_target(line) else {
