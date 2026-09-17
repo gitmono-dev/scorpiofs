@@ -38,16 +38,21 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, SnapshotError> {
         ));
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks_exact(4) {
-        let vals: Vec<u8> = chunk
-            .iter()
-            .map(|&c| if c == b'=' { Ok(0) } else { dec(c).ok_or(()) })
-            .collect::<Result<_, _>>()
-            .map_err(|_| SnapshotError::new(SnapshotErrorCode::Internal, "base64 bad char"))?;
+    for chunk in bytes.as_chunks::<4>().0 {
+        let v = |c: u8| -> Result<u8, SnapshotError> {
+            if c == b'=' {
+                Ok(0)
+            } else {
+                dec(c).ok_or_else(|| {
+                    SnapshotError::new(SnapshotErrorCode::Internal, "base64 bad char")
+                })
+            }
+        };
+        let (a, b, c, d) = (v(chunk[0])?, v(chunk[1])?, v(chunk[2])?, v(chunk[3])?);
         // All shifts stay within u8: masks keep the top bits bounded.
-        out.push((vals[0] << 2) | (vals[1] >> 4));
-        out.push((vals[1] & 0x0f) << 4 | (vals[2] >> 2));
-        out.push((vals[2] & 0x03) << 6 | vals[3]);
+        out.push((a << 2) | (b >> 4));
+        out.push((b & 0x0f) << 4 | (c >> 2));
+        out.push((c & 0x03) << 6 | d);
         if chunk[2] == b'=' {
             out.truncate(out.len() - 2);
         } else if chunk[3] == b'=' {
