@@ -360,6 +360,7 @@ impl Mst2Client {
                 });
             }
         }
+        self.count_units(out.len() as u64);
         Ok(out)
     }
 }

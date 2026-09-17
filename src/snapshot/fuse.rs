@@ -55,7 +55,10 @@ enum Node {
 struct State {
     next_inode: u64,
     nodes: HashMap<u64, Node>,
+    /// Whole-file content cache (small files, hydrated CAS objects).
     contents: HashMap<u64, Arc<Vec<u8>>>,
+    /// Large files opened through the verified chunk reader (range reads).
+    chunked: HashMap<u64, Arc<crate::snapshot::range::ChunkedFile>>,
 }
 
 /// Kernel file type for one view entry. Symlinks are their own type, not
@@ -127,6 +130,7 @@ impl Mst2Fuse {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
             contents: HashMap::new(),
+            chunked: HashMap::new(),
         };
         state.nodes.insert(
             ROOT_INODE,
@@ -492,31 +496,22 @@ impl Filesystem for Mst2Fuse {
             // as file content".
             return Err(Errno::from(libc::ELOOP));
         }
-        let f = match node {
-            Node::File(f) => f,
-            Node::Dir(_) => return Err(Errno::from(libc::EISDIR)),
-        };
-        {
-            let state = self.state.lock().unwrap();
-            if state.contents.contains_key(&inode) {
-                return Ok(ReplyOpen {
-                    fh: inode,
-                    flags: 0,
-                });
-            }
+        match node {
+            Node::File(_) => Ok(ReplyOpen {
+                fh: inode,
+                flags: 0,
+            }),
+            Node::Dir(_) => Err(Errno::from(libc::EISDIR)),
         }
-        let bytes = self.fetch_content(&f).await?;
-        self.state
-            .lock()
-            .unwrap()
-            .contents
-            .insert(inode, Arc::new(bytes));
-        Ok(ReplyOpen {
-            fh: inode,
-            flags: 0,
-        })
     }
 
+    /// Serve `[offset, offset+size)` of a file, fetching only what covers it
+    /// (spec 07 §6, spec 11 §6: `open` prepares a handle, `read` starts I/O).
+    ///
+    /// Order of sources: an already-materialized whole file (small files and
+    /// hydrated CAS objects) is sliced; otherwise small files come through
+    /// the OBJECT path and large files through the verified chunk reader,
+    /// which transfers only the covering chunks.
     async fn read(
         &self,
         _req: Request,
@@ -525,19 +520,87 @@ impl Filesystem for Mst2Fuse {
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        let bytes = {
-            let state = self.state.lock().unwrap();
-            state
-                .contents
-                .get(&fh)
-                .cloned()
-                .or_else(|| state.contents.get(&inode).cloned())
-                .ok_or_else(|| Errno::from(libc::EBADF))?
+        let _ = fh;
+        let f = match self.node(inode)? {
+            Node::File(f) => f,
+            Node::Dir(_) => return Err(Errno::from(libc::EISDIR)),
         };
-        let start = (offset as usize).min(bytes.len());
-        let end = (start + size as usize).min(bytes.len());
+        if size == 0 || offset >= f.size {
+            return Ok(ReplyData {
+                data: Bytes::new(),
+            });
+        }
+        let end = offset.saturating_add(size as u64).min(f.size);
+
+        // 1. Whole content already in memory (verified when it was read).
+        if let Some(bytes) = self.state.lock().unwrap().contents.get(&inode).cloned() {
+            let start = (offset as usize).min(bytes.len());
+            let stop = (end as usize).min(bytes.len());
+            return Ok(ReplyData {
+                data: Bytes::copy_from_slice(&bytes[start..stop]),
+            });
+        }
+
+        // 2. Local CAS: verified at hydration, so slicing it serves the range
+        //    without any network transfer. Cached for later reads.
+        if let Some(store) = &self.store {
+            if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
+                let arc = Arc::new(bytes);
+                let start = (offset as usize).min(arc.len());
+                let stop = (end as usize).min(arc.len());
+                let out = Bytes::copy_from_slice(&arc[start..stop]);
+                self.state.lock().unwrap().contents.insert(inode, arc);
+                return Ok(ReplyData { data: out });
+            }
+        }
+
+        // 3. Small file over the network: OBJECT frames carry it whole.
+        if f.size <= crate::snapshot::range::OBJECT_CAP {
+            let bytes = Arc::new(self.fetch_content(&f).await?);
+            let start = (offset as usize).min(bytes.len());
+            let stop = (end as usize).min(bytes.len());
+            let out = Bytes::copy_from_slice(&bytes[start..stop]);
+            self.state.lock().unwrap().contents.insert(inode, bytes);
+            return Ok(ReplyData { data: out });
+        }
+
+        // 4. Large file: verified chunk reader, transferred range only.
+        let reader = self
+            .reader
+            .as_ref()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .clone();
+        let chunked = {
+            let cached = self.state.lock().unwrap().chunked.get(&inode).cloned();
+            match cached {
+                Some(c) => c,
+                None => {
+                    let path = format!("/{}", f.path);
+                    let c = Arc::new(
+                        crate::snapshot::range::ChunkedFile::open(
+                            &reader,
+                            &path,
+                            &f.digest,
+                            f.size,
+                        )
+                        .await
+                        .map_err(io_err)?,
+                    );
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .chunked
+                        .insert(inode, c.clone());
+                    c
+                }
+            }
+        };
+        let data = chunked
+            .read_range(offset, end - offset)
+            .await
+            .map_err(io_err)?;
         Ok(ReplyData {
-            data: Bytes::copy_from_slice(&bytes[start..end]),
+            data: Bytes::from(data),
         })
     }
 

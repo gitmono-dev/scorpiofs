@@ -11,12 +11,14 @@ pub mod coordinator;
 pub mod durable;
 pub mod frames;
 pub mod fuse;
+pub mod range;
 pub mod reader;
 pub mod types;
 
 pub use client::Mst2Client;
 pub use coordinator::FetchCoordinator;
 pub use durable::{DurableStore, HydrateReport, ViewMeta};
+pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use types::{
     Capabilities, Descriptor, DirEntry, DirectoryResponse, LookupResult, SnapshotError,

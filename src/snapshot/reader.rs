@@ -222,6 +222,12 @@ impl SnapshotReader {
         &self.caps
     }
 
+    /// Negotiated content encoding for frame responses, exposed for the
+    /// range reader (which drives the client directly).
+    pub fn encoding_hint(&self) -> Option<&'static str> {
+        self.content_encoding()
+    }
+
     /// Negotiated content encoding for frame responses: zstd when the
     /// deployment advertises it, otherwise identity (`None`).
     fn content_encoding(&self) -> Option<&'static str> {

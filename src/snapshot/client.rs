@@ -33,6 +33,13 @@ pub struct Mst2Client {
     base: String,
     /// Transport-level retries performed (metrics, spec 13 §6).
     retries: Arc<AtomicU64>,
+    /// Payload bytes received (frame/blob bodies), for the "transfer is
+    /// proportional to the requested range" property of range reads.
+    recv_bytes: Arc<AtomicU64>,
+    /// Content units (OBJECT entries and CHUNK chunks) actually fetched.
+    /// Wire bytes cannot prove a range read stayed narrow when a frame is
+    /// compressed, but the unit count can.
+    units_fetched: Arc<AtomicU64>,
 }
 
 /// Retry policy for idempotent reads: bounded attempts, exponential
@@ -46,7 +53,24 @@ impl Mst2Client {
             http: Arc::new(reqwest::Client::new()),
             base: base_url.into().trim_end_matches('/').to_string(),
             retries: Arc::new(AtomicU64::new(0)),
+            recv_bytes: Arc::new(AtomicU64::new(0)),
+            units_fetched: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Content units (objects/chunks) this client has fetched so far.
+    pub fn units_fetched(&self) -> u64 {
+        self.units_fetched.load(Ordering::Relaxed)
+    }
+
+    /// Record `n` fetched content units (called by the frame consumers).
+    pub(crate) fn count_units(&self, n: u64) {
+        self.units_fetched.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Payload bytes this client has received so far.
+    pub fn received_bytes(&self) -> u64 {
+        self.recv_bytes.load(Ordering::Relaxed)
     }
 
     /// How many transport retries this client has performed.
@@ -180,6 +204,8 @@ impl Mst2Client {
         let resp = self.send_retrying(self.http.get(url)).await?;
         let resp = ok_or_error(resp).await?;
         let bytes = resp.bytes().await.map_err(net_err)?;
+        self.recv_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         // Defense in depth: verify locally even though the server enforces
         // expected_digest too. ring is already a dependency.
         use ring::digest::{Context, SHA256};
@@ -351,6 +377,8 @@ impl Mst2Client {
         )
         .await?;
         let bytes = resp.bytes().await.map_err(de_err)?;
+        self.recv_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(bytes.to_vec())
     }
 
