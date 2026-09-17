@@ -6,8 +6,10 @@
 # HTTP bind address, and whether to install a systemd service. It also keeps a
 # non-interactive mode for automation and the original release-install flags.
 #
-# Interactive use (including curl | bash):
+# Interactive use (including curl | bash) on Linux only:
 #   curl -fsSL https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh | bash
+# macOS: do not run this script. Download the aarch64-apple-darwin tarball
+# from GitHub Releases and follow docs/macos.md.
 #
 # Safer use:
 #   curl -fsSLO https://raw.githubusercontent.com/gitmono-dev/scorpiofs/main/install.sh
@@ -825,7 +827,16 @@ open_interactive_tty() {
     TTY_FD=3
 }
 
+refuse_darwin() {
+    case "$(uname -s)" in
+        Darwin)
+            die "install.sh is Linux-only. Download scorpiofs-<ver>-aarch64-apple-darwin.tar.gz from GitHub Releases and follow docs/macos.md"
+            ;;
+    esac
+}
+
 detect_target() {
+    refuse_darwin
     case "$(uname -m)" in
         x86_64|amd64) echo "x86_64-unknown-linux-gnu" ;;
         aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
@@ -1667,6 +1678,7 @@ uninstall() {
 
 main() {
     parse_args "$@"
+    refuse_darwin
     if [ "$DO_UNINSTALL" -eq 1 ]; then uninstall; exit 0; fi
     apply_environment_options
     open_interactive_tty
