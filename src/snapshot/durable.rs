@@ -323,6 +323,140 @@ impl DurableStore {
             bytes_total += f.size;
         }
 
+        self.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
+    }
+
+    /// Concurrent hydration (spec 11 §7): identical verification/write-ahead
+    /// rules as [`hydrate_with`], but files are fetched through `fetch` with
+    /// up to `concurrency` leaders. The fetcher is expected to merge
+    /// identical content itself (single-flight); here we merge the durable
+    /// side as well so the same content id is written and journaled once
+    /// while every logical path is still recorded.
+    pub async fn hydrate_concurrent<F>(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        concurrency: usize,
+        fetch: F,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        F: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        if let Some(stored) = self.stored_view()? {
+            if stored.snapshot_id != view.snapshot_id {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DurableViewConflict,
+                    format!(
+                        "store at {} holds view {}, refusing to hydrate {}",
+                        self.root.display(),
+                        stored.snapshot_id,
+                        view.snapshot_id
+                    ),
+                ));
+            }
+        }
+        let journal = self.read_journal()?;
+        let fetched = std::sync::atomic::AtomicU64::new(0);
+        let resumed = std::sync::atomic::AtomicU64::new(0);
+        let repaired = std::sync::atomic::AtomicU64::new(0);
+        let bytes_total = std::sync::atomic::AtomicU64::new(0);
+        let store = self;
+
+        // Plan: journal credit is decided up front (same snapshot of the
+        // journal for all tasks), then fetch+verify+write runs concurrently.
+        use futures::stream::{StreamExt, TryStreamExt};
+        let plan: Vec<(SnapshotFile, bool)> = manifest
+            .iter()
+            .map(|f| {
+                let credit = matches!(journal.get(&f.rel_path), Some(rec)
+                    if rec.digest == f.content_digest && rec.size == f.size);
+                (f.clone(), credit)
+            })
+            .collect();
+
+        futures::stream::iter(plan)
+            .map(Ok::<_, SnapshotError>)
+            .try_for_each_concurrent(concurrency.max(1), |(f, credit)| {
+                let fetched = &fetched;
+                let resumed = &resumed;
+                let repaired = &repaired;
+                let bytes_total = &bytes_total;
+                let fetch = fetch.clone();
+                async move {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let already = store.verify_blob(&f.content_digest, f.size)?;
+                    if credit && already {
+                        resumed.fetch_add(1, Relaxed);
+                        bytes_total.fetch_add(f.size, Relaxed);
+                        return Ok(());
+                    } else if credit {
+                        // Credited but the object is gone/bad: repair it.
+                        let _ = fs::remove_file(store.blob_path(&f.content_digest));
+                        repaired.fetch_add(1, Relaxed);
+                    }
+                    let bytes: std::sync::Arc<Vec<u8>> = fetch(f.clone()).await?;
+                    // The store independently re-verifies, regardless of
+                    // any verification the fetch path claimed.
+                    let got = digest_of(&bytes);
+                    if got != f.content_digest {
+                        return Err(SnapshotError::new(
+                            SnapshotErrorCode::DigestMismatch,
+                            format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
+                        ));
+                    }
+                    if bytes.len() as u64 != f.size {
+                        return Err(SnapshotError::new(
+                            SnapshotErrorCode::DigestMismatch,
+                            format!(
+                                "{}: view advertises {} bytes, content is {}",
+                                f.rel_path,
+                                f.size,
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                    write_atomic(
+                        &store.root.join(BLOB_DIR),
+                        &blob_name(&f.content_digest),
+                        &bytes,
+                    )?;
+                    store.append_journal(&FileRecord {
+                        rel_path: f.rel_path.clone(),
+                        digest: f.content_digest.clone(),
+                        size: f.size,
+                    })?;
+                    fetched.fetch_add(1, Relaxed);
+                    bytes_total.fetch_add(f.size, Relaxed);
+                    Ok(())
+                }
+            })
+            .await?;
+
+        let fetched = fetched.load(std::sync::atomic::Ordering::Relaxed);
+        let resumed = resumed.load(std::sync::atomic::Ordering::Relaxed);
+        let repaired = repaired.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes_total = bytes_total.load(std::sync::atomic::Ordering::Relaxed);
+        store.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
+    }
+
+    /// Shared DURABLE_COMPLETE tail for the sequential and concurrent cores.
+    fn finish_hydration(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        bytes_total: u64,
+        fetched: u64,
+        resumed: u64,
+        repaired: u64,
+    ) -> Result<HydrateReport, SnapshotError> {
         // Persist the manifest before the marker: an offline reopen must
         // serve exactly the view that was hydrated, not a guess rebuilt from
         // the journal.
@@ -490,7 +624,13 @@ pub fn digest_of(bytes: &[u8]) -> String {
 /// A crash leaves either the old object or nothing — never a half-written one.
 fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
     fs::create_dir_all(dir).map_err(io_err)?;
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    // Random per writer: concurrent hydrations of identical content may race
+    // on the same final name but must not share a tmp path.
+    let tmp = dir.join(format!(
+        ".{name}.tmp.{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     {
         let mut f = File::create(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;

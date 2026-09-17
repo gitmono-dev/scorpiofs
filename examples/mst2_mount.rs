@@ -55,7 +55,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 DurableStore::path_for(std::path::Path::new(&store_root), &scope, &snapshot_id);
             let store = Arc::new(DurableStore::open(&dir)?);
             let was_complete = store.is_complete()?;
-            let report = store.hydrate(&reader).await?;
+            let manifest = reader.file_manifest().await?;
+            let view = scorpiofs::snapshot::ViewMeta {
+                snapshot_id: snapshot_id.clone(),
+                namespace_view_id: reader.descriptor.namespace_view_id.clone(),
+                scope: reader.descriptor.scope.clone(),
+                lease_id: reader.lease_id.clone(),
+            };
+            // Frame transport when advertised (OBJECT for small files,
+            // chunk-map/CHUNK for >256 KiB); raw blob otherwise.
+            let use_frames = reader.capabilities().features.objects
+                && reader.capabilities().features.chunk_reads;
+            let concurrency = std::env::var("M2_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4usize);
+            let coordinator =
+                scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), concurrency);
+            let report = store
+                .hydrate_concurrent(&view, &manifest, concurrency, move |f| {
+                    let coordinator = coordinator.clone();
+                    Box::pin(async move { coordinator.fetch(f, use_frames).await })
+                })
+                .await?;
+            store.pin(&view)?;
             let verified = store.verify_all(&store.manifest()?)?;
             if !store.is_complete()? {
                 return Err("hydration finished without a completeness marker".into());
