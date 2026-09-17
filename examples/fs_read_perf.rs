@@ -6,11 +6,13 @@
 //! Run with:  `cargo run --release --example fs_read_perf -- <dir>`
 //! (Generate a test tree first with `script/run.sh` or `script/run_1000_files.sh`.)
 
-use std::env;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::{
+    env,
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 fn collect_files_recursively(dir: &Path) -> Vec<PathBuf> {
     if dir.file_name() == Some(std::ffi::OsStr::new(".git")) {

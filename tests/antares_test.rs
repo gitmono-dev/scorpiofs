@@ -15,14 +15,13 @@
 //! sudo -E cargo test --test antares_test -- --ignored --nocapture --test-threads=1
 //! ```
 
+use std::{io::Write, path::PathBuf};
+
 use scorpiofs::{
-    antares::fuse::AntaresFuse,
-    antares::{AntaresManager, AntaresPaths},
+    antares::{fuse::AntaresFuse, AntaresManager, AntaresPaths},
     util::config,
 };
 use serial_test::serial;
-use std::io::Write;
-use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;

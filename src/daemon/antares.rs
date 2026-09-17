@@ -16,7 +16,6 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
 #[cfg(not(target_os = "macos"))]
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
@@ -1371,7 +1370,7 @@ impl AntaresServiceImpl {
                         dest, e
                     ))
                 })?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(target_os = "macos"))]

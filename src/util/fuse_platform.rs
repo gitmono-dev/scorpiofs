@@ -240,8 +240,9 @@ pub(crate) fn mount_table_contains(stdout: &str, candidates: &[PathBuf]) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::{is_not_mounted_message, mount_line_target, mount_table_contains};
     use std::path::PathBuf;
+
+    use super::{is_not_mounted_message, mount_line_target, mount_table_contains};
 
     #[test]
     fn parses_macos_mount_line() {

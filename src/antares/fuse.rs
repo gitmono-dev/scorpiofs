@@ -189,15 +189,17 @@ mod tests {
     };
     use serial_test::serial;
     use tokio::time::{sleep, Duration};
-
-    use crate::util::{
-        file_attr::make_file_attr,
-        fuse_platform::{self, fuse_provider},
-    };
     use uuid::Uuid;
 
     use super::AntaresFuse;
-    use crate::{dicfuse::Dicfuse, util::config};
+    use crate::{
+        dicfuse::Dicfuse,
+        util::{
+            config,
+            file_attr::make_file_attr,
+            fuse_platform::{self, fuse_provider},
+        },
+    };
 
     #[derive(Debug, Clone)]
     struct MemNode {
