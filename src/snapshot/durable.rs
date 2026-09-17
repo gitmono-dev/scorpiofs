@@ -881,9 +881,9 @@ mod tests {
         // rejection happens before any filesystem call.
         for bad in [
             "sha256:../../victim.bin",
-            "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",   // non-hex
-            "sha256:abcd",                // too short
-            "/etc/passwd",                // no prefix, not hex
+            "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg", // non-hex
+            "sha256:abcd",                                                             // too short
+            "/etc/passwd", // no prefix, not hex
         ] {
             let err = store
                 .verify_blob(bad, 0)

@@ -153,7 +153,10 @@ impl Mst2Client {
                 Frame::Error(e) => {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::Internal,
-                        format!("server rejected metadata/pages: {} (request_id {})", e.code, e.request_id),
+                        format!(
+                            "server rejected metadata/pages: {} (request_id {})",
+                            e.code, e.request_id
+                        ),
                     ))
                 }
                 _ => {}
