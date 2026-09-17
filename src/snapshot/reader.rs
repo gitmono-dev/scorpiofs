@@ -14,7 +14,7 @@ use crate::snapshot::{
 };
 
 /// One resolved file in the fixed view.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotFile {
     /// Scope-relative path, leading `/` stripped.
     pub rel_path: String,
@@ -136,7 +136,14 @@ impl Drop for LeaseKeeper {
 /// the caller falls back to the requested window.
 fn parse_rfc3339_unix(s: &str) -> Option<u64> {
     let b = s.as_bytes();
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
         return None;
     }
     let num = |from: usize, to: usize| -> Option<u64> {
@@ -262,6 +269,42 @@ impl SnapshotReader {
         self.client
             .blob_verified(self.snapshot_id(), &request_path, digest)
             .await
+    }
+
+    /// One directory, following the cursor to the end, so callers see every
+    /// entry with the directory's own `directory_root` (spec 04 §6: the
+    /// cursor chain is the complete enumeration, never a silent first page).
+    pub async fn directory_page(
+        &self,
+        dir: &str,
+        limit: u32,
+    ) -> Result<crate::snapshot::types::DirectoryResponse, SnapshotError> {
+        self.ensure_lease().await?;
+        let mut cursor: Option<String> = None;
+        let mut merged: Option<crate::snapshot::types::DirectoryResponse> = None;
+        loop {
+            let page = self
+                .client
+                .directory(self.snapshot_id(), dir, limit, cursor.as_deref())
+                .await?;
+            match &mut merged {
+                None => merged = Some(page.clone()),
+                Some(acc) => {
+                    if acc.directory_root != page.directory_root {
+                        return Err(SnapshotError::new(
+                            SnapshotErrorCode::CursorStale,
+                            "directory_root changed mid-enumeration",
+                        ));
+                    }
+                    acc.entries.extend(page.entries.clone());
+                    acc.next_cursor = page.next_cursor.clone();
+                }
+            }
+            match page.next_cursor {
+                None => return Ok(merged.expect("first page always merged")),
+                Some(c) => cursor = Some(c),
+            }
+        }
     }
 
     /// Walk the whole scope via paginated `directory`, collecting files.

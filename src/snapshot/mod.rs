@@ -11,6 +11,7 @@ pub mod coordinator;
 pub mod durable;
 pub mod frames;
 pub mod fuse;
+pub mod incremental;
 pub mod range;
 pub mod reader;
 pub mod types;
@@ -18,6 +19,7 @@ pub mod types;
 pub use client::Mst2Client;
 pub use coordinator::FetchCoordinator;
 pub use durable::{DurableStore, HydrateReport, ViewMeta};
+pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use types::{

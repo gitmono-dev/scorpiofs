@@ -20,12 +20,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mst2_codec::chunkmap::{CHUNK_SIZE, CHUNKS_PER_PAGE};
+use mst2_codec::chunkmap::{CHUNKS_PER_PAGE, CHUNK_SIZE};
 
 use crate::snapshot::{
-    SnapshotError, SnapshotErrorCode,
     frames::{ChunkRequest, VerifiedChunkMap},
     reader::SnapshotReader,
+    SnapshotError, SnapshotErrorCode,
 };
 
 /// Files at or below this size use the OBJECT path (spec 07 §2).
@@ -121,7 +121,10 @@ impl ChunkedFile {
             if from > to || to > bytes.len() {
                 return Err(SnapshotError::new(
                     SnapshotErrorCode::Internal,
-                    format!("chunk {index}: slice {from}..{to} outside {} bytes", bytes.len()),
+                    format!(
+                        "chunk {index}: slice {from}..{to} outside {} bytes",
+                        bytes.len()
+                    ),
                 ));
             }
             out.extend_from_slice(&bytes[from..to]);
@@ -201,10 +204,7 @@ impl ChunkedFile {
                 ),
             ));
         }
-        self.chunks
-            .lock()
-            .await
-            .insert(index, Arc::new(unit.bytes));
+        self.chunks.lock().await.insert(index, Arc::new(unit.bytes));
         Ok(())
     }
 

@@ -53,9 +53,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let dir =
                 DurableStore::path_for(std::path::Path::new(&store_root), &scope, &snapshot_id);
-            let store = Arc::new(DurableStore::open(&dir)?);
+            // Content is shared by every view of the scope (spec 11 §3), and
+            // verified subtrees are reused across versions (spec 11 §10).
+            let scope_dir = dir.parent().expect("snapshot dir has a scope parent");
+            let content_dir = scope_dir.join("blobs");
+            let store = Arc::new(DurableStore::open_with_content(&dir, &content_dir)?);
             let was_complete = store.is_complete()?;
-            let manifest = reader.file_manifest().await?;
+            let cache = scorpiofs::snapshot::ScopeCache::open(scope_dir)?;
+            let mut sync = scorpiofs::snapshot::IncrementalSync::new(&reader, &cache);
+            let manifest = sync.sync().await?;
+            let meters = sync.meters();
+            eprintln!(
+                "sync: traversal_nodes={} fetched_pages={} reused_pages={} reused_subtrees={} files={}",
+                meters.traversal_nodes,
+                meters.fetched_pages,
+                meters.reused_pages,
+                meters.reused_subtrees,
+                manifest.len()
+            );
             let view = scorpiofs::snapshot::ViewMeta {
                 snapshot_id: snapshot_id.clone(),
                 namespace_view_id: reader.descriptor.namespace_view_id.clone(),
@@ -92,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.repaired,
                 report.bytes_total,
             );
-            Mst2Fuse::from_reader_with_store(reader, store).await?
+            Mst2Fuse::from_manifest(reader, store, manifest)
         }
     };
 

@@ -27,7 +27,6 @@ async fn short_lease_is_renewed_proactively_and_revocation_is_typed() {
     let reader = SnapshotReader::resolve(client.clone(), "/project", 3)
         .await
         .expect("resolve");
-    let lease = reader.lease_id.clone();
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 

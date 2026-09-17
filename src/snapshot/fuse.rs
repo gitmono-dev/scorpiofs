@@ -111,6 +111,16 @@ impl Mst2Fuse {
         Ok(Self::build(Some(reader), Some(store), manifest))
     }
 
+    /// Build over a reader, a store and an already-computed manifest (the
+    /// incremental sync's result), so the tree is not walked twice.
+    pub fn from_manifest(
+        reader: SnapshotReader,
+        store: Arc<DurableStore>,
+        manifest: Vec<SnapshotFile>,
+    ) -> Self {
+        Self::build(Some(reader), Some(store), manifest)
+    }
+
     /// Reopen a completed, pinned hydration with no server contact at all.
     /// The manifest comes from the store, and every read re-verifies against
     /// the digest the view advertised when it was hydrated.
@@ -179,7 +189,11 @@ impl Mst2Fuse {
             .children
             .iter()
             .map(|(name, ino)| {
-                let kind = state.nodes.get(ino).map(entry_kind).unwrap_or(FileType::RegularFile);
+                let kind = state
+                    .nodes
+                    .get(ino)
+                    .map(entry_kind)
+                    .unwrap_or(FileType::RegularFile);
                 (*ino, kind, name.clone())
             })
             .collect();
@@ -526,9 +540,7 @@ impl Filesystem for Mst2Fuse {
             Node::Dir(_) => return Err(Errno::from(libc::EISDIR)),
         };
         if size == 0 || offset >= f.size {
-            return Ok(ReplyData {
-                data: Bytes::new(),
-            });
+            return Ok(ReplyData { data: Bytes::new() });
         }
         let end = offset.saturating_add(size as u64).min(f.size);
 
@@ -578,19 +590,12 @@ impl Filesystem for Mst2Fuse {
                     let path = format!("/{}", f.path);
                     let c = Arc::new(
                         crate::snapshot::range::ChunkedFile::open(
-                            &reader,
-                            &path,
-                            &f.digest,
-                            f.size,
+                            &reader, &path, &f.digest, f.size,
                         )
                         .await
                         .map_err(io_err)?,
                     );
-                    self.state
-                        .lock()
-                        .unwrap()
-                        .chunked
-                        .insert(inode, c.clone());
+                    self.state.lock().unwrap().chunked.insert(inode, c.clone());
                     c
                 }
             }

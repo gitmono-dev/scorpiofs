@@ -11,8 +11,8 @@
 //! retryable statuses (429/5xx) are re-attempted; a typed server error is
 //! definitive and returned as-is.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -255,10 +255,7 @@ async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, Snaps
 /// Statuses worth another attempt: throttling and transient server faults.
 /// A 4xx typed error is definitive and never retried.
 fn retryable_status(status: StatusCode) -> bool {
-    matches!(
-        status.as_u16(),
-        429 | 500 | 502 | 503 | 504
-    )
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
 }
 
 /// Transport failures that a retry can plausibly fix. A malformed-URL or

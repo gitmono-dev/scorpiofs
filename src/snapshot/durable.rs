@@ -87,16 +87,43 @@ pub struct HydrateReport {
 }
 
 /// One snapshot's durable local store.
+///
+/// The per-view metadata (view/manifest/journal/marker/pin) lives under
+/// `root`; the *content* is a content-addressed store that may be shared by
+/// every view of one scope (`open_with_content`). Sharing is safe because a
+/// blob is addressed by the digest of its bytes and re-verified before use,
+/// and it is what makes a new version reuse content instead of downloading
+/// it again (spec 11 §3/§10.2: key is auth_domain + digest + size).
 pub struct DurableStore {
     root: PathBuf,
+    content: PathBuf,
 }
 
 impl DurableStore {
     /// Open (creating if needed) the store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
         let root = root.into();
-        fs::create_dir_all(root.join(BLOB_DIR)).map_err(io_err)?;
-        Ok(Self { root })
+        let content = root.join(BLOB_DIR);
+        Self::open_with_content(root, content)
+    }
+
+    /// Open a view whose content comes from `content` (a scope-level cache
+    /// shared with other views), while its own metadata stays under `root`.
+    pub fn open_with_content(
+        root: impl Into<PathBuf>,
+        content: impl Into<PathBuf>,
+    ) -> Result<Self, SnapshotError> {
+        let root = root.into();
+        let content = content.into();
+        fs::create_dir_all(&root).map_err(io_err)?;
+        fs::create_dir_all(&content).map_err(io_err)?;
+        Ok(Self { root, content })
+    }
+
+    /// The content-addressed cache backing this view (shared across the
+    /// views of one scope when opened with `open_with_content`).
+    pub fn content_dir(&self) -> &Path {
+        &self.content
     }
 
     /// `root/snapshots/<scope-slug>/<snapshot-hex>` — the conventional layout
@@ -117,7 +144,7 @@ impl DurableStore {
 
     fn blob_path(&self, digest: &str) -> PathBuf {
         let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
-        self.root.join(BLOB_DIR).join(hex)
+        self.content.join(hex)
     }
 
     /// True only when the marker exists *and* names this view. A marker that
@@ -261,31 +288,39 @@ impl DurableStore {
             }
         }
 
-        let journal = self.read_journal()?;
+        // Structural check only: a corrupt journal is still an error, but the
+        // reuse decision below is made against the CAS, not the journal.
+        let _journal = self.read_journal()?;
         let mut fetched = 0u64;
         let mut resumed = 0u64;
         let mut repaired = 0u64;
         let mut bytes_total = 0u64;
 
         for f in manifest {
-            // Resume path: a journal entry counts only if the CAS object is
-            // still there and still hashes to the digest the view advertises.
-            if let Some(rec) = journal.get(&f.rel_path) {
-                if rec.digest == f.content_digest && rec.size == f.size {
-                    match self.verify_blob(&f.content_digest, f.size) {
-                        Ok(true) => {
-                            resumed += 1;
-                            bytes_total += f.size;
-                            continue;
-                        }
-                        Ok(false) => {
-                            // Truncated/corrupt object: drop it and refetch.
-                            let _ = fs::remove_file(self.blob_path(&f.content_digest));
-                            repaired += 1;
-                        }
-                        Err(e) => return Err(e),
+            // Content reuse (spec 11 §10.2): the CAS is content-addressed and
+            // shared across the views of one scope, so a byte-identical file
+            // from an earlier version is already here. A journal entry is not
+            // required — but every hit is re-hashed before it is credited, and
+            // a truncated or tampered object is repaired rather than served.
+            match self.verify_blob(&f.content_digest, f.size) {
+                Ok(true) => {
+                    self.append_journal(&FileRecord {
+                        rel_path: f.rel_path.clone(),
+                        digest: f.content_digest.clone(),
+                        size: f.size,
+                    })?;
+                    resumed += 1;
+                    bytes_total += f.size;
+                    continue;
+                }
+                Ok(false) => {
+                    if self.blob_path(&f.content_digest).exists() {
+                        // Present but wrong: drop it and refetch.
+                        let _ = fs::remove_file(self.blob_path(&f.content_digest));
+                        repaired += 1;
                     }
                 }
+                Err(e) => return Err(e),
             }
 
             let bytes = fetch(f).await?;
@@ -363,7 +398,7 @@ impl DurableStore {
                 ));
             }
         }
-        let journal = self.read_journal()?;
+        let _journal = self.read_journal()?;
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
         let repaired = std::sync::atomic::AtomicU64::new(0);
@@ -373,18 +408,13 @@ impl DurableStore {
         // Plan: journal credit is decided up front (same snapshot of the
         // journal for all tasks), then fetch+verify+write runs concurrently.
         use futures::stream::{StreamExt, TryStreamExt};
-        let plan: Vec<(SnapshotFile, bool)> = manifest
-            .iter()
-            .map(|f| {
-                let credit = matches!(journal.get(&f.rel_path), Some(rec)
-                    if rec.digest == f.content_digest && rec.size == f.size);
-                (f.clone(), credit)
-            })
-            .collect();
+        // Every file goes through the same CAS check: content reuse is a
+        // property of the shared store, not of this view's journal.
+        let plan: Vec<SnapshotFile> = manifest.to_vec();
 
         futures::stream::iter(plan)
             .map(Ok::<_, SnapshotError>)
-            .try_for_each_concurrent(concurrency.max(1), |(f, credit)| {
+            .try_for_each_concurrent(concurrency.max(1), |f| {
                 let fetched = &fetched;
                 let resumed = &resumed;
                 let repaired = &repaired;
@@ -392,13 +422,13 @@ impl DurableStore {
                 let fetch = fetch.clone();
                 async move {
                     use std::sync::atomic::Ordering::Relaxed;
-                    let already = store.verify_blob(&f.content_digest, f.size)?;
-                    if credit && already {
+                    if store.verify_blob(&f.content_digest, f.size)? {
                         resumed.fetch_add(1, Relaxed);
                         bytes_total.fetch_add(f.size, Relaxed);
                         return Ok(());
-                    } else if credit {
-                        // Credited but the object is gone/bad: repair it.
+                    }
+                    if store.blob_path(&f.content_digest).exists() {
+                        // Present but wrong: drop it and refetch.
                         let _ = fs::remove_file(store.blob_path(&f.content_digest));
                         repaired.fetch_add(1, Relaxed);
                     }
@@ -423,11 +453,7 @@ impl DurableStore {
                             ),
                         ));
                     }
-                    write_atomic(
-                        &store.root.join(BLOB_DIR),
-                        &blob_name(&f.content_digest),
-                        &bytes,
-                    )?;
+                    write_atomic(&store.content, &blob_name(&f.content_digest), &bytes)?;
                     store.append_journal(&FileRecord {
                         rel_path: f.rel_path.clone(),
                         digest: f.content_digest.clone(),
@@ -811,7 +837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_journal_entry_refetches_only_that_file() {
+    async fn reuse_is_content_addressed_not_journal_dependent() {
         let tmp = tempfile::tempdir().unwrap();
         let (manifest, content) = manifest_fixture();
         let store = DurableStore::open(tmp.path()).unwrap();
@@ -820,15 +846,30 @@ mod tests {
             .await
             .unwrap();
 
-        // Blob survives but the journal record for it is gone (crash between
-        // rename and journal append).
+        // The journal is a resume hint, not the reuse authority: with the
+        // content still verified in the CAS, a missing journal entry must
+        // not cause a re-download (the shared store is content-addressed).
         std::fs::remove_file(tmp.path().join(JOURNAL_FILE)).unwrap();
         let calls2 = RefCell::new(Vec::new());
         let report = hydrate_counted(&store, &manifest, &content, &calls2)
             .await
             .unwrap();
-        assert_eq!(report.fetched, 3, "no journal means no resume credit");
-        assert_eq!(report.resumed, 0);
+        assert_eq!(report.fetched, 0, "CAS hits must not refetch");
+        assert_eq!(report.resumed, 3);
+        assert!(calls2.borrow().is_empty());
+
+        // What *does* force a refetch is the content itself going away:
+        // only the missing object is fetched, and the journal is rebuilt.
+        let victim = &manifest[1];
+        std::fs::remove_file(store.blob_path(&victim.content_digest)).unwrap();
+        let calls3 = RefCell::new(Vec::new());
+        let report = hydrate_counted(&store, &manifest, &content, &calls3)
+            .await
+            .unwrap();
+        assert_eq!(calls3.borrow().as_slice().len(), 1, "one missing object");
+        assert_eq!(report.fetched, 1);
+        assert_eq!(report.resumed, 2);
+        store.verify_all(&manifest).unwrap();
     }
 
     #[tokio::test]
