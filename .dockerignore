@@ -1,0 +1,38 @@
+# Host / CI artifacts — never send into the image build context.
+target/
+target-*/
+**/target/
+
+# Local VCS / editor / agent state
+.libra/
+.git/
+.github/
+.cursor/
+.idea/
+.vscode/
+.agent/
+.agents/
+.codex/
+.claude/
+__pycache__/
+
+# Not needed to build the image (docs, tests, dev scripts, installer)
+docs/
+tests/
+test/
+script/
+examples/
+install.sh
+docker-compose.yml
+deploy/systemd/
+deploy/README.md
+
+# Runtime state / local config the image must never bake in
+config.toml
+scorpio.toml
+test_config.toml
+*.db
+**/*.log
+tmp/
+.tmp*/
+.DS_Store

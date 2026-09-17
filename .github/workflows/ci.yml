@@ -123,3 +123,55 @@ jobs:
       
       - name: Run tests
         run: cargo test --verbose
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    # Full release build inside the container (no host cargo cache reuse).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build only — nothing is pushed. This guards the Dockerfile and
+      # .dockerignore that the mega2 IT compose stack builds from
+      # (`build: context: ../scorpiofs`, image `scorpiofs:local`).
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: scorpiofs:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke the image
+        run: |
+          set -euo pipefail
+          # Both binaries run and report their version through the entrypoint.
+          docker run --rm scorpiofs:ci --version
+          docker run --rm --entrypoint antares scorpiofs:ci --version
+
+          # The entrypoint must refuse `serve` without backend URLs.
+          if docker run --rm scorpiofs:ci serve; then
+            echo "entrypoint accepted serve without SCORPIO_BASE_URL/SCORPIO_LFS_URL" >&2
+            exit 1
+          fi
+
+          # The baked config plus the image ENV overrides must validate.
+          docker run --rm \
+            -e SCORPIO_BASE_URL=http://mega.example:8000 \
+            -e SCORPIO_LFS_URL=http://mega.example:8000/api/v1/lfs \
+            scorpiofs:ci config validate
+
+          # FUSE prerequisites inside the container (the same device/cap/apparmor
+          # trio the compose stacks grant). `doctor` fails on missing /dev/fuse or
+          # non-writable runtime dirs; an unreachable mega server is only a warning.
+          docker run --rm \
+            --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
+            -e SCORPIO_BASE_URL=http://mega.example:8000 \
+            -e SCORPIO_LFS_URL=http://mega.example:8000/api/v1/lfs \
+            scorpiofs:ci doctor
