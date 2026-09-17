@@ -300,7 +300,12 @@ this endpoint reports overlay candidates, not Git status.
 
 **端点**: `DELETE /mounts/{mount_id}`
 
-**描述**: 卸载并删除指定的 FUSE 挂载。
+**描述**: 卸载并删除指定的 FUSE 挂载。卸载成功后，该挂载的 `mountpoint`、`upper` 与
+`cl` 目录会被一并删除（每次挂载都会生成新的 UUID，删除后没有任何 API 能再接回这些目录；
+`antares_mount_root` 也因此不会残留空目录）。`mountpoint` 只以 `remove_dir` 删除空目录：
+若 FUSE 会话意外仍在挂载中，不会经由挂载删除任何可见文件。卸载失败时（`Failed`）三个目录
+全部保留，便于排查与重试。**upper 层中未提交的私有修改会随删除一起丢弃**，需要保留时请先
+通过 Libra 提交或复制出来。
 
 **路径参数**:
 - `mount_id`: 挂载的 UUID
@@ -744,7 +749,9 @@ export RUST_LOG=libfuse_fs::passthrough::newlogfs=debug,rfuse3=trace
 
 ### 清理
 - 始终在删除挂载目录前先卸载文件系统，避免内核 I/O 错误
-- 卸载失败的挂载会保留在状态中，标记为 `Failed` 状态
+- `DELETE /mounts/{id}` 卸载成功后删除该挂载的 mountpoint（仅空目录）、upper、cl 目录；
+  创建过程中因重复 `job_id` / `(path, cl)` 回滚的孤儿挂载也走同一清理
+- 卸载失败的挂载会保留在状态中，标记为 `Failed` 状态，目录全部保留
 
 ---
 

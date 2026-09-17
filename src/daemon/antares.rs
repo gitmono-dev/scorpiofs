@@ -1268,6 +1268,49 @@ impl AntaresServiceImpl {
         Ok(())
     }
 
+    /// Remove the per-mount directories of an instance that has been unmounted
+    /// for good. Every mount gets a fresh UUID, so nothing can reattach to
+    /// these paths afterwards; leaving them behind leaks disk and litters
+    /// `antares_mount_root` (visible on the host when the root is bind-mounted).
+    ///
+    /// The mountpoint is removed with `remove_dir`, never `remove_dir_all`: it
+    /// must be an empty directory once the FUSE session is detached, so if a
+    /// mount is unexpectedly still attached (`EBUSY` / `ENOTEMPTY`) we refuse to
+    /// touch it rather than delete user-visible files through the mount. The
+    /// private upper/CL layers are plain directories owned by this instance and
+    /// are removed recursively. Failures are logged, not fatal.
+    fn remove_mount_dirs(
+        mount_id: Uuid,
+        mountpoint: &Path,
+        upper_dir: &Path,
+        cl_dir: Option<&Path>,
+    ) {
+        if let Err(e) = std::fs::remove_dir(mountpoint) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    mount_id = %mount_id,
+                    mountpoint = %mountpoint.display(),
+                    error = %e,
+                    "antares svc: mountpoint directory left in place after unmount"
+                );
+            }
+        }
+        for (layer, dir) in [("upper_dir", Some(upper_dir)), ("cl_dir", cl_dir)] {
+            let Some(dir) = dir else { continue };
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    mount_id = %mount_id,
+                    layer,
+                    dir = %dir.display(),
+                    error = %e,
+                    "antares svc: failed to remove layer directory after unmount"
+                ),
+            }
+        }
+    }
+
     fn create_whiteout(path: &Path) -> Result<(), ServiceError> {
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -1919,11 +1962,12 @@ impl AntaresService for AntaresServiceImpl {
                     mount_id
                 );
                 let _ = fuse.unmount().await;
-                let _ = std::fs::remove_dir_all(&mountpoint_str);
-                let _ = std::fs::remove_dir_all(&upper_dir_str);
-                if let Some(c) = cl_dir_str.as_deref() {
-                    let _ = std::fs::remove_dir_all(c);
-                }
+                Self::remove_mount_dirs(
+                    mount_id,
+                    Path::new(&mountpoint_str),
+                    Path::new(&upper_dir_str),
+                    cl_dir_str.as_deref().map(Path::new),
+                );
                 return Err(err);
             }
         } else if index.contains_key(&(
@@ -1945,11 +1989,12 @@ impl AntaresService for AntaresServiceImpl {
                 mount_id
             );
             let _ = fuse.unmount().await;
-            let _ = std::fs::remove_dir_all(&mountpoint_str);
-            let _ = std::fs::remove_dir_all(&upper_dir_str);
-            if let Some(c) = cl_dir_str.as_deref() {
-                let _ = std::fs::remove_dir_all(c);
-            }
+            Self::remove_mount_dirs(
+                mount_id,
+                Path::new(&mountpoint_str),
+                Path::new(&upper_dir_str),
+                cl_dir_str.as_deref().map(Path::new),
+            );
             return Err(err);
         }
 
@@ -2367,6 +2412,10 @@ impl AntaresService for AntaresServiceImpl {
                 elapsed_ms = start.elapsed().as_millis(),
                 "antares svc: delete_mount success"
             );
+
+            // The instance is gone from the maps and cannot be reattached, so
+            // reclaim its mountpoint and private layers (outside the locks).
+            Self::remove_mount_dirs(mount_id, &mountpoint, &upper_dir, cl_dir.as_deref());
 
             // Persist state to file for recovery
             self.persist_state().await;
@@ -3355,6 +3404,55 @@ mod tests {
             .changes
             .iter()
             .all(|change| change.kind == ChangeKind::Modified));
+    }
+
+    #[test]
+    fn remove_mount_dirs_reclaims_mountpoint_and_layers() {
+        let root = tempfile::tempdir().unwrap();
+        let mount_id = Uuid::new_v4();
+        let mountpoint = root.path().join("mnt").join(mount_id.to_string());
+        let upper = root.path().join("upper").join(mount_id.to_string());
+        let cl = root.path().join("cl").join(mount_id.to_string());
+        std::fs::create_dir_all(&mountpoint).unwrap();
+        std::fs::create_dir_all(upper.join("src")).unwrap();
+        std::fs::write(upper.join("src/edit.rs"), "upper").unwrap();
+        std::fs::create_dir_all(cl.join("src")).unwrap();
+        std::fs::write(cl.join("src/cl.rs"), "cl").unwrap();
+
+        AntaresServiceImpl::remove_mount_dirs(mount_id, &mountpoint, &upper, Some(&cl));
+
+        assert!(!mountpoint.exists(), "empty mountpoint must be removed");
+        assert!(!upper.exists(), "private upper layer must be removed");
+        assert!(!cl.exists(), "private CL layer must be removed");
+        // The per-mount roots themselves are left alone.
+        assert!(root.path().join("mnt").exists());
+        assert!(root.path().join("upper").exists());
+
+        // Idempotent: nothing to do and nothing to fail on a second call.
+        AntaresServiceImpl::remove_mount_dirs(mount_id, &mountpoint, &upper, Some(&cl));
+    }
+
+    #[test]
+    fn remove_mount_dirs_never_deletes_through_a_populated_mountpoint() {
+        // If the FUSE session were unexpectedly still attached, the mountpoint
+        // would not be an empty directory. Its contents must survive untouched
+        // while the private layers are still reclaimed.
+        let root = tempfile::tempdir().unwrap();
+        let mount_id = Uuid::new_v4();
+        let mountpoint = root.path().join("mnt").join(mount_id.to_string());
+        let upper = root.path().join("upper").join(mount_id.to_string());
+        std::fs::create_dir_all(mountpoint.join("still-visible")).unwrap();
+        std::fs::write(mountpoint.join("still-visible/file"), "keep").unwrap();
+        std::fs::create_dir_all(&upper).unwrap();
+
+        AntaresServiceImpl::remove_mount_dirs(mount_id, &mountpoint, &upper, None);
+
+        assert!(mountpoint.join("still-visible/file").exists());
+        assert_eq!(
+            std::fs::read_to_string(mountpoint.join("still-visible/file")).unwrap(),
+            "keep"
+        );
+        assert!(!upper.exists());
     }
 
     #[tokio::test]
