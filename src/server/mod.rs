@@ -128,11 +128,12 @@ pub async fn mount_filesystem_with_antares_cache<
     let gid = unsafe { libc::getgid() };
 
     let mut mount_options = MountOptions::default();
-    mount_options
-        .allow_other(true)
-        .force_readdir_plus(true)
-        .uid(uid)
-        .gid(gid);
+    mount_options.uid(uid).gid(gid);
+    // allow_other / force_readdir_plus are Linux FUSE concepts. macFUSE does
+    // not advertise READDIRPLUS, and same-user Finder/Terminal access does not
+    // need allow_other.
+    #[cfg(target_os = "linux")]
+    mount_options.allow_other(true).force_readdir_plus(true);
     if enable_antares_cache {
         apply_antares_cache_mount_options(&mut mount_options);
     }

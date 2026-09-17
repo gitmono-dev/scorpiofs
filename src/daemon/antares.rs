@@ -3,11 +3,12 @@
 //! Provides Axum routes to create, list, query, and delete FUSE mounts backed by
 //! AntaresService implementations. Includes graceful shutdown with cleanup.
 
+#[cfg(any(test, target_os = "macos"))]
+use std::ffi::OsString;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    ffi::CString,
     net::SocketAddr,
-    os::unix::{ffi::OsStrExt, fs::FileTypeExt},
+    os::unix::fs::FileTypeExt,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -16,6 +17,8 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(not(target_os = "macos"))]
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 use async_trait::async_trait;
 use axum::{
@@ -796,6 +799,43 @@ impl MountEntry {
     }
 }
 
+/// OCI overlay whiteout prefix (libfuse-fs default on macOS).
+const OCI_WHITEOUT_PREFIX: &str = ".wh.";
+/// OCI opaque-directory marker; not a per-file delete.
+const OCI_OPAQUE_MARKER: &str = ".wh..wh..opq";
+
+#[cfg(any(test, target_os = "macos"))]
+fn oci_whiteout_path(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default();
+    let mut marked = OsString::from(OCI_WHITEOUT_PREFIX);
+    marked.push(name);
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(marked),
+        _ => PathBuf::from(marked),
+    }
+}
+
+fn classify_layer_entry(
+    file_type: std::fs::FileType,
+    relative: &Path,
+) -> Option<(ChangeKind, String)> {
+    let name = relative.file_name()?.to_str()?;
+    if name == OCI_OPAQUE_MARKER {
+        return None;
+    }
+    if let Some(hidden) = name.strip_prefix(OCI_WHITEOUT_PREFIX) {
+        let mut logical = relative.to_path_buf();
+        logical.set_file_name(hidden);
+        return Some((ChangeKind::Deleted, logical.to_str()?.to_string()));
+    }
+    let path = relative.to_str()?.to_string();
+    if file_type.is_char_device() {
+        Some((ChangeKind::Deleted, path))
+    } else {
+        Some((ChangeKind::Modified, path))
+    }
+}
+
 /// Get current time as milliseconds since UNIX epoch.
 fn current_epoch_ms() -> u64 {
     SystemTime::now()
@@ -850,19 +890,12 @@ fn scan_layer_changes(
                 continue;
             }
 
-            let relative = relative.to_str().ok_or_else(|| {
-                ServiceError::Internal(format!(
-                    "Antares upper path {:?} is not valid UTF-8",
-                    relative
-                ))
-            })?;
+            let Some((kind, logical_path)) = classify_layer_entry(file_type, relative) else {
+                continue;
+            };
             let changed = ChangedPath {
-                kind: if file_type.is_char_device() {
-                    ChangeKind::Deleted
-                } else {
-                    ChangeKind::Modified
-                },
-                path: relative.to_string(),
+                kind,
+                path: logical_path,
                 source_path: None,
             };
             changes.insert(changed.path.clone(), changed);
@@ -1325,21 +1358,41 @@ impl AntaresServiceImpl {
             let _ = std::fs::remove_dir_all(path);
         }
 
-        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|e| {
-            ServiceError::Internal(format!("invalid whiteout path {:?}: {}", path, e))
-        })?;
-
-        let mode = libc::S_IFCHR;
-        let dev = 0;
-        let res = unsafe { libc::mknod(c_path.as_ptr(), mode, dev) };
-        if res != 0 {
-            return Err(ServiceError::Internal(format!(
-                "failed to create whiteout {:?}: {}",
-                path,
-                std::io::Error::last_os_error()
-            )));
+        #[cfg(target_os = "macos")]
+        {
+            let dest = oci_whiteout_path(path);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&dest)
+                .map_err(|e| {
+                    ServiceError::Internal(format!(
+                        "failed to create OCI whiteout {:?}: {}",
+                        dest, e
+                    ))
+                })?;
+            Ok(())
         }
-        Ok(())
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+                ServiceError::Internal(format!("invalid whiteout path {:?}: {}", path, e))
+            })?;
+
+            let mode = libc::S_IFCHR;
+            let dev = 0;
+            let res = unsafe { libc::mknod(c_path.as_ptr(), mode, dev) };
+            if res != 0 {
+                return Err(ServiceError::Internal(format!(
+                    "failed to create whiteout {:?}: {}",
+                    path,
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(())
+        }
     }
 
     async fn build_cl_layer(
@@ -3403,6 +3456,39 @@ mod tests {
             .changes
             .iter()
             .all(|change| change.kind == ChangeKind::Modified));
+    }
+
+    #[test]
+    fn oci_whiteout_path_prefixes_basename() {
+        assert_eq!(
+            oci_whiteout_path(Path::new("/tmp/src/foo.rs")),
+            PathBuf::from("/tmp/src/.wh.foo.rs")
+        );
+    }
+
+    #[test]
+    fn changed_path_scan_treats_oci_whiteout_as_delete() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/.wh.gone.rs"), "").unwrap();
+        std::fs::write(root.path().join("src/.wh..wh..opq"), "").unwrap();
+        std::fs::write(root.path().join("src/keep.rs"), "k").unwrap();
+
+        let response = scan_mount_changes(Uuid::new_v4(), root.path(), None).unwrap();
+        let mut changes: Vec<_> = response
+            .changes
+            .iter()
+            .map(|change| (change.path.as_str(), change.kind.clone()))
+            .collect();
+        changes.sort_by(|a, b| a.0.cmp(b.0));
+
+        assert_eq!(
+            changes,
+            vec![
+                ("src/gone.rs", ChangeKind::Deleted),
+                ("src/keep.rs", ChangeKind::Modified),
+            ]
+        );
     }
 
     #[test]

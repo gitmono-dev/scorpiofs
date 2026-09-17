@@ -68,36 +68,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// The FUSE unmount helper to invoke, resolved once.
-///
-/// Prefers fuse3's `fusermount3` — which this project's fuse3-based stack uses
-/// and which the deployment artifacts (Dockerfile / install.sh / systemd)
-/// install — and falls back to fuse2's `fusermount` for fuse2-only hosts.
-pub(crate) fn fusermount_bin() -> &'static str {
-    use std::sync::OnceLock;
-    static BIN: OnceLock<&'static str> = OnceLock::new();
-    BIN.get_or_init(|| {
-        if binary_on_path("fusermount3") {
-            "fusermount3"
-        } else if binary_on_path("fusermount") {
-            "fusermount"
-        } else {
-            // Neither present; default to the modern helper so any resulting
-            // error names what the docs tell users to install.
-            "fusermount3"
-        }
-    })
-}
-
-fn binary_on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-        .unwrap_or(false)
-}
-
 use crate::{
     dicfuse::{Dicfuse, DicfuseManager},
-    util::config,
+    util::{config, fuse_platform},
 };
 
 fn unmount_grace_duration() -> std::time::Duration {
@@ -348,7 +321,7 @@ impl AntaresManager {
     /// Unmount the FUSE filesystem and remove bookkeeping for a job.
     ///
     /// First attempts to unmount using the stored FUSE handle (proper teardown).
-    /// Falls back to `fusermount -u` if no handle is available.
+    /// Falls back to the platform unmount helper if no handle is available.
     /// Bookkeeping is always removed regardless of unmount outcome.
     pub async fn umount_job(&self, job_id: &str) -> std::io::Result<Option<AntaresConfig>> {
         use tracing::{info, warn};
@@ -376,40 +349,34 @@ impl AntaresManager {
                 }
                 Err(e) => {
                     warn!(
-                        "FUSE handle unmount failed for {:?}: {}, falling back to fusermount",
+                        "FUSE handle unmount failed for {:?}: {}, falling back to platform unmount",
                         mount_path, e
                     );
-                    // Fallback to fusermount -u
-                    let _ = tokio::process::Command::new(crate::antares::fusermount_bin())
-                        .arg("-u")
-                        .arg(mount_path)
-                        .output()
-                        .await;
+                    let _ = fuse_platform::unmount_path(mount_path, false).await;
                 }
             }
         } else {
-            // No FUSE handle available, use fusermount directly
-            let output = tokio::process::Command::new(crate::antares::fusermount_bin())
-                .arg("-u")
-                .arg(mount_path)
-                .output()
-                .await?;
-
-            if !output.status.success() {
-                let error_msg = String::from_utf8_lossy(&output.stderr);
-                if error_msg.contains("not mounted") || error_msg.contains("Invalid argument") {
-                    warn!(
-                        "Filesystem at {:?} is not mounted, removing bookkeeping only: {}",
-                        mount_path, error_msg
-                    );
-                } else {
-                    warn!(
-                        "fusermount -u failed with status {} for {:?}: {}",
-                        output.status, mount_path, error_msg
+            match fuse_platform::unmount_path(mount_path, false).await {
+                Ok(()) => {
+                    info!(
+                        "Successfully unmounted {:?} via platform unmount",
+                        mount_path
                     );
                 }
-            } else {
-                info!("Successfully unmounted {:?} via fusermount", mount_path);
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if fuse_platform::is_not_mounted_message(&error_msg) {
+                        warn!(
+                            "Filesystem at {:?} is not mounted, removing bookkeeping only: {}",
+                            mount_path, error_msg
+                        );
+                    } else {
+                        warn!(
+                            "platform unmount failed for {:?}: {}",
+                            mount_path, error_msg
+                        );
+                    }
+                }
             }
         }
         drop(fuse_handles);

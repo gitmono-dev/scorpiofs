@@ -293,25 +293,33 @@ sudo bash install.sh --uninstall
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which:
 
-- builds `x86_64-unknown-linux-gnu` (and best-effort `aarch64-unknown-linux-musl`
-  via `cross`; a failure there does not block the x86_64 release);
+- builds `x86_64-unknown-linux-gnu` on Ubuntu 22.04 (required; glibc 2.35);
+- builds best-effort `aarch64-unknown-linux-musl` via `cross` (a failure there
+  does not block the required legs);
+- builds required `aarch64-apple-darwin` on `macos-14` (Apple Silicon; not
+  notarized). There is no Intel Mac artifact;
 - packages each target as `scorpiofs-<version>-<target>.tar.gz` containing
   `scorpio`, `antares`, `LICENSE-MIT`, `LICENSE-APACHE`, and `README.md`;
 - generates a `<tarball>.sha256` per artifact plus a combined `SHA256SUMS`;
 - creates a GitHub Release with all artifacts attached.
 
-`install.sh` downloads the per-target tarball **and its `.sha256`**, then runs
-`sha256sum -c` and refuses to install on mismatch. Before replacing installed
-binaries, it also runs both extracted binaries with `--version`; this catches
-CPU, dynamic-linker, and glibc incompatibilities without leaving a broken
-installation behind. GNU release binaries are built on Ubuntu 22.04 to retain
-glibc 2.35 compatibility.
+`install.sh` is **Linux-only**. On Darwin it exits before downloading so it
+cannot pick the musl Linux tarball. macOS users unpack the darwin tarball
+themselves; see [docs/macos.md](../docs/macos.md).
+
+On Linux, `install.sh` downloads the per-target tarball **and its `.sha256`**,
+then runs `sha256sum -c` and refuses to install on mismatch. Before replacing
+installed binaries, it also runs both extracted binaries with `--version`; this
+catches CPU, dynamic-linker, and glibc incompatibilities without leaving a
+broken installation behind. GNU release binaries are built on Ubuntu 22.04 to
+retain glibc 2.35 compatibility.
 
 Publishing to **crates.io is decoupled** from the binary release: the
 `publish-crate` job targets a protected GitHub Environment (`crates-io`).
 Configure a required reviewer on that environment so an ordinary tag push cannot
 publish the crate without manual approval, and store `CARGO_REGISTRY_TOKEN` as an
-environment secret (least privilege).
+environment secret (least privilege). If that secret is empty, the job skips
+`cargo publish` instead of failing.
 
 This project is dual-licensed under MIT (`LICENSE-MIT`) OR Apache-2.0
 (`LICENSE-APACHE`).

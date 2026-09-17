@@ -1,4 +1,7 @@
-# Nightly-only rustfmt options used by the codebase.
-# Run `cargo +nightly fmt` to format.
-imports_granularity = "Crate"
+unstable_features = true
+
 group_imports = "StdExternalCrate"
+
+reorder_imports = true
+
+imports_granularity = "Crate"

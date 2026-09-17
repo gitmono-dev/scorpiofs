@@ -1,9 +1,8 @@
 use std::time::Duration;
 
-use asyncfuse::{
-    raw::reply::{FileAttr, ReplyEntry},
-    FileType, Timestamp,
-};
+use asyncfuse::{raw::reply::ReplyEntry, FileType};
+
+use crate::util::file_attr::empty_file_attr;
 
 /// Placeholder TTL for default entries.
 /// Callers (Dicfuse::get_stat / get_stat_fast / readdirplus) always override
@@ -13,21 +12,7 @@ const DEFAULT_ENTRY_TTL: Duration = Duration::ZERO;
 pub fn default_file_entry(inode: u64) -> ReplyEntry {
     ReplyEntry {
         ttl: DEFAULT_ENTRY_TTL,
-        attr: FileAttr {
-            ino: inode,
-            size: 0,
-            blocks: 0,
-            atime: Timestamp::new(0, 0),
-            mtime: Timestamp::new(0, 0),
-            ctime: Timestamp::new(0, 0),
-            kind: FileType::RegularFile,
-            perm: 0o755,
-            nlink: 0,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            blksize: 0,
-        },
+        attr: empty_file_attr(inode, FileType::RegularFile, 0o755),
         generation: 0,
     }
 }
@@ -35,21 +20,7 @@ pub fn default_file_entry(inode: u64) -> ReplyEntry {
 pub fn default_dic_entry(inode: u64) -> ReplyEntry {
     ReplyEntry {
         ttl: DEFAULT_ENTRY_TTL,
-        attr: FileAttr {
-            ino: inode,
-            size: 0,
-            blocks: 0,
-            atime: Timestamp::new(0, 0),
-            mtime: Timestamp::new(0, 0),
-            ctime: Timestamp::new(0, 0),
-            kind: FileType::Directory,
-            perm: 0o755,
-            nlink: 0,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            blksize: 0,
-        },
+        attr: empty_file_attr(inode, FileType::Directory, 0o755),
         generation: 0,
     }
 }

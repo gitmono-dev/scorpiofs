@@ -15,9 +15,10 @@ sudo apt update
 sudo apt install build-essential pkg-config libfuse3-dev libssl-dev
 ```
 
-## Required `allow_other` support for unprivileged runs
+## Required `allow_other` support for unprivileged Linux runs
 
-ScorpioFS requests the `allow_other` mount option for its FUSE mounts. Before
+On Linux, ScorpioFS requests the `allow_other` mount option for its FUSE
+mounts. Before
 running it as a non-root user, uncomment or add this exact line in
 `/etc/fuse.conf`:
 
@@ -27,3 +28,9 @@ user_allow_other
 
 This setting permits FUSE filesystems to use the `allow_other` mount option.
 The interactive installer can enable it with `--enable-user-allow-other`.
+
+## macOS
+
+macOS does **not** need `libfuse3-dev` or `/etc/fuse.conf`. Install macFUSE,
+run the sibling mega2 eval compose file, and follow [macos.md](macos.md).
+ScorpioFS does not request `allow_other` on macOS.

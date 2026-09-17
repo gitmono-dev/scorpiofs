@@ -12,6 +12,13 @@
 base_url = "http://localhost:8000"
 # Git LFS endpoint (usually the same host as base_url).
 lfs_url = "http://localhost:8000/lfs"
+#
+# macOS hybrid (native scorpio + sibling mega2-compose.yml):
+#   cd /path/to/mega2 && docker compose -f mega2-compose.yml up -d --wait
+#   base_url = "http://127.0.0.1:9000"
+#   lfs_url  = "http://127.0.0.1:9000/api/v1/lfs"
+# Do not copy the `/lfs` example path above when talking to that stack.
+# See docs/macos.md.
 
 # --- Core paths ---
 # FUSE mount point exposed to users.

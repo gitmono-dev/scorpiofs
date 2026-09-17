@@ -1,9 +1,9 @@
 //! `scorpio doctor` — environment diagnostics.
 //!
 //! Runs a series of lightweight, mostly-local checks and prints a human-readable
-//! report to stdout. Critical failures (missing FUSE device, non-writable
+//! report to stdout. Critical failures (missing FUSE provider, non-writable
 //! runtime directories) yield a non-zero exit code; advisory issues (no
-//! `user_allow_other`, unreachable mega server) are reported as warnings.
+//! `user_allow_other` on Linux, unreachable mega server) are reported as warnings.
 //!
 //! Configuration must already be loaded (via `cli::init`) before calling
 //! [`run`], so the directory/URL checks reflect the effective config.
@@ -15,7 +15,13 @@ use std::{
     time::Duration,
 };
 
-use crate::{cli::exit, util::config};
+use crate::{
+    cli::exit,
+    util::{
+        config,
+        fuse_platform::{self, FuseProvider},
+    },
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
@@ -55,17 +61,62 @@ pub async fn run() -> i32 {
 }
 
 fn check_fuse(failures: &mut u32) {
-    if Path::new("/dev/fuse").exists() {
-        report(Status::Ok, "fuse device", "/dev/fuse is present");
-    } else {
-        report(
-            Status::Fail,
-            "fuse device",
-            "/dev/fuse not found (load the `fuse` kernel module, or run in a FUSE-capable environment / container with --device /dev/fuse)",
-        );
-        *failures += 1;
+    match fuse_platform::fuse_provider() {
+        FuseProvider::LinuxFuse => {
+            report(Status::Ok, "fuse device", "/dev/fuse is present");
+            #[cfg(target_os = "linux")]
+            check_linux_filesystems();
+        }
+        FuseProvider::MacFuse => {
+            report(
+                Status::Ok,
+                "fuse provider",
+                &format!(
+                    "macFUSE mount helper is present ({})",
+                    fuse_platform::MACFUSE_MOUNT
+                ),
+            );
+            report(
+                Status::Ok,
+                "fuse permissions",
+                "ScorpioFS does not request allow_other on macOS; same-user Finder/Terminal access is enough",
+            );
+        }
+        FuseProvider::FuseTUnsupported => {
+            report(
+                Status::Warn,
+                "fuse-t",
+                "FUSE-T is installed but not supported (asyncfuse only speaks macFUSE)",
+            );
+            report(
+                Status::Fail,
+                "fuse provider",
+                "macFUSE not found. Install macFUSE (Apple Silicon: allow kexts in Recovery / Reduced Security), then re-run doctor",
+            );
+            *failures += 1;
+        }
+        FuseProvider::Unavailable => {
+            #[cfg(target_os = "macos")]
+            report(
+                Status::Fail,
+                "fuse provider",
+                "macFUSE not found. Install macFUSE from https://macfuse.io (Apple Silicon: allow kexts in Recovery / Reduced Security)",
+            );
+            #[cfg(not(target_os = "macos"))]
+            report(
+                Status::Fail,
+                "fuse device",
+                "/dev/fuse not found (load the `fuse` kernel module, or run in a FUSE-capable environment / container with --device /dev/fuse)",
+            );
+            *failures += 1;
+            #[cfg(target_os = "linux")]
+            check_linux_filesystems();
+        }
     }
+}
 
+#[cfg(target_os = "linux")]
+fn check_linux_filesystems() {
     match fs::read_to_string("/proc/filesystems") {
         // `/proc/filesystems` lists one fs per line; the name is the last field.
         // Match it exactly so "fuseblk"/"fusectl" don't count as "fuse".
@@ -89,6 +140,12 @@ fn check_fuse(failures: &mut u32) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn check_fuse_conf() {
+    // `/etc/fuse.conf` / `user_allow_other` is a Linux concept.
+}
+
+#[cfg(not(target_os = "macos"))]
 fn check_fuse_conf() {
     match fs::read_to_string("/etc/fuse.conf") {
         Ok(contents) => {

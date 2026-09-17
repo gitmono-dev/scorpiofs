@@ -12,6 +12,13 @@ pub use manager::DicfuseManager;
 
 use crate::util::config;
 
+#[cfg(target_os = "macos")]
+type Stat64 = libc::stat;
+#[cfg(target_os = "linux")]
+type Stat64 = libc::stat64;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+type Stat64 = libc::stat;
+
 /// Compute the backing store directory for a given base path.
 ///
 /// - Global (root) view uses the configured `store_root` directly.
@@ -126,7 +133,7 @@ impl Layer for Dicfuse {
         inode: Inode,
         _handle: Option<u64>,
         _mapping: bool,
-    ) -> std::io::Result<(libc::stat64, std::time::Duration)> {
+    ) -> std::io::Result<(Stat64, std::time::Duration)> {
         // Resolve inode -> StorageItem to derive type/size.
         let item = self
             .store
@@ -169,7 +176,7 @@ impl Layer for Dicfuse {
         };
 
         // Construct stat64 structure using zeroed() for platform-specific padding fields.
-        let mut stat: libc::stat64 = unsafe { std::mem::zeroed() };
+        let mut stat: Stat64 = unsafe { std::mem::zeroed() };
         stat.st_dev = 0;
         stat.st_ino = inode;
         stat.st_nlink = nlink as _;

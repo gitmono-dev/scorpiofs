@@ -55,10 +55,16 @@ https://crates.io/crates/scorpiofs
 
 ### How to Use?
 
-**Prerequisites:** Linux with FUSE enabled, the FUSE 3 development library
-(`libfuse3-dev` on Ubuntu), and a running Mega/monorepo server. See
-[docs/develop.md](docs/develop.md) for system setup (may require `sudo` for
-FUSE).
+**Prerequisites:** a FUSE-capable host and a running Mega/monorepo server.
+
+- **Linux:** FUSE enabled plus the FUSE 3 development library (`libfuse3-dev`
+  on Ubuntu). See [docs/develop.md](docs/develop.md) (may require `sudo`).
+- **macOS (Apple Silicon):** macFUSE plus a sibling
+  [mega2](https://github.com/gitmono-dev/mega2) eval stack. Download
+  `scorpiofs-<ver>-aarch64-apple-darwin.tar.gz` from
+  [Releases](https://github.com/gitmono-dev/scorpiofs/releases) and follow
+  [docs/macos.md](docs/macos.md). Do **not** run `install.sh` on macOS. FUSE-T
+  is not supported. Intel Macs must build from source.
 
 1. Start the mono server (e.g. `http://localhost:8000`).
 2. Edit **`scorpio.toml`** (not `config.toml`): set `base_url`, `workspace`, and `store_path`. The `config.toml` file is a **runtime state file** (tracks mounted workspaces), created automatically on first run.
@@ -243,10 +249,12 @@ as read-only input and is never rewritten.
 
 ### How to Deploy?
 
-ScorpioFS mounts a FUSE filesystem, so every deployment target needs a
-FUSE-capable host (`/dev/fuse` + the `fuse` module + `fuse3`). Run
-`scorpio doctor` to check a host. Full guidance is in
-[deploy/README.md](deploy/README.md).
+ScorpioFS mounts a FUSE filesystem. On Linux that means `/dev/fuse` + the
+`fuse` module + `fuse3`, then [`install.sh`](install.sh). On macOS install
+macFUSE, download the Apple Silicon release tarball, and run the daemon on the
+host; see [docs/macos.md](docs/macos.md). Do not `curl | bash install.sh` on
+macOS. Run `scorpio doctor` to check a host. Full Linux/container guidance is
+in [deploy/README.md](deploy/README.md).
 
 **Docker / Compose** — a multi-stage [`Dockerfile`](Dockerfile) and
 [`docker-compose.yml`](docker-compose.yml) are provided; config is entirely

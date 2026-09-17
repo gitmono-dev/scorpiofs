@@ -201,16 +201,15 @@ pub mod util;
 /// use scorpiofs::prelude::*;
 /// ```
 pub mod prelude {
-    // Antares core types
-    // Antares FUSE layer
-    pub use crate::antares::fuse::AntaresFuse;
-    pub use crate::antares::{AntaresConfig, AntaresManager, AntaresPaths};
-    // Daemon types
-    pub use crate::daemon::antares::{
-        AntaresDaemon, AntaresService, AntaresServiceImpl, ApiError, BuildClRequest,
-        CreateMountRequest, ErrorBody, HealthResponse, MountCollection, MountCreated, MountLayers,
-        MountLifecycle, MountReadyResponse, MountStatus, PersistedMountState, PersistedState,
-        ServiceError, StateOwnership,
+    pub use crate::{
+        antares::{fuse::AntaresFuse, AntaresConfig, AntaresManager, AntaresPaths},
+        daemon::antares::{
+            AntaresDaemon, AntaresService, AntaresServiceImpl, ApiError, BuildClRequest,
+            CreateMountRequest, ErrorBody, HealthResponse, MountCollection, MountCreated,
+            MountLayers, MountLifecycle, MountReadyResponse, MountStatus, PersistedMountState,
+            PersistedState, ServiceError, StateOwnership,
+        },
+        dicfuse::DicfuseManager,
     };
     // Dicfuse (read-only base layer)
     pub use crate::dicfuse::DicfuseManager;

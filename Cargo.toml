@@ -1,6 +1,6 @@
 [package]
 name = "scorpiofs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 # `cargo run` (no --bin) runs the main `scorpio` binary; `antares` is the alias.
 default-run = "scorpio"
@@ -70,6 +70,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # optional strict single-frame frame encoding (spec 06 §3), added in 0.2.0.
 mst2-codec = { version = "0.2", features = ["zstd"] }
 
+
+# libfuse-fs pulls reqwest 0.12 → native-tls → openssl-sys. Vendored OpenSSL
+# lets aarch64-unknown-linux-musl cross builds succeed without a sysroot .pc.
+[target.'cfg(target_env = "musl")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [features]
 async-io = []
