@@ -5,6 +5,8 @@
 //! bind paths, routes and handles to the snapshot id/generation.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use crate::snapshot::{
     client::Mst2Client,
@@ -21,6 +23,144 @@ pub struct SnapshotFile {
     pub content_digest: String,
 }
 
+/// Keeps the fixed view's retention lease alive across every operation that
+/// reaches the server (spec 04 §4). The view itself never changes — only the
+/// server-side retention claim does — so renewal is invisible to callers.
+///
+/// Renewal happens lazily: an operation that is about to reach the server
+/// renews first when less than a third of the granted window remains. Reads
+/// served from the local CAS never touch this path, so a completed mount
+/// keeps working even if the lease lapses (regression-protected).
+struct LeaseKeeper {
+    /// Window requested (and the server's clamp is known: 1..=3600s).
+    lease_seconds: u64,
+    deadline: StdMutex<Instant>,
+    /// One renewer at a time; the loser re-checks the deadline and proceeds.
+    renewing: tokio::sync::Mutex<()>,
+    /// Background renewer; aborted when the last reader clone is dropped.
+    task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl LeaseKeeper {
+    fn new(lease_seconds: u64) -> Self {
+        let secs = lease_seconds.clamp(1, 3600);
+        LeaseKeeper {
+            lease_seconds: secs,
+            deadline: StdMutex::new(Instant::now() + Duration::from_secs(secs)),
+            renewing: tokio::sync::Mutex::new(()),
+            task: StdMutex::new(None),
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        *self.deadline.lock().unwrap()
+    }
+
+    /// Renew at a third of the window remaining. The server refuses to
+    /// renew an *already expired* lease, so proactive renewal (below) is
+    /// what keeps a long operation alive; this lazy path is the safety net
+    /// for an operation that starts close to the deadline.
+    fn renew_threshold(&self) -> Duration {
+        Duration::from_secs((self.lease_seconds / 3).max(1))
+    }
+
+    /// Renew if the deadline is close. A failed renewal is a typed error:
+    /// the caller must not proceed to use a lapsed lease silently.
+    async fn ensure(&self, client: &Mst2Client, lease_id: &str) -> Result<(), SnapshotError> {
+        if Instant::now() + self.renew_threshold() < self.deadline() {
+            return Ok(());
+        }
+        let _guard = self.renewing.lock().await;
+        // Another task may have renewed while we waited.
+        if Instant::now() + self.renew_threshold() < self.deadline() {
+            return Ok(());
+        }
+        self.renew_now(client, lease_id).await
+    }
+
+    /// One unconditional renewal, updating the deadline.
+    async fn renew_now(&self, client: &Mst2Client, lease_id: &str) -> Result<(), SnapshotError> {
+        let renewed = client.renew_lease(lease_id, self.lease_seconds).await?;
+        let expires = renewed
+            .get("lease_expires_at")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339_unix);
+        let next = match expires {
+            Some(unix) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let remaining = unix.saturating_sub(now).max(1);
+                Instant::now() + Duration::from_secs(remaining)
+            }
+            // Unparseable expiry: fall back to the requested window (the
+            // server never grants more than it was asked for).
+            None => Instant::now() + Duration::from_secs(self.lease_seconds),
+        };
+        *self.deadline.lock().unwrap() = next;
+        Ok(())
+    }
+
+    /// Start the background renewer. It renews every `lease/3` seconds for
+    /// as long as any clone of the reader is alive, so an operation that
+    /// outlives the initial window (a long hydrate) never lapses mid-way.
+    /// A renewal failure stops the loop: the lease is gone, and the next
+    /// source operation will surface the typed error.
+    fn spawn(self: &Arc<Self>, client: Mst2Client, lease_id: String) {
+        let keeper = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            let period = Duration::from_secs((keeper.lease_seconds / 3).max(1));
+            loop {
+                tokio::time::sleep(period).await;
+                if let Err(e) = keeper.renew_now(&client, &lease_id).await {
+                    tracing::warn!(error = %e, lease = %lease_id, "lease renewal failed; stopping renewer");
+                    return;
+                }
+            }
+        });
+        *self.task.lock().unwrap() = Some(handle);
+    }
+}
+
+impl Drop for LeaseKeeper {
+    fn drop(&mut self) {
+        if let Some(h) = self.task.lock().unwrap().take() {
+            h.abort();
+        }
+    }
+}
+
+/// Minimal RFC3339 (`YYYY-MM-DDTHH:MM:SSZ`) → unix seconds. Only the exact
+/// shape this deployment emits is accepted; anything else returns `None` and
+/// the caller falls back to the requested window.
+fn parse_rfc3339_unix(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<u64> {
+        std::str::from_utf8(&b[from..to]).ok()?.parse::<u64>().ok()
+    };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    // days_from_civil (Howard Hinnant), matching runtime.rs' inverse.
+    let y_adj = if mo <= 2 { y as i64 - 1 } else { y as i64 };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj - era * 400;
+    let mp = (mo as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
 /// A fixed view plus everything needed to read its content.
 #[derive(Clone)]
 pub struct SnapshotReader {
@@ -28,6 +168,7 @@ pub struct SnapshotReader {
     pub descriptor: Descriptor,
     pub lease_id: String,
     caps: Capabilities,
+    lease: Arc<LeaseKeeper>,
 }
 
 impl SnapshotReader {
@@ -51,12 +192,28 @@ impl SnapshotReader {
             ));
         }
         let res = client.resolve(scope, lease_seconds).await?;
+        let lease = Arc::new(LeaseKeeper::new(lease_seconds));
+        // Keep the retention claim alive for as long as this reader lives
+        // (a hydrate or mount may outlast the initial window). Outside a
+        // runtime there is nothing to spawn onto; the lazy path in
+        // `ensure_lease` still covers operations that start near expiry.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            lease.spawn(client.clone(), res.lease_id.clone());
+        }
         Ok(Self {
             client,
             descriptor: res.descriptor,
             lease_id: res.lease_id,
             caps,
+            lease,
         })
+    }
+
+    /// Renew the view's retention lease if it is close to expiry. Called
+    /// automatically before every operation that reaches the server; exposed
+    /// so a mount can also keep it warm while idle.
+    pub async fn ensure_lease(&self) -> Result<(), SnapshotError> {
+        self.lease.ensure(&self.client, &self.lease_id).await
     }
 
     /// Capabilities captured at resolve time; callers gate frame
@@ -81,6 +238,7 @@ impl SnapshotReader {
 
     /// Batch lookup of scope-relative paths.
     pub async fn lookup(&self, paths: &[String]) -> Result<Vec<LookupResult>, SnapshotError> {
+        self.ensure_lease().await?;
         Ok(self.client.lookup(self.snapshot_id(), paths).await?.results)
     }
 
@@ -94,6 +252,7 @@ impl SnapshotReader {
         } else {
             format!("/{rel_path}")
         };
+        self.ensure_lease().await?;
         self.client
             .blob_verified(self.snapshot_id(), &request_path, digest)
             .await
@@ -104,6 +263,7 @@ impl SnapshotReader {
     /// Missing a page after a server-advertised cursor is an error; empty
     /// results are only accepted at real EOF (`next_cursor = null`).
     pub async fn file_manifest(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
+        self.ensure_lease().await?;
         let mut out = Vec::new();
         self.walk_dir("/", &mut out).await?;
         Ok(out)
@@ -163,6 +323,7 @@ impl SnapshotReader {
         digest: &str,
         size: u64,
     ) -> Result<Vec<u8>, SnapshotError> {
+        self.ensure_lease().await?;
         let sid = self.snapshot_id();
         let request_path = if rel_path.starts_with('/') {
             rel_path.to_string()
@@ -313,3 +474,49 @@ impl SnapshotReader {
 /// Kept for potential future use of directory entry inspection.
 #[allow(dead_code)]
 fn _entry_marker(_e: &DirEntry) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_parser_matches_known_values() {
+        assert_eq!(parse_rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_unix("2026-09-16T02:28:42Z"),
+            Some(1_789_525_722)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2024-02-29T23:59:59Z"),
+            Some(1_709_251_199)
+        );
+    }
+
+    #[test]
+    fn rfc3339_parser_rejects_non_canonical_shapes() {
+        for bad in [
+            "",
+            "2026-09-16T02:28:42",       // missing Z
+            "2026-09-16 02:28:42Z",      // space separator
+            "2026-13-01T00:00:00Z",      // month 13
+            "2026-09-16T24:00:00Z",      // hour 24
+            "2026-09-16T02:28:42+08:00", // offset form not emitted here
+        ] {
+            assert_eq!(parse_rfc3339_unix(bad), None, "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn lease_keeper_renews_only_near_expiry() {
+        // A fresh keeper with a comfortable window does not need renewal;
+        // with the window exhausted it does. `ensure` against a real client
+        // is covered by the live e2e; here we pin the threshold arithmetic.
+        let k = LeaseKeeper::new(60);
+        assert!(Instant::now() + k.renew_threshold() < k.deadline());
+        *k.deadline.lock().unwrap() = Instant::now() + Duration::from_secs(5);
+        assert!(Instant::now() + k.renew_threshold() >= k.deadline());
+        // The window is clamped to the server's 1..=3600 policy.
+        assert_eq!(LeaseKeeper::new(99_999).lease_seconds, 3600);
+        assert_eq!(LeaseKeeper::new(0).lease_seconds, 1);
+    }
+}

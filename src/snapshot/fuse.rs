@@ -4,6 +4,11 @@
 //! through the fixed view (no live-ref following); file content comes from
 //! digest-verified blob reads cached in memory. It does not touch the
 //! existing Antares overlay layer (read-only slice; write/upper stay there).
+//!
+//! Symlinks are served with real symlink semantics (spec 07 §1): the view
+//! exposes them as `fs_kind = "symlink"` whose content is the target bytes,
+//! so `readlink` returns that target and the kernel — not this filesystem —
+//! decides how to traverse it. Opening a symlink inode directly is ELOOP.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -51,6 +56,20 @@ struct State {
     next_inode: u64,
     nodes: HashMap<u64, Node>,
     contents: HashMap<u64, Arc<Vec<u8>>>,
+}
+
+/// Kernel file type for one view entry. Symlinks are their own type, not
+/// regular files (spec 07 §1); directories are handled by their node.
+fn entry_kind(node: &Node) -> FileType {
+    match node {
+        Node::Dir(_) => FileType::Directory,
+        Node::File(f) if f.fs_kind == "symlink" => FileType::Symlink,
+        Node::File(_) => FileType::RegularFile,
+    }
+}
+
+fn is_symlink(node: &Node) -> bool {
+    matches!(node, Node::File(f) if f.fs_kind == "symlink")
 }
 
 /// One directory entry as the kernel sees it, before it is split into the
@@ -156,10 +175,7 @@ impl Mst2Fuse {
             .children
             .iter()
             .map(|(name, ino)| {
-                let kind = match state.nodes.get(ino) {
-                    Some(Node::Dir(_)) => FileType::Directory,
-                    _ => FileType::RegularFile,
-                };
+                let kind = state.nodes.get(ino).map(entry_kind).unwrap_or(FileType::RegularFile);
                 (*ino, kind, name.clone())
             })
             .collect();
@@ -290,15 +306,23 @@ fn dir_attr(inode: u64) -> FileAttr {
 }
 
 fn file_attr(inode: u64, f: &FileNode) -> FileAttr {
+    let symlink = f.fs_kind == "symlink";
     FileAttr {
         ino: inode,
+        // For a symlink this is the target's length, per POSIX.
         size: f.size,
         blocks: (f.size / 512) + 1,
         atime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
         mtime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
         ctime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        kind: FileType::RegularFile,
-        perm: if f.fs_kind == "executable" {
+        kind: if symlink {
+            FileType::Symlink
+        } else {
+            FileType::RegularFile
+        },
+        perm: if symlink {
+            0o777
+        } else if f.fs_kind == "executable" {
             0o755
         } else {
             0o644
@@ -461,7 +485,14 @@ impl Filesystem for Mst2Fuse {
 
     async fn open(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
         let _ = _flags;
-        let f = match self.node(inode)? {
+        let node = self.node(inode)?;
+        if is_symlink(&node) {
+            // The kernel resolves symlinks itself; opening the link inode
+            // directly (e.g. O_NOFOLLOW) is ELOOP, never "serve target text
+            // as file content".
+            return Err(Errno::from(libc::ELOOP));
+        }
+        let f = match node {
             Node::File(f) => f,
             Node::Dir(_) => return Err(Errno::from(libc::EISDIR)),
         };
@@ -507,6 +538,34 @@ impl Filesystem for Mst2Fuse {
         let end = (start + size as usize).min(bytes.len());
         Ok(ReplyData {
             data: Bytes::copy_from_slice(&bytes[start..end]),
+        })
+    }
+
+    /// Return the symlink target recorded in the fixed view. The content is
+    /// the target bytes (git symlink blobs have no NUL terminator), verified
+    /// against the digest the view advertised.
+    async fn readlink(&self, _req: Request, inode: Inode) -> Result<ReplyData> {
+        let node = self.node(inode)?;
+        let f = match node {
+            Node::File(f) if f.fs_kind == "symlink" => f,
+            Node::File(_) => return Err(Errno::from(libc::EINVAL)),
+            Node::Dir(_) => return Err(Errno::from(libc::EINVAL)),
+        };
+        let cached = self.state.lock().unwrap().contents.get(&inode).cloned();
+        let target = match cached {
+            Some(b) => b,
+            None => {
+                let arc = Arc::new(self.fetch_content(&f).await?);
+                self.state
+                    .lock()
+                    .unwrap()
+                    .contents
+                    .insert(inode, arc.clone());
+                arc
+            }
+        };
+        Ok(ReplyData {
+            data: Bytes::copy_from_slice(target.as_slice()),
         })
     }
 

@@ -5,8 +5,15 @@
 //! `GET .../blob`. Content is always verified against the digest the fixed
 //! view advertises; a mismatch is an error, never silent corruption
 //! (spec 00 SYS-04).
+//!
+//! Every request is idempotent, so transport-level failures are retried
+//! with jittered backoff (spec 04 §10). Only connection/timeout errors and
+//! retryable statuses (429/5xx) are re-attempted; a typed server error is
+//! definitive and returned as-is.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -24,13 +31,66 @@ use crate::snapshot::types::{
 pub struct Mst2Client {
     http: Arc<reqwest::Client>,
     base: String,
+    /// Transport-level retries performed (metrics, spec 13 §6).
+    retries: Arc<AtomicU64>,
 }
+
+/// Retry policy for idempotent reads: bounded attempts, exponential
+/// backoff with jitter so a fleet of clients does not resynchronise.
+const MAX_ATTEMPTS: u32 = 4;
+const BASE_BACKOFF_MS: u64 = 40;
 
 impl Mst2Client {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             http: Arc::new(reqwest::Client::new()),
             base: base_url.into().trim_end_matches('/').to_string(),
+            retries: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// How many transport retries this client has performed.
+    pub fn retry_count(&self) -> u64 {
+        self.retries.load(Ordering::Relaxed)
+    }
+
+    /// Issue one logical request with bounded retries. The request must be
+    /// replayable (our bodies are JSON/bytes), which `try_clone` proves.
+    async fn send_retrying(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, SnapshotError> {
+        let req = builder.build().map_err(|e| {
+            SnapshotError::new(SnapshotErrorCode::Internal, format!("request build: {e}"))
+        })?;
+        let mut req = Some(req);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let this = if attempt < MAX_ATTEMPTS {
+                req.as_ref().and_then(|r| r.try_clone())
+            } else {
+                req.take()
+            };
+            let Some(this) = this else {
+                // Body was a one-shot stream; nothing safe to retry with.
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::Internal,
+                    "request body is not replayable",
+                ));
+            };
+            match self.http.execute(this).await {
+                Ok(resp) if attempt < MAX_ATTEMPTS && retryable_status(resp.status()) => {
+                    self.retries.fetch_add(1, Ordering::Relaxed);
+                    sleep_backoff(attempt).await;
+                }
+                Ok(resp) => return Ok(resp),
+                Err(e) if attempt < MAX_ATTEMPTS && retryable_transport(&e) => {
+                    self.retries.fetch_add(1, Ordering::Relaxed);
+                    sleep_backoff(attempt).await;
+                }
+                Err(e) => return Err(net_err(e)),
+            }
         }
     }
 
@@ -41,11 +101,8 @@ impl Mst2Client {
     /// Capability advertisement; clients gate features on this (spec 04 §3).
     pub async fn capabilities(&self) -> Result<Capabilities, SnapshotError> {
         let resp = self
-            .http
-            .get(self.snapshots_url("/capabilities"))
-            .send()
-            .await
-            .map_err(net_err)?;
+            .send_retrying(self.http.get(self.snapshots_url("/capabilities")))
+            .await?;
         ok_or_error(resp).await?.json().await.map_err(de_err)
     }
 
@@ -63,12 +120,8 @@ impl Mst2Client {
             "supported_metadata_codecs": [1],
         });
         let resp = self
-            .http
-            .post(self.snapshots_url("/resolve"))
-            .json(&body)
-            .send()
-            .await
-            .map_err(net_err)?;
+            .send_retrying(self.http.post(self.snapshots_url("/resolve")).json(&body))
+            .await?;
         ok_or_error(resp).await?.json().await.map_err(de_err)
     }
 
@@ -88,7 +141,7 @@ impl Mst2Client {
             url.push_str("&cursor=");
             url.push_str(&urlencode(c));
         }
-        let resp = self.http.get(url).send().await.map_err(net_err)?;
+        let resp = self.send_retrying(self.http.get(url)).await?;
         ok_or_error(resp).await?.json().await.map_err(de_err)
     }
 
@@ -100,12 +153,12 @@ impl Mst2Client {
     ) -> Result<LookupResponse, SnapshotError> {
         let body = serde_json::json!({"paths": paths});
         let resp = self
-            .http
-            .post(self.snapshots_url(&format!("/{snapshot_id}/lookup")))
-            .json(&body)
-            .send()
-            .await
-            .map_err(net_err)?;
+            .send_retrying(
+                self.http
+                    .post(self.snapshots_url(&format!("/{snapshot_id}/lookup")))
+                    .json(&body),
+            )
+            .await?;
         ok_or_error(resp).await?.json().await.map_err(de_err)
     }
 
@@ -124,7 +177,7 @@ impl Mst2Client {
             urlencode(path),
             urlencode(expected_digest)
         ));
-        let resp = self.http.get(url).send().await.map_err(net_err)?;
+        let resp = self.send_retrying(self.http.get(url)).await?;
         let resp = ok_or_error(resp).await?;
         let bytes = resp.bytes().await.map_err(net_err)?;
         // Defense in depth: verify locally even though the server enforces
@@ -171,6 +224,32 @@ async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, Snaps
         SnapshotErrorCode::Internal,
         format!("HTTP {status} without error envelope"),
     ))
+}
+
+/// Statuses worth another attempt: throttling and transient server faults.
+/// A 4xx typed error is definitive and never retried.
+fn retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        429 | 500 | 502 | 503 | 504
+    )
+}
+
+/// Transport failures that a retry can plausibly fix. A malformed-URL or
+/// body-encoding error is not retryable.
+fn retryable_transport(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// Exponential backoff with jitter derived from the clock, so retries from
+/// many clients do not line up.
+async fn sleep_backoff(attempt: u32) {
+    let base = BASE_BACKOFF_MS << (attempt.saturating_sub(1)).min(4);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() as u64) % (base + 1))
+        .unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(base + jitter)).await;
 }
 
 fn net_err(e: reqwest::Error) -> SnapshotError {
@@ -223,7 +302,7 @@ impl Mst2Client {
         url: impl AsRef<str>,
     ) -> Result<serde_json::Value, SnapshotError> {
         let url = url.as_ref();
-        ok_or_error(self.http.get(url).send().await.map_err(net_err)?)
+        ok_or_error(self.send_retrying(self.http.get(url)).await?)
             .await?
             .json()
             .await
@@ -236,18 +315,11 @@ impl Mst2Client {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, SnapshotError> {
         let url = url.as_ref();
-        ok_or_error(
-            self.http
-                .post(url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(net_err)?,
-        )
-        .await?
-        .json()
-        .await
-        .map_err(de_err)
+        ok_or_error(self.send_retrying(self.http.post(url).json(&body)).await?)
+            .await?
+            .json()
+            .await
+            .map_err(de_err)
     }
 
     pub(crate) async fn delete_json(
@@ -255,7 +327,7 @@ impl Mst2Client {
         url: impl AsRef<str>,
     ) -> Result<serde_json::Value, SnapshotError> {
         let url = url.as_ref();
-        ok_or_error(self.http.delete(url).send().await.map_err(net_err)?)
+        ok_or_error(self.send_retrying(self.http.delete(url)).await?)
             .await?
             .json()
             .await
@@ -269,13 +341,13 @@ impl Mst2Client {
     ) -> Result<Vec<u8>, SnapshotError> {
         let url = url.as_ref();
         let resp = ok_or_error(
-            self.http
-                .post(url)
-                .header("content-type", "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(net_err)?,
+            self.send_retrying(
+                self.http
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .body(body),
+            )
+            .await?,
         )
         .await?;
         let bytes = resp.bytes().await.map_err(de_err)?;
@@ -287,7 +359,7 @@ impl Mst2Client {
         url: impl AsRef<str>,
     ) -> Result<(u64, String, String), SnapshotError> {
         let url = url.as_ref();
-        let resp = ok_or_error(self.http.head(url).send().await.map_err(net_err)?).await?;
+        let resp = ok_or_error(self.send_retrying(self.http.head(url)).await?).await?;
         let headers = resp.headers();
         let len = headers
             .get("content-length")
