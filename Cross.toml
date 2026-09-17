@@ -1,0 +1,7 @@
+[build.env]
+passthrough = ["OPENSSL_STATIC", "OPENSSL_VENDORED"]
+
+[target.aarch64-unknown-linux-musl]
+pre-build = [
+    "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --assume-yes --no-install-recommends perl make",
+]

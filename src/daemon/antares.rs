@@ -3,9 +3,10 @@
 //! Provides Axum routes to create, list, query, and delete FUSE mounts backed by
 //! AntaresService implementations. Includes graceful shutdown with cleanup.
 
+#[cfg(any(test, target_os = "macos"))]
+use std::ffi::OsString;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    ffi::OsString,
     net::SocketAddr,
     os::unix::fs::FileTypeExt,
     path::{Component, Path, PathBuf},

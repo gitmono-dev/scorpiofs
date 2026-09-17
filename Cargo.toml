@@ -66,6 +66,11 @@ async-trait = "0.1.92"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 
+# libfuse-fs pulls reqwest 0.12 → native-tls → openssl-sys. Vendored OpenSSL
+# lets aarch64-unknown-linux-musl cross builds succeed without a sysroot .pc.
+[target.'cfg(target_env = "musl")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
 [features]
 async-io = []
 qlean-ci = []

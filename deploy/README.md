@@ -318,7 +318,8 @@ Publishing to **crates.io is decoupled** from the binary release: the
 `publish-crate` job targets a protected GitHub Environment (`crates-io`).
 Configure a required reviewer on that environment so an ordinary tag push cannot
 publish the crate without manual approval, and store `CARGO_REGISTRY_TOKEN` as an
-environment secret (least privilege).
+environment secret (least privilege). If that secret is empty, the job skips
+`cargo publish` instead of failing.
 
 This project is dual-licensed under MIT (`LICENSE-MIT`) OR Apache-2.0
 (`LICENSE-APACHE`).
