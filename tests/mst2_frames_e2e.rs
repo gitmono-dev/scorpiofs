@@ -25,6 +25,11 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
         "chunk_reads capability must be advertised"
     );
     assert!(caps.features.metadata_pages);
+    assert!(
+        caps.frame_encodings.iter().any(|e| e == "zstd"),
+        "zstd must be advertised alongside identity: {:?}",
+        caps.frame_encodings
+    );
 
     let reader = SnapshotReader::resolve(client.clone(), scope, 600)
         .await
@@ -51,6 +56,32 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
         .expect("small file over OBJECT frames");
     assert_eq!(bytes, b"t08 alpha\n");
     assert_eq!(bytes.len() as u64, small.size);
+
+    // The same object over an explicitly zstd-negotiated stream: the
+    // codec transparently decompresses and re-verifies content identity.
+    let zstd_map = client
+        .objects(
+            &sid,
+            &[(format!("/{}", small.rel_path), small.content_digest.clone())],
+            Some("zstd"),
+        )
+        .await
+        .expect("zstd objects batch");
+    let zstd_cid = scorpiofs::snapshot::frames::parse_digest(&small.content_digest).unwrap();
+    assert_eq!(zstd_map.get(&zstd_cid).unwrap().as_slice(), b"t08 alpha\n");
+
+    // An unsupported encoding is a typed client error.
+    let bad = client
+        .objects(
+            &sid,
+            &[(format!("/{}", small.rel_path), small.content_digest.clone())],
+            Some("gzip"),
+        )
+        .await;
+    assert!(matches!(
+        bad.map_err(|e| e.code),
+        Err(scorpiofs::snapshot::SnapshotErrorCode::ScopeInvalid)
+    ));
 
     // Empty file: a zero-length OBJECT unit must verify, never error as a
     // short read or masquerade as missing content.

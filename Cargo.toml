@@ -67,7 +67,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Shared MST/2 byte codec (sibling crate; CI needs the sibling checkout, as
 # monoengine does). Pure codec only — no HTTP/DB/FUSE types leak through it.
-mst2-codec = { path = "../mst2-codec" }
+mst2-codec = { path = "../mst2-codec", features = ["zstd"] }
 
 
 [features]

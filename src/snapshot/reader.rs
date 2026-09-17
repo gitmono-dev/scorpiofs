@@ -65,6 +65,16 @@ impl SnapshotReader {
         &self.caps
     }
 
+    /// Negotiated content encoding for frame responses: zstd when the
+    /// deployment advertises it, otherwise identity (`None`).
+    fn content_encoding(&self) -> Option<&'static str> {
+        if self.caps.frame_encodings.iter().any(|e| e == "zstd") {
+            Some("zstd")
+        } else {
+            None
+        }
+    }
+
     pub fn snapshot_id(&self) -> &str {
         &self.descriptor.snapshot_id
     }
@@ -162,7 +172,11 @@ impl SnapshotReader {
         if size <= 256 * 1024 {
             let map = self
                 .client
-                .objects(sid, &[(request_path, digest.to_string())])
+                .objects(
+                    sid,
+                    &[(request_path, digest.to_string())],
+                    self.content_encoding(),
+                )
                 .await?;
             let want = crate::snapshot::frames::parse_digest(digest)?;
             let bytes = map.get(&want).cloned().ok_or_else(|| {
@@ -222,7 +236,11 @@ impl SnapshotReader {
                     chunk_index: *i,
                 })
                 .collect();
-            for unit in self.client.chunks(sid, &items).await? {
+            for unit in self
+                .client
+                .chunks(sid, &items, self.content_encoding())
+                .await?
+            {
                 if unit.chunk_index >= map.chunk_count {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::DigestMismatch,

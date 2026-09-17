@@ -125,13 +125,19 @@ impl Mst2Client {
     }
 
     /// POST `/{sid}/metadata/pages`; returns `(page_id hex, page bytes)` in
-    /// frame order with duplicates removed by the server.
+    /// frame order with duplicates removed by the server. `encoding`
+    /// negotiates `identity` (default) or `zstd` frame compression.
     pub async fn metadata_pages(
         &self,
         sid: &str,
         items: &[MetadataPageItem],
+        encoding: Option<&str>,
     ) -> Result<Vec<([u8; 32], Vec<u8>)>, SnapshotError> {
-        let body = serde_json::to_vec(&serde_json::json!({ "items": items }))
+        let mut req = serde_json::json!({ "items": items });
+        if let Some(enc) = encoding {
+            req["encoding"] = serde_json::Value::String(enc.to_string());
+        }
+        let body = serde_json::to_vec(&req)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         let raw = self
             .post_octets(self.snap_url(&format!("/{sid}/metadata/pages")), body)
@@ -153,6 +159,7 @@ impl Mst2Client {
         &self,
         sid: &str,
         items: &[(String, String)],
+        encoding: Option<&str>,
     ) -> Result<HashMap<[u8; 32], Vec<u8>>, SnapshotError> {
         if items.is_empty() || items.len() > MAX_OBJECT_BATCH {
             return Err(SnapshotError::new(
@@ -160,13 +167,17 @@ impl Mst2Client {
                 "objects batch must hold 1..128 items",
             ));
         }
-        let body = serde_json::to_vec(&serde_json::json!({
+        let mut req = serde_json::json!({
             "items": items
                 .iter()
                 .map(|(p, d)| serde_json::json!({"path": p, "expected_digest": d}))
                 .collect::<Vec<_>>(),
-        }))
-        .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
+        });
+        if let Some(enc) = encoding {
+            req["encoding"] = serde_json::Value::String(enc.to_string());
+        }
+        let body = serde_json::to_vec(&req)
+            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         let raw = self
             .post_octets(self.snap_url(&format!("/{sid}/objects")), body.clone())
             .await?;
@@ -308,6 +319,7 @@ impl Mst2Client {
         &self,
         sid: &str,
         items: &[ChunkRequest],
+        encoding: Option<&str>,
     ) -> Result<Vec<ChunkUnit>, SnapshotError> {
         if items.is_empty() || items.len() > MAX_CHUNK_BATCH {
             return Err(SnapshotError::new(
@@ -315,7 +327,7 @@ impl Mst2Client {
                 "chunks batch must hold 1..128 items",
             ));
         }
-        let body = serde_json::to_vec(&serde_json::json!({
+        let mut req = serde_json::json!({
             "items": items
                 .iter()
                 .map(|i| serde_json::json!({
@@ -325,8 +337,12 @@ impl Mst2Client {
                     "chunk_index": i.chunk_index.to_string(),
                 }))
                 .collect::<Vec<_>>(),
-        }))
-        .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
+        });
+        if let Some(enc) = encoding {
+            req["encoding"] = serde_json::Value::String(enc.to_string());
+        }
+        let body = serde_json::to_vec(&req)
+            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         let raw = self
             .post_octets(self.snap_url(&format!("/{sid}/chunks")), body.clone())
             .await?;
@@ -402,7 +418,7 @@ fn check_end(
     Ok(())
 }
 
-pub(crate) fn parse_digest(s: &str) -> Result<[u8; 32], SnapshotError> {
+pub fn parse_digest(s: &str) -> Result<[u8; 32], SnapshotError> {
     let hex = s.strip_prefix("sha256:").unwrap_or(s);
     let mut out = [0u8; 32];
     if hex.len() != 64 {
@@ -431,7 +447,7 @@ pub(crate) fn parse_count(s: &str, field: &str) -> Result<u64, SnapshotError> {
     })
 }
 
-pub(crate) fn hex32(b: &[u8; 32]) -> String {
+pub fn hex32(b: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(64);
     for x in b {
