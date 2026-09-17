@@ -138,6 +138,13 @@ services:
       SCORPIO_LFS_URL: "http://mega2:8000/api/v1/lfs"
       # Override any other key the same way, e.g.:
       # SCORPIO_LOG_LEVEL: "scorpio=debug"
+      #
+      # To browse the FUSE mount on the HOST, move the mountpoints out of the
+      # named volume and bind them from an empty host dir with rshared
+      # propagation (see deploy/README.md, "Making the FUSE mount visible on
+      # the host"; also uncomment the two binds under `volumes:` below):
+      # SCORPIO_WORKSPACE: /mnt/scorpiofs/mount
+      # SCORPIO_ANTARES_MOUNT_ROOT: /mnt/scorpiofs/antares
     devices:
       - "/dev/fuse"
     cap_add:
@@ -152,11 +159,29 @@ services:
       - apparmor:unconfined
     volumes:
       - scorpiofs-data:/var/lib/scorpiofs
+      # Host-visible FUSE mounts (pair with the SCORPIO_WORKSPACE /
+      # SCORPIO_ANTARES_MOUNT_ROOT overrides above). Pre-create both host dirs
+      # as your user and keep `mount` empty; ScorpioFS refuses a non-empty
+      # mountpoint. Requires a rootful Docker on a host whose source path is a
+      # `shared` mount (systemd default).
+      # - type: bind
+      #   source: ${SCORPIOFS_HOST_MOUNT_DIR:-/tmp/scorpiofs}/mount
+      #   target: /mnt/scorpiofs/mount
+      #   bind:
+      #     propagation: rshared
+      # - type: bind
+      #   source: ${SCORPIOFS_HOST_MOUNT_DIR:-/tmp/scorpiofs}/antares
+      #   target: /mnt/scorpiofs/antares
+      #   bind:
+      #     propagation: rshared
     ports:
       # Bind the host side to loopback: the HTTP API is UNAUTHENTICATED, so do
       # not expose it on all host interfaces. For remote access put it behind a
       # firewall / authenticating reverse proxy and change this mapping.
       - "127.0.0.1:2725:2725"
+    # The daemon unmounts on SIGTERM (~20s daemon join + 15s Antares cleanup);
+    # a SIGKILL would leave host-visible mountpoints stale.
+    stop_grace_period: 45s
     # `scorpiofs` is the default CMD (`serve`); the HEALTHCHECK from the image
     # polls GET /health.
     restart: on-failure

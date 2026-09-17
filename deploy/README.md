@@ -85,18 +85,41 @@ its HTTP API on the host at `127.0.0.1:12725`.
 ```bash
 cd ../monoengine
 ./scripts/dev-test.sh up-scorpio      # data plane + mega2 + scorpiofs (builds scorpiofs:local)
-./scripts/dev-test.sh scorpio-smoke   # /health, dicfuse root, /api/fs/mount, /antares/mounts
+./scripts/dev-test.sh scorpio-smoke   # /health, dicfuse root, host mount, /api/fs/mount, /antares/mounts
+ls /tmp/mega2-scorpiofs/mount         # the monorepo, browsable on the host
 ./scripts/dev-test.sh down            # tears down every profile incl. scorpio, -v
 
-# Manual poking: the FUSE workspace only exists inside the container's mount namespace.
-docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio \
-  exec -T scorpiofs ls -la /var/lib/scorpiofs/mount
 curl -sS http://127.0.0.1:12725/health
+docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio \
+  exec -T scorpiofs ls -la /mnt/scorpiofs/mount   # same mount, seen from inside
 ```
 
 The registration entry (image, ports, privileges, cleanup) lives in mega2's
 `docs/refactoring/test-infra.md`; the workflow is described in its
 `docs/development.md` ("ScorpioFS 联调").
+
+### Making the FUSE mount visible on the host
+
+A FUSE mount performed inside a container lives in that container's mount
+namespace. To see it on the host, bind-mount an **empty host directory** onto
+the workspace path with `rshared` propagation; the mount event then propagates
+back to the host copy. ScorpioFS mounts with `allow_other`, so an unprivileged
+host user can browse it (entries show as owned by root). Requirements:
+
+- the host source must sit on a `shared` mount (systemd hosts have `/` shared
+  by default; check with `findmnt -o TARGET,PROPAGATION --target <dir>`);
+- rootful Docker whose daemon shares the host mount namespace (no
+  `PrivateMounts=` / `MountFlags=slave` on `docker.service`);
+- do **not** nest the rshared bind inside a named volume: the bind propagates
+  into the host's volume `_data` path, outlives the container and blocks
+  `docker volume rm`. Point `SCORPIO_WORKSPACE` / `SCORPIO_ANTARES_MOUNT_ROOT`
+  at a plain path (e.g. `/mnt/scorpiofs/...`) instead, as the mega2 IT stack
+  and the commented block in `docker-compose.yml` do;
+- stop the container gracefully (`stop_grace_period` ≥ 45s): a SIGKILL leaves
+  a stale `Transport endpoint is not connected` mount on the host that needs
+  `sudo umount -l <dir>`.
+
+`docker run` equivalent: `--mount type=bind,src=/tmp/scorpiofs/mount,dst=/mnt/scorpiofs/mount,bind-propagation=rshared -e SCORPIO_WORKSPACE=/mnt/scorpiofs/mount`.
 
 ### Security notes (containers)
 
