@@ -202,14 +202,9 @@ pub mod util;
 /// ```
 pub mod prelude {
     // Antares core types
-    pub use crate::antares::{AntaresConfig, AntaresManager, AntaresPaths};
-
     // Antares FUSE layer
     pub use crate::antares::fuse::AntaresFuse;
-
-    // Dicfuse (read-only base layer)
-    pub use crate::dicfuse::DicfuseManager;
-
+    pub use crate::antares::{AntaresConfig, AntaresManager, AntaresPaths};
     // Daemon types
     pub use crate::daemon::antares::{
         AntaresDaemon, AntaresService, AntaresServiceImpl, ApiError, BuildClRequest,
@@ -217,6 +212,8 @@ pub mod prelude {
         MountLifecycle, MountReadyResponse, MountStatus, PersistedMountState, PersistedState,
         ServiceError, StateOwnership,
     };
+    // Dicfuse (read-only base layer)
+    pub use crate::dicfuse::DicfuseManager;
 }
 
 // Re-export key antares types at crate root for convenience

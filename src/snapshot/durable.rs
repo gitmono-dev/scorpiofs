@@ -20,11 +20,13 @@
 //!   each recorded blob is re-hashed before it counts as hydrated, so a
 //!   truncated, torn or tampered CAS object is re-fetched rather than served.
 
-use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
@@ -719,8 +721,9 @@ fn io_err(e: io::Error) -> SnapshotError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::cell::RefCell;
+
+    use super::*;
 
     fn file(rel: &str, content: &[u8]) -> (SnapshotFile, Vec<u8>) {
         (

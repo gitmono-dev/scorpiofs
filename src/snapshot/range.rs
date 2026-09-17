@@ -17,8 +17,7 @@
 //! Small files (≤ 256 KiB) are served whole through the OBJECT path: the
 //! spec's small/large split, not a size threshold invented here.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use mst2_codec::chunkmap::{CHUNKS_PER_PAGE, CHUNK_SIZE};
 

@@ -11,9 +11,13 @@
 //! retryable statuses (429/5xx) are re-attempted; a typed server error is
 //! definitive and returned as-is.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use reqwest::StatusCode;
 use serde::Deserialize;

@@ -7,8 +7,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::CString,
     net::SocketAddr,
-    os::unix::ffi::OsStrExt,
-    os::unix::fs::FileTypeExt,
+    os::unix::{ffi::OsStrExt, fs::FileTypeExt},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},

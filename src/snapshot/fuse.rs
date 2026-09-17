@@ -10,19 +10,24 @@
 //! so `readlink` returns that target and the kernel — not this filesystem —
 //! decides how to traverse it. Opening a symlink inode directly is ELOOP.
 
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
-use asyncfuse::raw::prelude::*;
-use asyncfuse::raw::reply::{DirectoryEntry, DirectoryEntryPlus, ReplyDirectoryPlus};
-use asyncfuse::{Errno, FileType, Inode, Result};
+use asyncfuse::{
+    raw::{
+        prelude::*,
+        reply::{DirectoryEntry, DirectoryEntryPlus, ReplyDirectoryPlus},
+    },
+    Errno, FileType, Inode, Result,
+};
 use bytes::Bytes;
 use futures::stream::iter;
 
-use crate::snapshot::durable::DurableStore;
-use crate::snapshot::{SnapshotFile, SnapshotReader};
+use crate::snapshot::{durable::DurableStore, SnapshotFile, SnapshotReader};
 
 const ROOT_INODE: u64 = 1;
 const TTL: Duration = Duration::from_secs(60);

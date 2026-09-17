@@ -25,9 +25,11 @@
 //! "Did not download again" and "did not traverse everything" are different
 //! claims and are asserted separately.
 
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 

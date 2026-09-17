@@ -18,8 +18,7 @@
 //!     M2_CACHE_DIR=/var/lib/scorpio/mst2/snapshots/project \
 //!     cargo run --example mst2_sync
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use scorpiofs::snapshot::{
     DurableStore, IncrementalSync, Mst2Client, ScopeCache, SnapshotReader, ViewMeta,

@@ -7,8 +7,10 @@
 //! waiter. The concurrency semaphore is the scheduling knob (spec 13): it
 //! bounds simultaneous HTTP work without changing protocol semantics.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use tokio::sync::{oneshot, Semaphore};
 

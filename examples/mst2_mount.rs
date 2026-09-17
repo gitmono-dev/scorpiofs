@@ -15,10 +15,10 @@
 
 use std::sync::Arc;
 
-use scorpiofs::server;
-use scorpiofs::snapshot::durable::DurableStore;
-use scorpiofs::snapshot::fuse::Mst2Fuse;
-use scorpiofs::snapshot::{Mst2Client, SnapshotReader};
+use scorpiofs::{
+    server,
+    snapshot::{durable::DurableStore, fuse::Mst2Fuse, Mst2Client, SnapshotReader},
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

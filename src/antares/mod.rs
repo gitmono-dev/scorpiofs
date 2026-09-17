@@ -464,8 +464,9 @@ impl AntaresManager {
 
 #[cfg(test)]
 mod tests {
-    use super::unmount_grace_duration;
     use serial_test::serial;
+
+    use super::unmount_grace_duration;
 
     fn set_unmount_grace_env(value: Option<&str>) {
         // SAFETY: tests mutate process env in a controlled way and do not run in parallel here.

@@ -10,8 +10,10 @@
 
 use std::collections::HashMap;
 
-use mst2_codec::chunkmap::{merkle_root, verify_leaf, ChunkLeaf, ChunkMap, ProofSide, CHUNK_SIZE};
-use mst2_codec::treeframe::Frame;
+use mst2_codec::{
+    chunkmap::{merkle_root, verify_leaf, ChunkLeaf, ChunkMap, ProofSide, CHUNK_SIZE},
+    treeframe::Frame,
+};
 
 use crate::snapshot::{client::Mst2Client, SnapshotError, SnapshotErrorCode};
 

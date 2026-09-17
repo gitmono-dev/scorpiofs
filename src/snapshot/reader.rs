@@ -4,9 +4,11 @@
 //! manifest of the fixed view. The view never moves (spec 03 §6); callers
 //! bind paths, routes and handles to the snapshot id/generation.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
 
 use crate::snapshot::{
     client::Mst2Client,
