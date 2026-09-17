@@ -28,11 +28,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fs = match std::env::var("M2_STORE_DIR") {
         Ok(dir) if !dir.is_empty() => {
-            // Offline reopen: no network, no re-resolution.
-            let store = Arc::new(DurableStore::open(&dir)?);
+            // Offline reopen: no network, no re-resolution. The content came
+            // from the scope-level cache the online hydration wrote to, so
+            // reopen the same way; a store that predates the shared cache
+            // (view-local blobs) still opens if the scope cache is absent.
+            let view = std::path::PathBuf::from(&dir);
+            let scope_blobs = view
+                .parent()
+                .map(|scope| scope.join("blobs"))
+                .filter(|p| p.exists());
+            let store = Arc::new(match &scope_blobs {
+                Some(content) => DurableStore::open_with_content(&view, content)?,
+                None => DurableStore::open(&view)?,
+            });
             let manifest = store.manifest()?;
             let verified = store.verify_all(&manifest)?;
-            eprintln!("reopened {dir}: {verified} files re-verified, no server contact");
+            eprintln!(
+                "reopened {dir} (content {}): {verified} files re-verified, no server contact",
+                store.content_dir().display()
+            );
             Mst2Fuse::from_store(store)?
         }
         _ => {
