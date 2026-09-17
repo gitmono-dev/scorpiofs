@@ -42,6 +42,7 @@ docker build -t scorpiofs .
 docker run --rm \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
+  --cap-add DAC_READ_SEARCH \
   --security-opt apparmor:unconfined \
   -e SCORPIO_BASE_URL=http://your-mega:8000 \
   -e SCORPIO_LFS_URL=http://your-mega:8000/lfs \
@@ -53,11 +54,49 @@ docker run --rm \
 container entrypoint refuses to start without them (so it never silently points
 at localhost).
 
-`docker compose up` brings up ScorpioFS plus a `mega` backend; **set the `mega`
-image** in `docker-compose.yml` to the one you run (the default tag is a
-placeholder). Configuration is entirely env-driven (`SCORPIO_*`); no developer
-paths are baked into the image. The image ships a `HEALTHCHECK` against
-`GET /health`.
+`CAP_SYS_ADMIN` is what FUSE needs to `mount(2)`. `CAP_DAC_READ_SEARCH` is
+optional but recommended: the passthrough overlay layer uses
+`open_by_handle_at(2)`, and without the capability every mount logs
+`ERROR open_by_handle_at failed ... Operation not permitted` and falls back to
+fd-backed inodes (functional, but not the production code path).
+
+`docker compose up` brings up ScorpioFS plus a `mega2` backend (the published
+`genedna/mega2` image with its PostgreSQL / Redis / RustFS dependencies); see
+the header of `docker-compose.yml` for the knobs. Configuration is entirely
+env-driven (`SCORPIO_*`); no developer paths are baked into the image. The
+image ships a `HEALTHCHECK` against `GET /health`.
+
+The build context is trimmed by `.dockerignore` (no `target/`, VCS state, docs
+or tests), and the build stage uses BuildKit cache mounts for the cargo
+registry and `target/`, so a source change only recompiles the scorpiofs crate
+on rebuild. `.github/workflows/ci.yml` (`docker` job) builds the image on every
+PR and smokes `--version`, `config validate` and `doctor` (with `/dev/fuse`)
+without pushing anywhere.
+
+### Integrating with the mega2 IT compose stack
+
+The mega2 repository (`monoengine`, checked out as a **sibling** of this one)
+runs its integration stack from `docker-compose.test.yml` (compose project
+`mega2-it`). ScorpioFS is registered there as the `scorpiofs` service under the
+`scorpio` profile: it is built from `../scorpiofs` as `scorpiofs:local`, depends
+on the compose-hosted `mega2` (profile `app`, `http://mega2:8000`), and exposes
+its HTTP API on the host at `127.0.0.1:12725`.
+
+```bash
+cd ../monoengine
+./scripts/dev-test.sh up-scorpio      # data plane + mega2 + scorpiofs (builds scorpiofs:local)
+./scripts/dev-test.sh scorpio-smoke   # /health, dicfuse root, /api/fs/mount, /antares/mounts
+./scripts/dev-test.sh down            # tears down every profile incl. scorpio, -v
+
+# Manual poking: the FUSE workspace only exists inside the container's mount namespace.
+docker compose -p mega2-it -f docker-compose.test.yml --profile app --profile scorpio \
+  exec -T scorpiofs ls -la /var/lib/scorpiofs/mount
+curl -sS http://127.0.0.1:12725/health
+```
+
+The registration entry (image, ports, privileges, cleanup) lives in mega2's
+`docs/refactoring/test-infra.md`; the workflow is described in its
+`docs/development.md` ("ScorpioFS 联调").
 
 ### Security notes (containers)
 

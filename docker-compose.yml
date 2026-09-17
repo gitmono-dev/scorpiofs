@@ -1,41 +1,157 @@
-# docker compose up — brings up a ScorpioFS daemon plus its mega backend.
+# docker compose up — brings up a ScorpioFS daemon plus a mega2 backend.
+#
+# This is a self-contained local evaluation stack: the published
+# `genedna/mega2` image (trunk / storage-only, anonymous Git HTTP) with its
+# PostgreSQL / Redis / RustFS dependencies, and ScorpioFS built from this
+# checkout. It mirrors mega2's own `mega2-compose.yml` so the two stay in step.
+#
+#   docker compose up -d --build --wait
+#   curl -sS http://127.0.0.1:2725/health
+#   docker compose exec -T scorpiofs ls -la /var/lib/scorpiofs/mount
+#   docker compose down -v          # discard all state
 #
 # IMPORTANT: FUSE in containers needs the host's /dev/fuse device and
 # CAP_SYS_ADMIN, and is NOT available on every Docker host (e.g. some managed
 # / rootless environments). See deploy/README.md for prerequisites.
+#
+# For integration testing against the mega2 repository's own IT stack
+# (`docker-compose.test.yml`, compose project `mega2-it`) use the `scorpio`
+# profile registered there instead of this file; see deploy/README.md.
+#
+# Note: mega2 in trunk mode does not serve the Change List API
+# (`/api/v1/cl/*`), so Antares CL-layer mounts are unavailable here; plain
+# dicfuse browsing and Antares job mounts without `cl` work.
 
 services:
-  # The mega/monorepo backend. Replace the image with the one you run; the
-  # default tag is a placeholder so this file is self-documenting, not a promise
-  # that the image exists. Adjust the port/command to your mega deployment.
-  mega:
-    image: ghcr.io/gitmono-dev/mega:latest
-    # command: ["...mega server args..."]
-    expose:
-      - "8000"
-    # Uncomment to expose the mega API on the host:
+  postgres:
+    image: postgres:18.6-alpine3.24
+    environment:
+      POSTGRES_USER: mega2
+      POSTGRES_PASSWORD: mega2_local_password
+      POSTGRES_DB: mega2
+    volumes:
+      - mega2-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mega2 -d mega2"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8.10.1-alpine3.23
+    volumes:
+      - mega2-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: rustfs_secret
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+    volumes:
+      - mega2-rustfs:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  rustfs-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://rustfs:9000 rustfs rustfs_secret &&
+      /usr/bin/mc mb --ignore-existing local/mega2 &&
+      exec sleep infinity
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/bin/mc ls local/mega2"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
+
+  # The monorepo backend. Override MEGA2_IMAGE to pin a tag or use a local build.
+  mega2:
+    image: ${MEGA2_IMAGE:-genedna/mega2:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_healthy
+    environment:
+      MEGA_BASE_DIR: /var/lib/mega2
+      MEGA_DATABASE__DB_TYPE: postgres
+      MEGA_DATABASE__DB_URL: postgres://mega2:mega2_local_password@postgres:5432/mega2
+      MEGA_DATABASE__MIN_CONNECTION: 1
+      MEGA_REDIS__URL: redis://redis:6379
+      MEGA_MONOREPO__PUSH_POLICY: trunk
+      MEGA_CEDAR__ENFORCEMENT: "off"
+      MEGA_GIT__ANONYMOUS_ACCESS: "true"
+      MEGA_GIT__PUSH_AUTH: none
+      MEGA_GIT__SSH_RECEIVE_PACK: "false"
+      MEGA_OBJECT_STORAGE__STORAGE_TYPE: s3compatible
+      MEGA_OBJECT_STORAGE__S3__REGION: us-east-1
+      MEGA_OBJECT_STORAGE__S3__BUCKET: mega2
+      MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID: rustfs
+      MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: rustfs_secret
+      MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: http://rustfs:9000
+      MEGA_LOG__PRINT_STD: "true"
+    command: ["service", "http", "--host", "0.0.0.0", "-p", "8000"]
+    volumes:
+      - mega2-data:/var/lib/mega2
+    # Uncomment to reach the mega2 API / Git Smart HTTP from the host
+    # (anonymous writes are enabled, so keep it on loopback):
     # ports:
-    #   - "8000:8000"
-    restart: unless-stopped
+    #   - "127.0.0.1:9000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/openapi.json"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
 
   scorpiofs:
     build:
       context: .
     depends_on:
-      - mega
+      mega2:
+        condition: service_healthy
     environment:
-      # base_url / lfs_url are required and point at the mega service above.
-      SCORPIO_BASE_URL: "http://mega:8000"
-      SCORPIO_LFS_URL: "http://mega:8000/lfs"
+      # base_url / lfs_url are required and point at the mega2 service above.
+      SCORPIO_BASE_URL: "http://mega2:8000"
+      SCORPIO_LFS_URL: "http://mega2:8000/api/v1/lfs"
       # Override any other key the same way, e.g.:
       # SCORPIO_LOG_LEVEL: "scorpio=debug"
     devices:
       - "/dev/fuse"
     cap_add:
+      # SYS_ADMIN: mount(2) for FUSE. DAC_READ_SEARCH: open_by_handle_at(2) in the
+      # passthrough overlay layer; without it every mount logs an ERROR and falls
+      # back to fd-backed inodes (still works, but not the production code path).
       - SYS_ADMIN
+      - DAC_READ_SEARCH
     security_opt:
-      # FUSE mounts frequently need the default AppArmor profile relaxed.
+      # FUSE mounts frequently need the default AppArmor profile relaxed
+      # (ignored on hosts without AppArmor).
       - apparmor:unconfined
+    volumes:
+      - scorpiofs-data:/var/lib/scorpiofs
     ports:
       # Bind the host side to loopback: the HTTP API is UNAUTHENTICATED, so do
       # not expose it on all host interfaces. For remote access put it behind a
@@ -44,3 +160,10 @@ services:
     # `scorpiofs` is the default CMD (`serve`); the HEALTHCHECK from the image
     # polls GET /health.
     restart: on-failure
+
+volumes:
+  mega2-postgres:
+  mega2-redis:
+  mega2-rustfs:
+  mega2-data:
+  scorpiofs-data:
