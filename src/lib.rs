@@ -211,8 +211,6 @@ pub mod prelude {
         },
         dicfuse::DicfuseManager,
     };
-    // Dicfuse (read-only base layer)
-    pub use crate::dicfuse::DicfuseManager;
 }
 
 // Re-export key antares types at crate root for convenience
