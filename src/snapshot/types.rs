@@ -93,6 +93,8 @@ pub struct CapabilityFeatures {
     #[serde(default)]
     pub lookup: bool,
     #[serde(default)]
+    pub metadata_pages: bool,
+    #[serde(default)]
     pub raw_blob: bool,
     #[serde(default)]
     pub objects: bool,

@@ -207,3 +207,105 @@ fn urlencode(s: &str) -> String {
 
 #[allow(dead_code)]
 fn _statuscode_marker(_: StatusCode) {}
+
+// ---------------------------------------------------------------------------
+// Generic verbs for the frame/navigation module (frames.rs). Kept here so the
+// HTTP client owns every transport-level decision; frames.rs owns verification.
+// ---------------------------------------------------------------------------
+
+impl Mst2Client {
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub(crate) async fn get_json(
+        &self,
+        url: impl AsRef<str>,
+    ) -> Result<serde_json::Value, SnapshotError> {
+        let url = url.as_ref();
+        ok_or_error(self.http.get(url).send().await.map_err(net_err)?)
+            .await?
+            .json()
+            .await
+            .map_err(de_err)
+    }
+
+    pub(crate) async fn post_json(
+        &self,
+        url: impl AsRef<str>,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, SnapshotError> {
+        let url = url.as_ref();
+        ok_or_error(
+            self.http
+                .post(url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(net_err)?,
+        )
+        .await?
+        .json()
+        .await
+        .map_err(de_err)
+    }
+
+    pub(crate) async fn delete_json(
+        &self,
+        url: impl AsRef<str>,
+    ) -> Result<serde_json::Value, SnapshotError> {
+        let url = url.as_ref();
+        ok_or_error(self.http.delete(url).send().await.map_err(net_err)?)
+            .await?
+            .json()
+            .await
+            .map_err(de_err)
+    }
+
+    pub(crate) async fn post_octets(
+        &self,
+        url: impl AsRef<str>,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, SnapshotError> {
+        let url = url.as_ref();
+        let resp = ok_or_error(
+            self.http
+                .post(url)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(net_err)?,
+        )
+        .await?;
+        let bytes = resp.bytes().await.map_err(de_err)?;
+        Ok(bytes.to_vec())
+    }
+
+    pub(crate) async fn head_blob(
+        &self,
+        url: impl AsRef<str>,
+    ) -> Result<(u64, String, String), SnapshotError> {
+        let url = url.as_ref();
+        let resp = ok_or_error(self.http.head(url).send().await.map_err(net_err)?).await?;
+        let headers = resp.headers();
+        let len = headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| {
+                SnapshotError::new(SnapshotErrorCode::Internal, "HEAD missing length")
+            })?;
+        let etag = headers
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let kind = headers
+            .get("x-mega-fs-kind")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Ok((len, etag, kind))
+    }
+}
