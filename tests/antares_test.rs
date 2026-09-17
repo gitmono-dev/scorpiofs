@@ -209,23 +209,17 @@ async fn test_mount_job_at_with_pathbuf() {
 
 /// Check if FUSE prerequisites are met.
 fn fuse_prereqs_available() -> bool {
-    let uid = unsafe { libc::geteuid() };
-    if uid != 0 {
-        println!("Skipping: requires root privileges");
-        return false;
-    }
-
-    if !std::path::Path::new("/dev/fuse").exists() {
-        println!("Skipping: /dev/fuse not available");
-        return false;
-    }
-
-    if std::process::Command::new("fusermount")
-        .arg("--version")
-        .output()
-        .is_err()
+    #[cfg(target_os = "linux")]
     {
-        println!("Skipping: fusermount not found");
+        let uid = unsafe { libc::geteuid() };
+        if uid != 0 {
+            println!("Skipping: requires root privileges");
+            return false;
+        }
+    }
+
+    if !scorpiofs::util::fuse_platform::fuse_provider().is_usable() {
+        println!("Skipping: FUSE provider not available");
         return false;
     }
 
@@ -628,10 +622,7 @@ async fn test_mount_job_no_cl_keep_running() {
         eprintln!("Warning: umount_job failed: {e}");
         // Fallback: lazy unmount so the test doesn't leave a zombie mount.
         let mp = config.mountpoint.to_string_lossy().to_string();
-        let _ = tokio::process::Command::new("fusermount")
-            .args(["-uz", &mp])
-            .output()
-            .await;
+        let _ = scorpiofs::util::fuse_platform::unmount_path(&mp, true).await;
     }
     println!("Done.");
 }

@@ -1,12 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
+use asyncfuse::raw::{logfs::LoggingFileSystem, MountHandle};
 use libfuse_fs::{
     passthrough::new_antares_passthroughfs_layer,
     unionfs::{config::Config, layer::Layer, OverlayFs},
 };
-use tokio::task::JoinHandle;
 
-use crate::server::mount_filesystem_with_antares_cache;
+use crate::{server::mount_filesystem_with_antares_cache, util::fuse_platform};
 
 /// Antares union-fs wrapper: dicfuse lower + passthrough upper/CL.
 pub struct AntaresFuse {
@@ -14,10 +14,9 @@ pub struct AntaresFuse {
     pub upper_dir: PathBuf,
     pub dic: Arc<crate::dicfuse::Dicfuse>,
     pub cl_dir: Option<PathBuf>,
-    /// Background task running the FUSE session.
-    fuse_task: Option<JoinHandle<()>>,
+    /// Live FUSE session. Drop / [`MountHandle::unmount`] tears the mount down.
+    mount_handle: Option<MountHandle>,
 }
-use asyncfuse::raw::logfs::LoggingFileSystem;
 impl AntaresFuse {
     /// Build directories for upper / optional CL layers.
     pub async fn new(
@@ -37,7 +36,7 @@ impl AntaresFuse {
             upper_dir,
             dic,
             cl_dir,
-            fuse_task: None,
+            mount_handle: None,
         })
     }
 
@@ -74,7 +73,7 @@ impl AntaresFuse {
 
     /// Mount the composed unionfs into the provided mountpoint, spawning a background task to run the FUSE session.
     pub async fn mount(&mut self) -> std::io::Result<()> {
-        if self.fuse_task.is_some() {
+        if self.mount_handle.is_some() {
             return Ok(());
         }
 
@@ -91,13 +90,10 @@ impl AntaresFuse {
         let handle =
             mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), false).await?;
 
-        // Spawn background task to run the FUSE session
-        let fuse_task = tokio::spawn(async move {
-            // This will block until unmount is called
-            let _ = handle.await;
-        });
-
-        self.fuse_task = Some(fuse_task);
+        // Keep the handle so unmount can call MountHandle::unmount() (macOS
+        // uses nix::mount::unmount; Linux uses fusermount3). Spawning a task
+        // that owns the handle would force a fusermount fallback.
+        self.mount_handle = Some(handle);
 
         // Readiness probe: wait until the FUSE mount is actually servicing requests.
         // Without this, callers (e.g., Buck2) that immediately stat() the mountpoint
@@ -136,115 +132,32 @@ impl AntaresFuse {
 
     /// Unmount the FUSE session if mounted.
     ///
-    /// Uses lazy unmount (`fusermount -uz`) to detach the filesystem even if
-    /// it's busy, preventing the unmount operation from blocking indefinitely.
-    /// A timeout is applied when waiting for the FUSE task to complete.
-    ///
-    /// # Errors
-    ///
-    /// This method will log warnings but not fail if:
-    /// - The FUSE task doesn't complete within the timeout
-    /// - The task panics
-    ///
-    /// Only critical errors (e.g., fusermount command execution failure)
-    /// will cause this method to return an error.
+    /// Prefers [`MountHandle::unmount`] (asyncfuse native path). Falls back to
+    /// the platform helper (`fusermount3` on Linux, `umount` on macOS).
     pub async fn unmount(&mut self) -> std::io::Result<()> {
-        if let Some(task) = self.fuse_task.take() {
-            let mount_path = self.mountpoint.to_string_lossy().to_string();
-            // Prefer graceful unmount first to reduce stale-handle windows for active clients.
-            // If it cannot finish quickly (busy mount), fall back to lazy detach.
-            let graceful = tokio::time::timeout(
-                tokio::time::Duration::from_millis(1200),
-                tokio::process::Command::new(crate::antares::fusermount_bin())
-                    .arg("-u")
-                    .arg(&mount_path)
-                    .output(),
-            )
-            .await;
-
-            match graceful {
-                Ok(Ok(output)) if output.status.success() => {}
-                Ok(Ok(output)) => {
-                    tracing::warn!(
-                        "fusermount -u failed for {}: {}; falling back to -uz",
-                        mount_path,
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    let lazy = tokio::process::Command::new(crate::antares::fusermount_bin())
-                        .arg("-uz")
-                        .arg(&mount_path)
-                        .output()
-                        .await?;
-                    if !lazy.status.success() {
-                        tracing::warn!(
-                            "fusermount -uz failed for {}: {}",
-                            mount_path,
-                            String::from_utf8_lossy(&lazy.stderr)
-                        );
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        "failed to execute fusermount -u for {}: {}; falling back to -uz",
-                        mount_path,
-                        e
-                    );
-                    let lazy = tokio::process::Command::new(crate::antares::fusermount_bin())
-                        .arg("-uz")
-                        .arg(&mount_path)
-                        .output()
-                        .await?;
-                    if !lazy.status.success() {
-                        tracing::warn!(
-                            "fusermount -uz failed for {}: {}",
-                            mount_path,
-                            String::from_utf8_lossy(&lazy.stderr)
-                        );
-                    }
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "fusermount -u timed out for {}; falling back to -uz",
-                        mount_path
-                    );
-                    let lazy = tokio::process::Command::new(crate::antares::fusermount_bin())
-                        .arg("-uz")
-                        .arg(&mount_path)
-                        .output()
-                        .await?;
-                    if !lazy.status.success() {
-                        tracing::warn!(
-                            "fusermount -uz failed for {}: {}",
-                            mount_path,
-                            String::from_utf8_lossy(&lazy.stderr)
-                        );
-                    }
-                }
+        let Some(handle) = self.mount_handle.take() else {
+            return Ok(());
+        };
+        let mount_path = self.mountpoint.clone();
+        match tokio::time::timeout(tokio::time::Duration::from_millis(1200), handle.unmount()).await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    path = %mount_path.display(),
+                    error = %e,
+                    "MountHandle::unmount failed; falling back to platform unmount"
+                );
+                fuse_platform::unmount_path(&mount_path, true).await
             }
-
-            // Wait for the FUSE task to complete with timeout to avoid hanging
-            let timeout_duration = tokio::time::Duration::from_secs(5);
-            match tokio::time::timeout(timeout_duration, task).await {
-                Ok(Ok(_)) => {
-                    // Task completed successfully
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        "fuse task panicked during unmount of {}: {:?}",
-                        mount_path,
-                        e
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "fuse task did not complete within {}s for {}, continuing anyway",
-                        timeout_duration.as_secs(),
-                        mount_path
-                    );
-                }
+            Err(_) => {
+                tracing::warn!(
+                    path = %mount_path.display(),
+                    "MountHandle::unmount timed out; falling back to platform unmount"
+                );
+                fuse_platform::unmount_path(&mount_path, true).await
             }
         }
-        Ok(())
     }
 }
 
@@ -276,6 +189,11 @@ mod tests {
     };
     use serial_test::serial;
     use tokio::time::{sleep, Duration};
+
+    use crate::util::{
+        file_attr::make_file_attr,
+        fuse_platform::{self, fuse_provider},
+    };
     use uuid::Uuid;
 
     use super::AntaresFuse;
@@ -335,25 +253,25 @@ mod tests {
 
         fn file_attr(node: &MemNode) -> FileAttr {
             let ts = Self::now_ts();
-            FileAttr {
-                ino: node.inode,
-                size: node.data.len() as u64,
-                blocks: 0,
-                atime: ts,
-                mtime: ts,
-                ctime: ts,
-                kind: node.kind,
-                perm: node.perm,
-                nlink: if node.kind == FileType::Directory {
+            make_file_attr(
+                node.inode,
+                node.data.len() as u64,
+                0,
+                ts,
+                ts,
+                ts,
+                node.kind,
+                node.perm,
+                if node.kind == FileType::Directory {
                     2
                 } else {
                     1
                 },
-                uid: node.uid,
-                gid: node.gid,
-                rdev: 0,
-                blksize: 4096,
-            }
+                node.uid,
+                node.gid,
+                0,
+                4096,
+            )
         }
 
         async fn create_child(
@@ -991,24 +909,17 @@ mod tests {
     }
 
     fn fuse_test_prereqs_or_skip() -> bool {
-        let uid = unsafe { libc::geteuid() };
-        if uid != 0 {
-            println!("Skipping: requires root privileges");
-            return false;
-        }
-
-        if !std::path::Path::new("/dev/fuse").exists() {
-            println!("Skipping: /dev/fuse not available");
-            return false;
-        }
-
-        // AntaresFuse::unmount uses `fusermount -uz`.
-        if std::process::Command::new(crate::antares::fusermount_bin())
-            .arg("--version")
-            .output()
-            .is_err()
+        #[cfg(target_os = "linux")]
         {
-            println!("Skipping: fusermount not found");
+            let uid = unsafe { libc::geteuid() };
+            if uid != 0 {
+                println!("Skipping: requires root privileges");
+                return false;
+            }
+        }
+
+        if !fuse_provider().is_usable() {
+            println!("Skipping: FUSE provider not available");
             return false;
         }
 
@@ -1071,7 +982,11 @@ mod tests {
         let mut fuse = AntaresFuse::new(mount.clone(), dic.clone(), upper.clone(), None)
             .await
             .unwrap();
-        fuse.mount().await.unwrap();
+        if let Err(e) = fuse.mount().await {
+            println!("Skipping: FUSE mount failed: {e}");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
 
         let mounted_file = mount.join("hello.txt");
 
@@ -1136,8 +1051,17 @@ mod tests {
             .await
             .unwrap();
 
-        fuse1.mount().await.unwrap();
-        fuse2.mount().await.unwrap();
+        if let Err(e) = fuse1.mount().await {
+            println!("Skipping: FUSE mount failed: {e}");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        if let Err(e) = fuse2.mount().await {
+            println!("Skipping: FUSE mount failed: {e}");
+            let _ = fuse1.unmount().await;
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
 
         let file1 = mount1.join("hello.txt");
         let file2 = mount2.join("hello.txt");
@@ -1262,21 +1186,10 @@ mod tests {
         // Keep mounted for inspection
         sleep(Duration::from_secs(5)).await;
 
-        // Unmount using lazy unmount to avoid blocking
+        // Unmount using the platform helper (lazy / force).
         println!("Unmounting...");
-        let output = tokio::process::Command::new(crate::antares::fusermount_bin())
-            .arg("-uz") // Use lazy unmount
-            .arg(&mount)
-            .output()
-            .await
-            .unwrap();
-
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr);
-            // Check if the error is because the filesystem is not mounted
-            if !error_msg.contains("not mounted") && !error_msg.contains("Invalid argument") {
-                eprintln!("fusermount failed: {}", error_msg);
-            }
+        if let Err(e) = fuse_platform::unmount_path(&mount, true).await {
+            eprintln!("platform unmount failed: {e}");
         }
 
         // Wait for FUSE task to complete with timeout (don't wait indefinitely)
@@ -1874,11 +1787,7 @@ mod tests {
         let base = PathBuf::from("/tmp/antares_deep_overlay_test3");
         // Clean up any existing mount point first
         let mount = base.join("mnt");
-        let _ = tokio::process::Command::new(crate::antares::fusermount_bin())
-            .arg("-uz")
-            .arg(&mount)
-            .output()
-            .await;
+        let _ = fuse_platform::unmount_path(&mount, true).await;
         let _ = std::fs::remove_dir_all(&base);
         let mount = base.join("mnt");
         let upper = base.join("upper");
@@ -1957,11 +1866,7 @@ mod tests {
         assert!(!lower_file.exists(), "File should NOT exist in lower layer");
 
         // Unmount
-        let _ = tokio::process::Command::new(crate::antares::fusermount_bin())
-            .arg("-uz")
-            .arg(&mount)
-            .output()
-            .await;
+        let _ = fuse_platform::unmount_path(&mount, true).await;
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&base);

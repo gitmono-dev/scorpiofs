@@ -9,9 +9,12 @@ use bytes::Bytes;
 use futures::stream::iter;
 
 use super::Dicfuse;
-use crate::dicfuse::{
-    abi::{default_dic_entry, default_file_entry},
-    store::EMPTY_BLOB_OID,
+use crate::{
+    dicfuse::{
+        abi::{default_dic_entry, default_file_entry},
+        store::EMPTY_BLOB_OID,
+    },
+    util::file_attr::empty_file_attr,
 };
 
 /// How long the kernel caches a "file does not exist" lookup result.
@@ -195,21 +198,7 @@ impl Filesystem for Dicfuse {
                 // tells the kernel how long to cache the negative result.
                 return Ok(ReplyEntry {
                     ttl: NEGATIVE_ENTRY_TTL,
-                    attr: FileAttr {
-                        ino: 0,
-                        size: 0,
-                        blocks: 0,
-                        atime: asyncfuse::Timestamp::new(0, 0),
-                        mtime: asyncfuse::Timestamp::new(0, 0),
-                        ctime: asyncfuse::Timestamp::new(0, 0),
-                        kind: asyncfuse::FileType::RegularFile,
-                        perm: 0,
-                        nlink: 0,
-                        uid: 0,
-                        gid: 0,
-                        rdev: 0,
-                        blksize: 0,
-                    },
+                    attr: empty_file_attr(0, asyncfuse::FileType::RegularFile, 0),
                     generation: 0,
                 });
             }

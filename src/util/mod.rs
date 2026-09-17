@@ -5,6 +5,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 pub mod config;
+pub mod file_attr;
+pub mod fuse_platform;
 pub mod logging;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]

@@ -79,7 +79,7 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Run environment diagnostics (FUSE, /etc/fuse.conf, directories, mega server).
+    /// Run environment diagnostics (FUSE provider, directories, mega server).
     Doctor,
     /// Generate a shell completion script (bash, zsh, fish, ...).
     Completions {

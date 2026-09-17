@@ -44,3 +44,18 @@ jobs:
       
       - name: Run doc tests
         run: cargo test --doc --verbose
+
+  macos-check:
+    name: macOS check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo test --lib
+        run: cargo test --lib --verbose
