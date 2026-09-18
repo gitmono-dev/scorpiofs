@@ -65,6 +65,11 @@ url = "2.5"
 async-trait = "0.1.92"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# Shared MST/2 byte codec (specs 03/05/06/07), published to crates.io. Pure
+# codec only — no HTTP/DB/FUSE types leak through it. `zstd` enables the
+# optional strict single-frame frame encoding (spec 06 §3), wire fixes in 0.3.0.
+mst2-codec = { version = "0.3", features = ["zstd"] }
+
 
 # libfuse-fs pulls reqwest 0.12 → native-tls → openssl-sys. Vendored OpenSSL
 # lets aarch64-unknown-linux-musl cross builds succeed without a sysroot .pc.

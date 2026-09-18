@@ -1,0 +1,89 @@
+# MST/2 end-to-end acceptance stack.
+#
+# Layered on top of the repository's own `docker-compose.yml` (mega2 +
+# ScorpioFS + PostgreSQL/Redis/RustFS), this file:
+#
+#   * replaces the published mega2 image with one built from the local
+#     monoengine checkout, with the MST/2 snapshot surface enabled
+#     (`[mst2].enabled`) and the publication recorder switched on;
+#   * adds a one-shot `mst2-e2e` service that seeds a repository, resolves a
+#     fixed view, hydrates it, mounts it through FUSE, and checks the mounted
+#     bytes against a plain `git clone` of the same commit — plus offline
+#     reopen, SYS-01 (main moves, the mount does not) and incremental reuse
+#     counters.
+#
+# Run it with:
+#   tests/mst2-e2e/run.sh
+#
+# FUSE inside a container needs /dev/fuse and CAP_SYS_ADMIN; see
+# deploy/README.md for the host prerequisites. The stack is local-only:
+# mega2 runs with `push_auth=none`, so nothing is published to the host.
+services:
+  mega2:
+    image: ${MEGA2_IMAGE:-mega2-mst2:local}
+    build:
+      # monoengine is the sibling checkout; this file lives in scorpiofs.
+      context: ../monoengine
+      dockerfile: Dockerfile.mst2
+    environment:
+      # The MST/2 surface stays off unless explicitly enabled, and every
+      # capability is only advertised once it has been accepted.
+      MEGA_MST2__ENABLED: "true"
+      MEGA_MST2__INSTANCE_UUID: "9f6c4e1a-7b2d-4c8e-a1f0-3d5b7c9e2a41"
+      # Publication receipts/outbox land in the same transaction as the
+      # trunk-push ref CAS.
+      MEGA_MST2__PUBLICATION_ENABLED: "true"
+      # Spec 04 §1: the MST/2 surface requires bearer credentials; the
+      # acceptance client is given the same value below.
+      MEGA_MST2__AUTH_TOKEN: "mst2-e2e-acceptance-token"
+    ports: !override
+      - "127.0.0.1:19700:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v2/snapshots/capabilities"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  # The base stack's ScorpioFS service (Antares daemon mount) is not part of
+  # the MST/2 acceptance and its image build expects the codec to be
+  # resolvable from the context alone; park it behind a profile so the default
+  # run neither builds nor starts it. Enable it with:
+  #   docker compose ... --profile antares-mount up
+  scorpiofs:
+    profiles: ["antares-mount"]
+
+  mst2-e2e:
+    build:
+      # Relative paths resolve against the project directory (the scorpiofs
+      # checkout, since that is where docker-compose.yml lives).
+      context: .
+      dockerfile: tests/mst2-e2e/Dockerfile
+      additional_contexts:
+        # `tests/` and `examples/` are excluded from the main build context
+        # by .dockerignore (the production image does not need them), so the
+        # acceptance script and the example binaries arrive as their own
+        # contexts.
+        e2efiles: tests/mst2-e2e
+        examplesctx: examples
+    depends_on:
+      mega2:
+        condition: service_healthy
+    environment:
+      M2_BASE: http://mega2:8000
+      M2_SCOPE: /project
+      M2_REPO_PATH: /project
+      M2_STORE_ROOT: /var/lib/scorpio/mst2
+      M2_LEASE: "120"
+      M2_TOKEN: mst2-e2e-acceptance-token
+    # FUSE needs the host device and privileges; the container is a
+    # short-lived test, not a service.
+    privileged: true
+    devices:
+      - /dev/fuse
+    restart: "no"
+    volumes:
+      - mst2-e2e-store:/var/lib/scorpio
+
+volumes:
+  mst2-e2e-store:
