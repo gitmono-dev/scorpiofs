@@ -14,7 +14,7 @@
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -35,6 +35,12 @@ use crate::snapshot::types::{
 pub struct Mst2Client {
     http: Arc<reqwest::Client>,
     base: String,
+    /// Bearer token for the snapshot surface (spec 04 §1). Sent as
+    /// `Authorization` on every request; unset for lab-only deployments.
+    token: Arc<StdMutex<Option<String>>>,
+    /// The lease this client resolved, sent as `X-Mega-Snapshot-Lease` on
+    /// snapshot-bound requests (spec 04 §1: identity in headers, not URLs).
+    lease: Arc<StdMutex<Option<String>>>,
     /// Transport-level retries performed (metrics, spec 13 §6).
     retries: Arc<AtomicU64>,
     /// Payload bytes received (frame/blob bodies), for the "transfer is
@@ -53,13 +59,38 @@ const BASE_BACKOFF_MS: u64 = 40;
 
 impl Mst2Client {
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_token(base_url, None)
+    }
+
+    /// Client with a bearer token for authenticated deployments (spec 04 §1).
+    /// The token can also come from `M2_TOKEN`; it is never logged.
+    pub fn with_token(base_url: impl Into<String>, token: Option<String>) -> Self {
+        let http = reqwest::Client::builder()
+            // Spec 14 §3: refuse automatic redirects — a redirect must never
+            // carry (or silently drop) credentials to another origin.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client with sane defaults");
         Self {
-            http: Arc::new(reqwest::Client::new()),
+            http: Arc::new(http),
             base: base_url.into().trim_end_matches('/').to_string(),
+            token: Arc::new(StdMutex::new(token)),
+            lease: Arc::new(StdMutex::new(None)),
             retries: Arc::new(AtomicU64::new(0)),
             recv_bytes: Arc::new(AtomicU64::new(0)),
             units_fetched: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Set or clear the bearer credential (e.g. after loading config).
+    pub fn set_token(&self, token: Option<String>) {
+        *self.token.lock().unwrap() = token;
+    }
+
+    /// Bind the lease produced by [`Mst2Client::resolve`]; it rides every
+    /// subsequent request as `X-Mega-Snapshot-Lease`. Called by the reader.
+    pub fn bind_lease(&self, lease_id: &str) {
+        *self.lease.lock().unwrap() = Some(lease_id.to_string());
     }
 
     /// Content units (objects/chunks) this client has fetched so far.
@@ -88,6 +119,20 @@ impl Mst2Client {
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, SnapshotError> {
+        // Spec 04 §1: identity travels in headers — bearer credential plus
+        // the resolved lease — never in the URL.
+        let builder = {
+            let token = self.token.lock().unwrap().clone();
+            let lease = self.lease.lock().unwrap().clone();
+            let mut b = builder;
+            if let Some(t) = token {
+                b = b.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            if let Some(l) = lease {
+                b = b.header("x-mega-snapshot-lease", l);
+            }
+            b
+        };
         let req = builder.build().map_err(|e| {
             SnapshotError::new(SnapshotErrorCode::Internal, format!("request build: {e}"))
         })?;

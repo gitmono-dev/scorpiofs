@@ -14,10 +14,17 @@ pub struct SnapshotError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotErrorCode {
     ScopeInvalid,
+    /// Malformed request (spec 14 §5 INVALID_REQUEST).
+    InvalidRequest,
+    /// Over a spec 14 §4 hard limit (body bytes, item counts).
+    LimitExceeded,
+    /// Missing or invalid credentials (spec 04 §1).
+    Unauthenticated,
     ScopeForbidden,
     ViewNotFound,
     SnapshotNotReady,
-    SnapshotUnknown,
+    /// The fixed view no longer exists (spec 14 §5 SNAPSHOT_GONE, 410).
+    SnapshotGone,
     PathNotFound,
     NotDirectory,
     UnsupportedEntry,
@@ -57,10 +64,13 @@ impl SnapshotErrorCode {
     pub fn from_server(code: &str) -> Self {
         match code {
             "SCOPE_INVALID" => Self::ScopeInvalid,
+            "INVALID_REQUEST" => Self::InvalidRequest,
+            "LIMIT_EXCEEDED" => Self::LimitExceeded,
+            "UNAUTHENTICATED" => Self::Unauthenticated,
             "SCOPE_FORBIDDEN" => Self::ScopeForbidden,
             "VIEW_NOT_FOUND" => Self::ViewNotFound,
             "SNAPSHOT_NOT_READY" => Self::SnapshotNotReady,
-            "SNAPSHOT_UNKNOWN" => Self::SnapshotUnknown,
+            "SNAPSHOT_GONE" => Self::SnapshotGone,
             "PATH_NOT_FOUND" => Self::PathNotFound,
             "NOT_DIRECTORY" => Self::NotDirectory,
             "UNSUPPORTED_ENTRY" => Self::UnsupportedEntry,
@@ -69,6 +79,8 @@ impl SnapshotErrorCode {
             "CURSOR_INVALID" => Self::CursorInvalid,
             "CURSOR_STALE" => Self::CursorStale,
             "PROOF_BUDGET_EXCEEDED" => Self::ProofBudgetExceeded,
+            "EXPECTED_DIGEST_MISMATCH" => Self::DigestMismatch,
+            // Pre-0.3 server builds used this spelling.
             "OBJECT_DIGEST_MISMATCH" => Self::DigestMismatch,
             "RANGE_NOT_SUPPORTED" => Self::RangeNotSupported,
             "SYMLINK_TRAVERSAL" => Self::SymlinkTraversal,

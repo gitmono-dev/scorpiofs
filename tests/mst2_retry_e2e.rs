@@ -15,7 +15,12 @@ use scorpiofs::snapshot::{DurableStore, Mst2Client, SnapshotReader};
 #[ignore]
 async fn hydrate_survives_injected_transient_failures() {
     let base = std::env::var("MST2_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:19701".into());
-    let client = Mst2Client::new(base);
+    let client = Mst2Client::with_token(
+        base,
+        std::env::var("M2_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("MST2_TOKEN").ok()),
+    );
 
     let reader = SnapshotReader::resolve(client.clone(), "/project", 600)
         .await

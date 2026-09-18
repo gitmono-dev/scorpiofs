@@ -215,6 +215,9 @@ impl SnapshotReader {
             ));
         }
         let res = client.resolve(scope, lease_seconds).await?;
+        // The lease is the read credential (spec 04 §1): from here on every
+        // request carries it as X-Mega-Snapshot-Lease.
+        client.bind_lease(&res.lease_id);
         let lease = Arc::new(LeaseKeeper::new(lease_seconds));
         // Keep the retention claim alive for as long as this reader lives
         // (a hydrate or mount may outlast the initial window). Outside a

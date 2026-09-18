@@ -34,7 +34,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(600u64);
 
-    let reader = SnapshotReader::resolve(Mst2Client::new(base), &scope, lease).await?;
+    let reader = SnapshotReader::resolve(
+        Mst2Client::with_token(
+            base,
+            std::env::var("M2_TOKEN")
+                .ok()
+                .or_else(|| std::env::var("MST2_TOKEN").ok()),
+        ),
+        &scope,
+        lease,
+    )
+    .await?;
     let snapshot_id = reader.snapshot_id().to_string();
     let cache = ScopeCache::open(&cache_dir)?;
     let mut sync = IncrementalSync::new(&reader, &cache);

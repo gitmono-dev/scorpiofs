@@ -21,7 +21,12 @@ fn pattern_at(i: usize) -> u8 {
 async fn range_read_transfers_only_the_covering_chunks() {
     let base =
         std::env::var("MST2_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:19700".to_string());
-    let client = Mst2Client::new(base);
+    let client = Mst2Client::with_token(
+        base,
+        std::env::var("M2_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("MST2_TOKEN").ok()),
+    );
     let reader = SnapshotReader::resolve(client.clone(), "/project", 600)
         .await
         .expect("resolve");

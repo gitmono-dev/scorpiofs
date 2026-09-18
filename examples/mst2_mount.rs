@@ -59,7 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store_root =
                 std::env::var("M2_STORE_ROOT").unwrap_or_else(|_| "/var/lib/scorpio/mst2".into());
 
-            let client = Mst2Client::new(base);
+            let client = Mst2Client::with_token(
+                base,
+                std::env::var("M2_TOKEN")
+                    .ok()
+                    .or_else(|| std::env::var("MST2_TOKEN").ok()),
+            );
             eprintln!("resolving {scope} ...");
             let reader = SnapshotReader::resolve(client, &scope, lease).await?;
             let snapshot_id = reader.snapshot_id().to_string();

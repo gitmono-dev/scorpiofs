@@ -21,7 +21,12 @@ fn base_url() -> String {
 #[tokio::test]
 #[ignore]
 async fn short_lease_is_renewed_proactively_and_revocation_is_typed() {
-    let client = Mst2Client::new(base_url());
+    let client = Mst2Client::with_token(
+        base_url(),
+        std::env::var("M2_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("MST2_TOKEN").ok()),
+    );
 
     // 3s lease: the 5s sleep below outlives it, so success proves renewal.
     let reader = SnapshotReader::resolve(client.clone(), "/project", 3)
@@ -82,7 +87,12 @@ async fn short_lease_is_renewed_proactively_and_revocation_is_typed() {
 #[tokio::test]
 #[ignore]
 async fn hydrated_content_survives_lease_revocation() {
-    let client = Mst2Client::new(base_url());
+    let client = Mst2Client::with_token(
+        base_url(),
+        std::env::var("M2_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("MST2_TOKEN").ok()),
+    );
     let reader = SnapshotReader::resolve(client.clone(), "/project", 600)
         .await
         .expect("resolve");

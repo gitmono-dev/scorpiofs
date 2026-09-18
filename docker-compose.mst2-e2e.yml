@@ -33,6 +33,9 @@ services:
       # Publication receipts/outbox land in the same transaction as the
       # trunk-push ref CAS.
       MEGA_MST2__PUBLICATION_ENABLED: "true"
+      # Spec 04 §1: the MST/2 surface requires bearer credentials; the
+      # acceptance client is given the same value below.
+      MEGA_MST2__AUTH_TOKEN: "mst2-e2e-acceptance-token"
     ports: !override
       - "127.0.0.1:19700:8000"
     healthcheck:
@@ -72,6 +75,7 @@ services:
       M2_REPO_PATH: /project
       M2_STORE_ROOT: /var/lib/scorpio/mst2
       M2_LEASE: "120"
+      M2_TOKEN: mst2-e2e-acceptance-token
     # FUSE needs the host device and privileges; the container is a
     # short-lived test, not a service.
     privileged: true

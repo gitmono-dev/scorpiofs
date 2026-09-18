@@ -12,7 +12,12 @@ const CHUNK: usize = 1 << 20;
 async fn frame_transport_verifies_objects_chunks_and_leases() {
     let base =
         std::env::var("MST2_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:19700".to_string());
-    let client = Mst2Client::new(base);
+    let client = Mst2Client::with_token(
+        base,
+        std::env::var("M2_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("MST2_TOKEN").ok()),
+    );
     let scope = std::env::var("MST2_SCOPE").unwrap_or_else(|_| "/project".to_string());
 
     let caps = client.capabilities().await.expect("capabilities");
@@ -159,7 +164,12 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
 async fn page_navigation_matches_json_directory() {
     let base =
         std::env::var("MST2_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:19700".to_string());
-    let client = Mst2Client::new(base);
+    let client = Mst2Client::with_token(
+        base,
+        std::env::var("M2_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("MST2_TOKEN").ok()),
+    );
     let scope = std::env::var("MST2_SCOPE").unwrap_or_else(|_| "/project".to_string());
     let reader = SnapshotReader::resolve(client.clone(), &scope, 600)
         .await
