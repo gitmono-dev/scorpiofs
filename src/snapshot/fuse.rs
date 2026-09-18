@@ -724,8 +724,7 @@ fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
     use crate::snapshot::SnapshotErrorCode::*;
     let code = match e.code {
         PathNotFound | ViewNotFound | SnapshotGone => libc::ENOENT,
-        Unauthenticated | ScopeForbidden => libc::EACCES,
-        ScopeForbidden | LeaseExpired | LeaseUnknown => libc::EACCES,
+        Unauthenticated | ScopeForbidden | LeaseExpired | LeaseUnknown => libc::EACCES,
         NotDirectory => libc::ENOTDIR,
         DigestMismatch => libc::EIO,
         _ => libc::EIO,
