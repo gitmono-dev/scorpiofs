@@ -2685,9 +2685,9 @@ dependencies = [
 
 [[package]]
 name = "mst2-codec"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a5f6d189b5ef2c9b40060709ae4b8fc45912cd5bc72e69f0e5d67996b923ff5"
+checksum = "3244bf3e00f33d5a5e42c073e1b23dfca001ddbfd7d7abebe836a85079edb24b"
 dependencies = [
  "sha2 0.10.9",
  "zstd",

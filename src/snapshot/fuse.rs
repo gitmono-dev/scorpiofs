@@ -27,7 +27,10 @@ use asyncfuse::{
 use bytes::Bytes;
 use futures::stream::iter;
 
-use crate::snapshot::{durable::DurableStore, SnapshotFile, SnapshotReader};
+use crate::{
+    snapshot::{durable::DurableStore, SnapshotFile, SnapshotReader},
+    util::file_attr::make_file_attr,
+};
 
 const ROOT_INODE: u64 = 1;
 const TTL: Duration = Duration::from_secs(60);
@@ -337,51 +340,51 @@ fn ensure_child(
 }
 
 fn dir_attr(inode: u64) -> FileAttr {
-    FileAttr {
-        ino: inode,
-        size: 0,
-        blocks: 0,
-        atime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        mtime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        ctime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        kind: FileType::Directory,
-        perm: 0o755,
-        nlink: 2,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        blksize: 4096,
-    }
+    make_file_attr(
+        inode,
+        0,
+        0,
+        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
+        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
+        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
+        FileType::Directory,
+        0o755,
+        2,
+        0,
+        0,
+        0,
+        4096,
+    )
 }
 
 fn file_attr(inode: u64, f: &FileNode) -> FileAttr {
     let symlink = f.fs_kind == "symlink";
-    FileAttr {
-        ino: inode,
+    make_file_attr(
+        inode,
         // For a symlink this is the target's length, per POSIX.
-        size: f.size,
-        blocks: (f.size / 512) + 1,
-        atime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        mtime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        ctime: asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        kind: if symlink {
+        f.size,
+        (f.size / 512) + 1,
+        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
+        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
+        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
+        if symlink {
             FileType::Symlink
         } else {
             FileType::RegularFile
         },
-        perm: if symlink {
+        if symlink {
             0o777
         } else if f.fs_kind == "executable" {
             0o755
         } else {
             0o644
         },
-        nlink: 1,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        blksize: 4096,
-    }
+        1,
+        0,
+        0,
+        0,
+        4096,
+    )
 }
 
 impl Filesystem for Mst2Fuse {
