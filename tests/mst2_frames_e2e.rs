@@ -13,7 +13,7 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
     let base =
         std::env::var("MST2_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:19700".to_string());
     let client = Mst2Client::new(base);
-    let scope = "/project";
+    let scope = std::env::var("MST2_SCOPE").unwrap_or_else(|_| "/project".to_string());
 
     let caps = client.capabilities().await.expect("capabilities");
     assert!(
@@ -31,7 +31,7 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
         caps.frame_encodings
     );
 
-    let reader = SnapshotReader::resolve(client.clone(), scope, 600)
+    let reader = SnapshotReader::resolve(client.clone(), &scope, 600)
         .await
         .expect("resolve");
     let sid = reader.snapshot_id().to_string();
@@ -135,7 +135,7 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
 
     // Release only this dedicated lease; resolve a second one first so the
     // release/404 checks do not depend on the test's first lease.
-    let res2 = client.resolve(scope, 600).await.expect("second resolve");
+    let res2 = client.resolve(&scope, 600).await.expect("second resolve");
     let lease2 = res2.lease_id;
     let released = client.release_lease(&lease2).await.expect("release");
     assert!(released, "first release removes the active lease");
@@ -149,4 +149,44 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
         gone.map_err(|e| (e.code, e.http_status)),
         Err((scorpiofs::snapshot::SnapshotErrorCode::LeaseUnknown, 404))
     ));
+}
+
+/// Spec 11 §6 acceptance: the binary page walk (metadata/pages, batched and
+/// parent-committed-id-bound) must produce exactly the entry set the JSON
+/// `directory` transport produces for the same fixed view.
+#[tokio::test]
+#[ignore]
+async fn page_navigation_matches_json_directory() {
+    let base =
+        std::env::var("MST2_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:19700".to_string());
+    let client = Mst2Client::new(base);
+    let scope = std::env::var("MST2_SCOPE").unwrap_or_else(|_| "/project".to_string());
+    let reader = SnapshotReader::resolve(client.clone(), &scope, 600)
+        .await
+        .expect("resolve");
+    assert!(reader.capabilities().features.metadata_pages);
+
+    let by_pages = reader.file_manifest_pages().await.expect("page walk");
+    let by_json = reader
+        .file_manifest_directory()
+        .await
+        .expect("json directory walk");
+
+    let key = |f: &scorpiofs::snapshot::SnapshotFile| {
+        (
+            f.rel_path.clone(),
+            f.fs_kind.clone(),
+            f.size,
+            f.content_digest.clone(),
+        )
+    };
+    let mut pages_set: Vec<_> = by_pages.iter().map(key).collect();
+    pages_set.sort();
+    let mut json_set: Vec<_> = by_json.iter().map(key).collect();
+    json_set.sort();
+    assert!(
+        !pages_set.is_empty(),
+        "the view must not read as empty through pages"
+    );
+    assert_eq!(pages_set, json_set, "page walk must match JSON directory");
 }

@@ -12,8 +12,22 @@ use std::{
 
 use crate::snapshot::{
     client::Mst2Client,
+    frames::MetadataPageItem,
     types::{Capabilities, Descriptor, DirEntry, LookupResult, SnapshotError, SnapshotErrorCode},
 };
+
+/// Batch cap for one `metadata/pages` request: the server accepts 1..64.
+const PAGES_BATCH: usize = 64;
+
+/// One pending page fetch: a directory plus the label route from that
+/// directory's MTP2 root, and the page id the parent page committed to (the
+/// descriptor's `metadata_root` for the scope root).
+#[derive(Debug, Clone)]
+struct PageFrontier {
+    dir: String,
+    route: Vec<u8>,
+    expected: String,
+}
 
 /// One resolved file in the fixed view.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -309,11 +323,131 @@ impl SnapshotReader {
         }
     }
 
-    /// Walk the whole scope via paginated `directory`, collecting files.
+    /// Walk the whole scope, collecting files. The MTP2 page surface
+    /// (`metadata/pages`, spec 04 §8 / 11 §6) is preferred — one batched
+    /// request per 64 pending pages instead of one paginated JSON request
+    /// per directory page — and the JSON `directory` transport is the
+    /// fallback for deployments without the capability.
     ///
-    /// Missing a page after a server-advertised cursor is an error; empty
-    /// results are only accepted at real EOF (`next_cursor = null`).
+    /// Missing a page after a server-advertised cursor or a parent-committed
+    /// child id is an error; empty results are only accepted at real EOF.
     pub async fn file_manifest(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
+        if self.caps.features.metadata_pages {
+            return self.file_manifest_pages().await;
+        }
+        self.ensure_lease().await?;
+        let mut out = Vec::new();
+        self.walk_dir("/", &mut out).await?;
+        Ok(out)
+    }
+
+    /// Walk the whole scope through the binary page surface. Every page
+    /// fetched is bound to the id its parent committed to (the descriptor's
+    /// `metadata_root` at the root) and re-hashed client-side, so a page the
+    /// fixed view does not contain can neither be accepted nor pass as one.
+    pub async fn file_manifest_pages(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
+        self.ensure_lease().await?;
+        let mut out = Vec::new();
+        let mut frontier = vec![PageFrontier {
+            dir: "/".to_string(),
+            route: Vec::new(),
+            expected: self.descriptor.metadata_root.clone(),
+        }];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while !frontier.is_empty() {
+            let take = frontier.len().min(PAGES_BATCH);
+            let batch: Vec<PageFrontier> = frontier.drain(..take).collect();
+            let mut by_id: HashMap<String, PageFrontier> = HashMap::new();
+            let mut items = Vec::with_capacity(batch.len());
+            for f in &batch {
+                by_id.insert(f.expected.clone(), f.clone());
+                items.push(MetadataPageItem {
+                    directory_path: f.dir.clone(),
+                    route: f.route.clone(),
+                    expected_digest: Some(f.expected.clone()),
+                });
+            }
+            let pages = self
+                .client
+                .metadata_pages(self.snapshot_id(), &items, self.content_encoding())
+                .await?;
+            let mut returned: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut fresh: Vec<(String, mst2_codec::metapage::Page)> = Vec::new();
+            for (pid, bytes) in pages {
+                let id = format!("sha256:{}", crate::snapshot::frames::hex32(&pid));
+                returned.insert(id.clone());
+                // The server dedupes; a page already verified through another
+                // item's route chain needs no second decode.
+                if seen.contains(&id) {
+                    continue;
+                }
+                // Re-hash the wire bytes ourselves: a (id, bytes) pair is a
+                // claim, not evidence.
+                if mst2_codec::metapage::page_id(&bytes) != pid {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        format!("metadata/pages payload does not hash to {id}"),
+                    ));
+                }
+                let (page, _) = mst2_codec::metapage::Page::decode(&bytes).map_err(|e| {
+                    SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        format!("metadata/pages page {id}: {e}"),
+                    )
+                })?;
+                fresh.push((id, page));
+            }
+            // Proven completeness: every page the parent committed to must be
+            // in the response — never silently enumerated as absent.
+            for f in &batch {
+                if !returned.contains(&f.expected) {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        format!(
+                            "metadata/pages did not return the requested page {} for {}",
+                            f.expected, f.dir
+                        ),
+                    ));
+                }
+            }
+            for (id, page) in fresh {
+                seen.insert(id.clone());
+                let f = &by_id[&id];
+                match page {
+                    mst2_codec::metapage::Page::Leaf { entries } => {
+                        for e in &entries {
+                            collect_entry(&f.dir, e, &mut out, &mut frontier)?;
+                        }
+                    }
+                    mst2_codec::metapage::Page::Branch {
+                        terminal, children, ..
+                    } => {
+                        if let Some(e) = terminal {
+                            collect_entry(&f.dir, &e, &mut out, &mut frontier)?;
+                        }
+                        for c in &children {
+                            let mut route = f.route.clone();
+                            route.push(c.label);
+                            frontier.push(PageFrontier {
+                                dir: f.dir.clone(),
+                                route,
+                                expected: format!(
+                                    "sha256:{}",
+                                    crate::snapshot::frames::hex32(&c.child_page_id)
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Manifest through the JSON `directory` transport only — the equivalence
+    /// baseline for the page walk (spec 11 §6: both transports must produce
+    /// the same entry set for the same view).
+    pub async fn file_manifest_directory(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
         self.ensure_lease().await?;
         let mut out = Vec::new();
         self.walk_dir("/", &mut out).await?;
@@ -525,6 +659,58 @@ impl SnapshotReader {
 /// Kept for potential future use of directory entry inspection.
 #[allow(dead_code)]
 fn _entry_marker(_e: &DirEntry) {}
+
+/// Turn one decoded MTP2 entry into either a manifest file or a new page
+/// frontier item (directories carry the child directory's own `page_id`, per
+/// spec 05 §3). The `fs_kind` strings match what the JSON `directory`
+/// transport emits, so both transports produce identical manifests.
+fn collect_entry(
+    dir: &str,
+    e: &mst2_codec::metapage::Entry,
+    out: &mut Vec<SnapshotFile>,
+    frontier: &mut Vec<PageFrontier>,
+) -> Result<(), SnapshotError> {
+    use mst2_codec::metapage::EntryKind as MetaEntryKind;
+    let name = std::str::from_utf8(&e.name)
+        .map_err(|_| {
+            SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "non-utf8 entry name in MTP2 page",
+            )
+        })?
+        .to_string();
+    let rel = if dir == "/" {
+        name
+    } else {
+        format!("{}/{}", dir.trim_start_matches('/'), name)
+    };
+    match e.kind {
+        MetaEntryKind::Directory => frontier.push(PageFrontier {
+            dir: format!("/{rel}"),
+            route: Vec::new(),
+            expected: format!("sha256:{}", crate::snapshot::frames::hex32(&e.child_root)),
+        }),
+        MetaEntryKind::Regular => out.push(SnapshotFile {
+            rel_path: rel,
+            fs_kind: "regular".to_string(),
+            size: e.size,
+            content_digest: format!("sha256:{}", crate::snapshot::frames::hex32(&e.content_id)),
+        }),
+        MetaEntryKind::Executable => out.push(SnapshotFile {
+            rel_path: rel,
+            fs_kind: "executable".to_string(),
+            size: e.size,
+            content_digest: format!("sha256:{}", crate::snapshot::frames::hex32(&e.content_id)),
+        }),
+        MetaEntryKind::Symlink => out.push(SnapshotFile {
+            rel_path: rel,
+            fs_kind: "symlink".to_string(),
+            size: e.size,
+            content_digest: format!("sha256:{}", crate::snapshot::frames::hex32(&e.content_id)),
+        }),
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
