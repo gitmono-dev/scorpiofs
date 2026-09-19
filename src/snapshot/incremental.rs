@@ -244,97 +244,331 @@ impl<'a> IncrementalSync<'a> {
         self.meters
     }
 
-    /// Produce the file manifest of the fixed view, reusing verified
-    /// subtrees whose page ids still match and whose pages are still here.
+    /// Batched level-order sync: directories are fetched up to 64 per
+    /// metadata_pages request (the endpoint's multi-item limit), collapsing
+    /// the per-directory request storm that dominated cold-mount time on
+    /// large trees. Closure records complete post-order — a record's file
+    /// list spans its whole subtree, so it is written when the directory's
+    /// page tree and all of its child directories have finished.
+    /// Batched level-order sync: directories are fetched up to 64 per
+    /// metadata_pages request (the endpoint's multi-item limit), collapsing
+    /// the per-directory request storm that dominated cold-mount time on
+    /// large trees. Closure records complete post-order — a record's file
+    /// list spans its whole subtree, so it is written when the directory's
+    /// page tree and all of its child directories have finished.
     pub async fn sync(&mut self) -> Result<Vec<SnapshotFile>, SnapshotError> {
-        // The root is always fetched: it is the entry point of the sync and
-        // its page id is what every reuse decision below hangs from.
-        let root_page_id = self.reader.descriptor.metadata_root.clone();
-        self.walk("/", Some(&root_page_id)).await
-    }
+        use std::collections::HashMap;
 
-    /// Walk one directory. `known_root` is the `directory_root` its parent
-    /// advertised (absent only for the scope root, which fetches first).
-    async fn walk(
-        &mut self,
-        dir: &str,
-        known_root: Option<&str>,
-    ) -> Result<Vec<SnapshotFile>, SnapshotError> {
-        if let Some(root) = known_root {
-            self.meters.traversal_nodes += 1;
-            if let Some(files) = self.try_reuse(root, dir).await? {
-                return Ok(files);
-            }
+        const PAGE_BATCH: usize = 64;
+
+        enum Item {
+            /// One page of a directory's own page tree. The route grows one
+            /// label per round; the parent page was already fetched.
+            Page {
+                dir: String,
+                route: Vec<u8>,
+                expected: String,
+            },
         }
 
-        let page = self.reader.directory_page(dir, 256).await?;
-        self.meters.fetched_pages += 1;
-        // Record every page of this directory's own MTP2 tree so a later
-        // version can check the subtree is byte-identical and still here.
-        let page_ids = self
-            .fetch_and_store_pages(dir, &page.directory_root)
-            .await?;
+        struct DirState {
+            base: String,
+            parent: Option<String>,
+            root_page_id: String,
+            page_ids: Vec<String>,
+            own_files: Vec<SnapshotFile>,
+            child_files: Vec<Vec<SnapshotFile>>, // finished children, child-relative
+            child_bases: Vec<String>,
+            pending_pages: usize,
+            pending_children: usize,
+        }
 
-        self.meters.traversal_nodes += 1;
-        let mut files = Vec::new();
-        for entry in &page.entries {
-            let rel = if dir == "/" {
-                entry.name.clone()
-            } else {
-                format!("{}/{}", dir.trim_start_matches('/'), entry.name)
-            };
-            if let Some(child_root) = &entry.directory_root {
-                let child = format!("/{rel}");
-                files.extend(Box::pin(self.walk(&child, Some(child_root))).await?);
-            } else if let Some(digest) = &entry.content_digest {
-                let size = entry
-                    .size
-                    .as_deref()
-                    .unwrap_or("0")
-                    .parse::<u64>()
-                    .map_err(|_| {
-                        SnapshotError::new(
-                            SnapshotErrorCode::Internal,
-                            format!("non-numeric size for {rel}"),
-                        )
+        let mut files_out: Vec<SnapshotFile> = Vec::new();
+        let mut states: HashMap<String, DirState> = HashMap::new();
+        let mut frontier: Vec<Item> = Vec::new();
+        let mut fetched_pages = 0u64;
+        let mut traversal_nodes = 0u64;
+
+        // Reuse hit -> the record covers the whole subtree: hand its files to
+        // the parent (or the result) without fetching anything.
+        macro_rules! finish_from_record {
+            ($dir:expr, $expected:expr, $parent:expr, $base:expr) => {{
+                if let Some(record_files) = self.try_reuse(&$expected, &$dir).await? {
+                    let prefixed: Vec<SnapshotFile> = record_files
+                        .iter()
+                        .map(|f| SnapshotFile {
+                            rel_path: with_prefix(&f.rel_path, &$base),
+                            ..f.clone()
+                        })
+                        .collect();
+                    match &$parent {
+                        Some(parent_path) => {
+                            if let Some(ps) = states.get_mut(parent_path) {
+                                ps.child_files.push(prefixed);
+                                ps.pending_children -= 1;
+                            }
+                        }
+                        None => files_out = prefixed,
+                    }
+                    true
+                } else {
+                    false
+                }
+            }};
+        }
+
+        // Enqueue a directory root: reuse first, otherwise create state and
+        // fetch its root page in a later batch.
+        macro_rules! enqueue_dir {
+            ($dir:expr, $expected:expr, $parent:expr, $base:expr) => {{
+                let dir: String = $dir;
+                let expected: String = $expected;
+                let parent: Option<String> = $parent;
+                let base: String = $base;
+                if let Some(parent_path) = &parent {
+                    if let Some(ps) = states.get_mut(parent_path) {
+                        ps.pending_children += 1;
+                    }
+                }
+                if !finish_from_record!(dir, expected, parent, base) {
+                    states.insert(
+                        dir.clone(),
+                        DirState {
+                            base,
+                            parent,
+                            root_page_id: expected.clone(),
+                            page_ids: Vec::new(),
+                            own_files: Vec::new(),
+                            child_files: Vec::new(),
+                            child_bases: Vec::new(),
+                            pending_pages: 1,
+                            pending_children: 0,
+                        },
+                    );
+                    frontier.push(Item::Page {
+                        dir,
+                        route: Vec::new(),
+                        expected,
+                    });
+                }
+            }};
+        }
+
+        enqueue_dir!(
+            "/".to_string(),
+            self.reader.descriptor.metadata_root.clone(),
+            None,
+            String::new()
+        );
+
+        while !frontier.is_empty() {
+            let take = frontier.len().min(PAGE_BATCH);
+            let batch: Vec<Item> = frontier.drain(..take).collect();
+
+            let items: Vec<MetadataPageItem> = batch
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Page {
+                        dir,
+                        route,
+                        expected,
+                    } => Some(MetadataPageItem {
+                        directory_path: dir.clone(),
+                        route: route.clone(),
+                        expected_digest: Some(expected.clone()),
+                    }),
+                })
+                .collect();
+            let pages = self
+                .reader
+                .client
+                .metadata_pages(
+                    self.reader.snapshot_id(),
+                    &items,
+                    self.reader.encoding_hint(),
+                )
+                .await?;
+            fetched_pages += pages.len() as u64;
+
+            // Attribute returned pages to their items and store each once.
+            let mut by_id: HashMap<String, Vec<u8>> = HashMap::new();
+            for (it, (pid, bytes)) in batch.iter().zip(pages.iter()) {
+                let id = format!("sha256:{}", crate::snapshot::frames::hex32(pid));
+                if let Item::Page { dir, .. } = it {
+                    if let Some(st) = states.get_mut(dir) {
+                        st.page_ids.push(id.clone());
+                    }
+                }
+                by_id.insert(id, bytes.clone());
+            }
+            for (id, bytes) in &by_id {
+                self.cache.put_page(id, bytes)?;
+            }
+
+            for it in &batch {
+                let Item::Page {
+                    dir,
+                    route,
+                    expected,
+                } = it
+                else {
+                    continue;
+                };
+                traversal_nodes += 1;
+                let bytes = by_id.get(expected).ok_or_else(|| {
+                    SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        format!(
+                            "metadata/pages did not return the requested page {expected} for {dir}"
+                        ),
+                    )
+                })?;
+                let (page, _) = mst2_codec::metapage::Page::decode(bytes).map_err(|e| {
+                    SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        format!("metadata/pages page {expected}: {e}"),
+                    )
+                })?;
+                let st = states.get_mut(dir).ok_or_else(|| {
+                    SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        format!("missing walk state for {dir}"),
+                    )
+                })?;
+                let mut child_dirs: Vec<(String, String, String)> = Vec::new(); // path, base, expected root
+                let mut handle_entry = |e: &mst2_codec::metapage::Entry,
+                                        child_dirs: &mut Vec<(String, String, String)>|
+                 -> Result<(), SnapshotError> {
+                    let name = std::str::from_utf8(&e.name)
+                        .map_err(|_| {
+                            SnapshotError::new(
+                                SnapshotErrorCode::Internal,
+                                "non-utf8 entry name in MTP2 page",
+                            )
+                        })?
+                        .to_string();
+                    let rel = if dir == "/" {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", dir.trim_start_matches('/'), name)
+                    };
+                    match e.kind {
+                        mst2_codec::metapage::EntryKind::Directory => {
+                            child_dirs.push((
+                                format!("/{rel}"),
+                                name,
+                                format!("sha256:{}", crate::snapshot::frames::hex32(&e.child_root)),
+                            ));
+                        }
+                        kind => {
+                            let fs_kind = match kind {
+                                mst2_codec::metapage::EntryKind::Regular => "regular",
+                                mst2_codec::metapage::EntryKind::Executable => "executable",
+                                mst2_codec::metapage::EntryKind::Symlink => "symlink",
+                                mst2_codec::metapage::EntryKind::Directory => unreachable!(),
+                            };
+                            st.own_files.push(SnapshotFile {
+                                rel_path: rel,
+                                fs_kind: fs_kind.to_string(),
+                                size: e.size,
+                                content_digest: format!(
+                                    "sha256:{}",
+                                    crate::snapshot::frames::hex32(&e.content_id)
+                                ),
+                            });
+                        }
+                    }
+                    Ok(())
+                };
+                match &page {
+                    mst2_codec::metapage::Page::Leaf { entries } => {
+                        for e in entries {
+                            handle_entry(e, &mut child_dirs)?;
+                        }
+                    }
+                    mst2_codec::metapage::Page::Branch {
+                        terminal, children, ..
+                    } => {
+                        if let Some(e) = terminal {
+                            handle_entry(e, &mut child_dirs)?;
+                        }
+                        for c in children {
+                            let mut next = route.clone();
+                            next.push(c.label);
+                            frontier.push(Item::Page {
+                                dir: dir.clone(),
+                                route: next,
+                                expected: format!(
+                                    "sha256:{}",
+                                    crate::snapshot::frames::hex32(&c.child_page_id)
+                                ),
+                            });
+                            st.pending_pages += 1;
+                        }
+                    }
+                }
+                st.pending_pages = st.pending_pages.saturating_sub(1);
+                for (child_path, child_base, child_expected) in child_dirs {
+                    enqueue_dir!(child_path, child_expected, Some(dir.clone()), child_base);
+                }
+            }
+
+            // Completion cascade: a directory whose page tree and children
+            // are done writes its record and hands its recursive file list
+            // to its parent (which may complete in turn).
+            loop {
+                let done_dir = states
+                    .iter()
+                    .find(|(_, st)| st.pending_pages == 0 && st.pending_children == 0)
+                    .map(|(d, _)| d.clone());
+                let Some(dir) = done_dir else { break };
+                let Some(mut st) = states.remove(&dir) else {
+                    break;
+                };
+
+                let mut recursive: Vec<SnapshotFile> = st.own_files.clone();
+                for (child_files, child_base) in
+                    st.child_files.drain(..).zip(st.child_bases.drain(..))
+                {
+                    for f in child_files {
+                        recursive.push(SnapshotFile {
+                            rel_path: with_prefix(&f.rel_path, &child_base),
+                            ..f
+                        });
+                    }
+                }
+                // Closure record: paths relative to this directory.
+                if self.cache.record_for(&st.root_page_id).is_none() {
+                    self.cache.put_record(&ClosureRecord {
+                        auth_domain: self.auth_domain.clone(),
+                        metadata_codec: self.codec,
+                        policy_revision: POLICY_REVISION,
+                        root_page_id: st.root_page_id.clone(),
+                        page_ids: st.page_ids.clone(),
+                        total_entries: recursive.len() as u64,
+                        files: recursive.clone(),
+                        pin_ref: self.reader.snapshot_id().to_string(),
                     })?;
-                files.push(SnapshotFile {
-                    rel_path: rel,
-                    fs_kind: entry.fs_kind.clone(),
-                    size,
-                    content_digest: digest.clone(),
-                });
-            } else {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::Internal,
-                    format!("file entry {rel} missing content_digest"),
-                ));
+                }
+
+                match st.parent.clone() {
+                    Some(parent_path) => {
+                        let base = st.base.clone();
+                        if let Some(ps) = states.get_mut(&parent_path) {
+                            ps.child_files.push(recursive);
+                            ps.pending_children -= 1;
+                        }
+                    }
+                    None => {
+                        files_out = recursive;
+                    }
+                }
             }
         }
 
-        // The record stores paths *relative to this directory*: a subtree's
-        // page ids do not depend on where the directory sits, so a moved
-        // directory has the same subtree identity but a different path. The
-        // path always comes from where the walk is now, never from the
-        // record (spec 11 §10.2: no name/path-based equivalence inference).
-        let relative: Vec<SnapshotFile> = files
-            .iter()
-            .map(|f| SnapshotFile {
-                rel_path: strip_prefix(&f.rel_path, dir),
-                ..f.clone()
-            })
-            .collect();
-        self.cache.put_record(&ClosureRecord {
-            auth_domain: self.auth_domain.clone(),
-            metadata_codec: self.codec,
-            policy_revision: POLICY_REVISION,
-            root_page_id: page.directory_root.clone(),
-            page_ids,
-            total_entries: relative.len() as u64,
-            files: relative,
-            pin_ref: self.reader.snapshot_id().to_string(),
-        })?;
-        Ok(files)
+        self.meters.traversal_nodes = traversal_nodes;
+        self.meters.fetched_pages = fetched_pages;
+        Ok(files_out)
     }
 
     /// Reuse the recorded subtree when every condition holds; otherwise
@@ -394,79 +628,6 @@ impl<'a> IncrementalSync<'a> {
             })
             .collect();
         Ok(Some(files))
-    }
-
-    /// Fetch the MTP2 page tree of one directory and store it verified.
-    fn fetch_and_store_pages<'f>(
-        &'f mut self,
-        dir: &'f str,
-        root_page_id: &'f str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<String>, SnapshotError>> + Send + 'f>,
-    > {
-        Box::pin(async move {
-            let mut page_ids = Vec::new();
-            let mut routes: Vec<Vec<u8>> = vec![Vec::new()];
-            while let Some(route) = routes.pop() {
-                let items = [MetadataPageItem {
-                    directory_path: dir.to_string(),
-                    route: route.clone(),
-                    expected_digest: if route.is_empty() {
-                        Some(root_page_id.to_string())
-                    } else {
-                        None
-                    },
-                }];
-                let pages = self
-                    .reader
-                    .client
-                    .metadata_pages(
-                        self.reader.snapshot_id(),
-                        &items,
-                        self.reader.encoding_hint(),
-                    )
-                    .await?;
-                self.meters.fetched_pages += pages.len() as u64;
-                // The root response must contain the page the walk named: a
-                // server answering with different ids is not the view we
-                // resolved, and filing a record under a root the response
-                // never delivered would make reuse self-referential.
-                if route.is_empty()
-                    && !pages.iter().any(|(pid, _)| {
-                        format!("sha256:{}", crate::snapshot::frames::hex32(pid)) == root_page_id
-                    })
-                {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::DigestMismatch,
-                        format!(
-                            "metadata/pages did not return the requested root page {}",
-                            root_page_id
-                        ),
-                    ));
-                }
-                for (pid, bytes) in pages {
-                    let id = format!("sha256:{}", crate::snapshot::frames::hex32(&pid));
-                    if page_ids.contains(&id) {
-                        continue;
-                    }
-                    self.cache.put_page(&id, &bytes)?;
-                    page_ids.push(id);
-                    // A branch page names its children; follow them so the
-                    // record covers the whole page tree, not just the root.
-                    // Only a branch names children; a leaf ends the walk.
-                    if let Ok((mst2_codec::metapage::Page::Branch { children, .. }, _)) =
-                        mst2_codec::metapage::Page::decode(&bytes)
-                    {
-                        for child in children {
-                            let mut next = route.clone();
-                            next.push(child.label);
-                            routes.push(next);
-                        }
-                    }
-                }
-            }
-            Ok(page_ids)
-        })
     }
 }
 
