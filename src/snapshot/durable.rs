@@ -608,6 +608,7 @@ impl DurableStore {
                     for (digest, data) in bytes {
                         by_digest.insert(digest, data);
                     }
+                    let mut journal_lines: Vec<String> = Vec::new();
                     for f in &batch {
                         let data = by_digest.remove(&f.content_digest).ok_or_else(|| {
                             SnapshotError::new(
@@ -636,18 +637,31 @@ impl DurableStore {
                                 ),
                             ));
                         }
-                        write_atomic(
+                        // No per-file fsync: the journal fsync at the end of
+                        // this batch is the durability point, and resume
+                        // re-hashes every object regardless.
+                        write_atomic_opts(
                             &store.content,
                             &blob_name(&f.content_digest),
                             data.as_slice(),
+                            false,
                         )?;
-                        store.append_journal(&FileRecord {
-                            rel_path: f.rel_path.clone(),
-                            digest: f.content_digest.clone(),
-                            size: f.size,
-                        })?;
+                        journal_lines.push(
+                            serde_json::to_string(&FileRecord {
+                                rel_path: f.rel_path.clone(),
+                                digest: f.content_digest.clone(),
+                                size: f.size,
+                            })
+                            .map_err(|e| {
+                                SnapshotError::new(SnapshotErrorCode::Internal, e.to_string())
+                            })?,
+                        );
                         fetched_b.fetch_add(1, Relaxed);
                         bytes_b.fetch_add(f.size, Relaxed);
+                    }
+                    store.append_journal_batch(&journal_lines)?;
+                    if let Ok(d) = std::fs::File::open(store.content_dir()) {
+                        let _ = d.sync_all();
                     }
                     Ok(())
                 }
@@ -883,13 +897,29 @@ impl DurableStore {
     fn append_journal(&self, rec: &FileRecord) -> Result<(), SnapshotError> {
         let line = serde_json::to_string(rec)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
+        self.append_journal_batch(&[line])
+    }
+
+    /// Append journal lines with a single write + fsync. Used by the batched
+    /// hydration: per-file fsyncs dominated cold-mount time on real trees
+    /// (3 fsyncs per file). Recovery does not depend on the per-file fsync —
+    /// resume re-hashes every CAS object before crediting it, so a batch
+    /// boundary is the only durability point that matters.
+    fn append_journal_batch(&self, lines: &[String]) -> Result<(), SnapshotError> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        for rec_line in lines {
+            buf.extend_from_slice(rec_line.as_bytes());
+            buf.extend_from_slice(b"\n");
+        }
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.root.join(JOURNAL_FILE))
             .map_err(io_err)?;
-        f.write_all(line.as_bytes()).map_err(io_err)?;
-        f.write_all(b"\n").map_err(io_err)?;
+        f.write_all(&buf).map_err(io_err)?;
         f.sync_all().map_err(io_err)
     }
 }
@@ -908,6 +938,13 @@ pub fn digest_of(bytes: &[u8]) -> String {
 /// Write `data` to `dir/name` atomically: temp file, fsync, rename, fsync dir.
 /// A crash leaves either the old object or nothing — never a half-written one.
 fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
+    write_atomic_opts(dir, name, data, true)
+}
+
+/// [`write_atomic`] without the fsyncs: for batched hydration the journal
+/// fsync at the batch boundary is the durability point, and resume re-hashes
+/// every object anyway — per-file fsyncs only burn wall time.
+fn write_atomic_opts(dir: &Path, name: &str, data: &[u8], sync: bool) -> Result<(), SnapshotError> {
     fs::create_dir_all(dir).map_err(io_err)?;
     // Random per writer: concurrent hydrations of identical content may race
     // on the same final name but must not share a tmp path.
@@ -919,11 +956,15 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
     {
         let mut f = File::create(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
-        f.sync_all().map_err(io_err)?;
+        if sync {
+            f.sync_all().map_err(io_err)?;
+        }
     }
     fs::rename(&tmp, dir.join(name)).map_err(io_err)?;
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
+    if sync {
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
     }
     Ok(())
 }
