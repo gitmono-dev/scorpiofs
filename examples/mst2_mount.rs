@@ -58,6 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(3600);
             let store_root =
                 std::env::var("M2_STORE_ROOT").unwrap_or_else(|_| "/var/lib/scorpio/mst2".into());
+            // Lazy by default: mount as soon as the root page arrives; content
+            // materializes on open. M2_LAZY=0 restores full hydration before
+            // the mount (offline-export semantics).
+            let lazy = std::env::var("M2_LAZY")
+                .map(|v| v != "0")
+                .unwrap_or(true);
 
             let client = Mst2Client::with_token(
                 base,
@@ -78,6 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let content_dir = scope_dir.join("blobs");
             let store = Arc::new(DurableStore::open_with_content(&dir, &content_dir)?);
             let was_complete = store.is_complete()?;
+
+            if lazy {
+                eprintln!("lazy mount: tree loads per directory on access");
+                Mst2Fuse::from_reader_lazy(reader, Some(store)).await?
+            } else {
             let cache = scorpiofs::snapshot::ScopeCache::open(scope_dir)?;
             let mut sync = scorpiofs::snapshot::IncrementalSync::new(&reader, &cache);
             let manifest = sync.sync().await?;
@@ -182,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.bytes_total,
             );
             Mst2Fuse::from_manifest(reader, store, manifest)?
+            }
         }
     };
 
