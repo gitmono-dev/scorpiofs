@@ -481,6 +481,226 @@ impl DurableStore {
         store.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
     }
 
+    /// Batched hydration: same verification, write-ahead, resume and journal
+    /// rules as [`hydrate_concurrent`], but small files (≤ [`OBJECT_CAP`]) are
+    /// fetched in OBJECT batches (≤128 unique digests, ≤7 MiB raw per request
+    /// — spec 14 §4 batch limits with headroom) instead of one request per
+    /// file. Large files still go through `fetch_large` (chunk-map + CHUNK).
+    ///
+    /// `fetch_batch` receives the batch's files (deduplicated by digest) and
+    /// must return every requested digest; missing digests are an error, and
+    /// every returned byte is re-verified here regardless of transport claims.
+    pub async fn hydrate_batches<FBatch, FLarge>(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        batch_concurrency: usize,
+        large_concurrency: usize,
+        fetch_batch: FBatch,
+        fetch_large: FLarge,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        FBatch: Fn(
+                Vec<SnapshotFile>,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+        FLarge: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        use std::collections::HashMap as BufMap;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        use futures::stream::{StreamExt, TryStreamExt};
+
+        if let Some(stored) = self.stored_view()? {
+            if stored.snapshot_id != view.snapshot_id {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DurableViewConflict,
+                    format!(
+                        "store at {} holds view {}, refusing to hydrate {}",
+                        self.root.display(),
+                        stored.snapshot_id,
+                        view.snapshot_id
+                    ),
+                ));
+            }
+        }
+        let _journal = self.read_journal()?;
+        let fetched = std::sync::atomic::AtomicU64::new(0);
+        let resumed = std::sync::atomic::AtomicU64::new(0);
+        let repaired = std::sync::atomic::AtomicU64::new(0);
+        let bytes_total = std::sync::atomic::AtomicU64::new(0);
+        let store = self;
+
+        // Phase 1: CAS reuse check decides what actually needs fetching.
+        // Paths sharing a digest are journaled individually but fetched once.
+        let mut need: Vec<SnapshotFile> = Vec::new();
+        for f in manifest {
+            match store.verify_blob(&f.content_digest, f.size) {
+                Ok(true) => {
+                    resumed.fetch_add(1, Relaxed);
+                    bytes_total.fetch_add(f.size, Relaxed);
+                    store.append_journal(&FileRecord {
+                        rel_path: f.rel_path.clone(),
+                        digest: f.content_digest.clone(),
+                        size: f.size,
+                    })?;
+                }
+                Ok(false) => {
+                    if store.blob_path(&f.content_digest)?.exists() {
+                        let _ = fs::remove_file(store.blob_path(&f.content_digest)?);
+                        repaired.fetch_add(1, Relaxed);
+                    }
+                    need.push(f.clone());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Phase 2: split small (OBJECT batch) from large (chunk path).
+        const OBJECT_CAP: u64 = 256 * 1024;
+        const BATCH_MAX_FILES: usize = 128;
+        const BATCH_MAX_BYTES: u64 = 7 * 1024 * 1024;
+        let (mut small, large): (Vec<SnapshotFile>, Vec<SnapshotFile>) =
+            need.into_iter().partition(|f| f.size <= OBJECT_CAP);
+        // Deduplicate small files by digest: one fetch unit per content.
+        small.sort_by(|a, b| a.content_digest.cmp(&b.content_digest));
+        small.dedup_by(|a, b| a.content_digest == b.content_digest);
+
+        // Group into batches under the server's per-request limits.
+        let mut batches: Vec<Vec<SnapshotFile>> = Vec::new();
+        let mut cur: Vec<SnapshotFile> = Vec::new();
+        let mut cur_bytes = 0u64;
+        for f in small.drain(..) {
+            if cur.len() >= BATCH_MAX_FILES || cur_bytes + f.size > BATCH_MAX_BYTES {
+                batches.push(std::mem::take(&mut cur));
+                cur_bytes = 0;
+            }
+            cur_bytes += f.size;
+            cur.push(f);
+        }
+        if !cur.is_empty() {
+            batches.push(cur);
+        }
+
+        // Phase 3: fetch batches concurrently; verify + write + journal.
+        let fetched_b = &fetched;
+        let bytes_b = &bytes_total;
+        futures::stream::iter(batches)
+            .map(Ok::<_, SnapshotError>)
+            .try_for_each_concurrent(batch_concurrency.max(1), |batch| {
+                let fetch_batch = fetch_batch.clone();
+                async move {
+                    let bytes = fetch_batch(batch.clone()).await?;
+                    let mut by_digest: BufMap<String, std::sync::Arc<Vec<u8>>> = BufMap::new();
+                    for (digest, data) in bytes {
+                        by_digest.insert(digest, data);
+                    }
+                    for f in &batch {
+                        let data = by_digest.remove(&f.content_digest).ok_or_else(|| {
+                            SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                format!(
+                                    "{}: objects batch did not return {}",
+                                    f.rel_path, f.content_digest
+                                ),
+                            )
+                        })?;
+                        let got = digest_of(&data);
+                        if got != f.content_digest {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
+                            ));
+                        }
+                        if data.len() as u64 != f.size {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                format!(
+                                    "{}: view advertises {} bytes, content is {}",
+                                    f.rel_path,
+                                    f.size,
+                                    data.len()
+                                ),
+                            ));
+                        }
+                        write_atomic(
+                            &store.content,
+                            &blob_name(&f.content_digest),
+                            data.as_slice(),
+                        )?;
+                        store.append_journal(&FileRecord {
+                            rel_path: f.rel_path.clone(),
+                            digest: f.content_digest.clone(),
+                            size: f.size,
+                        })?;
+                        fetched_b.fetch_add(1, Relaxed);
+                        bytes_b.fetch_add(f.size, Relaxed);
+                    }
+                    Ok(())
+                }
+            })
+            .await?;
+
+        // Phase 4: large files, one chunked fetch per file, concurrent.
+        let fetched_l = &fetched;
+        let bytes_l = &bytes_total;
+        futures::stream::iter(large)
+            .map(Ok::<_, SnapshotError>)
+            .try_for_each_concurrent(large_concurrency.max(1), |f| {
+                let fetch_large = fetch_large.clone();
+                async move {
+                    let bytes: std::sync::Arc<Vec<u8>> = fetch_large(f.clone()).await?;
+                    let got = digest_of(&bytes);
+                    if got != f.content_digest {
+                        return Err(SnapshotError::new(
+                            SnapshotErrorCode::DigestMismatch,
+                            format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
+                        ));
+                    }
+                    if bytes.len() as u64 != f.size {
+                        return Err(SnapshotError::new(
+                            SnapshotErrorCode::DigestMismatch,
+                            format!(
+                                "{}: view advertises {} bytes, content is {}",
+                                f.rel_path,
+                                f.size,
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                    write_atomic(&store.content, &blob_name(&f.content_digest), &bytes)?;
+                    store.append_journal(&FileRecord {
+                        rel_path: f.rel_path.clone(),
+                        digest: f.content_digest.clone(),
+                        size: f.size,
+                    })?;
+                    fetched_l.fetch_add(1, Relaxed);
+                    bytes_l.fetch_add(f.size, Relaxed);
+                    Ok(())
+                }
+            })
+            .await?;
+
+        let fetched = fetched.load(Relaxed);
+        let resumed = resumed.load(Relaxed);
+        let repaired = repaired.load(Relaxed);
+        let bytes_total = bytes_total.load(Relaxed);
+        store.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
+    }
+
     /// Shared DURABLE_COMPLETE tail for the sequential and concurrent cores.
     fn finish_hydration(
         &self,

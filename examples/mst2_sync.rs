@@ -87,14 +87,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scope: reader.descriptor.scope.clone(),
         lease_id: reader.lease_id.clone(),
     };
-    // Hydrate from the *incremental* manifest (never a second full walk),
-    // through the single-flight coordinator.
-    let coordinator = scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), 4);
+    // Hydrate from the *incremental* manifest (never a second full walk):
+    // small files ride OBJECT batches, large files use chunk frames.
+    let client = reader.client.clone();
+    let encoding = reader.encoding_hint().map(str::to_string);
+    let sid = reader.snapshot_id().to_string();
     let report = store
-        .hydrate_concurrent(&view, &manifest, 4, move |f| {
-            let coordinator = coordinator.clone();
-            Box::pin(async move { coordinator.fetch(f, false).await })
-        })
+        .hydrate_batches(
+            &view,
+            &manifest,
+            4,
+            4,
+            move |batch| {
+                let client = client.clone();
+                let encoding = encoding.clone();
+                let sid = sid.clone();
+                Box::pin(async move {
+                    let items: Vec<(String, String)> = batch
+                        .iter()
+                        .map(|f| (format!("/{}", f.rel_path), f.content_digest.clone()))
+                        .collect();
+                    let got = client.objects(&sid, &items, encoding.as_deref()).await?;
+                    let mut out = std::collections::HashMap::new();
+                    for f in &batch {
+                        let want = scorpiofs::snapshot::frames::parse_digest(&f.content_digest)?;
+                        let data = got.get(&want).ok_or_else(|| {
+                            scorpiofs::snapshot::SnapshotError::new(
+                                scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch,
+                                format!("batch missing {}", f.content_digest),
+                            )
+                        })?;
+                        out.insert(f.content_digest.clone(), std::sync::Arc::new(data.clone()));
+                    }
+                    Ok(out)
+                })
+            },
+            {
+                let reader_large = reader.clone();
+                move |f| {
+                    let reader = reader_large.clone();
+                    Box::pin(async move {
+                        let bytes = reader
+                            .read_file_frames(&f.rel_path, &f.content_digest, f.size)
+                            .await?;
+                        Ok(std::sync::Arc::new(bytes))
+                    })
+                }
+            },
+        )
         .await?;
     store.pin(&view)?;
 

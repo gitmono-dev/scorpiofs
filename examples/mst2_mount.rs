@@ -104,14 +104,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4usize);
-            let coordinator =
-                scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), concurrency);
-            let report = store
-                .hydrate_concurrent(&view, &manifest, concurrency, move |f| {
-                    let coordinator = coordinator.clone();
-                    Box::pin(async move { coordinator.fetch(f, use_frames).await })
-                })
-                .await?;
+            let report = if use_frames {
+                // Batched: small files ride OBJECT batches (128/request),
+                // large files use chunk-map + CHUNK frames per file.
+                let client = reader.client.clone();
+                let encoding = reader.encoding_hint().map(str::to_string);
+                let sid = reader.snapshot_id().to_string();
+                let reader_large = reader.clone();
+                store
+                    .hydrate_batches(
+                        &view,
+                        &manifest,
+                        concurrency,
+                        concurrency,
+                        move |batch| {
+                            let client = client.clone();
+                            let encoding = encoding.clone();
+                            let sid = sid.clone();
+                            Box::pin(async move {
+                                let items: Vec<(String, String)> = batch
+                                    .iter()
+                                    .map(|f| (format!("/{}", f.rel_path), f.content_digest.clone()))
+                                    .collect();
+                                let got = client.objects(&sid, &items, encoding.as_deref()).await?;
+                                let mut out = std::collections::HashMap::new();
+                                for f in &batch {
+                                    let want = scorpiofs::snapshot::frames::parse_digest(
+                                        &f.content_digest,
+                                    )?;
+                                    let data = got.get(&want).ok_or_else(|| {
+                                        scorpiofs::snapshot::SnapshotError::new(
+                                            scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch,
+                                            format!("batch missing {}", f.content_digest),
+                                        )
+                                    })?;
+                                    out.insert(
+                                        f.content_digest.clone(),
+                                        std::sync::Arc::new(data.clone()),
+                                    );
+                                }
+                                Ok(out)
+                            })
+                        },
+                        move |f| {
+                            let reader = reader_large.clone();
+                            Box::pin(async move {
+                                let bytes = reader
+                                    .read_file_frames(&f.rel_path, &f.content_digest, f.size)
+                                    .await?;
+                                Ok(std::sync::Arc::new(bytes))
+                            })
+                        },
+                    )
+                    .await?
+            } else {
+                let coordinator =
+                    scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), concurrency);
+                store
+                    .hydrate_concurrent(&view, &manifest, concurrency, move |f| {
+                        let coordinator = coordinator.clone();
+                        Box::pin(async move { coordinator.fetch(f, use_frames).await })
+                    })
+                    .await?
+            };
             store.pin(&view)?;
             let verified = store.verify_all(&store.manifest()?)?;
             if !store.is_complete()? {
