@@ -44,6 +44,12 @@ struct DirNode {
     children: HashMap<String, u64>,
     /// inode of the parent directory (`..`); the root is its own parent.
     parent: u64,
+    /// Lazy mounts: has this directory's page been fetched and its children
+    /// created? Eager mounts are born loaded.
+    loaded: bool,
+    /// The directory's own MTP2 page id (the parent entry commits to it) —
+    /// the lazy fetch target. Eager dirs carry it too (cheap, useful).
+    page_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -67,6 +73,8 @@ struct State {
     contents: HashMap<u64, Arc<Vec<u8>>>,
     /// Large files opened through the verified chunk reader (range reads).
     chunked: HashMap<u64, Arc<crate::snapshot::range::ChunkedFile>>,
+    /// Lazy mounts: directory pages are fetched on first readdir/lookup.
+    lazy: bool,
 }
 
 /// Kernel file type for one view entry. Symlinks are their own type, not
@@ -139,6 +147,281 @@ impl Mst2Fuse {
         Self::build(None, Some(store), manifest)
     }
 
+    /// Lazy mount (LAZY-MOUNT-SPEC): the tree starts at the scope root page —
+    /// ONE metadata request — and directory pages are fetched on first
+    /// readdir/lookup. File content materializes on open through the existing
+    /// per-file paths (memory -> CAS -> OBJECT -> chunk ranges). The view is
+    /// fixed, so lazily created inodes never go stale.
+    pub async fn from_reader_lazy(
+        reader: SnapshotReader,
+        store: Option<Arc<DurableStore>>,
+    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        let root_page_id = reader.descriptor.metadata_root.clone();
+        let sid = reader.snapshot_id().to_string();
+        let items = [crate::snapshot::frames::MetadataPageItem {
+            directory_path: "/".to_string(),
+            route: Vec::new(),
+            expected_digest: Some(root_page_id.clone()),
+        }];
+        let pages = reader
+            .client
+            .metadata_pages(&sid, &items, reader.encoding_hint())
+            .await?;
+        let root_bytes = pages
+            .iter()
+            .find(|(pid, _)| {
+                format!("sha256:{}", crate::snapshot::frames::hex32(pid)) == root_page_id
+            })
+            .map(|(_, b)| b.clone())
+            .ok_or_else(|| {
+                crate::snapshot::SnapshotError::new(
+                    crate::snapshot::SnapshotErrorCode::Internal,
+                    "metadata/pages did not return the scope root page",
+                )
+            })?;
+        let (page, _) = mst2_codec::metapage::Page::decode(&root_bytes).map_err(|e| {
+            crate::snapshot::SnapshotError::new(
+                crate::snapshot::SnapshotErrorCode::Internal,
+                format!("scope root page decode failed: {e}"),
+            )
+        })?;
+
+        let mut state = State {
+            next_inode: ROOT_INODE,
+            nodes: HashMap::new(),
+            contents: HashMap::new(),
+            chunked: HashMap::new(),
+            lazy: true,
+        };
+        state.nodes.insert(
+            ROOT_INODE,
+            Node::Dir(DirNode {
+                path: String::new(),
+                children: HashMap::new(),
+                parent: ROOT_INODE,
+                loaded: true,
+                page_id: Some(root_page_id.clone()),
+            }),
+        );
+        let entries = match &page {
+            mst2_codec::metapage::Page::Leaf { entries } => entries,
+            mst2_codec::metapage::Page::Branch { .. } => {
+                return Err(crate::snapshot::SnapshotError::new(
+                    crate::snapshot::SnapshotErrorCode::Internal,
+                    "scope root page must be a leaf for the lazy mount root",
+                ));
+            }
+        };
+        Self::apply_page_entries(&mut state, ROOT_INODE, "", entries)?;
+        Ok(Mst2Fuse {
+            reader: Some(reader),
+            store,
+            state: StdMutex::new(state),
+        })
+    }
+
+    /// Fetch one directory's MTP2 page tree (the root page plus, for wide
+    /// directories, the branch pages the root commits to) and create its
+    /// child inodes. The page ids come from the parent entry and the branch
+    /// children themselves, so every fetch is bound to what the fixed view
+    /// committed to.
+    async fn ensure_dir_loaded(
+        &self,
+        inode: Inode,
+    ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
+        let (path, page_id) = {
+            let state = self.state.lock().unwrap();
+            match state.nodes.get(&inode) {
+                Some(Node::Dir(d)) if !d.loaded => (d.path.clone(), d.page_id.clone()),
+                _ => return Ok(()), // loaded, or not a lazily-fetchable dir
+            }
+        };
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            crate::snapshot::SnapshotError::new(
+                crate::snapshot::SnapshotErrorCode::Internal,
+                "lazy mount requires a live reader",
+            )
+        })?;
+        let page_id = page_id.ok_or_else(|| {
+            crate::snapshot::SnapshotError::new(
+                crate::snapshot::SnapshotErrorCode::Internal,
+                "directory page id missing",
+            )
+        })?;
+        let sid = reader.snapshot_id().to_string();
+        let dir_path = format!("/{path}");
+
+        // BFS over the directory's own page tree: root page first, then the
+        // branch children each root/branch commits to. Bounded: pages are
+        // ≤16KiB and the tree is finite (spec 05 limits).
+        let mut all_entries: Vec<mst2_codec::metapage::Entry> = Vec::new();
+        let mut routes: Vec<(Vec<u8>, String)> = vec![(Vec::new(), page_id.clone())];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(page_id.clone());
+        while !routes.is_empty() {
+            let take = routes.len().min(64);
+            let batch: Vec<(Vec<u8>, String)> = routes.drain(..take).collect();
+            let items: Vec<crate::snapshot::frames::MetadataPageItem> = batch
+                .iter()
+                .map(
+                    |(route, expected)| crate::snapshot::frames::MetadataPageItem {
+                        directory_path: dir_path.clone(),
+                        route: route.clone(),
+                        expected_digest: Some(expected.clone()),
+                    },
+                )
+                .collect();
+            let pages = reader
+                .client
+                .metadata_pages(&sid, &items, reader.encoding_hint())
+                .await
+                .map_err(|e| {
+                    crate::snapshot::SnapshotError::new(
+                        crate::snapshot::SnapshotErrorCode::Internal,
+                        format!("lazy page fetch failed: {e}"),
+                    )
+                })?;
+            let mut by_id: HashMap<String, Vec<u8>> = HashMap::new();
+            for (pid, bytes) in &pages {
+                by_id.insert(
+                    format!("sha256:{}", crate::snapshot::frames::hex32(pid)),
+                    bytes.clone(),
+                );
+            }
+            for (route, expected) in &batch {
+                let bytes = by_id.get(expected).ok_or_else(|| {
+                    crate::snapshot::SnapshotError::new(
+                        crate::snapshot::SnapshotErrorCode::Internal,
+                        "lazy page walk did not return an expected page",
+                    )
+                })?;
+                let (page, _) = mst2_codec::metapage::Page::decode(bytes).map_err(|e| {
+                    crate::snapshot::SnapshotError::new(
+                        crate::snapshot::SnapshotErrorCode::Internal,
+                        format!("lazy page decode failed: {e}"),
+                    )
+                })?;
+                match &page {
+                    mst2_codec::metapage::Page::Leaf { entries } => {
+                        all_entries.extend(entries.iter().cloned());
+                    }
+                    mst2_codec::metapage::Page::Branch {
+                        terminal, children, ..
+                    } => {
+                        if let Some(e) = terminal {
+                            all_entries.push(e.clone());
+                        }
+                        for c in children {
+                            let mut next = route.clone();
+                            next.push(c.label);
+                            let child_id = format!(
+                                "sha256:{}",
+                                crate::snapshot::frames::hex32(&c.child_page_id)
+                            );
+                            if seen.insert(child_id.clone()) {
+                                routes.push((next, child_id));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut state = self.state.lock().unwrap();
+        Self::apply_page_entries(&mut state, inode, &path, &all_entries)?;
+        if let Node::Dir(d) = state.nodes.get_mut(&inode).expect("inode exists") {
+            d.loaded = true;
+        }
+        Ok(())
+    }
+
+    fn apply_page_entries(
+        state: &mut State,
+        parent_inode: Inode,
+        parent_path: &str,
+        entries: &[mst2_codec::metapage::Entry],
+    ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
+        for e in entries {
+            let name = std::str::from_utf8(&e.name)
+                .map_err(|_| {
+                    crate::snapshot::SnapshotError::new(
+                        crate::snapshot::SnapshotErrorCode::Internal,
+                        "non-utf8 entry name in MTP2 page",
+                    )
+                })?
+                .to_string();
+            let full = if parent_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent_path}/{name}")
+            };
+            if let Some(existing) = state
+                .nodes
+                .get(&parent_inode)
+                .and_then(|n| match n {
+                    Node::Dir(d) => d.children.get(&name),
+                    _ => None,
+                })
+                .cloned()
+            {
+                let _ = existing;
+                continue; // already created (e.g. concurrent load)
+            }
+            let inode = state.next_inode + 1;
+            state.next_inode = inode;
+            let node = match e.kind {
+                mst2_codec::metapage::EntryKind::Directory => Node::Dir(DirNode {
+                    path: full,
+                    children: HashMap::new(),
+                    parent: parent_inode,
+                    loaded: false,
+                    page_id: Some(format!(
+                        "sha256:{}",
+                        crate::snapshot::frames::hex32(&e.child_root)
+                    )),
+                }),
+                kind => {
+                    let fs_kind = match kind {
+                        mst2_codec::metapage::EntryKind::Regular => "regular",
+                        mst2_codec::metapage::EntryKind::Executable => "executable",
+                        mst2_codec::metapage::EntryKind::Symlink => "symlink",
+                        mst2_codec::metapage::EntryKind::Directory => unreachable!(),
+                    };
+                    Node::File(FileNode {
+                        path: full,
+                        fs_kind: fs_kind.to_string(),
+                        size: e.size,
+                        digest: format!("sha256:{}", crate::snapshot::frames::hex32(&e.content_id)),
+                    })
+                }
+            };
+            state.nodes.insert(inode, node);
+            if let Some(Node::Dir(d)) = state.nodes.get_mut(&parent_inode) {
+                d.children.insert(name, inode);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure a directory's children exist before lookup/readdir. No-op for
+    /// eager mounts and already-loaded directories.
+    async fn ensure_loaded(&self, inode: Inode) -> Result<()> {
+        let need = {
+            let state = self.state.lock().unwrap();
+            state.lazy
+                && match state.nodes.get(&inode) {
+                    Some(Node::Dir(d)) => !d.loaded,
+                    _ => false,
+                }
+        };
+        if need {
+            self.ensure_dir_loaded(inode)
+                .await
+                .map_err(|_| Errno::from(libc::EIO))?;
+        }
+        Ok(())
+    }
+
     fn build(
         reader: Option<SnapshotReader>,
         store: Option<Arc<DurableStore>>,
@@ -149,6 +432,7 @@ impl Mst2Fuse {
             nodes: HashMap::new(),
             contents: HashMap::new(),
             chunked: HashMap::new(),
+            lazy: false,
         };
         state.nodes.insert(
             ROOT_INODE,
@@ -156,6 +440,8 @@ impl Mst2Fuse {
                 path: String::new(),
                 children: HashMap::new(),
                 parent: ROOT_INODE,
+                loaded: true,
+                page_id: None,
             }),
         );
         for f in manifest {
@@ -330,6 +616,8 @@ fn ensure_child(
             path: full,
             children: HashMap::new(),
             parent: parent_inode,
+            loaded: true,
+            page_id: None,
         })
     };
     state.nodes.insert(inode, node);
@@ -414,6 +702,7 @@ impl Filesystem for Mst2Fuse {
     }
 
     async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
+        self.ensure_loaded(parent).await?;
         let name = name.to_string_lossy();
         let child = {
             let state = self.state.lock().unwrap();
@@ -443,6 +732,7 @@ impl Filesystem for Mst2Fuse {
         offset: i64,
     ) -> Result<ReplyDirectory<impl futures::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
+        self.ensure_loaded(inode).await?;
         let listing = self.listing(inode, offset)?;
         let entries: Vec<Result<DirectoryEntry>> = listing
             .into_iter()
@@ -502,6 +792,7 @@ impl Filesystem for Mst2Fuse {
     async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
         // Handle needed only so the kernel's directory-open round trip
         // succeeds; the read-only tree needs no per-handle state.
+        self.ensure_loaded(inode).await?;
         match self.node(inode)? {
             Node::Dir(_) => Ok(ReplyOpen {
                 fh: inode,

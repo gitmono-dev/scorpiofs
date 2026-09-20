@@ -58,6 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(3600);
             let store_root =
                 std::env::var("M2_STORE_ROOT").unwrap_or_else(|_| "/var/lib/scorpio/mst2".into());
+            // Lazy by default: mount as soon as the root page arrives; content
+            // materializes on open. M2_LAZY=0 restores full hydration before
+            // the mount (offline-export semantics).
+            let lazy = std::env::var("M2_LAZY").map(|v| v != "0").unwrap_or(true);
 
             let client = Mst2Client::with_token(
                 base,
@@ -78,11 +82,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let content_dir = scope_dir.join("blobs");
             let store = Arc::new(DurableStore::open_with_content(&dir, &content_dir)?);
             let was_complete = store.is_complete()?;
-            let cache = scorpiofs::snapshot::ScopeCache::open(scope_dir)?;
-            let mut sync = scorpiofs::snapshot::IncrementalSync::new(&reader, &cache);
-            let manifest = sync.sync().await?;
-            let meters = sync.meters();
-            eprintln!(
+
+            if lazy {
+                eprintln!("lazy mount: tree loads per directory on access");
+                Mst2Fuse::from_reader_lazy(reader, Some(store)).await?
+            } else {
+                let cache = scorpiofs::snapshot::ScopeCache::open(scope_dir)?;
+                let mut sync = scorpiofs::snapshot::IncrementalSync::new(&reader, &cache);
+                let manifest = sync.sync().await?;
+                let meters = sync.meters();
+                eprintln!(
                 "sync: traversal_nodes={} fetched_pages={} reused_pages={} reused_subtrees={} files={}",
                 meters.traversal_nodes,
                 meters.fetched_pages,
@@ -90,34 +99,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 meters.reused_subtrees,
                 manifest.len()
             );
-            let view = scorpiofs::snapshot::ViewMeta {
-                snapshot_id: snapshot_id.clone(),
-                namespace_view_id: reader.descriptor.namespace_view_id.clone(),
-                scope: reader.descriptor.scope.clone(),
-                lease_id: reader.lease_id.clone(),
-            };
-            // Frame transport when advertised (OBJECT for small files,
-            // chunk-map/CHUNK for >256 KiB); raw blob otherwise.
-            let use_frames = reader.capabilities().features.objects
-                && reader.capabilities().features.chunk_reads;
-            let concurrency = std::env::var("M2_CONCURRENCY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4usize);
-            let coordinator =
-                scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), concurrency);
-            let report = store
-                .hydrate_concurrent(&view, &manifest, concurrency, move |f| {
-                    let coordinator = coordinator.clone();
-                    Box::pin(async move { coordinator.fetch(f, use_frames).await })
-                })
-                .await?;
-            store.pin(&view)?;
-            let verified = store.verify_all(&store.manifest()?)?;
-            if !store.is_complete()? {
-                return Err("hydration finished without a completeness marker".into());
-            }
-            eprintln!(
+                let view = scorpiofs::snapshot::ViewMeta {
+                    snapshot_id: snapshot_id.clone(),
+                    namespace_view_id: reader.descriptor.namespace_view_id.clone(),
+                    scope: reader.descriptor.scope.clone(),
+                    lease_id: reader.lease_id.clone(),
+                };
+                // Frame transport when advertised (OBJECT for small files,
+                // chunk-map/CHUNK for >256 KiB); raw blob otherwise.
+                let use_frames = reader.capabilities().features.objects
+                    && reader.capabilities().features.chunk_reads;
+                let concurrency = std::env::var("M2_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4usize);
+                let report = if use_frames {
+                    // Batched: small files ride OBJECT batches (128/request),
+                    // large files use chunk-map + CHUNK frames per file.
+                    let client = reader.client.clone();
+                    let encoding = reader.encoding_hint().map(str::to_string);
+                    let sid = reader.snapshot_id().to_string();
+                    let reader_large = reader.clone();
+                    store
+                        .hydrate_batches(
+                            &view,
+                            &manifest,
+                            concurrency,
+                            concurrency,
+                            move |batch| {
+                                let client = client.clone();
+                                let encoding = encoding.clone();
+                                let sid = sid.clone();
+                                Box::pin(async move {
+                                    let items: Vec<(String, String)> = batch
+                                        .iter()
+                                        .map(|f| {
+                                            (format!("/{}", f.rel_path), f.content_digest.clone())
+                                        })
+                                        .collect();
+                                    let got =
+                                        client.objects(&sid, &items, encoding.as_deref()).await?;
+                                    let mut out = std::collections::HashMap::new();
+                                    for f in &batch {
+                                        let want = scorpiofs::snapshot::frames::parse_digest(
+                                            &f.content_digest,
+                                        )?;
+                                        let data = got.get(&want).ok_or_else(|| {
+                                            scorpiofs::snapshot::SnapshotError::new(
+                                            scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch,
+                                            format!("batch missing {}", f.content_digest),
+                                        )
+                                        })?;
+                                        out.insert(
+                                            f.content_digest.clone(),
+                                            std::sync::Arc::new(data.clone()),
+                                        );
+                                    }
+                                    Ok(out)
+                                })
+                            },
+                            move |f| {
+                                let reader = reader_large.clone();
+                                Box::pin(async move {
+                                    let bytes = reader
+                                        .read_file_frames(&f.rel_path, &f.content_digest, f.size)
+                                        .await?;
+                                    Ok(std::sync::Arc::new(bytes))
+                                })
+                            },
+                        )
+                        .await?
+                } else {
+                    let coordinator =
+                        scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), concurrency);
+                    store
+                        .hydrate_concurrent(&view, &manifest, concurrency, move |f| {
+                            let coordinator = coordinator.clone();
+                            Box::pin(async move { coordinator.fetch(f, use_frames).await })
+                        })
+                        .await?
+                };
+                store.pin(&view)?;
+                let verified = store.verify_all(&store.manifest()?)?;
+                if !store.is_complete()? {
+                    return Err("hydration finished without a completeness marker".into());
+                }
+                eprintln!(
                 "store={} reopened={was_complete} files={} fetched={} resumed={} repaired={} bytes={} verified={verified}",
                 dir.display(),
                 report.total_files,
@@ -126,7 +193,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.repaired,
                 report.bytes_total,
             );
-            Mst2Fuse::from_manifest(reader, store, manifest)?
+                Mst2Fuse::from_manifest(reader, store, manifest)?
+            }
         }
     };
 
