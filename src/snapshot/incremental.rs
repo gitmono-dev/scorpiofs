@@ -367,16 +367,16 @@ impl<'a> IncrementalSync<'a> {
 
             let items: Vec<MetadataPageItem> = batch
                 .iter()
-                .filter_map(|it| match it {
+                .map(|it| match it {
                     Item::Page {
                         dir,
                         route,
                         expected,
-                    } => Some(MetadataPageItem {
+                    } => MetadataPageItem {
                         directory_path: dir.clone(),
                         route: route.clone(),
                         expected_digest: Some(expected.clone()),
-                    }),
+                    },
                 })
                 .collect();
             let pages = self
@@ -394,10 +394,9 @@ impl<'a> IncrementalSync<'a> {
             let mut by_id: HashMap<String, Vec<u8>> = HashMap::new();
             for (it, (pid, bytes)) in batch.iter().zip(pages.iter()) {
                 let id = format!("sha256:{}", crate::snapshot::frames::hex32(pid));
-                if let Item::Page { dir, .. } = it {
-                    if let Some(st) = states.get_mut(dir) {
-                        st.page_ids.push(id.clone());
-                    }
+                let Item::Page { dir, .. } = it;
+                if let Some(st) = states.get_mut(dir) {
+                    st.page_ids.push(id.clone());
                 }
                 by_id.insert(id, bytes.clone());
             }
@@ -410,10 +409,7 @@ impl<'a> IncrementalSync<'a> {
                     dir,
                     route,
                     expected,
-                } = it
-                else {
-                    continue;
-                };
+                } = it;
                 traversal_nodes += 1;
                 let bytes = by_id.get(expected).ok_or_else(|| {
                     SnapshotError::new(
@@ -553,9 +549,9 @@ impl<'a> IncrementalSync<'a> {
 
                 match st.parent.clone() {
                     Some(parent_path) => {
-                        let base = st.base.clone();
                         if let Some(ps) = states.get_mut(&parent_path) {
                             ps.child_files.push(recursive);
+                            ps.child_bases.push(st.base.clone());
                             ps.pending_children -= 1;
                         }
                     }
@@ -629,17 +625,6 @@ impl<'a> IncrementalSync<'a> {
             .collect();
         Ok(Some(files))
     }
-}
-
-/// Path of `rel` as seen from directory `dir` (`/a/b` under `/a` -> `b`).
-fn strip_prefix(rel: &str, dir: &str) -> String {
-    let prefix = dir.trim_start_matches('/');
-    if prefix.is_empty() {
-        return rel.to_string();
-    }
-    rel.strip_prefix(prefix)
-        .map(|s| s.trim_start_matches('/').to_string())
-        .unwrap_or_else(|| rel.to_string())
 }
 
 /// Re-attach `dir` to a subtree-relative path.
@@ -794,16 +779,15 @@ mod tests {
         // Recorded relative to /a, replayed under /b: the page identity is
         // the same (that is why reuse is allowed), but the paths must follow
         // the current location.
-        assert_eq!(strip_prefix("a/b/c.txt", "/a"), "b/c.txt");
-        assert_eq!(strip_prefix("x.txt", "/"), "x.txt");
         assert_eq!(with_prefix("b/c.txt", "/b"), "b/b/c.txt");
         assert_eq!(with_prefix("x.txt", "/"), "x.txt");
         assert_eq!(with_prefix("", "/moved"), "moved");
         // Round-trip is stable for the same directory.
-        assert_eq!(
-            with_prefix(&strip_prefix("a/b/c.txt", "/a"), "/a"),
-            "a/b/c.txt"
-        );
+        let rel = "a/b/c.txt"
+            .strip_prefix("/a")
+            .map(|s| s.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| "a/b/c.txt".to_string());
+        assert_eq!(with_prefix(&rel, "/a"), "a/b/c.txt");
     }
 
     #[test]
