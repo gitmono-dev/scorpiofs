@@ -519,8 +519,7 @@ impl DurableStore {
             + Clone
             + 'static,
     {
-        use std::collections::HashMap as BufMap;
-        use std::sync::atomic::Ordering::Relaxed;
+        use std::{collections::HashMap as BufMap, sync::atomic::Ordering::Relaxed};
 
         use futures::stream::{StreamExt, TryStreamExt};
 
