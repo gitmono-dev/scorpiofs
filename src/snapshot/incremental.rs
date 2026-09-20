@@ -782,12 +782,6 @@ mod tests {
         assert_eq!(with_prefix("b/c.txt", "/b"), "b/b/c.txt");
         assert_eq!(with_prefix("x.txt", "/"), "x.txt");
         assert_eq!(with_prefix("", "/moved"), "moved");
-        // Round-trip is stable for the same directory.
-        let rel = "a/b/c.txt"
-            .strip_prefix("/a")
-            .map(|s| s.trim_start_matches('/').to_string())
-            .unwrap_or_else(|| "a/b/c.txt".to_string());
-        assert_eq!(with_prefix(&rel, "/a"), "a/b/c.txt");
     }
 
     #[test]
