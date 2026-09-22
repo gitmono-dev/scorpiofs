@@ -2108,6 +2108,359 @@ impl AntaresServiceImpl {
         Ok(fuse)
     }
 
+    /// Rebuild the mount over an MST/2 snapshot view instead of the Dicfuse
+    /// projection (spec 12 §1). The Dicfuse instance is still constructed — it
+    /// backs the effective-diff/verify paths for Dicfuse-lowered mounts and is
+    /// required by `AntaresFuse::new` — but the overlay's base layer is the
+    /// snapshot view.
+    async fn remount_with_mst2_lower(
+        mountpoint: &Path,
+        view: Arc<Mst2Fuse>,
+        dicfuse: Arc<Dicfuse>,
+        upper_dir: &Path,
+        cl_dir: Option<&Path>,
+    ) -> Result<AntaresFuse, ServiceError> {
+        let mut fuse = AntaresFuse::new(
+            mountpoint.to_path_buf(),
+            dicfuse,
+            upper_dir.to_path_buf(),
+            cl_dir.map(PathBuf::from),
+        )
+        .await
+        .map_err(|e| ServiceError::FuseFailure(format!("failed to rebuild overlay: {e}")))?
+        .with_lower_override(view as Arc<dyn libfuse_fs::unionfs::layer::Layer>);
+        fuse.mount()
+            .await
+            .map_err(|e| ServiceError::FuseFailure(format!("failed to remount: {e}")))?;
+        Ok(fuse)
+    }
+
+    /// MST/2 refresh: resolve the latest snapshot view and remount over it.
+    /// The upper layer and mountpoint are reused; only the view moves. The
+    /// Dicfuse semantics of re-pinning a per-revision store do not apply here.
+    #[allow(clippy::too_many_arguments)]
+    async fn mst2_refresh_lower(
+        &self,
+        mount_id: Uuid,
+        old_view: Arc<Mst2Fuse>,
+        path: &str,
+        upper_dir: &Path,
+        cl_dir: Option<&Path>,
+        mountpoint: &Path,
+        base_revision: &Option<String>,
+        start: Instant,
+    ) -> Result<RefreshResponse, ServiceError> {
+        let dicfuse = self.lower_dicfuse_for(path, None).await?;
+
+        // Dirty check against the *current* view: a refresh must not discard
+        // uncommitted upper content (same contract as the Dicfuse path).
+        let view_before = Arc::new(crate::daemon::lower_view::Mst2Lower(old_view.clone()));
+        let changes = effective_changes(view_before.as_ref(), upper_dir, &[])
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+
+        // Resolve the latest snapshot view (the MST/2 analogue of re-pinning).
+        let new_view = mst2_lower_layer()
+            .await?
+            .ok_or_else(|| ServiceError::Internal("mst2 lower disabled mid-flight".into()))?;
+
+        // Idempotency: re-resolving the same snapshot is a no-op.
+        let new_id = new_view.snapshot_id().map(str::to_string);
+        if old_view.snapshot_id() == new_view.snapshot_id().as_deref() {
+            return Ok(RefreshResponse {
+                disposition: RefreshDisposition::AlreadyAtTarget,
+                base_revision: base_revision.clone().unwrap_or_default(),
+                lower_revision: new_id,
+                generation,
+                code: None,
+                detail: None,
+            });
+        }
+
+        // Quiesce, remount over the new view, roll back on failure.
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.state = MountLifecycle::Quiescing;
+            if let Err(e) = entry.fuse.unmount().await {
+                entry.state = MountLifecycle::Ready;
+                return Err(ServiceError::FuseFailure(format!(
+                    "failed to quiesce mount {mount_id}: {e}"
+                )));
+            }
+        }
+
+        match Self::remount_with_mst2_lower(
+            mountpoint,
+            new_view.clone(),
+            dicfuse.clone(),
+            upper_dir,
+            cl_dir,
+        )
+        .await
+        {
+            Ok(new_fuse) => {
+                {
+                    let mut mounts = self.mounts.write().await;
+                    let entry = mounts
+                        .get_mut(&mount_id)
+                        .ok_or(ServiceError::NotFound(mount_id))?;
+                    entry.fuse = new_fuse;
+                    entry.mst2_lower = Some(new_view.clone());
+                    entry.pinned_refs = new_id.clone();
+                    entry.state = MountLifecycle::Ready;
+                    entry.last_seen_epoch_ms = current_epoch_ms();
+                }
+                self.persist_state().await;
+                tracing::info!(
+                    mount_id = %mount_id,
+                    snapshot = ?new_id,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "antares svc: mst2 refresh success"
+                );
+                Ok(RefreshResponse {
+                    disposition: RefreshDisposition::Switched,
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: new_id,
+                    generation,
+                    code: None,
+                    detail: None,
+                })
+            }
+            Err(e) => {
+                // Roll back to the old view so the mount keeps serving bytes.
+                let _ = Self::remount_with_mst2_lower(
+                    mountpoint,
+                    old_view,
+                    self.lower_dicfuse_for(path, None).await?,
+                    upper_dir,
+                    cl_dir,
+                )
+                .await;
+                Err(e)
+            }
+        }
+    }
+
+    /// MST/2 commit-finalize: verify the committed paths against the *latest*
+    /// snapshot (the push has already landed there), clear exactly those upper
+    /// entries, and remount over the new view.
+    #[allow(clippy::too_many_arguments)]
+    async fn mst2_commit_finalize(
+        &self,
+        mount_id: Uuid,
+        request: CommitFinalizeRequest,
+        old_view: Arc<Mst2Fuse>,
+        path: &str,
+        upper_dir: &Path,
+        cl_dir: Option<&Path>,
+        mountpoint: &Path,
+        base_revision: &Option<String>,
+        start: Instant,
+    ) -> Result<CommitFinalizeResponse, ServiceError> {
+        let dicfuse = self.lower_dicfuse_for(path, None).await?;
+
+        // Optimistic lock against the effective diff over the current view.
+        let view_before = Arc::new(crate::daemon::lower_view::Mst2Lower(old_view.clone()));
+        let changes = effective_changes(view_before.as_ref(), upper_dir, &[])
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+        if let Some(expected) = request.expected_generation {
+            if expected != generation {
+                return Ok(CommitFinalizeResponse {
+                    state: "conflict".into(),
+                    code: Some("GENERATION_CHANGED".into()),
+                    detail: Some(format!(
+                        "state generation {expected} no longer matches {generation}; \
+                         re-read state and re-commit"
+                    )),
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: None,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                });
+            }
+        }
+
+        // Resolve the latest snapshot: the client pushed its commit, so the
+        // newest view must already contain the committed content.
+        let new_view = mst2_lower_layer()
+            .await?
+            .ok_or_else(|| ServiceError::Internal("mst2 lower disabled mid-flight".into()))?;
+
+        // Verify the committed set against the new view in the view's own
+        // domain: the upper file's sha256 must equal the view's digest, which
+        // proves the commit landed and guards concurrent edits (spec 12 §1:
+        // sizes/identities come from verified entries, never a 0 placeholder).
+        for committed in &request.committed_paths {
+            let lower_digest = new_view.digest_for_path(&committed.path).await;
+            match (&committed.kind, lower_digest) {
+                (EffectiveKind::Deleted, None) => {}
+                (EffectiveKind::Deleted, Some(_)) => {
+                    return Ok(CommitFinalizeResponse {
+                        state: "conflict".into(),
+                        code: Some("TREE_MISMATCH".into()),
+                        detail: Some(format!(
+                            "committed deletion of {} is still served by the new snapshot",
+                            committed.path
+                        )),
+                        base_revision: base_revision.clone().unwrap_or_default(),
+                        lower_revision: None,
+                        generation,
+                        cleaned_paths: Vec::new(),
+                    });
+                }
+                (EffectiveKind::Added | EffectiveKind::Modified, None) => {
+                    return Ok(CommitFinalizeResponse {
+                        state: "conflict".into(),
+                        code: Some("TREE_MISMATCH".into()),
+                        detail: Some(format!(
+                            "committed path {} is absent from the new snapshot",
+                            committed.path
+                        )),
+                        base_revision: base_revision.clone().unwrap_or_default(),
+                        lower_revision: None,
+                        generation,
+                        cleaned_paths: Vec::new(),
+                    });
+                }
+                (EffectiveKind::Added | EffectiveKind::Modified, Some(lower_digest)) => {
+                    let bytes = tokio::fs::read(Path::new(upper_dir).join(&committed.path))
+                        .await
+                        .map_err(|e| {
+                            ServiceError::Internal(format!(
+                                "failed to read upper content of {}: {e}",
+                                committed.path
+                            ))
+                        })?;
+                    let upper_digest = crate::snapshot::durable::digest_of(&bytes);
+                    if upper_digest != *lower_digest {
+                        return Ok(CommitFinalizeResponse {
+                            state: "conflict".into(),
+                            code: Some("TREE_MISMATCH".into()),
+                            detail: Some(format!(
+                                "upper content of {} does not match the new snapshot \
+                                 ({upper_digest} vs {lower_digest})",
+                                committed.path
+                            )),
+                            base_revision: base_revision.clone().unwrap_or_default(),
+                            lower_revision: None,
+                            generation,
+                            cleaned_paths: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase B — quiesce, clear exactly the committed entries, remount over
+        // the new view. Rollbacks restore the previous projection.
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.state = MountLifecycle::Quiescing;
+            if let Err(e) = entry.fuse.unmount().await {
+                entry.state = MountLifecycle::Ready;
+                return Err(ServiceError::FuseFailure(format!(
+                    "failed to quiesce mount {mount_id}: {e}"
+                )));
+            }
+        }
+
+        let cleaned = match remove_committed_upper_entries(Path::new(upper_dir), &request.committed_paths)
+        {
+            Ok(cleaned) => cleaned,
+            Err(e) => {
+                let _ = Self::remount_with_mst2_lower(
+                    mountpoint,
+                    old_view.clone(),
+                    dicfuse.clone(),
+                    upper_dir,
+                    cl_dir,
+                )
+                .await;
+                return Ok(CommitFinalizeResponse {
+                    state: "failed".into(),
+                    code: Some("SWITCH_FAILED".into()),
+                    detail: Some(format!("upper cleanup failed: {e}")),
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: None,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                });
+            }
+        };
+
+        match Self::remount_with_mst2_lower(
+            mountpoint,
+            new_view.clone(),
+            dicfuse.clone(),
+            upper_dir,
+            cl_dir,
+        )
+        .await
+        {
+            Ok(new_fuse) => {
+                {
+                    let mut mounts = self.mounts.write().await;
+                    let entry = mounts
+                        .get_mut(&mount_id)
+                        .ok_or(ServiceError::NotFound(mount_id))?;
+                    entry.fuse = new_fuse;
+                    entry.mst2_lower = Some(new_view.clone());
+                    entry.pinned_refs = new_view.snapshot_id().map(str::to_string);
+                    entry.state = MountLifecycle::Ready;
+                    entry.last_seen_epoch_ms = current_epoch_ms();
+                }
+                self.persist_state().await;
+                tracing::info!(
+                    mount_id = %mount_id,
+                    snapshot = ?new_view.snapshot_id(),
+                    cleaned = cleaned.len(),
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "antares svc: mst2 commit_finalize success"
+                );
+                Ok(CommitFinalizeResponse {
+                    state: "ready".into(),
+                    code: None,
+                    detail: None,
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: new_view.snapshot_id().map(str::to_string),
+                    generation,
+                    cleaned_paths: cleaned,
+                })
+            }
+            Err(e) => {
+                let _ = Self::remount_with_mst2_lower(
+                    mountpoint,
+                    old_view,
+                    dicfuse.clone(),
+                    upper_dir,
+                    cl_dir,
+                )
+                .await;
+                Ok(CommitFinalizeResponse {
+                    state: "failed".into(),
+                    code: Some("SWITCH_FAILED".into()),
+                    detail: Some(format!(
+                        "remount over the new snapshot failed after cleanup: {e}; \
+                         worktree remounted on the previous projection"
+                    )),
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: None,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                })
+            }
+        }
+    }
+
     /// `chain` fork: seal the source's upper into a shared read-only layer, give the
     /// source a fresh upper (its view is byte-identical and it stays writable), and
     /// stack the sealed layer under the child — zero bytes copied.
@@ -3598,7 +3951,7 @@ impl AntaresService for AntaresServiceImpl {
                 entry.pinned_refs.clone(),
                 entry.sealed_chain.clone(),
                 entry.state.clone(),
-                entry.mst2_lower.is_some(),
+                entry.mst2_lower.clone(),
             )
         };
         if !matches!(mount_state, MountLifecycle::Mounted | MountLifecycle::Ready) {
@@ -3607,16 +3960,22 @@ impl AntaresService for AntaresServiceImpl {
             )));
         }
         // MST/2-lowered mounts move their lower by resolving a new snapshot, not
-        // by re-pinning the Dicfuse projection — refuse rather than run the
-        // Dicfuse semantics against the wrong projection (P3; see
+        // by re-pinning the Dicfuse projection (P3; see
         // mst2-impl/P3-HASH-DOMAIN-DESIGN.md).
-        if mst2_lower {
-            return Err(ServiceError::InvalidRequest(
-                "commit-finalize is not supported on an MST/2-lowered mount yet; \
-                 re-attach without mst2_lower_enabled or wait for the snapshot-side \
-                 finalize"
-                    .into(),
-            ));
+        if let Some(old_view) = mst2_lower.clone() {
+            return self
+                .mst2_commit_finalize(
+                    mount_id,
+                    request,
+                    old_view,
+                    &path,
+                    &upper_dir,
+                    cl_dir.as_deref(),
+                    &mountpoint,
+                    &base_revision,
+                    start,
+                )
+                .await;
         }
 
         let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
@@ -3895,7 +4254,7 @@ impl AntaresService for AntaresServiceImpl {
                 entry.pinned_refs.clone(),
                 entry.sealed_chain.clone(),
                 entry.state.clone(),
-                entry.mst2_lower.is_some(),
+                entry.mst2_lower.clone(),
             )
         };
         if !matches!(mount_state, MountLifecycle::Mounted | MountLifecycle::Ready) {
@@ -3904,15 +4263,21 @@ impl AntaresService for AntaresServiceImpl {
             )));
         }
         // MST/2-lowered mounts move their lower by resolving a new snapshot, not
-        // by re-pinning the Dicfuse projection — refuse rather than run the
-        // Dicfuse semantics against the wrong projection (P3; see
+        // by re-pinning the Dicfuse projection (P3; see
         // mst2-impl/P3-HASH-DOMAIN-DESIGN.md).
-        if mst2_lower {
-            return Err(ServiceError::InvalidRequest(
-                "refresh is not supported on an MST/2-lowered mount yet; the snapshot \
-                 view is pinned at attach time and follows its own refresh path"
-                    .into(),
-            ));
+        if let Some(old_view) = mst2_lower.clone() {
+            return self
+                .mst2_refresh_lower(
+                    mount_id,
+                    old_view,
+                    &path,
+                    &upper_dir,
+                    cl_dir.as_deref(),
+                    &mountpoint,
+                    &base_revision,
+                    start,
+                )
+                .await;
         }
 
         let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();

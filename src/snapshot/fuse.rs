@@ -552,6 +552,33 @@ impl Mst2Fuse {
             .cloned()
             .ok_or_else(|| Errno::from(libc::ENOENT))
     }
+
+    /// Content digest of `rel_path` in the fixed view, in the view's wire form
+    /// (`sha256:<hex>`). Directory pages are loaded on demand, so a lazy mount
+    /// resolves the path with the same metadata requests a lookup would make.
+    /// `None` = the path is absent from the view, or is a directory (which has
+    /// no content identity).
+    pub(crate) async fn digest_for_path(&self, rel_path: &str) -> Option<String> {
+        let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut inode = ROOT_INODE;
+        for part in parts {
+            if self.ensure_loaded(inode).await.is_err() {
+                return None;
+            }
+            let next = {
+                let state = self.state.lock().unwrap();
+                match state.nodes.get(&inode) {
+                    Some(Node::Dir(d)) => d.children.get(part).copied(),
+                    _ => None,
+                }
+            };
+            inode = next?;
+        }
+        match self.node(inode).ok()? {
+            Node::File(f) => Some(f.digest.clone()),
+            Node::Dir(_) => None,
+        }
+    }
 }
 
 type EnsureResult = std::result::Result<u64, crate::snapshot::SnapshotError>;
