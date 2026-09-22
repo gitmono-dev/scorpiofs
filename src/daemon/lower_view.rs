@@ -15,6 +15,7 @@ use async_trait::async_trait;
 
 use crate::daemon::worktree_v2::{git_blob_oid, lower_item_for};
 use crate::dicfuse::store::DictionaryStore;
+use crate::snapshot::fuse::Mst2Fuse;
 
 /// Which content-identity domain a lower projection speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,6 +58,22 @@ impl LowerView for DicfuseLower {
 
     fn hash_kind(&self) -> LowerHashKind {
         LowerHashKind::GitBlobOid
+    }
+}
+
+/// An MST/2 snapshot view as a [`LowerView`]: `sha256(raw)` content digests
+/// (spec 03 §1). Symlinks answer the digest of their target bytes, which is
+/// what the view stores and what the upper side hashes too (spec 07 §1).
+pub struct Mst2Lower(pub Arc<Mst2Fuse>);
+
+#[async_trait]
+impl LowerView for Mst2Lower {
+    async fn base_hash(&self, rel_path: &str) -> Option<String> {
+        self.0.digest_for_path(rel_path).await
+    }
+
+    fn hash_kind(&self) -> LowerHashKind {
+        LowerHashKind::Sha256Raw
     }
 }
 

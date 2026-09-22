@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::lower_view::{hash_content, LowerHashKind, LowerView};
 use crate::dicfuse::store::DictionaryStore;
 use crate::dicfuse::tree_store::StorageItem;
 
@@ -184,7 +185,11 @@ fn scan_upper_entries(upper_dir: &Path) -> std::io::Result<Vec<UpperEntry>> {
 ///
 /// Symlinks hash their target bytes (git stores the target as the blob), matching
 /// how the monorepo serves them.
-fn upper_content_oid(upper_dir: &Path, entry: &UpperEntry) -> std::io::Result<String> {
+fn upper_content_oid(
+    upper_dir: &Path,
+    entry: &UpperEntry,
+    kind: LowerHashKind,
+) -> std::io::Result<String> {
     let bytes = match entry.kind {
         UpperEntryKind::Symlink => std::fs::read_link(upper_dir.join(&entry.rel_path))?
             .as_os_str()
@@ -192,7 +197,7 @@ fn upper_content_oid(upper_dir: &Path, entry: &UpperEntry) -> std::io::Result<St
             .to_vec(),
         _ => std::fs::read(upper_dir.join(&entry.rel_path))?,
     };
-    Ok(git_blob_oid(&bytes))
+    Ok(hash_content(kind, &bytes))
 }
 
 /// Resolve the lower projection's item for a mount-relative path.
@@ -243,7 +248,7 @@ enum ChainBase {
 ///
 /// The sealed layers are plain host directories (renamed former uppers), so every
 /// lookup is a local filesystem probe — no FUSE, no network.
-fn chain_base_for(chain: &[PathBuf], rel_path: &str) -> Option<ChainBase> {
+fn chain_base_for(chain: &[PathBuf], rel_path: &str, kind: LowerHashKind) -> Option<ChainBase> {
     let rel = Path::new(rel_path);
     let name = rel.file_name()?.to_string_lossy().to_string();
     let parent = rel.parent().unwrap_or_else(|| Path::new(""));
@@ -263,11 +268,11 @@ fn chain_base_for(chain: &[PathBuf], rel_path: &str) -> Option<ChainBase> {
             }
             Ok(meta) if meta.file_type().is_symlink() => {
                 let bytes = fs::read_link(&entry).ok()?.as_os_str().as_encoded_bytes().to_vec();
-                return Some(ChainBase::Hash(git_blob_oid(&bytes)));
+                return Some(ChainBase::Hash(hash_content(kind, &bytes)));
             }
             Ok(_) => {
                 let bytes = fs::read(&entry).ok()?;
-                return Some(ChainBase::Hash(git_blob_oid(&bytes)));
+                return Some(ChainBase::Hash(hash_content(kind, &bytes)));
             }
             Err(_) => continue,
         }
@@ -281,19 +286,21 @@ fn chain_base_for(chain: &[PathBuf], rel_path: &str) -> Option<ChainBase> {
 /// for paths whose parents were not yet fetched, so the first scan of a cold deep
 /// path may hit the network; later scans are local.
 pub async fn effective_changes(
-    store: &DictionaryStore,
+    lower: &dyn LowerView,
     upper_dir: &Path,
     chain: &[PathBuf],
 ) -> std::io::Result<Vec<EffectiveChange>> {
+    let kind = lower.hash_kind();
     let mut by_path: BTreeMap<String, EffectiveChange> = BTreeMap::new();
 
     for entry in scan_upper_entries(upper_dir)? {
         // The base is the chain first (nearest layer wins, whiteouts honored);
-        // the Dicfuse projection answers only what the chain does not.
-        let base = match chain_base_for(chain, &entry.rel_path) {
+        // the lower projection answers only what the chain does not. Both sides
+        // are hashed in the lower's own identity domain.
+        let base = match chain_base_for(chain, &entry.rel_path, kind) {
             Some(base) => base,
-            None => match lower_item_for(store, &entry.rel_path).await {
-                Some(item) => ChainBase::Hash(item.hash.clone()),
+            None => match lower.base_hash(&entry.rel_path).await {
+                Some(hash) => ChainBase::Hash(hash),
                 None => ChainBase::Absent,
             },
         };
@@ -315,7 +322,7 @@ pub async fn effective_changes(
                 ChainBase::Absent => {}
             },
             UpperEntryKind::File | UpperEntryKind::Symlink => {
-                let content_hash = upper_content_oid(upper_dir, &entry)?;
+                let content_hash = upper_content_oid(upper_dir, &entry, kind)?;
                 match base {
                     ChainBase::Hash(base_hash) if base_hash == content_hash => {
                         // Edited back to the base content: effectively clean. The

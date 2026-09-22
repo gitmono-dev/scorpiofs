@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::{
     antares::fuse::AntaresFuse,
+    daemon::lower_view::DicfuseLower,
     daemon::upper_fork::{fork_upper, ForkCopyError, ForkCopyStats},
     daemon::worktree_v2::{
         effective_changes, flatten_chain_into_upper, generation_of, lower_item_for,
@@ -63,8 +64,7 @@ const MST2_LEASE_SECONDS: u64 = 3600;
 /// (spec 12 §1). Returns `None` in the default Dicfuse mode, so the legacy
 /// reader stays the only path unless the operator opted in explicitly
 /// (spec 15 §3: no silent fallback in either direction).
-async fn mst2_lower_layer() -> Result<Option<Arc<dyn libfuse_fs::unionfs::layer::Layer>>, ServiceError>
-{
+async fn mst2_lower_layer() -> Result<Option<Arc<Mst2Fuse>>, ServiceError> {
     if !config::mst2_lower_enabled() {
         return Ok(None);
     }
@@ -89,7 +89,33 @@ async fn mst2_lower_layer() -> Result<Option<Arc<dyn libfuse_fs::unionfs::layer:
         snapshot = ?fuse.snapshot_id(),
         "antares svc: serving MST/2 snapshot view as the lower layer"
     );
-    Ok(Some(Arc::new(fuse) as Arc<dyn libfuse_fs::unionfs::layer::Layer>))
+    Ok(Some(Arc::new(fuse)))
+}
+
+/// The lower projection a mount's effective diff must compare against: the
+/// MST/2 snapshot view when the mount serves one, otherwise the Dicfuse
+/// projection (P3; see `mst2-impl/P3-HASH-DOMAIN-DESIGN.md`).
+fn lower_view_for(entry: &MountEntry) -> Arc<dyn crate::daemon::lower_view::LowerView> {
+    use crate::daemon::lower_view::{DicfuseLower, Mst2Lower};
+    match &entry.mst2_lower {
+        Some(view) => Arc::new(Mst2Lower(view.clone())),
+        None => Arc::new(DicfuseLower(entry.fuse.dic.store.clone())),
+    }
+}
+
+/// MST/2-lowered mounts do not support the worktree-v2 mutations yet: their
+/// lower moves by resolving a new snapshot, not by re-pinning the Dicfuse
+/// projection, and the finalize/refresh plumbing for that is not in place.
+/// Refuse explicitly rather than executing the Dicfuse semantics against the
+/// wrong projection (spec 15 §3).
+fn reject_mst2_mutation(entry: &MountEntry, op: &str) -> Result<(), ServiceError> {
+    if entry.mst2_lower.is_some() {
+        return Err(ServiceError::InvalidRequest(format!(
+            "{op} is not supported on an MST/2-lowered mount yet; re-attach without \
+             mst2_lower_enabled or wait for the snapshot-side finalize/refresh"
+        )));
+    }
+    Ok(())
 }
 
 /// High-level HTTP daemon that exposes Antares orchestration capabilities.
@@ -1041,6 +1067,12 @@ struct MountEntry {
     /// Auto-generated CL directory (if cl is provided)
     cl_dir: Option<String>,
     fuse: AntaresFuse,
+    /// The MST/2 snapshot view backing this mount's lower projection, when the
+    /// mount was created with `mst2_lower_enabled` (spec 12 §1). Not persisted:
+    /// a restarted daemon refuses to restore such a mount rather than silently
+    /// serving the Dicfuse projection instead (spec 15 §3 — explicit modes, no
+    /// silent fallback).
+    mst2_lower: Option<Arc<Mst2Fuse>>,
     state: MountLifecycle,
     created_at_epoch_ms: u64,
     last_seen_epoch_ms: u64,
@@ -1321,6 +1353,12 @@ pub struct PersistedMountState {
     pub upper_dir: String,
     pub cl_dir: Option<String>,
     pub created_at_epoch_ms: u64,
+    /// Whether this mount's lower projection is an MST/2 snapshot view. Such a
+    /// mount is not restored across restarts: the view is resolved per process,
+    /// and rebuilding it with the Dicfuse projection instead would silently
+    /// serve a different base (spec 15 §3).
+    #[serde(default)]
+    pub mst2_lower: bool,
 }
 
 /// Persisted state file structure.
@@ -2341,6 +2379,7 @@ impl AntaresServiceImpl {
                     upper_dir: e.upper_dir.clone(),
                     cl_dir: e.cl_dir.clone(),
                     created_at_epoch_ms: e.created_at_epoch_ms,
+                    mst2_lower: e.mst2_lower.is_some(),
                 })
                 .collect(),
         };
@@ -2400,6 +2439,18 @@ impl AntaresServiceImpl {
         tracing::info!("Recovering {} mounts from state file", state.mounts.len());
 
         for persisted in state.mounts {
+            // An MST/2-lowered mount is not restored: its view is resolved per
+            // process, and rebuilding the mount with the Dicfuse projection
+            // instead would silently serve a different base (spec 15 §3).
+            if persisted.mst2_lower {
+                tracing::warn!(
+                    mount_id = %persisted.mount_id,
+                    "not restoring an MST/2-lowered mount after restart; re-attach it \
+                     (the Dicfuse projection would be a different base)"
+                );
+                continue;
+            }
+
             // Check if mountpoint still exists
             let mountpoint = PathBuf::from(&persisted.mountpoint);
             if !mountpoint.exists() {
@@ -2488,6 +2539,9 @@ impl AntaresServiceImpl {
                         upper_dir: persisted.upper_dir.clone(),
                         cl_dir: persisted.cl_dir.clone(),
                         fuse,
+                        // Recovery only restores Dicfuse-lowered mounts; the
+                        // MST/2 ones are skipped above and must be re-attached.
+                        mst2_lower: None,
                         // Dicfuse is ready after AntaresFuse::new() completes import_arc.
                         state: MountLifecycle::Ready,
                         created_at_epoch_ms: persisted.created_at_epoch_ms,
@@ -2794,8 +2848,11 @@ impl AntaresService for AntaresServiceImpl {
 
         // MST/2 lower projection (spec 12 §1): when the operator enabled it,
         // the snapshot view takes the Dicfuse slot as the overlay's base layer.
-        if let Some(lower) = mst2_lower_layer().await? {
-            fuse = fuse.with_lower_override(lower);
+        // The view is kept on the mount entry so the effective diff compares
+        // against the projection that is actually being served.
+        let mst2_lower = mst2_lower_layer().await?;
+        if let Some(view) = &mst2_lower {
+            fuse = fuse.with_lower_override(view.clone() as Arc<dyn libfuse_fs::unionfs::layer::Layer>);
         }
 
         // 7. Mount the filesystem
@@ -2884,6 +2941,7 @@ impl AntaresService for AntaresServiceImpl {
             upper_dir: upper_dir_str.clone(),
             cl_dir: cl_dir_str.clone(),
             fuse,
+            mst2_lower,
             state: MountLifecycle::Mounted,
             created_at_epoch_ms: now,
             last_seen_epoch_ms: now,
@@ -3450,7 +3508,7 @@ impl AntaresService for AntaresServiceImpl {
                 .iter()
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            let changes = effective_changes(&entry.fuse.dic.store, Path::new(&entry.upper_dir), &chain_dirs)
+            let changes = effective_changes(lower_view_for(entry).as_ref(), Path::new(&entry.upper_dir), &chain_dirs)
                 .await
                 .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
             generation_of(&changes)
@@ -3477,7 +3535,7 @@ impl AntaresService for AntaresServiceImpl {
     }
 
     async fn worktree_state_v2(&self, mount_id: Uuid) -> Result<WorktreeStateV2, ServiceError> {
-        let (path, upper_dir, base_revision, pinned_refs, sealed_chain, mount_state) = {
+        let (path, upper_dir, base_revision, pinned_refs, sealed_chain, mount_state, mst2_lower) = {
             let mounts = self.mounts.read().await;
             let entry = mounts
                 .get(&mount_id)
@@ -3489,6 +3547,7 @@ impl AntaresService for AntaresServiceImpl {
                 entry.pinned_refs.clone(),
                 entry.sealed_chain.clone(),
                 entry.state.clone(),
+                entry.mst2_lower.clone(),
             )
         };
 
@@ -3496,7 +3555,11 @@ impl AntaresService for AntaresServiceImpl {
             .lower_dicfuse_for(&path, pinned_refs.as_deref())
             .await?;
         let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
-        let changes = effective_changes(&dicfuse.store, &upper_dir, &chain_dirs)
+        let view: Arc<dyn crate::daemon::lower_view::LowerView> = match &mst2_lower {
+            Some(view) => Arc::new(crate::daemon::lower_view::Mst2Lower(view.clone())),
+            None => Arc::new(DicfuseLower(dicfuse.store.clone())),
+        };
+        let changes = effective_changes(view.as_ref(), &upper_dir, &chain_dirs)
             .await
             .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
         let generation = generation_of(&changes);
@@ -3521,7 +3584,7 @@ impl AntaresService for AntaresServiceImpl {
 
         // Phase A — reads and builds only. Every failure below this point leaves
         // the mount, the upper layer, and the bound revision untouched.
-        let (path, upper_dir, cl_dir, mountpoint, base_revision, pinned_refs, sealed_chain, mount_state) = {
+        let (path, upper_dir, cl_dir, mountpoint, base_revision, pinned_refs, sealed_chain, mount_state, mst2_lower) = {
             let mounts = self.mounts.read().await;
             let entry = mounts
                 .get(&mount_id)
@@ -3535,6 +3598,7 @@ impl AntaresService for AntaresServiceImpl {
                 entry.pinned_refs.clone(),
                 entry.sealed_chain.clone(),
                 entry.state.clone(),
+                entry.mst2_lower.is_some(),
             )
         };
         if !matches!(mount_state, MountLifecycle::Mounted | MountLifecycle::Ready) {
@@ -3542,12 +3606,24 @@ impl AntaresService for AntaresServiceImpl {
                 "mount {mount_id} is in state {mount_state:?}; cannot finalize a commit"
             )));
         }
+        // MST/2-lowered mounts move their lower by resolving a new snapshot, not
+        // by re-pinning the Dicfuse projection — refuse rather than run the
+        // Dicfuse semantics against the wrong projection (P3; see
+        // mst2-impl/P3-HASH-DOMAIN-DESIGN.md).
+        if mst2_lower {
+            return Err(ServiceError::InvalidRequest(
+                "commit-finalize is not supported on an MST/2-lowered mount yet; \
+                 re-attach without mst2_lower_enabled or wait for the snapshot-side \
+                 finalize"
+                    .into(),
+            ));
+        }
 
         let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
         let current = self
             .lower_dicfuse_for(&path, pinned_refs.as_deref())
             .await?;
-        let changes = effective_changes(&current.store, &upper_dir, &chain_dirs)
+        let changes = effective_changes(&DicfuseLower(current.store.clone()), &upper_dir, &chain_dirs)
             .await
             .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
         let generation = generation_of(&changes);
@@ -3621,7 +3697,7 @@ impl AntaresService for AntaresServiceImpl {
                 }
             }
             self.persist_state().await;
-            let changes = effective_changes(&current.store, &upper_dir, &[])
+            let changes = effective_changes(&DicfuseLower(current.store.clone()), &upper_dir, &[])
                 .await
                 .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
             return Ok(CommitFinalizeResponse {
@@ -3774,7 +3850,7 @@ impl AntaresService for AntaresServiceImpl {
             let _ = new_dicfuse.store.fetch_file_content(ino, &oid).await;
         }
 
-        let changes = effective_changes(&new_dicfuse.store, &upper_dir, &[])
+        let changes = effective_changes(&DicfuseLower(new_dicfuse.store.clone()), &upper_dir, &[])
             .await
             .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
         let generation = generation_of(&changes);
@@ -3805,7 +3881,7 @@ impl AntaresService for AntaresServiceImpl {
         request: RefreshRequest,
     ) -> Result<RefreshResponse, ServiceError> {
         let start = Instant::now();
-        let (path, upper_dir, cl_dir, mountpoint, base_revision, pinned_refs, sealed_chain, mount_state) = {
+        let (path, upper_dir, cl_dir, mountpoint, base_revision, pinned_refs, sealed_chain, mount_state, mst2_lower) = {
             let mounts = self.mounts.read().await;
             let entry = mounts
                 .get(&mount_id)
@@ -3819,6 +3895,7 @@ impl AntaresService for AntaresServiceImpl {
                 entry.pinned_refs.clone(),
                 entry.sealed_chain.clone(),
                 entry.state.clone(),
+                entry.mst2_lower.is_some(),
             )
         };
         if !matches!(mount_state, MountLifecycle::Mounted | MountLifecycle::Ready) {
@@ -3826,12 +3903,23 @@ impl AntaresService for AntaresServiceImpl {
                 "mount {mount_id} is in state {mount_state:?}; cannot refresh the lower"
             )));
         }
+        // MST/2-lowered mounts move their lower by resolving a new snapshot, not
+        // by re-pinning the Dicfuse projection — refuse rather than run the
+        // Dicfuse semantics against the wrong projection (P3; see
+        // mst2-impl/P3-HASH-DOMAIN-DESIGN.md).
+        if mst2_lower {
+            return Err(ServiceError::InvalidRequest(
+                "refresh is not supported on an MST/2-lowered mount yet; the snapshot \
+                 view is pinned at attach time and follows its own refresh path"
+                    .into(),
+            ));
+        }
 
         let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
         let current = self
             .lower_dicfuse_for(&path, pinned_refs.as_deref())
             .await?;
-        let changes = effective_changes(&current.store, &upper_dir, &chain_dirs)
+        let changes = effective_changes(&DicfuseLower(current.store.clone()), &upper_dir, &chain_dirs)
             .await
             .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
         let generation = generation_of(&changes);
@@ -3959,7 +4047,7 @@ impl AntaresService for AntaresServiceImpl {
         }
         self.persist_state().await;
 
-        let changes = effective_changes(&new_dicfuse.store, &upper_dir, &[])
+        let changes = effective_changes(&DicfuseLower(new_dicfuse.store.clone()), &upper_dir, &[])
             .await
             .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
         let generation = generation_of(&changes);
