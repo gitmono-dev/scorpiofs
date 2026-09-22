@@ -8,6 +8,7 @@ pub mod config;
 pub mod file_attr;
 pub mod fuse_platform;
 pub mod logging;
+pub mod mount_owner;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct GPath {

@@ -87,6 +87,11 @@ pub struct AntaresFuse {
     pub mountpoint: PathBuf,
     pub upper_dir: PathBuf,
     pub dic: Arc<crate::dicfuse::Dicfuse>,
+    /// Lower-projection override: when set, this layer takes the Dicfuse slot as
+    /// the overlay's base layer (spec 12 §1 — "现有 user-space Layer 适配到
+    /// SnapshotReader"). `dic` stays available for the paths that still speak
+    /// the Dicfuse store (effective diff, verify-committed, refresh).
+    pub lower_override: Option<Arc<dyn Layer>>,
     pub cl_dir: Option<PathBuf>,
     /// Sealed read-only delta layers from `chain` forks, **nearest first** (they
     /// shadow the Dicfuse projection below them). Plain host directories: they are
@@ -119,10 +124,18 @@ impl AntaresFuse {
             mountpoint,
             upper_dir,
             dic,
+            lower_override: None,
             cl_dir,
             frozen_dirs: Vec::new(),
             mount_handle: None,
         })
+    }
+
+    /// Serve `lower` in place of the Dicfuse projection as the overlay's base
+    /// layer (MST/2 snapshot view; spec 12 §1).
+    pub fn with_lower_override(mut self, lower: Arc<dyn Layer>) -> Self {
+        self.lower_override = Some(lower);
+        self
     }
 
     /// Attach sealed chain layers (chain forks). Each path must be an existing
@@ -163,7 +176,12 @@ impl AntaresFuse {
             lower_layers.push(Arc::new(frozen_layer) as Arc<dyn Layer>);
         }
 
-        lower_layers.push(self.dic.clone() as Arc<dyn Layer>);
+        // Base projection: an explicit override (MST/2 snapshot view) takes the
+        // Dicfuse slot when present (spec 12 §1).
+        match &self.lower_override {
+            Some(lower) => lower_layers.push(lower.clone()),
+            None => lower_layers.push(self.dic.clone() as Arc<dyn Layer>),
+        }
 
         // Upper layer mirrors upper_dir to keep writes separated from lower layers.
         let upper_layer: Arc<dyn Layer> = Arc::new(

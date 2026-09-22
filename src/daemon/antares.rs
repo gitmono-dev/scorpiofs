@@ -50,8 +50,47 @@ use crate::{
     },
     dicfuse::store::DictionaryStore,
     dicfuse::{Dicfuse, DicfuseManager},
+    snapshot::fuse::Mst2Fuse,
+    snapshot::{Mst2Client, SnapshotReader},
     util::config,
 };
+
+/// Retention window requested for an MST/2 snapshot view backing a mount. The
+/// server clamps to `1..=3600`; a mount outliving the window renews lazily.
+const MST2_LEASE_SECONDS: u64 = 3600;
+
+/// Build the MST/2 snapshot-view lower layer when `mst2_lower_enabled` is set
+/// (spec 12 §1). Returns `None` in the default Dicfuse mode, so the legacy
+/// reader stays the only path unless the operator opted in explicitly
+/// (spec 15 §3: no silent fallback in either direction).
+async fn mst2_lower_layer() -> Result<Option<Arc<dyn libfuse_fs::unionfs::layer::Layer>>, ServiceError>
+{
+    if !config::mst2_lower_enabled() {
+        return Ok(None);
+    }
+    let token = config::mst2_auth_token();
+    let client = Mst2Client::with_token(
+        config::mst2_base_url(),
+        (!token.is_empty()).then(|| token.to_string()),
+    );
+    let reader = SnapshotReader::resolve(client, config::mst2_scope(), MST2_LEASE_SECONDS)
+        .await
+        .map_err(|e| {
+            ServiceError::Internal(format!(
+                "mst2 lower: resolve({}) failed: {e}",
+                config::mst2_scope()
+            ))
+        })?;
+    let fuse = Mst2Fuse::from_reader_lazy(reader, None)
+        .await
+        .map_err(|e| ServiceError::Internal(format!("mst2 lower: build view failed: {e}")))?;
+    tracing::info!(
+        scope = config::mst2_scope(),
+        snapshot = ?fuse.snapshot_id(),
+        "antares svc: serving MST/2 snapshot view as the lower layer"
+    );
+    Ok(Some(Arc::new(fuse) as Arc<dyn libfuse_fs::unionfs::layer::Layer>))
+}
 
 /// High-level HTTP daemon that exposes Antares orchestration capabilities.
 pub struct AntaresDaemon<S: AntaresService> {
@@ -2752,6 +2791,12 @@ impl AntaresService for AntaresServiceImpl {
             .await
             .and_then(|fuse| fuse.with_frozen_layers(sealed))
             .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
+
+        // MST/2 lower projection (spec 12 §1): when the operator enabled it,
+        // the snapshot view takes the Dicfuse slot as the overlay's base layer.
+        if let Some(lower) = mst2_lower_layer().await? {
+            fuse = fuse.with_lower_override(lower);
+        }
 
         // 7. Mount the filesystem
         fuse.mount()
