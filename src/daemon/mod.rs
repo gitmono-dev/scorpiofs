@@ -19,6 +19,7 @@ use crate::{
     util::{config, GPath},
 };
 pub mod antares;
+pub mod lower_view;
 pub mod upper_fork;
 pub mod worktree_v2;
 //mod git;
