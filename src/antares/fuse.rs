@@ -2,11 +2,63 @@ use std::{path::PathBuf, sync::Arc};
 
 use asyncfuse::raw::{logfs::LoggingFileSystem, MountHandle};
 use libfuse_fs::{
-    passthrough::new_antares_passthroughfs_layer,
+    passthrough::new_antares_passthroughfs_layer_with,
     unionfs::{config::Config, layer::Layer, OverlayFs},
+    util::whiteout::WhiteoutFormat,
 };
 
 use crate::{server::mount_filesystem_with_antares_cache, util::fuse_platform};
+
+/// Antares records deletions with the OCI whiteout form (`.wh.<name>`) instead of the
+/// Linux kernel-overlayfs character-device form.
+///
+/// Two reasons, both load-bearing:
+///
+/// 1. A char-device whiteout is created with `mknod`, which requires `CAP_MKNOD`. ScorpioFS
+///    runs with `CAP_SYS_ADMIN` only, so under the char-device form deleting a file that
+///    exists solely in the Dicfuse lower layer fails with `EPERM`.
+/// 2. `scan_layer_changes` classifies `.wh.` entries as `ChangeKind::Deleted` (and char
+///    devices as well), so either form is *readable* — but only the OCI form is *writable*
+///    without extra privileges.
+///
+/// Changing this value changes the on-disk upper-layer representation, so an upper directory
+/// written under one form must not be reused under the other.
+const ANTARES_WHITEOUT_FORMAT: WhiteoutFormat = WhiteoutFormat::OciWhiteout;
+
+/// Hand a daemon-created directory to the invoking user when running via sudo.
+///
+/// `sudo`-launched daemons run as root, but FUSE passthrough writes are performed
+/// with the requesting user's credentials; a root-owned rw layer rejects them.
+/// Ownership is derived from `SUDO_USER` (best-effort, no-op as non-root).
+#[cfg(unix)]
+fn chown_to_invoking_user(dir: &std::path::Path) {
+    use std::os::unix::fs::{chown, MetadataExt};
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let Some(user) = std::env::var_os("SUDO_USER") else {
+        return;
+    };
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return;
+    };
+    if meta.uid() != 0 {
+        return; // already owned by a non-root user; leave it alone
+    }
+    let Ok(cuser) = std::ffi::CString::new(user.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    let pw = unsafe { libc::getpwnam(cuser.as_ptr()) };
+    if pw.is_null() {
+        return;
+    }
+    let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
+    if let Err(e) = chown(dir, Some(uid), Some(gid)) {
+        tracing::warn!(dir = %dir.display(), error = %e, "failed to chown upper layer");
+    }
+}
+#[cfg(not(unix))]
+fn chown_to_invoking_user(_dir: &std::path::Path) {}
 
 /// Antares union-fs wrapper: dicfuse lower + passthrough upper/CL.
 pub struct AntaresFuse {
@@ -14,6 +66,11 @@ pub struct AntaresFuse {
     pub upper_dir: PathBuf,
     pub dic: Arc<crate::dicfuse::Dicfuse>,
     pub cl_dir: Option<PathBuf>,
+    /// Sealed read-only delta layers from `chain` forks, **nearest first** (they
+    /// shadow the Dicfuse projection below them). Plain host directories: they are
+    /// part of the overlay lookup order but are never mounted themselves, so no
+    /// unmount-ordering constraint applies.
+    pub frozen_dirs: Vec<PathBuf>,
     /// Live FUSE session. Drop / [`MountHandle::unmount`] tears the mount down.
     mount_handle: Option<MountHandle>,
 }
@@ -30,33 +87,66 @@ impl AntaresFuse {
         }
         std::fs::create_dir_all(&upper_dir)?;
         std::fs::create_dir_all(&mountpoint)?;
+        // The passthrough write path executes with the *requesting* user's
+        // credentials (setfsuid per FUSE request), so the rw upper layer must be
+        // owned by that user. Under `sudo` the daemon creates it as root instead,
+        // which makes every user write fail with EACCES.
+        chown_to_invoking_user(&upper_dir);
 
         Ok(Self {
             mountpoint,
             upper_dir,
             dic,
             cl_dir,
+            frozen_dirs: Vec::new(),
             mount_handle: None,
         })
     }
 
+    /// Attach sealed chain layers (chain forks). Each path must be an existing
+    /// directory — sealed layers are renamed-in formers uppers, never created
+    /// fresh; creating one accidentally would silently serve a wrong projection.
+    /// Order: nearest first (they shadow the layers below them).
+    pub fn with_frozen_layers(mut self, frozen_dirs: Vec<PathBuf>) -> std::io::Result<Self> {
+        for frozen in &frozen_dirs {
+            if !frozen.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("sealed layer {} does not exist", frozen.display()),
+                ));
+            }
+        }
+        self.frozen_dirs = frozen_dirs;
+        Ok(self)
+    }
+
     /// Compose the union filesystem instance.
     pub async fn build_overlay(&self) -> std::io::Result<OverlayFs> {
-        // Build lower layers:
-        // - Optional CL dir sits above Dicfuse to override base files for the CL view.
-        // - Dicfuse remains the base read-only monorepo layer.
+        // Build lower layers, nearest first:
+        // - Optional CL dir sits above everything to override base files for the CL view.
+        // - Sealed chain layers follow, most recent first (they shadow what is below).
+        // - Dicfuse remains the base read-only monorepo projection.
         let mut lower_layers: Vec<Arc<dyn Layer>> = Vec::new();
 
         if let Some(cl_dir) = &self.cl_dir {
-            let cl_layer = new_antares_passthroughfs_layer(cl_dir).await?;
+            let cl_layer =
+                new_antares_passthroughfs_layer_with(cl_dir, ANTARES_WHITEOUT_FORMAT).await?;
             lower_layers.push(Arc::new(cl_layer) as Arc<dyn Layer>);
+        }
+
+        // Sealed chain layers, nearest first — each shadows the layers below it.
+        for frozen in &self.frozen_dirs {
+            let frozen_layer =
+                new_antares_passthroughfs_layer_with(frozen, ANTARES_WHITEOUT_FORMAT).await?;
+            lower_layers.push(Arc::new(frozen_layer) as Arc<dyn Layer>);
         }
 
         lower_layers.push(self.dic.clone() as Arc<dyn Layer>);
 
         // Upper layer mirrors upper_dir to keep writes separated from lower layers.
-        let upper_layer: Arc<dyn Layer> =
-            Arc::new(new_antares_passthroughfs_layer(&self.upper_dir).await?);
+        let upper_layer: Arc<dyn Layer> = Arc::new(
+            new_antares_passthroughfs_layer_with(&self.upper_dir, ANTARES_WHITEOUT_FORMAT).await?,
+        );
 
         // passthrough Upper  - readwrite file system over upper dir
         // passthrough CL  - readwrite file system over upper dir
@@ -2259,5 +2349,52 @@ mod tests {
         println!("✓ Test completed");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Guard the Antares whiteout format.
+    ///
+    /// Regression: with the platform default (`CharDev` on Linux) libfuse-fs records a
+    /// deletion by creating a character device with `mknod`, which requires `CAP_MKNOD`.
+    /// ScorpioFS deployments grant `CAP_SYS_ADMIN` only, so under the char-device form
+    /// deleting a file that exists solely in the Dicfuse lower layer fails with `EPERM` —
+    /// and a failure to record the deletion means the deletion is invisible in `changes`.
+    #[test]
+    fn antares_uses_oci_whiteout_format() {
+        assert_eq!(
+            super::ANTARES_WHITEOUT_FORMAT,
+            super::WhiteoutFormat::OciWhiteout,
+            "Antares must use the OCI whiteout form; the char-device form needs CAP_MKNOD",
+        );
+    }
+
+    /// Wiring guard: a writable Antares layer must report the OCI whiteout format through the
+    /// `Layer` trait, because that is the value libfuse-fs consults when creating a whiteout
+    /// and when detecting one. Setting the format on the `Config` is only effective if it
+    /// reaches this accessor.
+    #[tokio::test]
+    async fn antares_passthrough_layer_reports_oci_whiteout() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer =
+            super::new_antares_passthroughfs_layer_with(dir.path(), super::ANTARES_WHITEOUT_FORMAT)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            libfuse_fs::unionfs::layer::Layer::whiteout_format(&layer),
+            super::WhiteoutFormat::OciWhiteout,
+        );
+    }
+
+    /// The OCI form must be the one that `scan_layer_changes` already understands: a `.wh.`
+    /// entry in an upper layer is a deletion of the stripped name, not a file of its own.
+    #[test]
+    fn oci_whiteout_name_is_what_the_change_scanner_expects() {
+        assert!(libfuse_fs::util::whiteout::is_oci_whiteout_name(
+            std::ffi::OsStr::new(".wh.gone.rs")
+        ));
+        assert_eq!(
+            libfuse_fs::util::whiteout::oci_whiteout_target(std::ffi::OsStr::new(".wh.gone.rs")),
+            Some(std::ffi::OsStr::new("gone.rs")),
+        );
     }
 }

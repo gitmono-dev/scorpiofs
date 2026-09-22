@@ -48,11 +48,15 @@ static DICFUSE_CACHE: OnceCell<DashMap<DicfuseCacheKey, Arc<OnceCell<Arc<Dicfuse
 struct DicfuseCacheKey {
     store_root: String,
     base_path: String,
+    /// Pinned revision (Mega internal commit OID), empty when unpinned.
+    refs: String,
 }
 
 impl PartialEq for DicfuseCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        self.store_root == other.store_root && self.base_path == other.base_path
+        self.store_root == other.store_root
+            && self.base_path == other.base_path
+            && self.refs == other.refs
     }
 }
 
@@ -60,6 +64,7 @@ impl Hash for DicfuseCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.store_root.hash(state);
         self.base_path.hash(state);
+        self.refs.hash(state);
     }
 }
 
@@ -131,6 +136,72 @@ impl DicfuseManager {
         Self::for_base_path_with_store_root(base_path, &store_root).await
     }
 
+    /// Get or initialize a Dicfuse instance for a base path **pinned to a revision**.
+    ///
+    /// `refs` must be a Mega internal monorepo commit OID (from
+    /// `/api/v1/latest-commit`); raw git commit OIDs do not resolve. Instances are
+    /// cached per (base_path, refs): a pinned projection is immutable for that
+    /// revision, so sharing one across mounts of the same revision is free, while
+    /// different revisions never share tree caches.
+    ///
+    /// The on-disk store directory embeds the refs prefix — the persisted tree DB
+    /// is only valid for the revision that built it.
+    pub async fn for_base_path_and_refs(base_path: &str, refs: &str) -> Arc<Dicfuse> {
+        let store_root = config::store_path().to_string();
+        Self::for_base_path_refs_with_store_root(base_path, &store_root, refs).await
+    }
+
+    /// Test-friendly variant of [`Self::for_base_path_and_refs`] with an explicit store root.
+    pub async fn for_base_path_refs_with_store_root(
+        base_path: &str,
+        store_root: &str,
+        refs: &str,
+    ) -> Arc<Dicfuse> {
+        let normalized = normalize_base_path(base_path);
+        let refs = refs.trim();
+        debug_assert!(
+            !refs.is_empty(),
+            "pinned Dicfuse requires a non-empty refs; use for_base_path for the moving tip"
+        );
+
+        let cache = DICFUSE_CACHE.get_or_init(|| async { DashMap::new() }).await;
+        let key = DicfuseCacheKey {
+            store_root: store_root.to_string(),
+            base_path: normalized.clone(),
+            refs: refs.to_string(),
+        };
+
+        let cell = cache
+            .entry(key)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone();
+
+        cell.get_or_init(|| async move {
+            // Same layout as the unpinned dir plus a refs suffix: the persisted
+            // tree DB is revision-specific, so it must never be shared across refs.
+            let base_store_dir =
+                super::compute_store_dir_for_base_path_with_store_root(store_root, &normalized);
+            let refs_tag: String = refs.chars().take(12).collect();
+            let store_path = format!("{base_store_dir}-rev-{refs_tag}");
+            let _ = std::fs::create_dir_all(&store_path);
+
+            let dicfuse = Arc::new(
+                Dicfuse::new_with_base_path_store_path_and_refs(
+                    &normalized,
+                    &store_path,
+                    Some(refs.to_string()),
+                )
+                .await,
+            );
+            // The tree is immutable at this revision: prefetch eagerly so the mount
+            // becomes ready once and stays consistent.
+            dicfuse.start_import();
+            dicfuse
+        })
+        .await
+        .clone()
+    }
+
     /// Same as `for_base_path`, but allows explicitly specifying the store root directory.
     /// Useful for tests that want isolated on-disk state.
     pub async fn for_base_path_with_store_root(base_path: &str, store_root: &str) -> Arc<Dicfuse> {
@@ -146,6 +217,7 @@ impl DicfuseManager {
         let key = DicfuseCacheKey {
             store_root: store_root.to_string(),
             base_path: normalized.clone(),
+            refs: String::new(),
         };
 
         let cell = cache

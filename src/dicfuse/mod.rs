@@ -4,7 +4,7 @@ mod content_store;
 pub mod manager;
 mod size_store;
 pub mod store;
-mod tree_store;
+pub(crate) mod tree_store;
 
 use std::{ffi::OsStr, sync::Arc, time::Duration};
 
@@ -239,6 +239,31 @@ impl Dicfuse {
             readable: config::dicfuse_readable(),
             store: DictionaryStore::new_with_base_path_and_store_path(base_path, store_path)
                 .await
+                .into(),
+        }
+    }
+
+    /// Create a Dicfuse pinned to a specific monorepo revision.
+    ///
+    /// `refs` must be a Mega *internal* commit OID (from `/api/v1/latest-commit`);
+    /// raw git commit OIDs are not accepted by the tree API. Every directory
+    /// listing this store performs is pinned to that revision, so the projection
+    /// is immutable while the trunk moves on. Blob contents are fetched by OID and
+    /// need no pin.
+    ///
+    /// The caller must give a `store_path` that is unique per (base_path, refs):
+    /// the persisted tree DB bakes in the revision, so sharing a directory across
+    /// revisions would serve stale listings.
+    pub async fn new_with_base_path_store_path_and_refs(
+        base_path: &str,
+        store_path: &str,
+        refs: Option<String>,
+    ) -> Self {
+        Self {
+            readable: config::dicfuse_readable(),
+            store: DictionaryStore::new_with_base_path_and_store_path(base_path, store_path)
+                .await
+                .with_pinned_refs(refs)
                 .into(),
         }
     }

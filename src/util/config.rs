@@ -167,7 +167,13 @@ fn defaults() -> ScorpioConfig {
         antares_load_dir_depth: DEFAULT_ANTARES_LOAD_DIR_DEPTH,
         antares_dicfuse_dir_sync_ttl_secs: DEFAULT_ANTARES_DICFUSE_DIR_SYNC_TTL_SECS,
         antares_dicfuse_reply_ttl_secs: DEFAULT_ANTARES_DICFUSE_REPLY_TTL_SECS,
-        antares_dicfuse_stat_mode: DicfuseStatMode::Fast,
+        // Accurate, not Fast: under Fast, getattr reports size 0 for files never
+        // read in this revision, the kernel caches that attr, and the FUSE read
+        // of the real bytes gets truncated to empty — every consumer (git-style
+        // status scans, builds) then sees a bogus empty file until the attr TTL
+        // lapses. Size probes are cached in size.db, so the Accurate cost is one
+        // HEAD/Range per file per revision, not per access.
+        antares_dicfuse_stat_mode: DicfuseStatMode::Accurate,
         antares_dicfuse_open_buff_max_bytes: DEFAULT_ANTARES_DICFUSE_OPEN_BUFF_MAX_BYTES,
         antares_dicfuse_open_buff_max_files: DEFAULT_ANTARES_DICFUSE_OPEN_BUFF_MAX_FILES,
         antares_upper_root: format!("{base_path}/{DEFAULT_ANTARES_SUBDIR}/upper"),

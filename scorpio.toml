@@ -19,7 +19,11 @@ dicfuse_stat_mode = "accurate"
 dicfuse_open_buff_max_bytes = "268435456"
 dicfuse_open_buff_max_files = "4096"
 antares_load_dir_depth = "3"
-antares_dicfuse_stat_mode = "fast"
+# "fast" skips remote size probes, but then getattr reports size 0 for files
+# never read in this revision; the kernel caches that attr and truncates every
+# subsequent read to empty (git status sees bogus diffs against the index).
+# "accurate" probes once per file per revision and caches the result in size.db.
+antares_dicfuse_stat_mode = "accurate"
 antares_dicfuse_open_buff_max_bytes = "67108864"
 antares_dicfuse_open_buff_max_files = "1024"
 antares_dicfuse_dir_sync_ttl_secs = "120"

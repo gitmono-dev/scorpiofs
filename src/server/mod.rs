@@ -77,24 +77,18 @@ pub async fn mount_filesystem<F: Filesystem + std::marker::Sync + Send + 'static
     mount_filesystem_with_antares_cache(fs, mountpoint, false).await
 }
 
-#[allow(unused)]
-pub async fn mount_filesystem_with_antares_cache<
-    F: Filesystem + std::marker::Sync + Send + 'static,
->(
-    fs: F,
-    mountpoint: &OsStr,
-    enable_antares_cache: bool,
-) -> std::io::Result<MountHandle> {
+/// Make `path` ready to serve as a FUSE mountpoint, or explain why it cannot.
+///
+/// Creates the directory if it is missing, then requires it to be a directory and to
+/// be **empty**. An unreadable directory counts as non-empty: mounting over contents
+/// that cannot even be enumerated is not a recoverable mistake.
+///
+/// Split out of [`mount_filesystem_with_antares_cache`] so that an operation which
+/// creates a worktree *before* mounting it (such as `fork`) can run the identical
+/// check up front and fail without leaving a half-created worktree behind.
+pub fn prepare_mountpoint(path: &std::path::Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
 
-    // This library function does not install a logger. The scorpio/antares
-    // binaries call `util::logging::init` once at startup, which installs the
-    // tracing subscriber and the `log` -> `tracing` bridge; a library consumer
-    // that wants `log::` records captured must initialize tracing itself.
-    //let logfs = LoggingFileSystem::new(fs);
-
-    let mount_path: OsString = OsString::from(mountpoint);
-    let path = std::path::Path::new(&mount_path);
     if !path.exists() {
         std::fs::create_dir_all(path).map_err(|e| {
             Error::new(
@@ -124,6 +118,28 @@ pub async fn mount_filesystem_with_antares_cache<
             path.display()
         )));
     }
+    Ok(())
+}
+
+#[allow(unused)]
+pub async fn mount_filesystem_with_antares_cache<
+    F: Filesystem + std::marker::Sync + Send + 'static,
+>(
+    fs: F,
+    mountpoint: &OsStr,
+    enable_antares_cache: bool,
+) -> std::io::Result<MountHandle> {
+    use std::io::{Error, ErrorKind};
+
+    // This library function does not install a logger. The scorpio/antares
+    // binaries call `util::logging::init` once at startup, which installs the
+    // tracing subscriber and the `log` -> `tracing` bridge; a library consumer
+    // that wants `log::` records captured must initialize tracing itself.
+    //let logfs = LoggingFileSystem::new(fs);
+
+    let mount_path: OsString = OsString::from(mountpoint);
+    let path = std::path::Path::new(&mount_path);
+    prepare_mountpoint(path)?;
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 

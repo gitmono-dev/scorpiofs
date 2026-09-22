@@ -19,6 +19,8 @@ use crate::{
     util::{config, GPath},
 };
 pub mod antares;
+pub mod upper_fork;
+pub mod worktree_v2;
 //mod git;
 
 const SUCCESS: &str = "Success";
