@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use asyncfuse::raw::{logfs::LoggingFileSystem, MountHandle};
 use libfuse_fs::{
-    passthrough::new_antares_passthroughfs_layer_with,
+    passthrough::{config::Config as PassthroughConfig, PassthroughFs},
     unionfs::{config::Config, layer::Layer, OverlayFs},
     util::whiteout::WhiteoutFormat,
 };
@@ -59,6 +59,28 @@ fn chown_to_invoking_user(dir: &std::path::Path) {
 }
 #[cfg(not(unix))]
 fn chown_to_invoking_user(_dir: &std::path::Path) {}
+
+/// Build a passthrough layer for an Antares upper/CL/frozen directory.
+///
+/// Expressed with the published libfuse-fs 0.2.0 API: explicit whiteout format,
+/// xattr on, import at construction, writeback off (Antares keeps the safer
+/// non-writeback path — append-mode writes fail with EBADF under writeback).
+async fn new_antares_passthrough_layer(
+    dir: &std::path::Path,
+) -> std::io::Result<PassthroughFs<()>> {
+    let config = PassthroughConfig {
+        root_dir: dir.to_path_buf(),
+        xattr: true,
+        do_import: true,
+        writeback: false,
+        whiteout_format: ANTARES_WHITEOUT_FORMAT,
+        ..Default::default()
+    };
+    let fs = PassthroughFs::<()>::new(config)?;
+    #[cfg(target_os = "linux")]
+    fs.import().await?;
+    Ok(fs)
+}
 
 /// Antares union-fs wrapper: dicfuse lower + passthrough upper/CL.
 pub struct AntaresFuse {
@@ -130,14 +152,14 @@ impl AntaresFuse {
 
         if let Some(cl_dir) = &self.cl_dir {
             let cl_layer =
-                new_antares_passthroughfs_layer_with(cl_dir, ANTARES_WHITEOUT_FORMAT).await?;
+                new_antares_passthrough_layer(cl_dir).await?;
             lower_layers.push(Arc::new(cl_layer) as Arc<dyn Layer>);
         }
 
         // Sealed chain layers, nearest first — each shadows the layers below it.
         for frozen in &self.frozen_dirs {
             let frozen_layer =
-                new_antares_passthroughfs_layer_with(frozen, ANTARES_WHITEOUT_FORMAT).await?;
+                new_antares_passthrough_layer(frozen).await?;
             lower_layers.push(Arc::new(frozen_layer) as Arc<dyn Layer>);
         }
 
@@ -145,7 +167,7 @@ impl AntaresFuse {
 
         // Upper layer mirrors upper_dir to keep writes separated from lower layers.
         let upper_layer: Arc<dyn Layer> = Arc::new(
-            new_antares_passthroughfs_layer_with(&self.upper_dir, ANTARES_WHITEOUT_FORMAT).await?,
+            new_antares_passthrough_layer(&self.upper_dir).await?,
         );
 
         // passthrough Upper  - readwrite file system over upper dir
@@ -2374,10 +2396,7 @@ mod tests {
     #[tokio::test]
     async fn antares_passthrough_layer_reports_oci_whiteout() {
         let dir = tempfile::tempdir().unwrap();
-        let layer =
-            super::new_antares_passthroughfs_layer_with(dir.path(), super::ANTARES_WHITEOUT_FORMAT)
-                .await
-                .unwrap();
+        let layer = super::new_antares_passthrough_layer(dir.path()).await.unwrap();
 
         assert_eq!(
             libfuse_fs::unionfs::layer::Layer::whiteout_format(&layer),
