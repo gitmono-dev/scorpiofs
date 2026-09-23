@@ -139,7 +139,7 @@ jobs:
       # .dockerignore that the mega2 IT compose stack builds from
       # (`build: context: ../scorpiofs`, image `scorpiofs:local`).
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
