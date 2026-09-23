@@ -2471,7 +2471,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfuse-fs"
-version = "0.2.0"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e1f51352e2b0bcf582127a8145a1956b393c8a3219cf687a369e7a852b10e7f"
 dependencies = [
  "async-trait",
  "asyncfuse",
