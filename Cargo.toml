@@ -106,8 +106,3 @@ qlean = "0.3.1"
 [package.metadata.docs.rs]
 all-features = true
 targets = ["x86_64-unknown-linux-gnu"]
-
-# TEMPORARY: testing the no_open write fallback fix before the next
-# libfuse-fs release. Remove once libfuse-fs 0.3.0 is published.
-[patch.crates-io]
-libfuse-fs = { path = "../../rk8s-libfuse-oci/project/libfuse-fs" }
