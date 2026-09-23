@@ -47,6 +47,18 @@ pub struct ScorpioConfig {
     pub antares_cl_root: String,
     pub antares_mount_root: String,
     pub antares_state_file: String,
+    /// MST/2 lower projection (spec 12 §1). When enabled, mounts resolve a
+    /// fixed snapshot view from the MST/2 surface and serve it as the overlay's
+    /// base layer instead of the Dicfuse tree/blob path. Off by default: the
+    /// legacy reader and the snapshot reader are explicit modes, never a
+    /// silent fallback (spec 15 §3).
+    pub mst2_lower_enabled: bool,
+    /// MST/2 surface base URL (the `/api/v2/snapshots` service).
+    pub mst2_base_url: String,
+    /// Bearer token for the MST/2 surface (spec 04 §1). Empty = no auth header.
+    pub mst2_auth_token: String,
+    /// Namespace scope to resolve (`/project` for the trunk monorepo).
+    pub mst2_scope: String,
 }
 
 /// Filesystem paths the installer must prepare for the effective config.
@@ -167,13 +179,23 @@ fn defaults() -> ScorpioConfig {
         antares_load_dir_depth: DEFAULT_ANTARES_LOAD_DIR_DEPTH,
         antares_dicfuse_dir_sync_ttl_secs: DEFAULT_ANTARES_DICFUSE_DIR_SYNC_TTL_SECS,
         antares_dicfuse_reply_ttl_secs: DEFAULT_ANTARES_DICFUSE_REPLY_TTL_SECS,
-        antares_dicfuse_stat_mode: DicfuseStatMode::Fast,
+        // Accurate, not Fast: under Fast, getattr reports size 0 for files never
+        // read in this revision, the kernel caches that attr, and the FUSE read
+        // of the real bytes gets truncated to empty — every consumer (git-style
+        // status scans, builds) then sees a bogus empty file until the attr TTL
+        // lapses. Size probes are cached in size.db, so the Accurate cost is one
+        // HEAD/Range per file per revision, not per access.
+        antares_dicfuse_stat_mode: DicfuseStatMode::Accurate,
         antares_dicfuse_open_buff_max_bytes: DEFAULT_ANTARES_DICFUSE_OPEN_BUFF_MAX_BYTES,
         antares_dicfuse_open_buff_max_files: DEFAULT_ANTARES_DICFUSE_OPEN_BUFF_MAX_FILES,
         antares_upper_root: format!("{base_path}/{DEFAULT_ANTARES_SUBDIR}/upper"),
         antares_cl_root: format!("{base_path}/{DEFAULT_ANTARES_SUBDIR}/cl"),
         antares_mount_root: format!("{base_path}/{DEFAULT_ANTARES_SUBDIR}/mnt"),
         antares_state_file: format!("{base_path}/{DEFAULT_ANTARES_SUBDIR}/state.toml"),
+        mst2_lower_enabled: false,
+        mst2_base_url: "http://127.0.0.1:19700".to_string(),
+        mst2_auth_token: String::new(),
+        mst2_scope: "/project".to_string(),
     }
 }
 
@@ -536,6 +558,22 @@ fn build_config(r: &RawResolver) -> ConfigResult<ScorpioConfig> {
             "state_file",
             d.antares_state_file,
         )?,
+        mst2_lower_enabled: parse_bool(
+            r,
+            "mst2_lower_enabled",
+            "mst2",
+            "lower_enabled",
+            d.mst2_lower_enabled,
+        )?,
+        mst2_base_url: optional_string(r, "mst2_base_url", "mst2", "base_url", d.mst2_base_url)?,
+        mst2_auth_token: optional_string(
+            r,
+            "mst2_auth_token",
+            "mst2",
+            "auth_token",
+            d.mst2_auth_token,
+        )?,
+        mst2_scope: optional_string(r, "mst2_scope", "mst2", "scope", d.mst2_scope)?,
     };
 
     validate(&cfg)?;
@@ -1234,6 +1272,24 @@ pub fn antares_mount_root() -> &'static str {
 
 pub fn antares_state_file() -> &'static str {
     get_config().antares_state_file.as_str()
+}
+
+/// Whether mounts should serve an MST/2 snapshot view as the overlay's lower
+/// layer instead of the Dicfuse projection (spec 12 §1).
+pub fn mst2_lower_enabled() -> bool {
+    get_config().mst2_lower_enabled
+}
+
+pub fn mst2_base_url() -> &'static str {
+    get_config().mst2_base_url.as_str()
+}
+
+pub fn mst2_auth_token() -> &'static str {
+    get_config().mst2_auth_token.as_str()
+}
+
+pub fn mst2_scope() -> &'static str {
+    get_config().mst2_scope.as_str()
 }
 
 pub fn load_dir_depth() -> usize {

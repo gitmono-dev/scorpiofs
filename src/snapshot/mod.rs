@@ -12,6 +12,7 @@ pub mod durable;
 pub mod frames;
 pub mod fuse;
 pub mod incremental;
+pub mod layer;
 pub mod range;
 pub mod reader;
 pub mod types;

@@ -233,6 +233,22 @@ fn encode_api_path(path: &str) -> String {
     normalized.replace('+', "%2B").replace('#', "%23")
 }
 
+/// Percent-encode a raw query-string value (used for `refs` commit OIDs).
+/// Monorepo OIDs are hex, so this is normally a no-op — the encoding exists so a
+/// future change to the identifier format cannot inject query syntax.
+fn urlencode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 // Get Mega dictionary tree from server
 #[allow(unused)]
 async fn fetch_tree(path: &str) -> Result<ApiResponse, DictionaryError> {
@@ -478,7 +494,12 @@ async fn fetch_file_size(oid: &str) -> Option<u64> {
     None
 }
 
-async fn fetch_dir(path: &str) -> Result<ApiResponseExt, DictionaryError> {
+/// Directory listing against Mega's `content-hash` API.
+///
+/// `refs` pins the listing to a specific monorepo revision (a Mega internal commit
+/// OID from `/api/v1/latest-commit`). `None` keeps the legacy behavior: the moving
+/// trunk tip. Blob contents are fetched separately by immutable OID and need no pin.
+async fn fetch_dir(path: &str, refs: Option<&str>) -> Result<ApiResponseExt, DictionaryError> {
     let start = Instant::now();
     // NOTE: Timeout values are captured once on first use and cannot be changed at runtime.
     static CLIENT: Lazy<Client> = Lazy::new(|| {
@@ -492,11 +513,15 @@ async fn fetch_dir(path: &str) -> Result<ApiResponseExt, DictionaryError> {
 
     // Encode path for URL safety (e.g., '+' in crate versions → '%2B').
     let encoded_path = encode_api_path(path);
-    let url = format!(
+    let mut url = format!(
         "{}/api/v1/tree/content-hash?path={}",
         config::base_url(),
         encoded_path
     );
+    if let Some(refs) = refs {
+        url.push_str("&refs=");
+        url.push_str(&urlencode_component(refs));
+    }
 
     let max_retries = config::dicfuse_fetch_dir_max_retries().max(1);
     // Base delay for linear backoff: 100ms, 200ms, 300ms for attempts 0, 1, 2
@@ -799,6 +824,13 @@ pub struct DictionaryStore {
     open_buff_max_bytes: u64,
     open_buff_max_files: usize,
     open_buff_bytes: AtomicU64,
+    /// Revision this store is pinned to (a Mega monorepo commit OID from
+    /// `/api/v1/latest-commit`). When set, every directory listing request carries
+    /// `&refs=<oid>` so the store serves the tree of that exact revision instead of
+    /// the moving trunk tip. `None` keeps the legacy behavior: always the latest.
+    ///
+    /// File contents need no pinning: blobs are fetched by immutable OID.
+    pinned_refs: Option<String>,
 }
 
 #[allow(unused)]
@@ -842,6 +874,7 @@ impl DictionaryStore {
             open_buff_max_bytes: config::dicfuse_open_buff_max_bytes(),
             open_buff_max_files: config::dicfuse_open_buff_max_files(),
             open_buff_bytes: AtomicU64::new(0),
+            pinned_refs: None,
         }
     }
 
@@ -875,6 +908,7 @@ impl DictionaryStore {
             open_buff_max_bytes: config::dicfuse_open_buff_max_bytes(),
             open_buff_max_files: config::dicfuse_open_buff_max_files(),
             open_buff_bytes: AtomicU64::new(0),
+            pinned_refs: None,
         }
     }
 
@@ -939,12 +973,28 @@ impl DictionaryStore {
             open_buff_max_bytes,
             open_buff_max_files,
             open_buff_bytes: AtomicU64::new(0),
+            pinned_refs: None,
         }
     }
 
     /// Returns true if this call is the first one to start import for this store.
     pub fn try_start_import(&self) -> bool {
         !self.import_started.swap(true, Ordering::AcqRel)
+    }
+
+    /// Pin this store to a specific monorepo revision.
+    ///
+    /// Must be called BEFORE the first import/fetch: once tree data is loaded, the
+    /// store's persisted DB reflects whatever revision was current at fetch time.
+    /// See the `pinned_refs` field docs for semantics.
+    pub fn with_pinned_refs(mut self, refs: Option<String>) -> Self {
+        self.pinned_refs = refs;
+        self
+    }
+
+    /// The revision this store is pinned to, if any.
+    pub fn pinned_refs(&self) -> Option<&str> {
+        self.pinned_refs.as_deref()
     }
 
     /// Create a new DictionaryStore with a base path for subdirectory mounting.
@@ -1173,7 +1223,7 @@ impl DictionaryStore {
 
         // Fetch remote listing and populate children.
         let real_parent_path = self.to_real_path(&parent_user_path);
-        let fetched = fetch_dir(&real_parent_path)
+        let fetched = fetch_dir(&real_parent_path, self.pinned_refs.as_deref())
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
         if !fetched._req_result {
@@ -1511,7 +1561,10 @@ impl DictionaryStore {
     }
 
     pub async fn import(&self) {
-        let items = fetch_dir("").await.unwrap().data;
+        let items = fetch_dir("", self.pinned_refs.as_deref())
+            .await
+            .unwrap()
+            .data;
 
         //let root_inode = self.inodes.lock().await.get(&1).unwrap().clone();
         // deque for bus.
@@ -1549,7 +1602,10 @@ impl DictionaryStore {
             let path = it.to_string();
             debug!("fetch path :{path}");
             // get tree by parent inode.
-            new_items = fetch_dir(&path).await.unwrap().data;
+            new_items = fetch_dir(&path, self.pinned_refs.as_deref())
+                .await
+                .unwrap()
+                .data;
 
             // Insert all new inode.
             for newit in new_items {
@@ -1733,6 +1789,13 @@ impl DictionaryStore {
     /// - As a last resort, fetch size from remote by hash/oid (HEAD/Range) and persist it
     pub async fn get_or_fetch_file_size(&self, inode: u64, oid: &str) -> u64 {
         if let Some(persisted) = self.get_persisted_size(inode) {
+            if persisted == 0 && oid != EMPTY_BLOB_OID {
+                tracing::warn!(
+                    inode,
+                    oid,
+                    "get_or_fetch_file_size: persisted size 0 for non-empty blob"
+                );
+            }
             // NOTE: 0 is a valid cached size (empty file). We treat "not cached" as None.
             return persisted;
         }
@@ -1764,6 +1827,7 @@ impl DictionaryStore {
         }
 
         if oid.is_empty() {
+            tracing::warn!(inode, "get_or_fetch_file_size: empty oid, reporting size 0");
             return 0;
         }
 
@@ -1772,6 +1836,15 @@ impl DictionaryStore {
             return sz;
         }
 
+        // A transient remote hiccup must not surface as an empty file: the size
+        // result is cached by callers, so retry once before giving up.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(sz) = fetch_file_size(oid).await {
+            self.set_persisted_size(inode, sz);
+            return sz;
+        }
+
+        tracing::warn!(inode, oid, "get_or_fetch_file_size: probe failed, reporting size 0");
         0
     }
 
@@ -1782,6 +1855,13 @@ impl DictionaryStore {
     pub async fn file_size_for_stat(&self, inode: u64, oid: &str) -> u64 {
         match self.stat_mode() {
             config::DicfuseStatMode::Fast => {
+                if !oid.is_empty() && oid != EMPTY_BLOB_OID {
+                    tracing::warn!(
+                        inode,
+                        oid,
+                        "file_size_for_stat: FAST mode reporting unprobed size 0"
+                    );
+                }
                 if !oid.is_empty() && oid == EMPTY_BLOB_OID {
                     self.set_persisted_size(inode, 0);
                     return 0;
@@ -1815,6 +1895,9 @@ impl DictionaryStore {
     }
     /// Save to db and then save in the memory.
     pub fn save_file(&self, inode: u64, content: Vec<u8>) {
+        if content.is_empty() {
+            tracing::warn!(inode, "save_file: storing EMPTY content for inode");
+        }
         // Persist size metadata so getattr can report correct size even with lazy content.
         let _ = self
             .persistent_size_store
@@ -2019,7 +2102,7 @@ pub async fn load_dir_depth(store: Arc<DictionaryStore>, parent_path: String, ma
     let _dir_guard = dir_lock.lock().await;
 
     let queue = Arc::new(SegQueue::new());
-    let fetched = match fetch_dir(&real_parent_path).await {
+    let fetched = match fetch_dir(&real_parent_path, store.pinned_refs.as_deref()).await {
         Ok(r) => r,
         Err(e) => {
             warn!(
@@ -2188,7 +2271,7 @@ pub async fn load_dir_depth(store: Arc<DictionaryStore>, parent_path: String, ma
                     tokio::time::sleep(Duration::from_millis(REQUEST_DELAY_MS)).await;
 
                     // get all children inode
-                    let result = fetch_dir(&real_path).await;
+                    let result = fetch_dir(&real_path, store.pinned_refs.as_deref()).await;
                     match result {
                         Ok(resp) => {
                             if !resp._req_result {
@@ -2401,8 +2484,12 @@ pub async fn import_arc(store: Arc<DictionaryStore>) {
     // Antares mount) can now safely resolve root-level lookups without blocking on network IO.
     store.mark_ready();
 
-    // Optional deep prewarm: disabled by default for Antares subdir mounts (max_depth=0).
-    if store.max_depth() > 0 {
+    // Pinned stores (Antares lower projections) skip the deep prewarm: the
+    // revision is immutable, so on-demand fetches never go stale, and warming a
+    // large monorepo saturates the remote while a finalize/remount is serving
+    // user fetches concurrently — those fail fast, cache size 0, and reads come
+    // back empty for seconds.
+    if store.max_depth() > 0 && store.pinned_refs().is_none() {
         let max_depth = store.max_depth() + 2;
         info!(
             "[import_arc] Prewarming directory tree (user_root={user_root:?} real_root={real_root:?} max_depth={max_depth} load_dir_depth={})",
@@ -2622,7 +2709,7 @@ pub async fn load_dir(
     }
     //last, if the dir's hash is different from the parent dir's hash,
     //then fetch the dir from the server.
-    let fetched = fetch_dir(&real_parent_path)
+    let fetched = fetch_dir(&real_parent_path, store.pinned_refs.as_deref())
         .await
         .map_err(|e| io::Error::other(e.to_string()))?;
     if !fetched._req_result {
@@ -3012,6 +3099,7 @@ mod tests {
             open_buff_max_bytes,
             open_buff_max_files,
             open_buff_bytes: AtomicU64::new(0),
+            pinned_refs: None,
         }
     }
 

@@ -32,11 +32,11 @@ use crate::{
     util::file_attr::make_file_attr,
 };
 
-const ROOT_INODE: u64 = 1;
-const TTL: Duration = Duration::from_secs(60);
+pub(crate) const ROOT_INODE: u64 = 1;
+pub(crate) const TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
-struct DirNode {
+pub(crate) struct DirNode {
     /// Scope-relative path, no leading slash ("" for root).
     #[allow(dead_code)]
     path: String,
@@ -53,7 +53,7 @@ struct DirNode {
 }
 
 #[derive(Clone)]
-struct FileNode {
+pub(crate) struct FileNode {
     path: String,
     fs_kind: String,
     size: u64,
@@ -61,7 +61,7 @@ struct FileNode {
 }
 
 #[derive(Clone)]
-enum Node {
+pub(crate) enum Node {
     Dir(DirNode),
     File(FileNode),
 }
@@ -422,7 +422,7 @@ impl Mst2Fuse {
         Ok(())
     }
 
-    fn build(
+    pub(crate) fn build(
         reader: Option<SnapshotReader>,
         store: Option<Arc<DurableStore>>,
         manifest: Vec<SnapshotFile>,
@@ -543,7 +543,7 @@ impl Mst2Fuse {
         reader.read_file(&f.path, &f.digest).await.map_err(io_err)
     }
 
-    fn node(&self, inode: u64) -> Result<Node> {
+    pub(crate) fn node(&self, inode: u64) -> Result<Node> {
         self.state
             .lock()
             .unwrap()
@@ -551,6 +551,33 @@ impl Mst2Fuse {
             .get(&inode)
             .cloned()
             .ok_or_else(|| Errno::from(libc::ENOENT))
+    }
+
+    /// Content digest of `rel_path` in the fixed view, in the view's wire form
+    /// (`sha256:<hex>`). Directory pages are loaded on demand, so a lazy mount
+    /// resolves the path with the same metadata requests a lookup would make.
+    /// `None` = the path is absent from the view, or is a directory (which has
+    /// no content identity).
+    pub(crate) async fn digest_for_path(&self, rel_path: &str) -> Option<String> {
+        let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut inode = ROOT_INODE;
+        for part in parts {
+            if self.ensure_loaded(inode).await.is_err() {
+                return None;
+            }
+            let next = {
+                let state = self.state.lock().unwrap();
+                match state.nodes.get(&inode) {
+                    Some(Node::Dir(d)) => d.children.get(part).copied(),
+                    _ => None,
+                }
+            };
+            inode = next?;
+        }
+        match self.node(inode).ok()? {
+            Node::File(f) => Some(f.digest.clone()),
+            Node::Dir(_) => None,
+        }
     }
 }
 
@@ -627,7 +654,8 @@ fn ensure_child(
     Ok(inode)
 }
 
-fn dir_attr(inode: u64) -> FileAttr {
+pub(crate) fn dir_attr(inode: u64) -> FileAttr {
+    let owner = crate::util::mount_owner::mount_owner();
     make_file_attr(
         inode,
         0,
@@ -638,15 +666,16 @@ fn dir_attr(inode: u64) -> FileAttr {
         FileType::Directory,
         0o755,
         2,
-        0,
-        0,
+        owner.uid,
+        owner.gid,
         0,
         4096,
     )
 }
 
-fn file_attr(inode: u64, f: &FileNode) -> FileAttr {
+pub(crate) fn file_attr(inode: u64, f: &FileNode) -> FileAttr {
     let symlink = f.fs_kind == "symlink";
+    let owner = crate::util::mount_owner::mount_owner();
     make_file_attr(
         inode,
         // For a symlink this is the target's length, per POSIX.
@@ -668,8 +697,8 @@ fn file_attr(inode: u64, f: &FileNode) -> FileAttr {
             0o644
         },
         1,
-        0,
-        0,
+        owner.uid,
+        owner.gid,
         0,
         4096,
     )
@@ -1007,6 +1036,164 @@ impl Filesystem for Mst2Fuse {
         _pid: u32,
         _block: bool,
     ) -> Result<()> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    // ---- Read-only layer: deny every mutation with EROFS (spec 12 §7).
+    //
+    // The snapshot view is immutable; writes belong to the upper layer of the
+    // overlay. Answering EROFS (not the trait default ENOSYS) keeps the
+    // behaviour identical to the Dicfuse lower layer, so the union filesystem
+    // and the kernel treat this layer as read-only rather than unsupported.
+
+    async fn setattr(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: Option<u64>,
+        _set_attr: SetAttr,
+    ) -> Result<ReplyAttr> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn symlink(
+        &self,
+        _req: Request,
+        _parent: Inode,
+        _name: &OsStr,
+        _link: &OsStr,
+    ) -> Result<ReplyEntry> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn mknod(
+        &self,
+        _req: Request,
+        _parent: Inode,
+        _name: &OsStr,
+        _mode: u32,
+        _rdev: u32,
+    ) -> Result<ReplyEntry> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn mkdir(
+        &self,
+        _req: Request,
+        _parent: Inode,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+    ) -> Result<ReplyEntry> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn link(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _new_parent: Inode,
+        _new_name: &OsStr,
+    ) -> Result<ReplyEntry> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn unlink(&self, _req: Request, _parent: Inode, _name: &OsStr) -> Result<()> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn rmdir(&self, _req: Request, _parent: Inode, _name: &OsStr) -> Result<()> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn rename(
+        &self,
+        _req: Request,
+        _parent: Inode,
+        _name: &OsStr,
+        _new_parent: Inode,
+        _new_name: &OsStr,
+    ) -> Result<()> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn rename2(
+        &self,
+        _req: Request,
+        _parent: Inode,
+        _name: &OsStr,
+        _new_parent: Inode,
+        _new_name: &OsStr,
+        _flags: u32,
+    ) -> Result<()> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn write(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _offset: u64,
+        _data: &[u8],
+        _write_flags: u32,
+        _flags: u32,
+    ) -> Result<ReplyWrite> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn create(
+        &self,
+        _req: Request,
+        _parent: Inode,
+        _name: &OsStr,
+        _mode: u32,
+        _flags: u32,
+    ) -> Result<ReplyCreated> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn fallocate(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _offset: u64,
+        _length: u64,
+        _mode: u32,
+    ) -> Result<()> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_file_range(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh_in: u64,
+        _off_in: u64,
+        _inode_out: Inode,
+        _fh_out: u64,
+        _off_out: u64,
+        _length: u64,
+        _flags: u64,
+    ) -> Result<ReplyCopyFileRange> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn setxattr(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: u32,
+        _position: u32,
+    ) -> Result<()> {
+        Err(Errno::from(libc::EROFS))
+    }
+
+    async fn removexattr(&self, _req: Request, _inode: Inode, _name: &OsStr) -> Result<()> {
         Err(Errno::from(libc::EROFS))
     }
 }

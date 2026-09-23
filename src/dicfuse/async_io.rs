@@ -441,6 +441,7 @@ impl Filesystem for Dicfuse {
         size: u32,
     ) -> Result<ReplyData> {
         if !self.readable {
+            tracing::warn!(inode, "dicfuse read: readable=false, returning empty");
             return Ok(ReplyData {
                 data: Bytes::from("".as_bytes()),
             });
@@ -487,6 +488,9 @@ impl Filesystem for Dicfuse {
                     .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
                 let _offset = offset as usize;
                 let end = (_offset + size as usize).min(datas.len());
+                if datas.is_empty() {
+                    tracing::warn!(inode, "dicfuse read: memory cache still empty after refetch");
+                }
                 let slice = &datas[_offset..end];
                 return Ok(ReplyData {
                     data: Bytes::copy_from_slice(slice),
@@ -536,6 +540,9 @@ impl Filesystem for Dicfuse {
 
                 let _offset = offset as usize;
                 let end = (_offset + size as usize).min(buf.len());
+                if buf.is_empty() {
+                    tracing::warn!(inode, "dicfuse read: persisted content empty after refetch");
+                }
                 let slice = &buf[_offset..end];
                 return Ok(ReplyData {
                     data: Bytes::copy_from_slice(slice),

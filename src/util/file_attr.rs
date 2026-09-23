@@ -42,7 +42,13 @@ pub fn make_file_attr(
 }
 
 /// Zeroed attributes used for default / negative FUSE entries.
+///
+/// Ownership is the mount owner's, not the daemon's: the overlay's copy-up
+/// preserves the lower layer's uid/gid when it materializes a node in the
+/// upper layer, so reporting root here would create root-owned upper
+/// directories the user cannot write into.
 pub fn empty_file_attr(ino: u64, kind: FileType, perm: u16) -> FileAttr {
+    let owner = crate::util::mount_owner::mount_owner();
     make_file_attr(
         ino,
         0,
@@ -53,8 +59,8 @@ pub fn empty_file_attr(ino: u64, kind: FileType, perm: u16) -> FileAttr {
         kind,
         perm,
         0,
-        0,
-        0,
+        owner.uid,
+        owner.gid,
         0,
         0,
     )

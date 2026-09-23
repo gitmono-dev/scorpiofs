@@ -38,6 +38,13 @@ services:
       MEGA_MST2__AUTH_TOKEN: "mst2-e2e-acceptance-token"
     ports: !override
       - "127.0.0.1:19700:8000"
+    # The snapshot surface opens one fd per in-flight request; a full-tree
+    # walk issues thousands back-to-back and exhausts the 1024-fd default
+    # (axum then loops on "accept error: Too many open files").
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v2/snapshots/capabilities"]
       interval: 3s

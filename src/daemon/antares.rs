@@ -40,8 +40,83 @@ use uuid::Uuid;
 
 use crate::{
     antares::fuse::AntaresFuse,
+    daemon::lower_view::DicfuseLower,
+    daemon::upper_fork::{fork_upper, ForkCopyError, ForkCopyStats},
+    daemon::worktree_v2::{
+        effective_changes, flatten_chain_into_upper, generation_of, lower_item_for,
+        remove_committed_upper_entries,
+        resolve_latest_revision, AttachWorktreeRequest, AttachWorktreeResponse,
+        CommitFinalizeRequest, CommitFinalizeResponse, CommittedPath, EffectiveKind,
+        RefreshDisposition, RefreshRequest, RefreshResponse, WorktreeStateV2,
+    },
+    dicfuse::store::DictionaryStore,
     dicfuse::{Dicfuse, DicfuseManager},
+    snapshot::fuse::Mst2Fuse,
+    snapshot::{Mst2Client, SnapshotReader},
+    util::config,
 };
+
+/// Retention window requested for an MST/2 snapshot view backing a mount. The
+/// server clamps to `1..=3600`; a mount outliving the window renews lazily.
+const MST2_LEASE_SECONDS: u64 = 3600;
+
+/// Build the MST/2 snapshot-view lower layer when `mst2_lower_enabled` is set
+/// (spec 12 §1). Returns `None` in the default Dicfuse mode, so the legacy
+/// reader stays the only path unless the operator opted in explicitly
+/// (spec 15 §3: no silent fallback in either direction).
+async fn mst2_lower_layer() -> Result<Option<Arc<Mst2Fuse>>, ServiceError> {
+    if !config::mst2_lower_enabled() {
+        return Ok(None);
+    }
+    let token = config::mst2_auth_token();
+    let client = Mst2Client::with_token(
+        config::mst2_base_url(),
+        (!token.is_empty()).then(|| token.to_string()),
+    );
+    let reader = SnapshotReader::resolve(client, config::mst2_scope(), MST2_LEASE_SECONDS)
+        .await
+        .map_err(|e| {
+            ServiceError::Internal(format!(
+                "mst2 lower: resolve({}) failed: {e}",
+                config::mst2_scope()
+            ))
+        })?;
+    let fuse = Mst2Fuse::from_reader_lazy(reader, None)
+        .await
+        .map_err(|e| ServiceError::Internal(format!("mst2 lower: build view failed: {e}")))?;
+    tracing::info!(
+        scope = config::mst2_scope(),
+        snapshot = ?fuse.snapshot_id(),
+        "antares svc: serving MST/2 snapshot view as the lower layer"
+    );
+    Ok(Some(Arc::new(fuse)))
+}
+
+/// The lower projection a mount's effective diff must compare against: the
+/// MST/2 snapshot view when the mount serves one, otherwise the Dicfuse
+/// projection (P3; see `mst2-impl/P3-HASH-DOMAIN-DESIGN.md`).
+fn lower_view_for(entry: &MountEntry) -> Arc<dyn crate::daemon::lower_view::LowerView> {
+    use crate::daemon::lower_view::{DicfuseLower, Mst2Lower};
+    match &entry.mst2_lower {
+        Some(view) => Arc::new(Mst2Lower(view.clone())),
+        None => Arc::new(DicfuseLower(entry.fuse.dic.store.clone())),
+    }
+}
+
+/// MST/2-lowered mounts do not support the worktree-v2 mutations yet: their
+/// lower moves by resolving a new snapshot, not by re-pinning the Dicfuse
+/// projection, and the finalize/refresh plumbing for that is not in place.
+/// Refuse explicitly rather than executing the Dicfuse semantics against the
+/// wrong projection (spec 15 §3).
+fn reject_mst2_mutation(entry: &MountEntry, op: &str) -> Result<(), ServiceError> {
+    if entry.mst2_lower.is_some() {
+        return Err(ServiceError::InvalidRequest(format!(
+            "{op} is not supported on an MST/2-lowered mount yet; re-attach without \
+             mst2_lower_enabled or wait for the snapshot-side finalize/refresh"
+        )));
+    }
+    Ok(())
+}
 
 /// High-level HTTP daemon that exposes Antares orchestration capabilities.
 pub struct AntaresDaemon<S: AntaresService> {
@@ -90,6 +165,15 @@ where
                 "/mounts/{mount_id}/worktree/refresh-plan",
                 post(Self::plan_worktree_refresh),
             )
+            .route("/mounts/{mount_id}/fork", post(Self::fork_mount))
+            // Worktree Control Protocol v2 (docs/scorpiofs-libra-complete-spec-v1.md).
+            .route("/worktrees", post(Self::attach_worktree))
+            .route("/worktrees/{mount_id}/state", get(Self::worktree_state_v2))
+            .route(
+                "/worktrees/{mount_id}/commit-finalize",
+                post(Self::commit_finalize),
+            )
+            .route("/worktrees/{mount_id}/refresh", post(Self::refresh_lower))
             .with_state(self.service.clone())
     }
 
@@ -349,6 +433,51 @@ where
             service.plan_worktree_refresh(mount_id, request).await?,
         ))
     }
+
+    /// Derive a new worktree mount from an existing one.
+    async fn fork_mount(
+        State(service): State<Arc<S>>,
+        AxumPath(mount_id): AxumPath<Uuid>,
+        Json(request): Json<ForkMountRequest>,
+    ) -> Result<(StatusCode, Json<ForkMountResponse>), ApiError> {
+        let response = service.fork_mount(mount_id, request).await?;
+        Ok((StatusCode::CREATED, Json(response)))
+    }
+
+    /// Worktree v2: attach a worktree with its lower pinned from the first request.
+    async fn attach_worktree(
+        State(service): State<Arc<S>>,
+        Json(request): Json<AttachWorktreeRequest>,
+    ) -> Result<(StatusCode, Json<AttachWorktreeResponse>), ApiError> {
+        let response = service.attach_worktree(request).await?;
+        Ok((StatusCode::CREATED, Json(response)))
+    }
+
+    /// Worktree v2: effective diff of a mount.
+    async fn worktree_state_v2(
+        State(service): State<Arc<S>>,
+        AxumPath(mount_id): AxumPath<Uuid>,
+    ) -> Result<Json<WorktreeStateV2>, ApiError> {
+        Ok(Json(service.worktree_state_v2(mount_id).await?))
+    }
+
+    /// Worktree v2: finalize a commit (pin lower, clean committed upper entries).
+    async fn commit_finalize(
+        State(service): State<Arc<S>>,
+        AxumPath(mount_id): AxumPath<Uuid>,
+        Json(request): Json<CommitFinalizeRequest>,
+    ) -> Result<Json<CommitFinalizeResponse>, ApiError> {
+        Ok(Json(service.commit_finalize(mount_id, request).await?))
+    }
+
+    /// Worktree v2: move the lower projection to a newer revision.
+    async fn refresh_lower(
+        State(service): State<Arc<S>>,
+        AxumPath(mount_id): AxumPath<Uuid>,
+        Json(request): Json<RefreshRequest>,
+    ) -> Result<Json<RefreshResponse>, ApiError> {
+        Ok(Json(service.refresh_lower(mount_id, request).await?))
+    }
 }
 
 /// Asynchronous service boundary that the HTTP layer depends on.
@@ -423,6 +552,60 @@ pub trait AntaresService: Send + Sync {
         ))
     }
 
+    /// Derive a new worktree mount from an existing one.
+    ///
+    /// Default implementation reports the capability as absent, following the same
+    /// pattern as the other worktree operations: a client must be able to tell "this
+    /// daemon cannot fork" from "this fork failed".
+    async fn fork_mount(
+        &self,
+        _source_mount_id: Uuid,
+        _request: ForkMountRequest,
+    ) -> Result<ForkMountResponse, ServiceError> {
+        Err(ServiceError::Unsupported(
+            "fork is not implemented by this Antares service".into(),
+        ))
+    }
+
+    /// Worktree Control Protocol v2: effective diff, commit finalize, lower switch.
+    ///
+    /// See `docs/scorpiofs-libra-complete-spec-v1.md` and `worktree_v2.rs` for the
+    /// failure modes these operations eliminate over the v1 contract.
+    async fn attach_worktree(
+        &self,
+        _request: AttachWorktreeRequest,
+    ) -> Result<AttachWorktreeResponse, ServiceError> {
+        Err(ServiceError::Unsupported(
+            "worktree v2 attach is not implemented by this Antares service".into(),
+        ))
+    }
+
+    async fn worktree_state_v2(&self, _mount_id: Uuid) -> Result<WorktreeStateV2, ServiceError> {
+        Err(ServiceError::Unsupported(
+            "worktree v2 state is not implemented by this Antares service".into(),
+        ))
+    }
+
+    async fn commit_finalize(
+        &self,
+        _mount_id: Uuid,
+        _request: CommitFinalizeRequest,
+    ) -> Result<CommitFinalizeResponse, ServiceError> {
+        Err(ServiceError::Unsupported(
+            "commit finalize is not implemented by this Antares service".into(),
+        ))
+    }
+
+    async fn refresh_lower(
+        &self,
+        _mount_id: Uuid,
+        _request: RefreshRequest,
+    ) -> Result<RefreshResponse, ServiceError> {
+        Err(ServiceError::Unsupported(
+            "lower refresh is not implemented by this Antares service".into(),
+        ))
+    }
+
     async fn health_info(&self) -> HealthResponse;
     async fn shutdown_cleanup(&self) -> Result<(), ServiceError>;
 }
@@ -459,6 +642,41 @@ pub struct CreateMountRequest {
     /// Optional CL (changelist) identifier for the CL layer
     #[serde(default)]
     pub cl: Option<String>,
+    /// Optional absolute filesystem mountpoint. When omitted, Antares allocates
+    /// one under `antares_mount_root`; when present, this directory is mounted
+    /// directly. The caller must provide an empty directory.
+    #[serde(default)]
+    pub mountpoint: Option<String>,
+    /// **Internal only — not part of the HTTP contract.** A pre-populated upper
+    /// directory to adopt instead of generating one.
+    ///
+    /// `fork` needs this because an upper layer is only imported into the FUSE layer
+    /// when the session starts: a delta written into the upper *after* mounting is
+    /// invisible through the mount (and can even make writes fail with `EEXIST`),
+    /// while `GET /worktree` — which scans the directory directly — reports it,
+    /// leaving the API and the filesystem disagreeing. So the child's delta has to be
+    /// on disk before the mount exists.
+    ///
+    /// `skip_deserializing` is load-bearing: if a client could set this, mount
+    /// creation would become arbitrary directory creation, and the failure paths call
+    /// `remove_dir_all` on it.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub upper_dir: Option<String>,
+    /// **Internal only — not part of the HTTP contract.** Pin the mount's Dicfuse
+    /// lower to this Mega *internal* commit OID instead of the moving trunk tip.
+    ///
+    /// The Worktree-v2 attach sets it so the projection is immutable from the first
+    /// request; v1 mounts stay unpinned. Like `upper_dir`, `skip_deserializing` is
+    /// load-bearing — a client able to pin an arbitrary revision would be able to
+    /// serve content the mount's owner never asked for.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub pinned_refs: Option<String>,
+    /// **Internal only.** Sealed chain layers for a `chain`-fork child, nearest
+    /// first (host paths). Same `skip_deserializing` rationale as `pinned_refs`:
+    /// a client able to stack arbitrary directories below its view would read
+    /// content its mount never projected.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub sealed_chain: Vec<String>,
 }
 
 /// Request payload for building/rebuilding a CL layer.
@@ -553,11 +771,33 @@ pub struct MountChangesResponse {
     pub changes: Vec<ChangedPath>,
 }
 
+/// Where a worktree sits inside its VCS repository, so that a process running *in*
+/// the mount can find the repository it belongs to.
+///
+/// Deliberately tiny. The authoritative state (HEAD, index, refs, objects) lives
+/// host-side under `commondir`, keyed by `worktree_id`, and must never be
+/// materialized in the upper layer: what gets written into a mount is a *pointer*,
+/// not a repository. ScorpioFS does not interpret either value.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VcsPointer {
+    /// Absolute path of the repository's shared state directory. The caller owns
+    /// canonicalization — the value is written verbatim, and a VCS that compares it
+    /// against its own canonical storage will reject a messy one.
+    pub commondir: String,
+    /// Stable identifier of this worktree within that repository.
+    pub worktree_id: String,
+}
+
 /// Request used by Libra immediately after attaching a clean worktree mount.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BindWorktreeBaseRequest {
     /// Immutable commit/revision that Dicfuse is expected to project for this mount.
     pub base_revision: String,
+    /// Optional. When present, the pointer files are written into the mount.
+    ///
+    /// Optional so an older client keeps working unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcs_pointer: Option<VcsPointer>,
 }
 
 /// Current ScorpioFS contribution to a Git-compatible worktree state.
@@ -625,6 +865,73 @@ pub struct ChangedPath {
 pub enum ChangeKind {
     Modified,
     Deleted,
+}
+
+/// How `fork` should produce the child worktree's layers.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkMode {
+    /// Copy the parent's writable delta into a fresh upper layer. The child ends up
+    /// with its own independent layers and the parent keeps working. Cost is
+    /// proportional to the parent's *delta*, not to the repository size.
+    #[default]
+    Materialize,
+    /// Share a frozen copy of the parent's upper layer as a lower layer instead of
+    /// copying it, for an O(1) fork. **Not implemented**: a request is downgraded to
+    /// `Materialize` and the response reports `mode_downgraded_from`, so a caller is
+    /// never silently given a different mechanism than the one it asked for.
+    Chain,
+}
+
+/// Request to derive a new worktree mount from an existing one.
+///
+/// The monorepo path is inherited from the source: a fork is a second worktree over
+/// the *same* subtree, so there is nothing to choose. The child's mountpoint is
+/// generated by the daemon, exactly as on `POST /mounts`; read it back from the
+/// response (`path`) or from `GET /mounts/{id}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ForkMountRequest {
+    /// Optional task identifier, as on mount creation.
+    #[serde(default)]
+    pub job_id: Option<String>,
+    /// Optional target mountpoint. When omitted, ScorpioFS allocates one below
+    /// its configured mount root; Libra supplies the linked worktree path.
+    #[serde(default)]
+    pub mountpoint: Option<String>,
+    /// Layer strategy. Defaults to `materialize`.
+    #[serde(default)]
+    pub mode: ForkMode,
+    /// Carry the source's CL layer into the child. Off by default: a CL is a build
+    /// baseline, not a worktree edit (see `docs/worktree-state-transitions.md`).
+    #[serde(default)]
+    pub inherit_cl: bool,
+}
+
+/// Result of a `fork`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ForkMountResponse {
+    pub mount_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    pub path: String,
+    /// The worktree this one was derived from.
+    pub source_mount_id: Uuid,
+    /// The mode actually used.
+    pub mode: ForkMode,
+    /// Set when the requested mode could not be honoured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_downgraded_from: Option<ForkMode>,
+    /// Lower layers, **nearest first**. Clients must not reorder this.
+    pub lower_chain: Vec<String>,
+    /// The source's base binding, inherited. `None` until `POST .../worktree/base`.
+    pub base_revision: Option<String>,
+    pub mount_state: MountLifecycle,
+    /// Always `None` under `materialize`; reserved for `chain`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_frozen_layer: Option<String>,
+    /// What the delta copy actually did. `None` under `chain`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_stats: Option<ForkCopyStats>,
 }
 
 /// Health check response payload.
@@ -744,6 +1051,15 @@ struct MountEntry {
     cl: Option<String>,
     /// Immutable revision selected by Libra for an interactive worktree.
     base_revision: Option<String>,
+    /// Mega *internal* commit OID the Dicfuse lower is pinned to (from
+    /// `/api/v1/latest-commit`). `None` = legacy mount whose lower tracks the
+    /// moving trunk tip. Distinct from `base_revision`, which lives in the VCS
+    /// client's identifier space (a git commit OID).
+    pinned_refs: Option<String>,
+    /// Sealed delta layers from `chain` forks, **nearest first** (host directory
+    /// paths). They shadow the Dicfuse projection below them and are flattened
+    /// into the upper at the next finalize/refresh.
+    sealed_chain: Vec<String>,
     /// Auto-generated mountpoint path
     mountpoint: String,
     /// Auto-generated upper directory
@@ -751,6 +1067,12 @@ struct MountEntry {
     /// Auto-generated CL directory (if cl is provided)
     cl_dir: Option<String>,
     fuse: AntaresFuse,
+    /// The MST/2 snapshot view backing this mount's lower projection, when the
+    /// mount was created with `mst2_lower_enabled` (spec 12 §1). Not persisted:
+    /// a restarted daemon refuses to restore such a mount rather than silently
+    /// serving the Dicfuse projection instead (spec 15 §3 — explicit modes, no
+    /// silent fallback).
+    mst2_lower: Option<Arc<Mst2Fuse>>,
     state: MountLifecycle,
     created_at_epoch_ms: u64,
     last_seen_epoch_ms: u64,
@@ -797,6 +1119,73 @@ impl MountEntry {
     fn update_last_seen(&mut self) {
         self.last_seen_epoch_ms = current_epoch_ms();
     }
+}
+
+/// Directory inside a mount that holds the VCS pointer.
+const VCS_POINTER_DIR: &str = ".libra";
+
+/// Write (or verify) the VCS pointer inside a mount.
+///
+/// Idempotent for identical content, and refuses to silently rewrite a *different*
+/// identity: two worktrees claiming the same directory would be worse than an error.
+///
+/// The two files are written into the mount, so they land in the writable upper layer.
+/// `scan_layer_changes` skips this directory, so the pointer never shows up as a local
+/// change — which is what lets the VCS layer treat the worktree as clean.
+fn write_vcs_pointer(mountpoint: &Path, pointer: &VcsPointer) -> Result<(), ServiceError> {
+    let commondir = pointer.commondir.trim();
+    let worktree_id = pointer.worktree_id.trim();
+
+    if commondir.is_empty() || worktree_id.is_empty() {
+        return Err(ServiceError::InvalidRequest(
+            "vcs_pointer.commondir and vcs_pointer.worktree_id cannot be empty".into(),
+        ));
+    }
+    // One value per line. An embedded newline would forge an extra line rather than
+    // describing a path.
+    if commondir.contains('\n') || worktree_id.contains('\n') {
+        return Err(ServiceError::InvalidRequest(
+            "vcs_pointer values must not contain newlines".into(),
+        ));
+    }
+    if !Path::new(commondir).is_absolute() {
+        return Err(ServiceError::InvalidRequest(
+            "vcs_pointer.commondir must be an absolute path".into(),
+        ));
+    }
+
+    let dir = mountpoint.join(VCS_POINTER_DIR);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ServiceError::Internal(format!("failed to create {}: {e}", dir.display())))?;
+
+    for (name, value) in [("commondir", commondir), ("worktree_id", worktree_id)] {
+        let path = dir.join(name);
+        let wanted = format!("{value}\n");
+        match std::fs::read_to_string(&path) {
+            // Already correct: a repeated bind is a no-op.
+            Ok(existing) if existing == wanted => continue,
+            Ok(existing) => {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "worktree pointer {} already reads {:?}; refusing to rewrite it to {:?}",
+                    path.display(),
+                    existing.trim_end(),
+                    value
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ServiceError::Internal(format!(
+                    "failed to read {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+        std::fs::write(&path, wanted).map_err(|e| {
+            ServiceError::Internal(format!("failed to write {}: {e}", path.display()))
+        })?;
+    }
+
+    Ok(())
 }
 
 /// OCI overlay whiteout prefix (libfuse-fs default on macOS).
@@ -953,10 +1342,23 @@ pub struct PersistedMountState {
     pub cl: Option<String>,
     #[serde(default)]
     pub base_revision: Option<String>,
+    /// Mega internal commit OID the Dicfuse lower is pinned to.
+    #[serde(default)]
+    pub pinned_refs: Option<String>,
+    /// Sealed delta layers, nearest first (host paths). Flattened away at the
+    /// next finalize/refresh; persisted so recovery rebuilds the same view.
+    #[serde(default)]
+    pub sealed_chain: Vec<String>,
     pub mountpoint: String,
     pub upper_dir: String,
     pub cl_dir: Option<String>,
     pub created_at_epoch_ms: u64,
+    /// Whether this mount's lower projection is an MST/2 snapshot view. Such a
+    /// mount is not restored across restarts: the view is resolved per process,
+    /// and rebuilding it with the Dicfuse projection instead would silently
+    /// serve a different base (spec 15 §3).
+    #[serde(default)]
+    pub mst2_lower: bool,
 }
 
 /// Persisted state file structure.
@@ -1481,8 +1883,31 @@ impl AntaresServiceImpl {
     /// - Support incremental directory tree loading to reduce initial wait time
     /// - Add progress callback for long-running initialization
     /// - Consider lazy loading for very large subdirectory mounts
-    async fn get_or_create_dicfuse(&self, path: &str) -> Result<Arc<Dicfuse>, ServiceError> {
+    async fn get_or_create_dicfuse(
+        &self,
+        path: &str,
+        pinned_refs: Option<&str>,
+    ) -> Result<Arc<Dicfuse>, ServiceError> {
         const INIT_TIMEOUT_SECS: u64 = 120;
+
+        // A pinned mount must never share the path-keyed (unpinned) instances: its
+        // projection is a fixed revision, theirs tracks the moving trunk tip.
+        if let Some(refs) = pinned_refs {
+            let dicfuse = DicfuseManager::for_base_path_and_refs(path, refs).await;
+            if tokio::time::timeout(
+                Duration::from_secs(INIT_TIMEOUT_SECS),
+                dicfuse.store.wait_for_ready(),
+            )
+            .await
+            .is_err()
+            {
+                return Err(ServiceError::FuseFailure(format!(
+                    "pinned Dicfuse for {path} at {refs} did not become ready within \
+                     {INIT_TIMEOUT_SECS}s"
+                )));
+            }
+            return Ok(dicfuse);
+        }
 
         // For root path, use the shared global instance (but ensure it's initialized first).
         if path.is_empty() || path == "/" {
@@ -1587,6 +2012,703 @@ impl AntaresServiceImpl {
     }
 
     /// Persist current mount state to file.
+    /// Resolve the Dicfuse instance backing a mount's lower projection.
+    ///
+    /// Pinned mounts get their pinned instance; legacy mounts share the path-keyed
+    /// unpinned instance. Callers must NOT cache the result across a finalize: the
+    /// pin changes the instance.
+    async fn lower_dicfuse_for(
+        &self,
+        path: &str,
+        pinned_refs: Option<&str>,
+    ) -> Result<Arc<Dicfuse>, ServiceError> {
+        match pinned_refs {
+            Some(refs) => {
+                let dicfuse = DicfuseManager::for_base_path_and_refs(path, refs).await;
+                if tokio::time::timeout(Duration::from_secs(120), dicfuse.store.wait_for_ready())
+                    .await
+                    .is_err()
+                {
+                    return Err(ServiceError::FuseFailure(format!(
+                        "pinned Dicfuse for {path} at {refs} did not become ready"
+                    )));
+                }
+                Ok(dicfuse)
+            }
+            None => self.get_or_create_dicfuse(path, None).await,
+        }
+    }
+
+    /// Verify that a candidate lower actually serves what a VCS commit claims.
+    ///
+    /// Per-path optimistic lock: the committed hashes must be exactly what the new
+    /// lower serves. This proves the push landed AND that no path was concurrently
+    /// edited between staging and finalize.
+    async fn verify_committed_paths(
+        new_store: &DictionaryStore,
+        committed: &[CommittedPath],
+    ) -> Result<(), String> {
+        for path in committed {
+            let item = lower_item_for(new_store, &path.path).await;
+            match (&path.kind, item) {
+                (EffectiveKind::Deleted, None) => {}
+                (EffectiveKind::Deleted, Some(item)) => {
+                    return Err(format!(
+                        "committed deletion of {} does not match the new revision \
+                         (lower still serves blob {})",
+                        path.path, item.hash
+                    ));
+                }
+                (EffectiveKind::Added | EffectiveKind::Modified, None) => {
+                    return Err(format!(
+                        "committed path {} is absent from the new revision",
+                        path.path
+                    ));
+                }
+                (EffectiveKind::Added | EffectiveKind::Modified, Some(item)) => {
+                    if let Some(expected) = &path.content_hash {
+                        if item.hash != *expected {
+                            return Err(format!(
+                                "committed content of {} does not match the new revision \
+                                 (commit {}, lower {})",
+                                path.path, expected, item.hash
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild a mount's FUSE session over a new lower projection.
+    ///
+    /// The caller must have already unmounted the old session. The upper directory
+    /// and mountpoint are reused unchanged; only the Dicfuse instance moves.
+    async fn remount_with_lower(
+        mountpoint: &Path,
+        dicfuse: Arc<Dicfuse>,
+        upper_dir: &Path,
+        cl_dir: Option<&Path>,
+        sealed_chain: &[String],
+    ) -> Result<AntaresFuse, ServiceError> {
+        let frozen = sealed_chain.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let mut fuse = AntaresFuse::new(
+            mountpoint.to_path_buf(),
+            dicfuse,
+            upper_dir.to_path_buf(),
+            cl_dir.map(PathBuf::from),
+        )
+        .await
+        .and_then(|fuse| fuse.with_frozen_layers(frozen))
+        .map_err(|e| ServiceError::FuseFailure(format!("failed to rebuild overlay: {e}")))?;
+        fuse.mount()
+            .await
+            .map_err(|e| ServiceError::FuseFailure(format!("failed to remount: {e}")))?;
+        Ok(fuse)
+    }
+
+    /// Rebuild the mount over an MST/2 snapshot view instead of the Dicfuse
+    /// projection (spec 12 §1). The Dicfuse instance is still constructed — it
+    /// backs the effective-diff/verify paths for Dicfuse-lowered mounts and is
+    /// required by `AntaresFuse::new` — but the overlay's base layer is the
+    /// snapshot view.
+    async fn remount_with_mst2_lower(
+        mountpoint: &Path,
+        view: Arc<Mst2Fuse>,
+        dicfuse: Arc<Dicfuse>,
+        upper_dir: &Path,
+        cl_dir: Option<&Path>,
+    ) -> Result<AntaresFuse, ServiceError> {
+        let mut fuse = AntaresFuse::new(
+            mountpoint.to_path_buf(),
+            dicfuse,
+            upper_dir.to_path_buf(),
+            cl_dir.map(PathBuf::from),
+        )
+        .await
+        .map_err(|e| ServiceError::FuseFailure(format!("failed to rebuild overlay: {e}")))?
+        .with_lower_override(view as Arc<dyn libfuse_fs::unionfs::layer::Layer>);
+        fuse.mount()
+            .await
+            .map_err(|e| ServiceError::FuseFailure(format!("failed to remount: {e}")))?;
+        Ok(fuse)
+    }
+
+    /// MST/2 refresh: resolve the latest snapshot view and remount over it.
+    /// The upper layer and mountpoint are reused; only the view moves. The
+    /// Dicfuse semantics of re-pinning a per-revision store do not apply here.
+    #[allow(clippy::too_many_arguments)]
+    async fn mst2_refresh_lower(
+        &self,
+        mount_id: Uuid,
+        old_view: Arc<Mst2Fuse>,
+        path: &str,
+        upper_dir: &Path,
+        cl_dir: Option<&Path>,
+        mountpoint: &Path,
+        base_revision: &Option<String>,
+        start: Instant,
+    ) -> Result<RefreshResponse, ServiceError> {
+        let dicfuse = self.lower_dicfuse_for(path, None).await?;
+
+        // Dirty check against the *current* view: a refresh must not discard
+        // uncommitted upper content (same contract as the Dicfuse path).
+        let view_before = Arc::new(crate::daemon::lower_view::Mst2Lower(old_view.clone()));
+        let changes = effective_changes(view_before.as_ref(), upper_dir, &[])
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+
+        // Resolve the latest snapshot view (the MST/2 analogue of re-pinning).
+        let new_view = mst2_lower_layer()
+            .await?
+            .ok_or_else(|| ServiceError::Internal("mst2 lower disabled mid-flight".into()))?;
+
+        // Idempotency: re-resolving the same snapshot is a no-op.
+        let new_id = new_view.snapshot_id().map(str::to_string);
+        if old_view.snapshot_id() == new_view.snapshot_id().as_deref() {
+            return Ok(RefreshResponse {
+                disposition: RefreshDisposition::AlreadyAtTarget,
+                base_revision: base_revision.clone().unwrap_or_default(),
+                lower_revision: new_id,
+                generation,
+                code: None,
+                detail: None,
+            });
+        }
+
+        // Quiesce, remount over the new view, roll back on failure.
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.state = MountLifecycle::Quiescing;
+            if let Err(e) = entry.fuse.unmount().await {
+                entry.state = MountLifecycle::Ready;
+                return Err(ServiceError::FuseFailure(format!(
+                    "failed to quiesce mount {mount_id}: {e}"
+                )));
+            }
+        }
+
+        match Self::remount_with_mst2_lower(
+            mountpoint,
+            new_view.clone(),
+            dicfuse.clone(),
+            upper_dir,
+            cl_dir,
+        )
+        .await
+        {
+            Ok(new_fuse) => {
+                {
+                    let mut mounts = self.mounts.write().await;
+                    let entry = mounts
+                        .get_mut(&mount_id)
+                        .ok_or(ServiceError::NotFound(mount_id))?;
+                    entry.fuse = new_fuse;
+                    entry.mst2_lower = Some(new_view.clone());
+                    entry.pinned_refs = new_id.clone();
+                    entry.state = MountLifecycle::Ready;
+                    entry.last_seen_epoch_ms = current_epoch_ms();
+                }
+                self.persist_state().await;
+                tracing::info!(
+                    mount_id = %mount_id,
+                    snapshot = ?new_id,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "antares svc: mst2 refresh success"
+                );
+                Ok(RefreshResponse {
+                    disposition: RefreshDisposition::Switched,
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: new_id,
+                    generation,
+                    code: None,
+                    detail: None,
+                })
+            }
+            Err(e) => {
+                // Roll back to the old view so the mount keeps serving bytes.
+                let _ = Self::remount_with_mst2_lower(
+                    mountpoint,
+                    old_view,
+                    self.lower_dicfuse_for(path, None).await?,
+                    upper_dir,
+                    cl_dir,
+                )
+                .await;
+                Err(e)
+            }
+        }
+    }
+
+    /// MST/2 commit-finalize: verify the committed paths against the *latest*
+    /// snapshot (the push has already landed there), clear exactly those upper
+    /// entries, and remount over the new view.
+    #[allow(clippy::too_many_arguments)]
+    async fn mst2_commit_finalize(
+        &self,
+        mount_id: Uuid,
+        request: CommitFinalizeRequest,
+        old_view: Arc<Mst2Fuse>,
+        path: &str,
+        upper_dir: &Path,
+        cl_dir: Option<&Path>,
+        mountpoint: &Path,
+        base_revision: &Option<String>,
+        start: Instant,
+    ) -> Result<CommitFinalizeResponse, ServiceError> {
+        let dicfuse = self.lower_dicfuse_for(path, None).await?;
+
+        // Optimistic lock against the effective diff over the current view.
+        let view_before = Arc::new(crate::daemon::lower_view::Mst2Lower(old_view.clone()));
+        let changes = effective_changes(view_before.as_ref(), upper_dir, &[])
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+        if let Some(expected) = request.expected_generation {
+            if expected != generation {
+                return Ok(CommitFinalizeResponse {
+                    state: "conflict".into(),
+                    code: Some("GENERATION_CHANGED".into()),
+                    detail: Some(format!(
+                        "state generation {expected} no longer matches {generation}; \
+                         re-read state and re-commit"
+                    )),
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: None,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                });
+            }
+        }
+
+        // Resolve the latest snapshot: the client pushed its commit, so the
+        // newest view must already contain the committed content.
+        let new_view = mst2_lower_layer()
+            .await?
+            .ok_or_else(|| ServiceError::Internal("mst2 lower disabled mid-flight".into()))?;
+
+        // Verify the committed set against the new view in the view's own
+        // domain: the upper file's sha256 must equal the view's digest, which
+        // proves the commit landed and guards concurrent edits (spec 12 §1:
+        // sizes/identities come from verified entries, never a 0 placeholder).
+        for committed in &request.committed_paths {
+            let lower_digest = new_view.digest_for_path(&committed.path).await;
+            match (&committed.kind, lower_digest) {
+                (EffectiveKind::Deleted, None) => {}
+                (EffectiveKind::Deleted, Some(_)) => {
+                    return Ok(CommitFinalizeResponse {
+                        state: "conflict".into(),
+                        code: Some("TREE_MISMATCH".into()),
+                        detail: Some(format!(
+                            "committed deletion of {} is still served by the new snapshot",
+                            committed.path
+                        )),
+                        base_revision: base_revision.clone().unwrap_or_default(),
+                        lower_revision: None,
+                        generation,
+                        cleaned_paths: Vec::new(),
+                    });
+                }
+                (EffectiveKind::Added | EffectiveKind::Modified, None) => {
+                    return Ok(CommitFinalizeResponse {
+                        state: "conflict".into(),
+                        code: Some("TREE_MISMATCH".into()),
+                        detail: Some(format!(
+                            "committed path {} is absent from the new snapshot",
+                            committed.path
+                        )),
+                        base_revision: base_revision.clone().unwrap_or_default(),
+                        lower_revision: None,
+                        generation,
+                        cleaned_paths: Vec::new(),
+                    });
+                }
+                (EffectiveKind::Added | EffectiveKind::Modified, Some(lower_digest)) => {
+                    let bytes = tokio::fs::read(Path::new(upper_dir).join(&committed.path))
+                        .await
+                        .map_err(|e| {
+                            ServiceError::Internal(format!(
+                                "failed to read upper content of {}: {e}",
+                                committed.path
+                            ))
+                        })?;
+                    let upper_digest = crate::snapshot::durable::digest_of(&bytes);
+                    if upper_digest != *lower_digest {
+                        return Ok(CommitFinalizeResponse {
+                            state: "conflict".into(),
+                            code: Some("TREE_MISMATCH".into()),
+                            detail: Some(format!(
+                                "upper content of {} does not match the new snapshot \
+                                 ({upper_digest} vs {lower_digest})",
+                                committed.path
+                            )),
+                            base_revision: base_revision.clone().unwrap_or_default(),
+                            lower_revision: None,
+                            generation,
+                            cleaned_paths: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase B — quiesce, clear exactly the committed entries, remount over
+        // the new view. Rollbacks restore the previous projection.
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.state = MountLifecycle::Quiescing;
+            if let Err(e) = entry.fuse.unmount().await {
+                entry.state = MountLifecycle::Ready;
+                return Err(ServiceError::FuseFailure(format!(
+                    "failed to quiesce mount {mount_id}: {e}"
+                )));
+            }
+        }
+
+        let cleaned = match remove_committed_upper_entries(Path::new(upper_dir), &request.committed_paths)
+        {
+            Ok(cleaned) => cleaned,
+            Err(e) => {
+                let _ = Self::remount_with_mst2_lower(
+                    mountpoint,
+                    old_view.clone(),
+                    dicfuse.clone(),
+                    upper_dir,
+                    cl_dir,
+                )
+                .await;
+                return Ok(CommitFinalizeResponse {
+                    state: "failed".into(),
+                    code: Some("SWITCH_FAILED".into()),
+                    detail: Some(format!("upper cleanup failed: {e}")),
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: None,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                });
+            }
+        };
+
+        match Self::remount_with_mst2_lower(
+            mountpoint,
+            new_view.clone(),
+            dicfuse.clone(),
+            upper_dir,
+            cl_dir,
+        )
+        .await
+        {
+            Ok(new_fuse) => {
+                {
+                    let mut mounts = self.mounts.write().await;
+                    let entry = mounts
+                        .get_mut(&mount_id)
+                        .ok_or(ServiceError::NotFound(mount_id))?;
+                    entry.fuse = new_fuse;
+                    entry.mst2_lower = Some(new_view.clone());
+                    entry.pinned_refs = new_view.snapshot_id().map(str::to_string);
+                    entry.state = MountLifecycle::Ready;
+                    entry.last_seen_epoch_ms = current_epoch_ms();
+                }
+                self.persist_state().await;
+                tracing::info!(
+                    mount_id = %mount_id,
+                    snapshot = ?new_view.snapshot_id(),
+                    cleaned = cleaned.len(),
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "antares svc: mst2 commit_finalize success"
+                );
+                Ok(CommitFinalizeResponse {
+                    state: "ready".into(),
+                    code: None,
+                    detail: None,
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: new_view.snapshot_id().map(str::to_string),
+                    generation,
+                    cleaned_paths: cleaned,
+                })
+            }
+            Err(e) => {
+                let _ = Self::remount_with_mst2_lower(
+                    mountpoint,
+                    old_view,
+                    dicfuse.clone(),
+                    upper_dir,
+                    cl_dir,
+                )
+                .await;
+                Ok(CommitFinalizeResponse {
+                    state: "failed".into(),
+                    code: Some("SWITCH_FAILED".into()),
+                    detail: Some(format!(
+                        "remount over the new snapshot failed after cleanup: {e}; \
+                         worktree remounted on the previous projection"
+                    )),
+                    base_revision: base_revision.clone().unwrap_or_default(),
+                    lower_revision: None,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                })
+            }
+        }
+    }
+
+    /// `chain` fork: seal the source's upper into a shared read-only layer, give the
+    /// source a fresh upper (its view is byte-identical and it stays writable), and
+    /// stack the sealed layer under the child — zero bytes copied.
+    ///
+    /// Requires the source to be pinned: a sealed layer over a moving trunk tip
+    /// would give the child a base with no stable identity. The caller downgrades
+    /// unpinned sources to `materialize` before getting here.
+    #[allow(clippy::too_many_arguments)]
+    async fn fork_mount_chain(
+        &self,
+        source_mount_id: Uuid,
+        request: ForkMountRequest,
+        source_path: String,
+        source_upper: PathBuf,
+        source_pinned: String,
+        mut source_chain: Vec<String>,
+        inherited_base: String,
+        start: Instant,
+    ) -> Result<ForkMountResponse, ServiceError> {
+        let upper_root = PathBuf::from(crate::util::config::antares_upper_root());
+        let frozen = upper_root.join(format!("sealed-{}", Uuid::new_v4()));
+        let source_new_upper = upper_root.join(Uuid::new_v4().to_string());
+        // Parent's VCS pointer target (host gitdir), captured while sealing.
+        let mut source_pointer_target: Option<PathBuf> = None;
+
+        // 1. Quiesce the source and seal its upper with one rename (same filesystem,
+        //    atomic). Rollback restores the rename and the mount.
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&source_mount_id)
+                .ok_or(ServiceError::NotFound(source_mount_id))?;
+            entry.state = MountLifecycle::Quiescing;
+            if let Err(e) = entry.fuse.unmount().await {
+                entry.state = MountLifecycle::Ready;
+                return Err(ServiceError::FuseFailure(format!(
+                    "chain fork: failed to quiesce the source mount: {e}"
+                )));
+            }
+            if let Err(e) = std::fs::rename(&source_upper, &frozen) {
+                entry.state = MountLifecycle::Ready;
+                return Err(ServiceError::FuseFailure(format!(
+                    "chain fork: failed to seal the source upper: {e}"
+                )));
+            }
+            // The sealed layer must not carry the parent's VCS pointer: the child
+            // inherits the layer read-only and would otherwise resolve the PARENT's
+            // `.libra` (wrong index, wrong identity). Capture the pointer target so
+            // the parent's rebuilt upper can serve the same link, then drop it from
+            // the sealed layer.
+            source_pointer_target = std::fs::read_link(frozen.join(".libra")).ok();
+            let pointer_path = frozen.join(".libra");
+            match std::fs::symlink_metadata(&pointer_path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    if let Err(e) = std::fs::remove_file(&pointer_path) {
+                        entry.state = MountLifecycle::Ready;
+                        return Err(ServiceError::FuseFailure(format!(
+                            "chain fork: failed to strip the VCS pointer from the sealed layer: {e}"
+                        )));
+                    }
+                }
+                Ok(meta) if meta.is_dir() => {
+                    if let Err(e) = std::fs::remove_dir_all(&pointer_path) {
+                        entry.state = MountLifecycle::Ready;
+                        return Err(ServiceError::FuseFailure(format!(
+                            "chain fork: failed to strip the VCS pointer dir from the sealed layer: {e}"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Rebuild the source: fresh empty upper over [frozen] + its old chain.
+        //    Its view is unchanged and it keeps accepting writes; the child shares
+        //    the same sealed layer read-only.
+        let source_dicfuse =
+            DicfuseManager::for_base_path_and_refs(&source_path, &source_pinned).await;
+        if tokio::time::timeout(
+            Duration::from_secs(180),
+            source_dicfuse.store.wait_for_ready(),
+        )
+        .await
+        .is_err()
+        {
+            // Roll back the seal: the source keeps its original upper, unchained.
+            if let Err(rename_err) = std::fs::rename(&frozen, &source_upper) {
+                tracing::error!(
+                    "chain fork: rollback rename failed: {rename_err}; the source upper is now at {}",
+                    frozen.display()
+                );
+            }
+            {
+                let mut mounts = self.mounts.write().await;
+                if let Some(entry) = mounts.get_mut(&source_mount_id) {
+                    entry.state = MountLifecycle::Ready;
+                }
+            }
+            return Err(ServiceError::FuseFailure(
+                "chain fork: the sealed Dicfuse projection did not become ready; the source was restored unchanged".into(),
+            ));
+        }
+
+        let mut new_chain: Vec<String> = vec![frozen.to_string_lossy().to_string()];
+        new_chain.extend(source_chain.iter().cloned());
+
+        let (source_mountpoint, source_cl_dir) = {
+            let mounts = self.mounts.read().await;
+            match mounts.get(&source_mount_id) {
+                Some(entry) => (
+                    entry.mountpoint.clone(),
+                    entry.cl_dir.clone().map(PathBuf::from),
+                ),
+                None => {
+                    let _ = std::fs::rename(&frozen, &source_upper);
+                    return Err(ServiceError::Internal(
+                        "chain fork: source mount vanished mid-fork".into(),
+                    ));
+                }
+            }
+        };
+
+        let source_fuse = match AntaresFuse::new(
+            PathBuf::from(&source_mountpoint),
+            source_dicfuse.clone(),
+            source_new_upper.clone(),
+            source_cl_dir.clone(),
+        )
+        .await
+        .and_then(|fuse| fuse.with_frozen_layers(new_chain.iter().map(PathBuf::from).collect()))
+        .map_err(|e| ServiceError::FuseFailure(format!("chain fork source rebuild: {e}")))
+        {
+            Ok(mut fuse) => match fuse.mount().await {
+                Ok(()) => fuse,
+                Err(e) => {
+                    let _ = Self::remount_with_lower(
+                        Path::new(&source_mountpoint),
+                        source_dicfuse,
+                        &source_upper,
+                        source_cl_dir.as_deref(),
+                        &source_chain,
+                    )
+                    .await;
+                    let _ = std::fs::rename(&frozen, &source_upper);
+                    return Err(ServiceError::FuseFailure(format!(
+                        "chain fork: source remount failed: {e}"
+                    )));
+                }
+            },
+            Err(e) => {
+                let _ = std::fs::rename(&frozen, &source_upper);
+                return Err(ServiceError::FuseFailure(format!(
+                    "chain fork: source rebuild failed: {e}"
+                )));
+            }
+        };
+
+        // Serve the same VCS pointer from the parent's new upper: the sealed layer
+        // no longer carries it, and Libra expects `<worktree>/.libra` to resolve.
+        if let Some(target) = &source_pointer_target {
+            std::os::unix::fs::symlink(target, source_new_upper.join(".libra")).map_err(|e| {
+                ServiceError::FuseFailure(format!(
+                    "chain fork: failed to re-create the parent VCS pointer: {e}"
+                ))
+            })?;
+        }
+
+        {
+            let mut mounts = self.mounts.write().await;
+            if let Some(entry) = mounts.get_mut(&source_mount_id) {
+                entry.fuse = source_fuse;
+                entry.upper_dir = source_new_upper.to_string_lossy().to_string();
+                entry.sealed_chain = new_chain.clone();
+                entry.state = MountLifecycle::Ready;
+                entry.last_seen_epoch_ms = current_epoch_ms();
+            }
+        }
+        self.persist_state().await;
+
+        // 3. The child: fresh upper over [frozen] + the source's old chain, the same
+        //    pinned Dicfuse instance (shared through the manager cache), the same
+        //    bound base. create_mount handles duplicates and job binding.
+        let job_id = request
+            .job_id
+            .clone()
+            .unwrap_or_else(|| format!("chain-fork-{}-{}", source_mount_id, Uuid::new_v4()));
+        let created = match self
+            .create_mount(CreateMountRequest {
+                job_id: Some(job_id),
+                build_id: None,
+                path: source_path,
+                cl_path: None,
+                cl: None,
+                mountpoint: request.mountpoint.clone(),
+                upper_dir: None,
+                pinned_refs: Some(source_pinned.clone()),
+                sealed_chain: new_chain.clone(),
+            })
+            .await
+        {
+            Ok(created) => created,
+            Err(e) => {
+                // The source is already rebuilt and writable; only the child failed.
+                return Err(ServiceError::Internal(format!(
+                    "chain fork: child mount failed (source unchanged): {e}"
+                )));
+            }
+        };
+
+        // 4. Bind the child's base to the inherited revision (fresh clean mount).
+        self.bind_worktree_base(
+            created.mount_id,
+            BindWorktreeBaseRequest {
+                base_revision: inherited_base.clone(),
+                vcs_pointer: None,
+            },
+        )
+        .await?;
+
+        // 5. Report the child's lower chain: the sealed dirs, nearest first, then
+        //    the pinned Dicfuse projection.
+        let mut lower_chain: Vec<String> = new_chain.clone();
+        lower_chain.push(format!("dicfuse@{source_pinned}"));
+
+        tracing::info!(
+            source_mount_id = %source_mount_id,
+            mount_id = %created.mount_id,
+            sealed_layer = %frozen.display(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "antares svc: fork_mount_chain success"
+        );
+
+        Ok(ForkMountResponse {
+            mount_id: created.mount_id,
+            job_id: request.job_id,
+            path: created.mountpoint,
+            source_mount_id,
+            mode: ForkMode::Chain,
+            mode_downgraded_from: None,
+            lower_chain,
+            // Inherited: a fork is a copy of the same revision, not a new one.
+            base_revision: Some(inherited_base),
+            mount_state: MountLifecycle::Ready,
+            source_frozen_layer: Some(frozen.to_string_lossy().to_string()),
+            copy_stats: None,
+        })
+    }
+
     async fn persist_state(&self) {
         if self.state_ownership == StateOwnership::External {
             return;
@@ -1604,10 +2726,13 @@ impl AntaresServiceImpl {
                     cl_path: e.cl_path.clone(),
                     cl: e.cl.clone(),
                     base_revision: e.base_revision.clone(),
+                    pinned_refs: e.pinned_refs.clone(),
+                    sealed_chain: e.sealed_chain.clone(),
                     mountpoint: e.mountpoint.clone(),
                     upper_dir: e.upper_dir.clone(),
                     cl_dir: e.cl_dir.clone(),
                     created_at_epoch_ms: e.created_at_epoch_ms,
+                    mst2_lower: e.mst2_lower.is_some(),
                 })
                 .collect(),
         };
@@ -1667,6 +2792,18 @@ impl AntaresServiceImpl {
         tracing::info!("Recovering {} mounts from state file", state.mounts.len());
 
         for persisted in state.mounts {
+            // An MST/2-lowered mount is not restored: its view is resolved per
+            // process, and rebuilding the mount with the Dicfuse projection
+            // instead would silently serve a different base (spec 15 §3).
+            if persisted.mst2_lower {
+                tracing::warn!(
+                    mount_id = %persisted.mount_id,
+                    "not restoring an MST/2-lowered mount after restart; re-attach it \
+                     (the Dicfuse projection would be a different base)"
+                );
+                continue;
+            }
+
             // Check if mountpoint still exists
             let mountpoint = PathBuf::from(&persisted.mountpoint);
             if !mountpoint.exists() {
@@ -1677,24 +2814,56 @@ impl AntaresServiceImpl {
                 continue;
             }
 
-            // Get or create Dicfuse instance (uses cache for subdirectory paths)
-            let dicfuse = match self.get_or_create_dicfuse(&persisted.path).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to get Dicfuse for {} during recovery: {}",
-                        persisted.mount_id,
-                        e
-                    );
-                    continue;
+            // Get or create Dicfuse instance (uses cache for subdirectory paths).
+            // A pinned mount must come back pinned: an unpinned instance would serve
+            // the moving trunk tip, silently breaking the lower_revision invariant.
+            let dicfuse = match &persisted.pinned_refs {
+                Some(refs) => {
+                    let pinned =
+                        DicfuseManager::for_base_path_and_refs(&persisted.path, refs).await;
+                    match tokio::time::timeout(
+                        Duration::from_secs(120),
+                        pinned.store.wait_for_ready(),
+                    )
+                    .await
+                    {
+                        Ok(()) => pinned,
+                        Err(_) => {
+                            tracing::warn!(
+                                "Pinned Dicfuse for {} at {} did not become ready during recovery",
+                                persisted.mount_id,
+                                refs
+                            );
+                            continue;
+                        }
+                    }
                 }
+                None => match self.get_or_create_dicfuse(&persisted.path, None).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to get Dicfuse for {} during recovery: {}",
+                            persisted.mount_id,
+                            e
+                        );
+                        continue;
+                    }
+                },
             };
 
             let upper_dir = PathBuf::from(&persisted.upper_dir);
             let cl_dir = persisted.cl_dir.as_ref().map(PathBuf::from);
 
             // Try to create and mount AntaresFuse
-            match AntaresFuse::new(mountpoint.clone(), dicfuse, upper_dir, cl_dir.clone()).await {
+            let frozen = persisted
+                .sealed_chain
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            match AntaresFuse::new(mountpoint.clone(), dicfuse, upper_dir, cl_dir.clone())
+                .await
+                .and_then(|fuse| fuse.with_frozen_layers(frozen))
+            {
                 Ok(mut fuse) => {
                     if let Err(e) = fuse.mount().await {
                         tracing::warn!(
@@ -1717,10 +2886,15 @@ impl AntaresServiceImpl {
                         cl_path: Some(cl_path.clone()),
                         cl: persisted.cl.clone(),
                         base_revision: persisted.base_revision.clone(),
+                        pinned_refs: persisted.pinned_refs.clone(),
+                        sealed_chain: persisted.sealed_chain.clone(),
                         mountpoint: persisted.mountpoint.clone(),
                         upper_dir: persisted.upper_dir.clone(),
                         cl_dir: persisted.cl_dir.clone(),
                         fuse,
+                        // Recovery only restores Dicfuse-lowered mounts; the
+                        // MST/2 ones are skipped above and must be re-attached.
+                        mst2_lower: None,
                         // Dicfuse is ready after AntaresFuse::new() completes import_arc.
                         state: MountLifecycle::Ready,
                         created_at_epoch_ms: persisted.created_at_epoch_ms,
@@ -1790,6 +2964,24 @@ impl AntaresServiceImpl {
                 "changes.v1".to_string(),
                 "worktree-base.v1".to_string(),
                 "refresh-plan.v1".to_string(),
+                // Advertises that this daemon records upper-layer deletions in the OCI
+                // whiteout form (`.wh.<name>`), so a deletion of a lower-layer file is
+                // observable in `changes` without requiring `CAP_MKNOD`. A VCS client that
+                // relies on deletions (e.g. a `sync` that must delete remote files) must
+                // refuse to operate when this capability is absent rather than silently
+                // miss deletions.
+                "whiteout.oci.v1".to_string(),
+                // Derive a new worktree mount from an existing one
+                // (`POST /mounts/{mount_id}/fork`).
+                "fork.v1".to_string(),
+                // Worktree Control Protocol v2: effective diff, commit finalize,
+                // lower refresh (docs/scorpiofs-libra-complete-spec-v1.md).
+                "worktree.state.v2".to_string(),
+                "worktree.attach.v2".to_string(),
+                // Chain forks: sealed layers shared between parent and child.
+                "worktree.fork-chain.v2".to_string(),
+                "worktree.commit-finalize.v2".to_string(),
+                "worktree.refresh.v2".to_string(),
             ],
             status: "healthy".to_string(),
             mount_count: mounts.len(),
@@ -1929,8 +3121,28 @@ impl AntaresService for AntaresServiceImpl {
         let cl_root = crate::util::config::antares_cl_root();
 
         // Auto-generate paths based on UUID
-        let mountpoint_str = format!("{}/{}", mount_root, id_str);
-        let upper_dir_str = format!("{}/{}", upper_root, id_str);
+        let mountpoint_str = request
+            .mountpoint
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", mount_root, id_str));
+        // `fork` supplies a pre-populated upper (see `CreateMountRequest::upper_dir`);
+        // everything else gets a fresh one. The hint is validated to sit under the
+        // configured upper root so a stray value cannot point the failure-path
+        // `remove_dir_all` at an unrelated directory.
+        let upper_dir_str = match request.upper_dir.as_deref() {
+            Some(hint) => {
+                let hint_path = Path::new(hint.trim_end_matches('/'));
+                let root = Path::new(upper_root.trim_end_matches('/'));
+                if hint_path.parent() != Some(root) {
+                    return Err(ServiceError::InvalidRequest(format!(
+                        "upper_dir must be a direct child of {}",
+                        root.display()
+                    )));
+                }
+                hint_path.to_string_lossy().to_string()
+            }
+            None => format!("{}/{}", upper_root, id_str),
+        };
         let cl_dir_str = request
             .cl
             .as_ref()
@@ -1972,12 +3184,29 @@ impl AntaresService for AntaresServiceImpl {
         // If a specific base path is requested (not root), get from cache or create a dedicated
         // Dicfuse with path remapping. Otherwise, use the shared global instance.
         // This may take time for new subdirectory paths as it waits for import_arc to complete.
-        let dicfuse = self.get_or_create_dicfuse(&request.path).await?;
+        let dicfuse = self
+            .get_or_create_dicfuse(&request.path, request.pinned_refs.as_deref())
+            .await?;
 
         // 6. Create AntaresFuse instance (may take time, not holding lock)
+        let sealed = request
+            .sealed_chain
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
         let mut fuse = AntaresFuse::new(mountpoint, dicfuse, upper_dir, cl_dir)
             .await
+            .and_then(|fuse| fuse.with_frozen_layers(sealed))
             .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
+
+        // MST/2 lower projection (spec 12 §1): when the operator enabled it,
+        // the snapshot view takes the Dicfuse slot as the overlay's base layer.
+        // The view is kept on the mount entry so the effective diff compares
+        // against the projection that is actually being served.
+        let mst2_lower = mst2_lower_layer().await?;
+        if let Some(view) = &mst2_lower {
+            fuse = fuse.with_lower_override(view.clone() as Arc<dyn libfuse_fs::unionfs::layer::Layer>);
+        }
 
         // 7. Mount the filesystem
         fuse.mount()
@@ -2059,10 +3288,13 @@ impl AntaresService for AntaresServiceImpl {
             cl_path: request.cl_path.clone(),
             cl: request.cl.clone(),
             base_revision: None,
+            pinned_refs: request.pinned_refs.clone(),
+            sealed_chain: request.sealed_chain.clone(),
             mountpoint: mountpoint_str.clone(),
             upper_dir: upper_dir_str.clone(),
             cl_dir: cl_dir_str.clone(),
             fuse,
+            mst2_lower,
             state: MountLifecycle::Mounted,
             created_at_epoch_ms: now,
             last_seen_epoch_ms: now,
@@ -2245,21 +3477,49 @@ impl AntaresService for AntaresServiceImpl {
             ));
         }
 
-        let existing_base = {
+        // Collect what validation needs first: the pointer write below is filesystem
+        // I/O and should not run while holding the mount-table lock.
+        let (existing_base, mountpoint, cl_present, mount_state) = {
             let mounts = self.mounts.read().await;
             let entry = mounts
                 .get(&mount_id)
                 .ok_or(ServiceError::NotFound(mount_id))?;
-            entry.base_revision.clone()
+            (
+                entry.base_revision.clone(),
+                PathBuf::from(&entry.mountpoint),
+                entry.cl.is_some(),
+                entry.state.clone(),
+            )
         };
-        if let Some(existing) = existing_base {
+
+        if let Some(existing) = &existing_base {
             if existing != base_revision {
                 return Err(ServiceError::InvalidRequest(format!(
                     "mount {} is already bound to base revision {}",
                     mount_id, existing
                 )));
             }
+            // Repeating the same binding is idempotent, and re-asserts the pointer so a
+            // caller whose first attempt lost the write can simply ask again.
+            if let Some(pointer) = &request.vcs_pointer {
+                write_vcs_pointer(&mountpoint, pointer)?;
+            }
             return self.worktree_state(mount_id).await;
+        }
+
+        if !matches!(
+            &mount_state,
+            MountLifecycle::Mounted | MountLifecycle::Ready
+        ) {
+            return Err(ServiceError::InvalidRequest(format!(
+                "mount {} is currently in state {:?}; cannot bind a Libra worktree base",
+                mount_id, mount_state
+            )));
+        }
+        if cl_present {
+            return Err(ServiceError::InvalidRequest(
+                "cannot bind a Libra worktree base to a mount with a CL layer".into(),
+            ));
         }
 
         let state = self.worktree_state(mount_id).await?;
@@ -2269,11 +3529,19 @@ impl AntaresService for AntaresServiceImpl {
             ));
         }
 
+        // Pointer first, binding second: if the pointer cannot be written, no binding
+        // has been advertised on the strength of state that is not on disk.
+        if let Some(pointer) = &request.vcs_pointer {
+            write_vcs_pointer(&mountpoint, pointer)?;
+        }
+
         {
             let mut mounts = self.mounts.write().await;
             let entry = mounts
                 .get_mut(&mount_id)
                 .ok_or(ServiceError::NotFound(mount_id))?;
+            // Re-check under the write lock: the mount may have moved on while the
+            // pointer was being written.
             if !matches!(entry.state, MountLifecycle::Mounted | MountLifecycle::Ready) {
                 return Err(ServiceError::InvalidRequest(format!(
                     "mount {} is currently in state {:?}; cannot bind a Libra worktree base",
@@ -2285,16 +3553,18 @@ impl AntaresService for AntaresServiceImpl {
                     "cannot bind a Libra worktree base to a mount with a CL layer".into(),
                 ));
             }
-            if let Some(existing) = &entry.base_revision {
-                if existing != base_revision {
+            match &entry.base_revision {
+                Some(existing) if existing != base_revision => {
                     return Err(ServiceError::InvalidRequest(format!(
                         "mount {} is already bound to base revision {}",
                         mount_id, existing
                     )));
                 }
-            } else {
-                entry.base_revision = Some(base_revision.to_string());
-                entry.update_last_seen();
+                Some(_) => {}
+                None => {
+                    entry.base_revision = Some(base_revision.to_string());
+                    entry.update_last_seen();
+                }
             }
         }
 
@@ -2335,6 +3605,835 @@ impl AntaresService for AntaresServiceImpl {
         })
     }
 
+    async fn fork_mount(
+        &self,
+        source_mount_id: Uuid,
+        request: ForkMountRequest,
+    ) -> Result<ForkMountResponse, ServiceError> {
+        let start = Instant::now();
+
+        // Resolve what we need from the source, then drop the lock: the delta copy
+        // below does blocking filesystem I/O and must not hold the mount table.
+        //
+        // The monorepo path is *inherited*: a fork is a second worktree over the same
+        // subtree, so the caller does not get to point it somewhere else. Note that
+        // `path` here is the monorepo path (as on `POST /mounts`), **not** a filesystem
+        // location — the child's mountpoint is generated by `create_mount`.
+        let (source_path, source_upper, source_cl, source_cl_path, source_base, source_pinned, source_chain) = {
+            let mounts = self.mounts.read().await;
+            let entry = mounts
+                .get(&source_mount_id)
+                .ok_or(ServiceError::NotFound(source_mount_id))?;
+
+            if matches!(
+                &entry.state,
+                MountLifecycle::Quiescing | MountLifecycle::Unmounting | MountLifecycle::Unmounted
+            ) {
+                return Err(ServiceError::InvalidRequest(format!(
+                    "source mount {} is in state {:?} and cannot be forked from",
+                    source_mount_id, entry.state
+                )));
+            }
+
+            (
+                entry.path.clone(),
+                PathBuf::from(&entry.upper_dir),
+                entry.cl.clone(),
+                entry.cl_path.clone(),
+                entry.base_revision.clone(),
+                entry.pinned_refs.clone(),
+                entry.sealed_chain.clone(),
+            )
+        };
+
+        let inherited_base = source_base.clone().ok_or_else(|| {
+            ServiceError::InvalidRequest(
+                "cannot fork a worktree without a bound base revision".into(),
+            )
+        })?;
+
+        // Chain requires a pinned source: a sealed layer over a MOVING trunk tip
+        // would make the child's base meaningless. Unpinned sources fall back to
+        // materialize and the response says so.
+        let (mode, mode_downgraded_from) = match (&request.mode, &source_pinned) {
+            (ForkMode::Chain, None) => (ForkMode::Materialize, Some(ForkMode::Chain)),
+            (ForkMode::Chain, Some(_)) => (ForkMode::Chain, None),
+            (ForkMode::Materialize, _) => (ForkMode::Materialize, None),
+        };
+        // The child is a distinct mount: never inherit the source's job binding,
+        // and never let the (path, cl) duplicate check reject a second fork.
+        let job_id = request
+            .job_id
+            .clone()
+            .unwrap_or_else(|| format!("fork-{}-{}", source_mount_id, Uuid::new_v4()));
+        let sealed_fork = mode == ForkMode::Chain;
+
+        if sealed_fork {
+            return self
+                .fork_mount_chain(
+                    source_mount_id,
+                    request.clone(),
+                    source_path.clone(),
+                    source_upper.clone(),
+                    source_pinned
+                        .clone()
+                        .expect("checked above: chain requires a pinned source"),
+                    source_chain.clone(),
+                    inherited_base.clone(),
+                    start,
+                )
+                .await;
+        }
+
+        // The child's delta must be on disk *before* the FUSE session starts, because
+        // the upper layer is only imported at mount time. So it is copied into a
+        // staging upper directory, which `create_mount` then adopts (the internal
+        // `upper_dir` field) instead of generating an empty one.
+        let staging = PathBuf::from(crate::util::config::antares_upper_root())
+            .join(Uuid::new_v4().to_string());
+
+        let (src, dst) = (source_upper.clone(), staging.clone());
+        let copied = tokio::task::spawn_blocking(move || fork_upper(&src, &dst))
+            .await
+            .map_err(|e| ServiceError::Internal(format!("fork delta copy task failed: {e}")))?;
+
+        let copy_stats = match copied {
+            Ok(stats) => stats,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(match err {
+                    ForkCopyError::SourceBusy { .. } => {
+                        ServiceError::InvalidRequest(format!("fork aborted: {err}"))
+                    }
+                    ForkCopyError::UnsupportedEntry { .. } => ServiceError::InvalidRequest(
+                        format!("fork cannot copy this worktree: {err}"),
+                    ),
+                    ForkCopyError::Io { .. } => {
+                        ServiceError::Internal(format!("fork failed while copying: {err}"))
+                    }
+                });
+            }
+        };
+
+        let inherit_cl = request.inherit_cl;
+        let created = match self
+            .create_mount(CreateMountRequest {
+                job_id: Some(job_id),
+                build_id: None,
+                path: source_path,
+                cl_path: if inherit_cl { source_cl_path } else { None },
+                cl: if inherit_cl { source_cl } else { None },
+                mountpoint: request.mountpoint.clone(),
+                upper_dir: Some(staging.to_string_lossy().to_string()),
+                // The child inherits the source's pin: a fork of a pinned worktree
+                // must not silently fall back to the moving trunk tip.
+                pinned_refs: source_pinned,
+                sealed_chain: Vec::new(),
+            })
+            .await
+        {
+            Ok(created) => created,
+            Err(err) => {
+                // `create_mount` rolls back the paths it owns, but the staging
+                // directory is ours to clean up.
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err);
+            }
+        };
+
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&created.mount_id)
+                .ok_or(ServiceError::NotFound(created.mount_id))?;
+            entry.base_revision = Some(inherited_base.clone());
+            entry.update_last_seen();
+        }
+        self.persist_state().await;
+
+        let status = self.describe_mount(created.mount_id).await?;
+
+        // Nearest-first: the CL layer (a build baseline) sits above the shared
+        // Dicfuse projection. Callers must not reorder this.
+        let mut lower_chain = Vec::new();
+        if let Some(cl) = status.layers.cl.clone() {
+            lower_chain.push(cl);
+        }
+        lower_chain.push(status.layers.dicfuse.clone());
+
+        tracing::info!(
+            source_mount_id = %source_mount_id,
+            mount_id = %created.mount_id,
+            mode = ?mode,
+            files = copy_stats.files,
+            bytes = copy_stats.bytes,
+            reflink_used = copy_stats.reflink_used,
+            retries = copy_stats.retries,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "antares svc: fork_mount success"
+        );
+
+        Ok(ForkMountResponse {
+            mount_id: created.mount_id,
+            job_id: status.job_id.clone(),
+            path: status.mountpoint.clone(),
+            source_mount_id,
+            mode,
+            mode_downgraded_from,
+            lower_chain,
+            // Inherited: a fork is a copy of the same revision, not a new one.
+            base_revision: Some(inherited_base),
+            mount_state: status.state.clone(),
+            // Reserved for `chain`; always absent under `materialize`.
+            source_frozen_layer: None,
+            copy_stats: Some(copy_stats),
+        })
+    }
+
+    async fn attach_worktree(
+        &self,
+        request: AttachWorktreeRequest,
+    ) -> Result<AttachWorktreeResponse, ServiceError> {
+        let start = Instant::now();
+        let repo_path = Self::normalize_mount_path(&request.repo_path);
+
+        // Fail before creating anything if the mountpoint cannot serve a FUSE
+        // session — the same rule v1's mount path enforces, just earlier.
+        let mountpoint = PathBuf::from(Self::normalize_mount_path(&request.mountpoint));
+        crate::server::prepare_mountpoint(&mountpoint).map_err(|e| {
+            ServiceError::InvalidRequest(format!(
+                "attach target {} is not usable as a mountpoint: {e}",
+                mountpoint.display()
+            ))
+        })?;
+
+        // Pin the lower now: an explicit internal OID from the client, or the
+        // monorepo's latest commit for the path. Either way the projection is
+        // immutable from the first request — no tip-drift window before bind.
+        let lower_revision = match request.lower_revision.as_deref().map(str::trim) {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => resolve_latest_revision(config::base_url(), &repo_path)
+                .await
+                .map_err(ServiceError::Internal)?,
+        };
+
+        let created = self
+            .create_mount(CreateMountRequest {
+                job_id: request.job_id.clone(),
+                build_id: None,
+                path: repo_path.clone(),
+                cl_path: None,
+                cl: None,
+                mountpoint: Some(mountpoint.to_string_lossy().to_string()),
+                upper_dir: None,
+                pinned_refs: Some(lower_revision.clone()),
+                sealed_chain: Vec::new(),
+            })
+            .await?;
+
+        // Record the client-side binding on the fresh (clean) mount: the same
+        // validation v1's bind endpoint runs, inlined for the single-call attach.
+        // The pointer files stay the client's business — the daemon never writes
+        // VCS metadata into a mount.
+        if let Some(base) = request
+            .base_revision
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        {
+            self.bind_worktree_base(
+                created.mount_id,
+                BindWorktreeBaseRequest {
+                    base_revision: base.to_string(),
+                    vcs_pointer: None,
+                },
+            )
+            .await?;
+        }
+
+        let generation = {
+            let mounts = self.mounts.read().await;
+            let entry = mounts
+                .get(&created.mount_id)
+                .ok_or(ServiceError::NotFound(created.mount_id))?;
+            let chain_dirs = entry
+                .sealed_chain
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let changes = effective_changes(lower_view_for(entry).as_ref(), Path::new(&entry.upper_dir), &chain_dirs)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+            generation_of(&changes)
+        };
+
+        tracing::info!(
+            mount_id = %created.mount_id,
+            worktree_id = ?request.worktree_id,
+            repo_path = %repo_path,
+            lower_revision = %lower_revision,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "antares svc: attach_worktree success"
+        );
+
+        Ok(AttachWorktreeResponse {
+            mount_id: created.mount_id.to_string(),
+            worktree_id: request.worktree_id,
+            mountpoint: created.mountpoint,
+            base_revision: request.base_revision,
+            lower_revision,
+            state: "ready".into(),
+            generation,
+        })
+    }
+
+    async fn worktree_state_v2(&self, mount_id: Uuid) -> Result<WorktreeStateV2, ServiceError> {
+        let (path, upper_dir, base_revision, pinned_refs, sealed_chain, mount_state, mst2_lower) = {
+            let mounts = self.mounts.read().await;
+            let entry = mounts
+                .get(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            (
+                entry.path.clone(),
+                PathBuf::from(&entry.upper_dir),
+                entry.base_revision.clone(),
+                entry.pinned_refs.clone(),
+                entry.sealed_chain.clone(),
+                entry.state.clone(),
+                entry.mst2_lower.clone(),
+            )
+        };
+
+        let dicfuse = self
+            .lower_dicfuse_for(&path, pinned_refs.as_deref())
+            .await?;
+        let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
+        let view: Arc<dyn crate::daemon::lower_view::LowerView> = match &mst2_lower {
+            Some(view) => Arc::new(crate::daemon::lower_view::Mst2Lower(view.clone())),
+            None => Arc::new(DicfuseLower(dicfuse.store.clone())),
+        };
+        let changes = effective_changes(view.as_ref(), &upper_dir, &chain_dirs)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+
+        Ok(WorktreeStateV2 {
+            mount_id: mount_id.to_string(),
+            lower_revision: pinned_refs,
+            base_revision,
+            state: format!("{mount_state:?}").to_lowercase(),
+            generation,
+            dirty: !changes.is_empty(),
+            changes,
+        })
+    }
+
+    async fn commit_finalize(
+        &self,
+        mount_id: Uuid,
+        request: CommitFinalizeRequest,
+    ) -> Result<CommitFinalizeResponse, ServiceError> {
+        let start = Instant::now();
+
+        // Phase A — reads and builds only. Every failure below this point leaves
+        // the mount, the upper layer, and the bound revision untouched.
+        let (path, upper_dir, cl_dir, mountpoint, base_revision, pinned_refs, sealed_chain, mount_state, mst2_lower) = {
+            let mounts = self.mounts.read().await;
+            let entry = mounts
+                .get(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            (
+                entry.path.clone(),
+                PathBuf::from(&entry.upper_dir),
+                entry.cl_dir.clone().map(PathBuf::from),
+                PathBuf::from(&entry.mountpoint),
+                entry.base_revision.clone(),
+                entry.pinned_refs.clone(),
+                entry.sealed_chain.clone(),
+                entry.state.clone(),
+                entry.mst2_lower.clone(),
+            )
+        };
+        if !matches!(mount_state, MountLifecycle::Mounted | MountLifecycle::Ready) {
+            return Err(ServiceError::InvalidRequest(format!(
+                "mount {mount_id} is in state {mount_state:?}; cannot finalize a commit"
+            )));
+        }
+        // MST/2-lowered mounts move their lower by resolving a new snapshot, not
+        // by re-pinning the Dicfuse projection (P3; see
+        // mst2-impl/P3-HASH-DOMAIN-DESIGN.md).
+        if let Some(old_view) = mst2_lower.clone() {
+            return self
+                .mst2_commit_finalize(
+                    mount_id,
+                    request,
+                    old_view,
+                    &path,
+                    &upper_dir,
+                    cl_dir.as_deref(),
+                    &mountpoint,
+                    &base_revision,
+                    start,
+                )
+                .await;
+        }
+
+        let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
+        let current = self
+            .lower_dicfuse_for(&path, pinned_refs.as_deref())
+            .await?;
+        let changes = effective_changes(&DicfuseLower(current.store.clone()), &upper_dir, &chain_dirs)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+
+        if let Some(expected) = request.expected_generation {
+            if expected != generation {
+                return Ok(CommitFinalizeResponse {
+                    state: "conflict".into(),
+                    code: Some("GENERATION_CHANGED".into()),
+                    detail: Some(format!(
+                        "state generation {expected} no longer matches {generation}; \
+                         re-read state and re-commit"
+                    )),
+                    base_revision: base_revision.unwrap_or_default(),
+                    lower_revision: pinned_refs,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                });
+            }
+        }
+        if let Some(expected) = &request.expected_base_revision {
+            match &base_revision {
+                Some(actual) if actual != expected => {
+                    return Ok(CommitFinalizeResponse {
+                        state: "conflict".into(),
+                        code: Some("BASE_MISMATCH".into()),
+                        detail: Some(format!(
+                            "bound base revision is {actual}, client expected {expected}"
+                        )),
+                        base_revision: base_revision.unwrap_or_default(),
+                        lower_revision: pinned_refs,
+                        generation,
+                        cleaned_paths: Vec::new(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let new_refs = match request.new_base_revision.as_deref().map(str::trim) {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => resolve_latest_revision(config::base_url(), &path)
+                .await
+                .map_err(ServiceError::Internal)?,
+        };
+
+        // A sealed chain is a delta against the OLD revision: keeping it across a
+        // lower switch would let stale chain entries shadow the new projection.
+        // Flatten it into the upper (nearest wins, upper wins over everything);
+        // the chain's O(1) fork cost becomes a one-time O(uncommitted delta) here.
+        let chain_empty = chain_dirs.is_empty();
+        if !chain_empty {
+            let dirs = chain_dirs.clone();
+            let upper = upper_dir.clone();
+            tokio::task::spawn_blocking(move || flatten_chain_into_upper(&dirs, &upper))
+                .await
+                .map_err(|e| ServiceError::Internal(format!("chain flatten task failed: {e}")))?
+                .map_err(|e| ServiceError::Internal(format!("chain flatten failed: {e}")))?;
+        }
+
+        // Already at the requested revision: only the upper cleanup remains, which
+        // makes a retried finalize idempotent. The chain is already flattened.
+        if pinned_refs.as_deref() == Some(new_refs.as_str()) {
+            let cleaned = remove_committed_upper_entries(&upper_dir, &request.committed_paths)
+                .map_err(|e| ServiceError::Internal(format!("upper cleanup failed: {e}")))?;
+            {
+                let mut mounts = self.mounts.write().await;
+                if let Some(entry) = mounts.get_mut(&mount_id) {
+                    entry.sealed_chain = Vec::new();
+                    entry.last_seen_epoch_ms = current_epoch_ms();
+                }
+            }
+            self.persist_state().await;
+            let changes = effective_changes(&DicfuseLower(current.store.clone()), &upper_dir, &[])
+                .await
+                .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+            return Ok(CommitFinalizeResponse {
+                state: "ready".into(),
+                code: None,
+                detail: None,
+                base_revision: base_revision.unwrap_or_default(),
+                lower_revision: pinned_refs,
+                generation: generation_of(&changes),
+                cleaned_paths: cleaned,
+            });
+        }
+
+        let new_dicfuse = DicfuseManager::for_base_path_and_refs(&path, &new_refs).await;
+        if tokio::time::timeout(
+            Duration::from_secs(180),
+            new_dicfuse.store.wait_for_ready(),
+        )
+        .await
+        .is_err()
+        {
+            return Ok(CommitFinalizeResponse {
+                state: "failed".into(),
+                code: Some("SWITCH_FAILED".into()),
+                detail: Some(format!(
+                    "pinned lower for revision {new_refs} did not become ready"
+                )),
+                base_revision: base_revision.unwrap_or_default(),
+                lower_revision: pinned_refs,
+                generation,
+                cleaned_paths: Vec::new(),
+            });
+        }
+
+        if let Err(detail) =
+            Self::verify_committed_paths(&new_dicfuse.store, &request.committed_paths).await
+        {
+            return Ok(CommitFinalizeResponse {
+                state: "conflict".into(),
+                code: Some("TREE_MISMATCH".into()),
+                detail: Some(detail),
+                base_revision: base_revision.unwrap_or_default(),
+                lower_revision: pinned_refs,
+                generation,
+                cleaned_paths: Vec::new(),
+            });
+        }
+
+        // Phase B — mutation. Quiesce, remove exactly the committed entries, then
+        // remount over the new lower. Rollbacks restore the original chain: the
+        // flatten was view-neutral, so the original stack serves the same bytes.
+        let old_dicfuse = current;
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.state = MountLifecycle::Quiescing;
+            if let Err(e) = entry.fuse.unmount().await {
+                entry.state = MountLifecycle::Ready;
+                return Err(ServiceError::FuseFailure(format!(
+                    "failed to quiesce mount {mount_id}: {e}"
+                )));
+            }
+        }
+
+        let cleaned = match remove_committed_upper_entries(&upper_dir, &request.committed_paths)
+        {
+            Ok(cleaned) => cleaned,
+            Err(e) => {
+                let _ = Self::remount_with_lower(
+                    &mountpoint,
+                    old_dicfuse,
+                    &upper_dir,
+                    cl_dir.as_deref(),
+                    &sealed_chain,
+                )
+                .await;
+                return Ok(CommitFinalizeResponse {
+                    state: "failed".into(),
+                    code: Some("SWITCH_FAILED".into()),
+                    detail: Some(format!("upper cleanup failed: {e}")),
+                    base_revision: base_revision.unwrap_or_default(),
+                    lower_revision: pinned_refs,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                });
+            }
+        };
+
+        let mut new_fuse = match Self::remount_with_lower(
+            &mountpoint,
+            new_dicfuse.clone(),
+            &upper_dir,
+            cl_dir.as_deref(),
+            &[],
+        )
+        .await
+        {
+            Ok(fuse) => fuse,
+            Err(e) => {
+                let _ = Self::remount_with_lower(
+                    &mountpoint,
+                    old_dicfuse,
+                    &upper_dir,
+                    cl_dir.as_deref(),
+                    &sealed_chain,
+                )
+                .await;
+                return Ok(CommitFinalizeResponse {
+                    state: "failed".into(),
+                    code: Some("SWITCH_FAILED".into()),
+                    detail: Some(format!(
+                        "remount over revision {new_refs} failed after cleanup: {e}; \
+                         worktree remounted on the previous projection"
+                    )),
+                    base_revision: base_revision.unwrap_or_default(),
+                    lower_revision: pinned_refs,
+                    generation,
+                    cleaned_paths: Vec::new(),
+                });
+            }
+        };
+
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.fuse = new_fuse;
+            entry.pinned_refs = Some(new_refs.clone());
+            // Flattened above: the chain no longer applies to the new revision.
+            entry.sealed_chain = Vec::new();
+            entry.state = MountLifecycle::Ready;
+            entry.last_seen_epoch_ms = current_epoch_ms();
+        }
+        self.persist_state().await;
+
+        // Warm the committed paths into the new store so the first read after a
+        // sync cannot race store initialization and come back empty.
+        for committed in &request.committed_paths {
+            let Some(item) = lower_item_for(&new_dicfuse.store, &committed.path).await else {
+                continue;
+            };
+            if item.is_dir() {
+                continue;
+            }
+            let ino = item.get_inode();
+            let oid = item.hash.clone();
+            let _ = new_dicfuse.store.fetch_file_content(ino, &oid).await;
+        }
+
+        let changes = effective_changes(&DicfuseLower(new_dicfuse.store.clone()), &upper_dir, &[])
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+
+        tracing::info!(
+            mount_id = %mount_id,
+            lower_revision = %new_refs,
+            cleaned = cleaned.len(),
+            dirty = !changes.is_empty(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "antares svc: commit_finalize success"
+        );
+
+        Ok(CommitFinalizeResponse {
+            state: "ready".into(),
+            code: None,
+            detail: None,
+            base_revision: base_revision.unwrap_or_default(),
+            lower_revision: Some(new_refs),
+            generation,
+            cleaned_paths: cleaned,
+        })
+    }
+
+    async fn refresh_lower(
+        &self,
+        mount_id: Uuid,
+        request: RefreshRequest,
+    ) -> Result<RefreshResponse, ServiceError> {
+        let start = Instant::now();
+        let (path, upper_dir, cl_dir, mountpoint, base_revision, pinned_refs, sealed_chain, mount_state, mst2_lower) = {
+            let mounts = self.mounts.read().await;
+            let entry = mounts
+                .get(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            (
+                entry.path.clone(),
+                PathBuf::from(&entry.upper_dir),
+                entry.cl_dir.clone().map(PathBuf::from),
+                PathBuf::from(&entry.mountpoint),
+                entry.base_revision.clone(),
+                entry.pinned_refs.clone(),
+                entry.sealed_chain.clone(),
+                entry.state.clone(),
+                entry.mst2_lower.clone(),
+            )
+        };
+        if !matches!(mount_state, MountLifecycle::Mounted | MountLifecycle::Ready) {
+            return Err(ServiceError::InvalidRequest(format!(
+                "mount {mount_id} is in state {mount_state:?}; cannot refresh the lower"
+            )));
+        }
+        // MST/2-lowered mounts move their lower by resolving a new snapshot, not
+        // by re-pinning the Dicfuse projection (P3; see
+        // mst2-impl/P3-HASH-DOMAIN-DESIGN.md).
+        if let Some(old_view) = mst2_lower.clone() {
+            return self
+                .mst2_refresh_lower(
+                    mount_id,
+                    old_view,
+                    &path,
+                    &upper_dir,
+                    cl_dir.as_deref(),
+                    &mountpoint,
+                    &base_revision,
+                    start,
+                )
+                .await;
+        }
+
+        let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
+        let current = self
+            .lower_dicfuse_for(&path, pinned_refs.as_deref())
+            .await?;
+        let changes = effective_changes(&DicfuseLower(current.store.clone()), &upper_dir, &chain_dirs)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+
+        if request.require_clean && !changes.is_empty() {
+            return Ok(RefreshResponse {
+                disposition: RefreshDisposition::BlockedDirty,
+                base_revision: base_revision.unwrap_or_default(),
+                lower_revision: pinned_refs,
+                generation,
+                code: Some("BLOCKED_DIRTY".into()),
+                detail: Some(format!(
+                    "{} effective change(s) exist; commit or stash before refreshing",
+                    changes.len()
+                )),
+            });
+        }
+
+        let target = match request.target_revision.as_deref().map(str::trim) {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => resolve_latest_revision(config::base_url(), &path)
+                .await
+                .map_err(ServiceError::Internal)?,
+        };
+
+        if pinned_refs.as_deref() == Some(target.as_str()) {
+            return Ok(RefreshResponse {
+                disposition: RefreshDisposition::AlreadyAtTarget,
+                base_revision: base_revision.unwrap_or_default(),
+                lower_revision: pinned_refs,
+                generation,
+                code: None,
+                detail: None,
+            });
+        }
+
+        // Flatten before the switch: a sealed chain is a delta against the OLD
+        // revision and must not shadow the new projection.
+        if !chain_dirs.is_empty() {
+            let dirs = chain_dirs.clone();
+            let upper = upper_dir.clone();
+            tokio::task::spawn_blocking(move || flatten_chain_into_upper(&dirs, &upper))
+                .await
+                .map_err(|e| ServiceError::Internal(format!("chain flatten task failed: {e}")))?
+                .map_err(|e| ServiceError::Internal(format!("chain flatten failed: {e}")))?;
+        }
+
+        let new_dicfuse = DicfuseManager::for_base_path_and_refs(&path, &target).await;
+        if tokio::time::timeout(
+            Duration::from_secs(180),
+            new_dicfuse.store.wait_for_ready(),
+        )
+        .await
+        .is_err()
+        {
+            return Ok(RefreshResponse {
+                disposition: RefreshDisposition::BaseMismatch,
+                base_revision: base_revision.unwrap_or_default(),
+                lower_revision: pinned_refs,
+                generation,
+                code: Some("SWITCH_FAILED".into()),
+                detail: Some(format!("lower for revision {target} did not become ready")),
+            });
+        }
+
+        let old_dicfuse = current;
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.state = MountLifecycle::Quiescing;
+            if let Err(e) = entry.fuse.unmount().await {
+                entry.state = MountLifecycle::Ready;
+                return Err(ServiceError::FuseFailure(format!(
+                    "failed to quiesce mount {mount_id}: {e}"
+                )));
+            }
+        }
+
+        let mut new_fuse = match Self::remount_with_lower(
+            &mountpoint,
+            new_dicfuse.clone(),
+            &upper_dir,
+            cl_dir.as_deref(),
+            &[],
+        )
+        .await
+        {
+            Ok(fuse) => fuse,
+            Err(e) => {
+                let _ = Self::remount_with_lower(
+                    &mountpoint,
+                    old_dicfuse,
+                    &upper_dir,
+                    cl_dir.as_deref(),
+                    &sealed_chain,
+                )
+                .await;
+                return Ok(RefreshResponse {
+                    disposition: RefreshDisposition::BaseMismatch,
+                    base_revision: base_revision.unwrap_or_default(),
+                    lower_revision: pinned_refs,
+                    generation,
+                    code: Some("SWITCH_FAILED".into()),
+                    detail: Some(format!(
+                        "remount over revision {target} failed: {e}; \
+                         worktree remounted on the previous projection"
+                    )),
+                });
+            }
+        };
+
+        {
+            let mut mounts = self.mounts.write().await;
+            let entry = mounts
+                .get_mut(&mount_id)
+                .ok_or(ServiceError::NotFound(mount_id))?;
+            entry.fuse = new_fuse;
+            entry.pinned_refs = Some(target.clone());
+            // Flattened above: the chain no longer applies to the new revision.
+            entry.sealed_chain = Vec::new();
+            entry.state = MountLifecycle::Ready;
+            entry.last_seen_epoch_ms = current_epoch_ms();
+        }
+        self.persist_state().await;
+
+        let changes = effective_changes(&DicfuseLower(new_dicfuse.store.clone()), &upper_dir, &[])
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let generation = generation_of(&changes);
+
+        tracing::info!(
+            mount_id = %mount_id,
+            lower_revision = %target,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "antares svc: refresh_lower success"
+        );
+
+        Ok(RefreshResponse {
+            disposition: RefreshDisposition::Switched,
+            base_revision: base_revision.unwrap_or_default(),
+            lower_revision: Some(target),
+            generation,
+            code: None,
+            detail: None,
+        })
+    }
+
     async fn delete_mount(&self, mount_id: Uuid) -> Result<MountStatus, ServiceError> {
         let start = Instant::now();
         // Acquire write locks to update state
@@ -2368,6 +4467,7 @@ impl AntaresService for AntaresServiceImpl {
         let cl = entry.cl.clone();
         let job_id = entry.job_id.clone();
         let job_id_for_log = job_id.clone();
+        let sealed_chain = entry.sealed_chain.clone();
         tracing::info!(
             mount_id = %mount_id,
             task_id = ?job_id_for_log,
@@ -2455,6 +4555,21 @@ impl AntaresService for AntaresServiceImpl {
             } else {
                 index.remove(&(path, cl, cl_path));
             }
+            // Sealed layers of a chain fork are shared: reclaim one only when no
+            // surviving mount still references it. Computed before the locks drop.
+            let orphaned = if sealed_chain.is_empty() {
+                Vec::new()
+            } else {
+                let referenced: std::collections::HashSet<&str> = mounts
+                    .values()
+                    .flat_map(|e| e.sealed_chain.iter().map(String::as_str))
+                    .collect();
+                sealed_chain
+                    .iter()
+                    .filter(|d| !referenced.contains(d.as_str()))
+                    .cloned()
+                    .collect()
+            };
             drop(mounts);
             drop(index);
             drop(job_index);
@@ -2468,6 +4583,11 @@ impl AntaresService for AntaresServiceImpl {
             // The instance is gone from the maps and cannot be reattached, so
             // reclaim its mountpoint and private layers (outside the locks).
             Self::remove_mount_dirs(mount_id, &mountpoint, &upper_dir, cl_dir.as_deref());
+            for dir in orphaned {
+                if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                    tracing::warn!("sealed layer {} cleanup failed: {e}", dir);
+                }
+            }
 
             // Persist state to file for recovery
             self.persist_state().await;
@@ -3846,6 +5966,14 @@ mod tests {
                         cl_path: None,
                         path: format!("/project/path{}", i),
                         cl: None,
+
+                        upper_dir: None,
+
+                        mountpoint: None,
+
+                        pinned_refs: None,
+                    
+                        sealed_chain: Vec::new(),
                     })
                     .await
                 })
@@ -3871,6 +5999,14 @@ mod tests {
             cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
+
+            upper_dir: None,
+
+            mountpoint: None,
+
+            pinned_refs: None,
+        
+            sealed_chain: Vec::new(),
         };
 
         // First mount should succeed
@@ -3892,6 +6028,14 @@ mod tests {
             cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
+
+            upper_dir: None,
+
+            mountpoint: None,
+
+            pinned_refs: None,
+        
+            sealed_chain: Vec::new(),
         };
 
         let first = service.create_mount(request.clone()).await.unwrap();
@@ -3911,6 +6055,14 @@ mod tests {
             cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
+
+            upper_dir: None,
+
+            mountpoint: None,
+
+            pinned_refs: None,
+        
+            sealed_chain: Vec::new(),
         };
 
         let first = service.create_mount(request.clone()).await.unwrap();
@@ -3936,6 +6088,14 @@ mod tests {
             cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
+
+            upper_dir: None,
+
+            mountpoint: None,
+
+            pinned_refs: None,
+        
+            sealed_chain: Vec::new(),
         };
         let req2 = CreateMountRequest {
             job_id: Some("job-b".into()),
@@ -3943,6 +6103,14 @@ mod tests {
             cl_path: None,
             path: "/third-party/mega".into(),
             cl: Some("CL123".into()),
+
+            upper_dir: None,
+
+            mountpoint: None,
+
+            pinned_refs: None,
+        
+            sealed_chain: Vec::new(),
         };
 
         let r1 = service.create_mount(req1).await;
@@ -3966,6 +6134,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
@@ -3993,6 +6169,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL1".into()),
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await;
         assert!(result1.is_ok());
@@ -4005,6 +6189,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL2".into()),
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await;
         assert!(result2.is_ok());
@@ -4032,6 +6224,14 @@ mod tests {
                     cl_path: None,
                     path: format!("/concurrent-path-{}", i),
                     cl: None,
+
+                    upper_dir: None,
+
+                    mountpoint: None,
+
+                    pinned_refs: None,
+                
+                    sealed_chain: Vec::new(),
                 };
                 svc.create_mount(request).await
             });
@@ -4077,6 +6277,14 @@ mod tests {
             cl_path: None,
             path: "/test-concurrent-ops".to_string(),
             cl: None,
+
+            upper_dir: None,
+
+            mountpoint: None,
+
+            pinned_refs: None,
+        
+            sealed_chain: Vec::new(),
         };
         let created = service.create_mount(request).await.unwrap();
         let mount_id = created.mount_id;
@@ -4113,6 +6321,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
@@ -4136,6 +6352,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
@@ -4161,6 +6385,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
@@ -4198,6 +6430,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL123".into()),
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
@@ -4223,6 +6463,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: None,
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
@@ -4245,6 +6493,14 @@ mod tests {
                 cl_path: None,
                 path: "/third-party/mega".into(),
                 cl: Some("CL123".into()),
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
@@ -4272,6 +6528,14 @@ mod tests {
                 cl_path: None,
                 path: "/test/path".into(),
                 cl: None,
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
@@ -4313,6 +6577,14 @@ mod tests {
                 cl_path: None,
                 path: "/test/path".into(),
                 cl: Some("CL123".into()),
+
+                upper_dir: None,
+
+                mountpoint: None,
+
+                pinned_refs: None,
+            
+                sealed_chain: Vec::new(),
             })
             .await
             .unwrap();
