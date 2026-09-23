@@ -133,7 +133,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Build only — nothing is pushed. This guards the Dockerfile and
       # .dockerignore that the mega2 IT compose stack builds from
