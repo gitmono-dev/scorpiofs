@@ -9,19 +9,22 @@ set -euo pipefail
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../bin/common.sh
 source "$SELF_DIR/../bin/common.sh"
-SRC=""; NAME=""; FILTER_KB=200; TREE=""
+SRC=""; NAME=""; FILTER_KB=200; TREE=""; REUSE=0
 while [ $# -gt 0 ]; do case "$1" in
   --src) SRC="$2"; shift 2;; --name) NAME="$2"; shift 2;;
-  --filter-kb) FILTER_KB="$2"; shift 2;; --tree) TREE="$2"; shift 2;;
+  --filter-kb) FILTER_KB="$2"; shift 2;; --tree) TREE="$2"; REUSE=1; shift 2;;
   *) echo "unknown arg $1" >&2; exit 1;;
 esac; done
+TREE="${TREE:-/tmp/filtered-${NAME:-anon}}"
 require_env
 git_id
 STAGE="/tmp/mono-seed-stage"
 
-if [ -n "$TREE" ]; then
+if [ "$REUSE" = 1 ]; then
+  [ -d "$TREE" ] || { echo "--tree $TREE not found" >&2; exit 1; }
   echo "reusing filtered tree: $TREE"
   rm -rf "$STAGE"; git clone -q "$M2/project" "$STAGE"
+  FILES=$(find "$TREE" -type f | wc -l)
 else
   [ -d "$SRC" ] || { echo "--src $SRC not found" >&2; exit 1; }
   [ -n "$NAME" ] || { echo "--name required" >&2; exit 1; }

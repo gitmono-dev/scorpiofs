@@ -14,8 +14,9 @@ GIT_WT="$WORK/exp1-git"
 MONO_MAIN="$WORK/exp1-mono-main"
 MONO_WT="$WORK/exp1-mono-wt"
 BR="bench-$(date +%s)"
+export GIT_WT MONO_MAIN MONO_WT BR
 
-fresh_dirs() { rm -rf "$GIT_WT" "$MONO_MAIN" "$MONO_WT"; mkdir -p "$WORK"; }
+fresh_dirs() { detach_mount "$MONO_WT" 2>/dev/null; rm -rf "$GIT_WT" "$MONO_MAIN" "$MONO_WT"; mkdir -p "$WORK"; }
 attach_mono() { # 照 demo.sh 已验证路径：clone --no-checkout → worktree add
   libra_env "$LIBRA" clone -q -b main --no-checkout "$M2/project" "$MONO_MAIN" >/dev/null 2>&1
   libra "$MONO_MAIN" config set user.name bench >/dev/null
@@ -28,21 +29,22 @@ probe_first_write() { # 首写探测 = 第一个可写文件落盘
   f="$d/.bench-probe-$ROUND"
   echo ok > "$f" && rm -f "$f"
 }
-export -f probe_first_write
+export -f probe_first_write attach_mono
 
 # ---------- E1-TTFW ----------
 case_ttfw() {
   require_env; fresh_dirs
   run_metric E1 TTFW git "$ROUNDS" ttfw bash -c '
+    rm -rf $GIT_WT-$ROUND
     cold_cache
     t0=$(now_ms)
-    git clone -q "'"$M2"'/project" "'"$GIT_WT"'"-$ROUND 2>/dev/null
-    probe_first_write "'"$GIT_WT"'-$ROUND"
+    git clone -q $M2/project $GIT_WT-$ROUND
+    probe_first_write $GIT_WT-$ROUND
     t1=$(now_ms); echo "ttfw_ms $((t1-t0))"'
   run_metric E1 TTFW mono "$ROUNDS" ttfw bash -c '
     cold_cache
     t0=$(now_ms)
-    attach_mono && probe_first_write "'"$MONO_WT"'"
+    attach_mono && probe_first_write $MONO_WT
     t1=$(now_ms); echo "ttfw_ms $((t1-t0))"'
   fresh_dirs
 }
@@ -56,10 +58,7 @@ case_disk() { # 每侧准备一次（非计时），测 du；3 个位置：clone
   local g m store total
   g=$(du_bytes "$GIT_WT")
   m=$(du_bytes "$MONO_WT")
-  store=0
-  for d in "$HOME/.scorpio"* "$HOME/.cache/scorpiofs" /var/lib/scorpiofs; do
-    [ -d "$d" ] && store=$((store + $(du_bytes "$d")))
-  done
+  store=$(store_bytes)
   record E1 DISK git 1 disk_bytes "$g" "{\"repo\":\"$REPO_NAME\"}"
   record E1 DISK mono 1 disk_bytes "$((m + store))" "{\"mount\":$m,\"store\":$store,\"repo\":\"$REPO_NAME\"}"
   echo "git=$g mono_mount=$m mono_store=$store"
@@ -119,18 +118,26 @@ case_status() {
 # ---------- E1-COMMIT ----------
 case_commit() {
   require_env; fresh_dirs
+  # git 侧: clone 一次，轮内 add/commit/push（main 前进）
   git clone -q "$M2/project" "$GIT_WT"
-  ROUND=1 attach_mono && sleep 2
   run_metric E1 COMMIT git "$ROUNDS" commit_ms bash -c '
     t0=$(now_ms)
-    ( cd "'"$GIT_WT"'" \
+    ( cd $GIT_WT \
       && echo "bench $ROUND $(date +%s)" >> bench-notes.txt \
       && git add -A && git commit -qm "bench $ROUND" && git push -q origin HEAD:refs/heads/main )
     t1=$(now_ms); echo "commit_ms $((t1-t0))"'
+  # mono 侧: git 轮已推进 main，基于新 tip 重新 clone+attach（避免 non-FF）
+  detach_mount "$MONO_WT" 2>/dev/null; rm -rf "$MONO_MAIN" "$MONO_WT"
+  libra_env "$LIBRA" clone -q -b main --no-checkout "$M2/project" "$MONO_MAIN" >/dev/null 2>&1
+  libra "$MONO_MAIN" config set user.name bench >/dev/null
+  libra "$MONO_MAIN" config set user.email bench@gitmono.local >/dev/null
+  libra "$MONO_MAIN" worktree add --backend scorpiofs -b "bench-cm-$(date +%s)" "$MONO_WT" >/dev/null 2>&1 \
+    || { echo "attach failed" >&2; exit 1; }
+  sleep 2
   run_metric E1 COMMIT mono "$ROUNDS" commit_ms bash -c '
     t0=$(now_ms)
-    echo "bench $ROUND $(date +%s)" >> "'"$MONO_WT"'/bench-notes.txt"
-    libra "'"$MONO_WT"'" sync -m "bench $ROUND" > /dev/null
+    echo "bench $ROUND $(date +%s)" >> $MONO_WT/bench-notes.txt
+    libra $MONO_WT sync -m "bench $ROUND" > /dev/null
     t1=$(now_ms); echo "commit_ms $((t1-t0))"'
   fresh_dirs
 }

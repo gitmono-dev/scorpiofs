@@ -9,17 +9,18 @@ BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-$BENCH_ROOT/results/raw}"
 mkdir -p "$RESULTS_DIR"
 
-# ---- 环境探测（可被环境变量覆盖） ----
-M2="${M2:-http://127.0.0.1:19000}"                 # mega2 HTTP
-GITEA="${GITEA:-http://127.0.0.1:30080}"           # gitea HTTP
-GITEA_USER="${GITEA_USER:-bench}"
-GITEA_TOKEN="${GITEA_TOKEN:-}"
-API="${API:-http://127.0.0.1:37251}/antares"       # scorpiofs daemon
-LIBRA="${LIBRA:-$HOME/.local/bin/libra}"
-SCORPIO="${SCORPIO:-$HOME/.local/bin/scorpio}"
-OPENCODE="${OPENCODE:-opencode}"
-AGENT_MODEL="${AGENT_MODEL:-}"                     # 传给 opencode 的 model，可空
-WORK="${WORK:-$HOME/bench-work}"                   # 工作区根（各实验子目录自建）
+# ---- 环境探测（可被环境变量覆盖；全部 export 供内层 bash -c 使用） ----
+export M2="${M2:-http://127.0.0.1:19000}"
+export GITEA="${GITEA:-http://127.0.0.1:30080}"           # gitea HTTP
+export GITEA_USER="${GITEA_USER:-bench}"
+export GITEA_TOKEN="${GITEA_TOKEN:-}"
+export API="${API:-http://127.0.0.1:37251}/antares"       # scorpiofs daemon
+export LIBRA="${LIBRA:-$HOME/.local/bin/libra}"
+export SCORPIO="${SCORPIO:-$HOME/.local/bin/scorpio}"
+export OPENCODE="${OPENCODE:-opencode}"
+export AGENT_MODEL="${AGENT_MODEL:-}"                     # 传给 opencode 的 model，可空
+export WORK="${WORK:-$HOME/bench-work}"                   # 工作区根（各实验子目录自建）
+export RESULTS_DIR
 mkdir -p "$WORK"
 
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 2; }; }
@@ -53,7 +54,8 @@ cold_cache() {
 # ---- JSONL 落盘 ----
 # record <exp> <case> <side> <round> <metric> <value> [meta_json]
 record() {
-  local exp="$1" case_="$2" side="$3" round="$4" metric="$5" value="$6" meta="${7:-\{\}}"
+  local exp="$1" case_="$2" side="$3" round="$4" metric="$5" value="$6"
+  local meta="${7:-}"; [ -n "$meta" ] || meta='{}'
   local line
   line=$(python3 - "$exp" "$case_" "$side" "$round" "$metric" "$value" "$meta" <<'PY'
 import json, sys, datetime
@@ -85,13 +87,14 @@ for_round() {
 # ---- 通用采样循环：run_metric <exp> <case> <side> <rounds> <metric> -- <cmd...>
 #      cmd 需把测量值打到 stdout 最后一行 "<metric>_ms <value>"（timed 的格式）
 run_metric() {
-  local exp="$1" case_="$2" side="$3" rounds="$4" metric="$5"; shift 5; shift # --
+  local exp="$1" case_="$2" side="$3" rounds="$4" metric="$5"; shift 5
+  [ "${1:-}" = "--" ] && shift
   local r out val
   for ((r = 1; r <= rounds; r++)); do
     out=$("$@") || { echo "run failed (round $r), see meta" >&2; record "$exp" "$case_" "$side" "$r" "$metric" -1 "{\"note\":\"run failed\"}"; continue; }
     val=$(echo "$out" | awk -v m="${metric}_ms" '$1==m{print $2}' | tail -1)
     echo "$out"
-    [ -n "$val" ] && record "$exp" "$case_" "$side" "$r" "$metric" "$val"
+    [ -n "$val" ] && record "$exp" "$case_" "$side" "$r" "$metric" "$val" '{}'
   done
 }
 
@@ -108,14 +111,40 @@ net_bytes() { # 输出 rx+tx 总字节
 mount_id() { # <worktree> -> mount id
   cat "$1/.libra/scorpiofs_mount_id" 2>/dev/null
 }
-detach_mount() { # <worktree>
-  local mid; mid=$(mount_id "$1") || return 0
-  [ -n "$mid" ] && curl -sS --noproxy '*' -X DELETE "$API/mounts/$mid" >/dev/null 2>&1 || true
+detach_mount() { # <worktree>：DELETE mount（若 id 存在）并无条件尝试摘 FUSE 挂载
+  local mid; mid=$(mount_id "$1")
+  if [ -n "$mid" ]; then
+    curl -sS --noproxy '*' -X DELETE "$API/mounts/$mid" >/dev/null 2>&1 || true
+    sleep 1
+  fi
+  fusermount3 -u "$1" 2>/dev/null || sudo fusermount3 -uz "$1" 2>/dev/null || true
   return 0
 }
+
+# scorpio store 目录列表（本机 e2e 布局 + 常见位置；云上由 SCORPIO_STORE_PATH 覆盖）
+store_dirs() {
+  echo "${SCORPIO_STORE_PATH:-$HOME/e2e/store}"
+  echo "$HOME/.scorpio"*
+  echo "$HOME/.cache/scorpiofs"
+  echo /var/lib/scorpiofs
+}
+store_bytes() { # store 总字节
+  local s=0 d
+  while IFS= read -r d; do
+    [ -d "$d" ] && s=$((s + $(du_bytes "$d")))
+  done < <(store_dirs)
+  echo "$s"
+}
+mono_total_bytes() { # <worktree> mount + store 总量
+  echo $(( $(du_bytes "$1") + $(store_bytes) ))
+}
 # libra 运行环境（与 demo.sh runlibra 同源）
-libra_env() { env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u no_proxy -u NO_PROXY LIBRA_SCORPIOFS_ENDPOINT="$API"; }
+libra_env() { env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u no_proxy -u NO_PROXY LIBRA_SCORPIOFS_ENDPOINT="$API" "$@"; }
 libra() { local dir="$1"; shift; (cd "$dir" && libra_env "$LIBRA" "$@"); }
 
 # ---- git 身份（一次性） ----
 git_id() { git config --global user.name bench; git config --global user.email bench@gitmono.local; }
+
+# 内层 `bash -c` 子进程需要直接调用的函数
+export -f now_ms cold_cache net_bytes du_bytes store_bytes mono_total_bytes record \
+  mount_id detach_mount libra_env libra need require_env

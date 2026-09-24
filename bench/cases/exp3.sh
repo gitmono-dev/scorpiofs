@@ -24,14 +24,6 @@ fresh_mono() {
   libra "$MONO_MAIN" worktree add --backend scorpiofs -b "$BR" "$WT" >/dev/null 2>&1 \
     && [ -f "$WT/.libra/scorpiofs_mount_id" ]
 }
-mono_store_bytes() { # mount + store 总量
-  local m s=0 d
-  m=$(du_bytes "$WT")
-  for d in "$HOME/.scorpio"* "$HOME/.cache/scorpiofs" /var/lib/scorpiofs; do
-    [ -d "$d" ] && s=$((s + $(du_bytes "$d")))
-  done
-  echo $((m + s))
-}
 
 # ---------- E3-INIT ----------
 case_init() {
@@ -58,7 +50,7 @@ case_init() {
     fresh_mono
     t1=$(now_ms)
     record E3 INIT mono "$r" init_ms $((t1 - t0)) "{\"repo\":\"$REPO_NAME\",\"variant\":\"attach\"}"
-    record E3 INIT mono "$r" disk_bytes "$(mono_store_bytes)" "{}"
+    record E3 INIT mono "$r" disk_bytes "$(mono_total_bytes "$WT")" "{}"
   done
   rm -rf "$B"/git-full-* "$B"/git-shallow-*
 }
@@ -110,7 +102,7 @@ case_multi() {
     libra "$WT" fork -b "fork$i-$ROUND" "$B/mono-fork-$i" >/dev/null 2>&1
   done
   t1=$(now_ms)
-  mwork=$(mono_store_bytes)
+  mwork=$(mono_total_bytes "$WT")
   for ((i = 1; i <= N; i++)); do mwork=$((mwork + $(du_bytes "$B/mono-fork-$i"))); done
   record E3 MULTI mono 1 multi_ms $((t1 - t0)) "{\"worktrees\":$N,\"note\":\"attach+chain forks\"}"
   record E3 MULTI mono 1 disk_bytes "$mwork" "{\"worktrees\":$N,\"note\":\"mount+store+fork uppers\"}"
