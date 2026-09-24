@@ -1,0 +1,11 @@
+# bench/infra/prometheus.yml — 抓取 node-exporter 与各 runner
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: node
+    static_configs:
+      - targets:
+          - "node-a:9100"    # mega2 节点（runner 上也可直接抓）
+          - "runner-mono:9100"
+          - "runner-git:9100"

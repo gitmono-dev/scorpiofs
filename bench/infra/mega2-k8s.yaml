@@ -1,0 +1,101 @@
+# bench/infra/mega2-k8s.yaml — 控制面 k8s manifests（可选形态；k3s 兼容）
+# kubectl apply -f mega2-k8s.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bench
+---
+# mega2 需要 mega2-mst2:local 镜像——先 docker save/load 到节点或推私有 ACR
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mega2
+  namespace: bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mega2 }
+  template:
+    metadata:
+      labels: { app: mega2 }
+    spec:
+      containers:
+        - name: mega2
+          image: mega2-mst2:local
+          ports:
+            - containerPort: 19000
+            - containerPort: 19700
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}        # 评测数据可弃；正式用 PVC（ESSD CSI）
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mega2
+  namespace: bench
+spec:
+  selector: { app: mega2 }
+  ports:
+    - { name: http, port: 19000, targetPort: 19000 }
+    - { name: mst2, port: 19700, targetPort: 19700 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitea
+  namespace: bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: gitea }
+  template:
+    metadata:
+      labels: { app: gitea }
+    spec:
+      containers:
+        - name: gitea
+          image: gitea/gitea:1.22
+          env:
+            - { name: GITEA__security__INSTALL_LOCK, value: "true" }
+            - { name: GITEA__server__ROOT_URL, value: "http://gitea.bench:3000" }
+          ports:
+            - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitea
+  namespace: bench
+spec:
+  selector: { app: gitea }
+  ports:
+    - { port: 3000, targetPort: 3000 }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: bench
+spec:
+  selector:
+    matchLabels: { app: node-exporter }
+  template:
+    metadata:
+      labels: { app: node-exporter }
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: ne
+          image: prom/node-exporter:v1.8.2
+          args: ["--path.rootfs=/host"]
+          volumeMounts:
+            - { name: root, mountPath: /host, readOnly: true }
+      volumes:
+        - name: root
+          hostPath: { path: / }

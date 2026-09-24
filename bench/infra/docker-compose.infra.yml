@@ -1,0 +1,57 @@
+# bench/infra/docker-compose.infra.yml — 控制面：gitea（git 对照）+ 观测栈
+# 用法: docker compose -f docker-compose.infra.yml -p bench-infra up -d --wait
+# gitea: :30080 web / :30022 ssh；prometheus: :9090；grafana: :3000（admin/admin）
+services:
+  gitea:
+    image: gitea/gitea:1.22
+    container_name: bench-gitea
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__server__HTTP_PORT=3000
+      - GITEA__server__ROOT_URL=http:// bench-node:30080/
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__service__DISABLE_REGISTRATION=false
+    ports:
+      - "30080:3000"
+      - "30022:22"
+    volumes:
+      - gitea-data:/data
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: bench-prom
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: bench-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: bench-nodeexp
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command: ["--path.rootfs=/host"]
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+volumes:
+  gitea-data:
+  prom-data:
+  grafana-data:
