@@ -1083,6 +1083,11 @@ impl DictionaryStore {
     pub fn dir_refresh_needed(&self, parent_inode: u64) -> io::Result<bool> {
         let parent_user_path = self.inode_to_user_path(parent_inode)?;
         if let Some(dir) = self.dirs.get(&parent_user_path) {
+            // Pinned store: loaded directories can never change (immutable
+            // revision), so lookup fast-path must not kick background refreshes.
+            if self.pinned_refs().is_some_and(|p| !p.is_empty()) {
+                return Ok(!dir.loaded);
+            }
             return Ok(dir_needs_refresh(&dir, self.dir_sync_ttl()));
         }
         Ok(true)
@@ -2524,7 +2529,8 @@ pub async fn import_arc(store: Arc<DictionaryStore>) {
     // Spawn background task for periodic directory watching.
     // For Antares subdir mounts (default max_depth=0), we skip the watcher to avoid background
     // remote storms; directories are refreshed lazily when accessed.
-    if store.max_depth() > 0 {
+    // Pinned stores serve an immutable revision — watching is meaningless there too.
+    if store.max_depth() > 0 && store.pinned_refs().is_none_or(|p| p.is_empty()) {
         let watch_path = user_root;
         tokio::spawn(async move {
             loop {
@@ -2612,13 +2618,17 @@ pub async fn load_dir(
     ensure_dir_tracked(&dirs, &parent_path);
 
     // Best-effort TTL: avoid repeated refreshes of the same directory in hot loops.
+    // A pinned store serves an immutable revision — once a directory is loaded its
+    // hash can never change, so the periodic hash probe is pure network waste and
+    // the refresh is skipped entirely (equivalent to an infinite TTL).
+    let pinned = store.pinned_refs().is_some_and(|p| !p.is_empty());
     let ttl = store.dir_sync_ttl();
-    if ttl != Duration::from_secs(0) {
+    if pinned || ttl != Duration::from_secs(0) {
         if let Some(d) = dirs.get(&parent_path) {
             if let Some(ts) = d.last_sync {
-                if ts.elapsed() < ttl {
+                if pinned || ts.elapsed() < ttl {
                     debug!(
-                        "load_dir: skip refresh due to TTL (user={parent_path:?} ttl={:?})",
+                        "load_dir: skip refresh due to TTL (user={parent_path:?} ttl={:?} pinned={pinned})",
                         ttl
                     );
                     return Ok(false);

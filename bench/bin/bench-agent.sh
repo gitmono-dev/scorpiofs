@@ -8,7 +8,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=common.sh
 source "$HERE/common.sh"
 
-TASK="${1:?T1|T2|T3|T4|T5}"; SIDE="${2:?git|mono}"
+TASK="${1:?T1|T2|T3|T4|T5|MA1|MA2|MA3}"; SIDE="${2:?git|mono}"
 WT="${WT:?WT env required (workdir or mountpoint)}"
 ROUNDS="${ROUNDS:-5}"
 EXP="${EXP:-E1}"
@@ -47,13 +47,43 @@ judge_T5() {
     && grep -rq "dep_v2" "$WT/common/src/api.rs" 2>/dev/null \
     && ! grep -rn "shim::dep(" "$WT" --include='*.rs' 2>/dev/null | grep -v dep_v2 >/dev/null
 }
+
+# ---------- MA1/MA2/MA3: 针对 mega2 合成 monorepo（synthsmoke）的三关联任务 ----------
+# 背景（三个任务共享同一语境，互不依赖、独立判分）：
+#   仓库是一个 Rust 合成工具库（synthsmoke/ 下按目录分模块，函数名 synth_<n>）。
+MA1_BG='本仓库是一个 Rust 合成工具库：synthsmoke/ 目录下按子目录分模块，绝大多数源文件定义了形如 `fn synth_<数字>(x: u64) -> u64` 的函数。'
+prompt_MA1="$MA1_BG 统计：(1) 整个仓库中 \`fn synth_\` 字符串出现的总次数（可用 grep -r 统计行数）；(2) 这些字符串分布在多少个不重复的目录（按文件所在目录计）。把结果写入仓库根目录的 answer.txt，恰好两行：第一行 count=<数字>，第二行 dirs=<数字>。不要改动其他任何文件。"
+judge_MA1() {
+  local expect_c expect_d
+  expect_c=$(grep -r "fn synth_" "$WT" --include='*.rs' 2>/dev/null | wc -l)
+  expect_d=$(grep -rl "fn synth_" "$WT" --include='*.rs' 2>/dev/null | xargs -n1 dirname 2>/dev/null | sort -u | wc -l)
+  local c d
+  c=$(sed -n 's/^count=\([0-9]*\)$/\1/p' "$WT/answer.txt" 2>/dev/null)
+  d=$(sed -n 's/^dirs=\([0-9]*\)$/\1/p' "$WT/answer.txt" 2>/dev/null)
+  [ "$c" = "$expect_c" ] && [ "$d" = "$expect_d" ]
+}
+prompt_MA2="$MA1_BG 你要在仓库根目录新增一个注册入口：创建文件 registry.rs，内容为如下函数（一字不差）：\`pub fn bench_registry() -> &'static str { \"bench\" }\`。只创建这一个文件，不要改动其他文件。"
+judge_MA2() {
+  grep -q 'pub fn bench_registry() -> &.static str { "bench" }' "$WT/registry.rs" 2>/dev/null
+}
+prompt_MA3="$MA1_BG 你负责一次微小的行为变更：在 synthsmoke/ 下任选一个包含 \`wrapping_add\` 的源文件，把其中**第一处** \`wrapping_add\` 改为 \`wrapping_sub\`（只允许改这一处，其余内容保持不变）。"
+judge_MA3() {
+  # Baseline is a per-round pre-run snapshot (PRE_SUB/PRE_ADD) so leftover
+  # edits from previous rounds do not accumulate into the expectation.
+  [ -n "${PRE_SUB:-}" ] && [ -n "${PRE_ADD:-}" ] || { echo "MA3: no pre snapshot" >&2; return 1; }
+  local now_sub now_add
+  now_sub=$(grep -r "wrapping_sub" "$WT" --include='*.rs' 2>/dev/null | wc -l)
+  now_add=$(grep -r "wrapping_add" "$WT" --include='*.rs' 2>/dev/null | wc -l)
+  [ "$now_sub" = "$((PRE_SUB + 1))" ] && [ "$now_add" = "$((PRE_ADD - 1))" ]
+}
 PROMPT_VAR="prompt_$TASK"; JUDGE_VAR="judge_$TASK"
 [ -n "${!PROMPT_VAR:-}" ] || { echo "unknown task $TASK" >&2; exit 1; }
 
 # T2/T3 判分需要参考树（未改动基线）；mono 侧用 lower 对应的过滤树，git 侧用 clone 基线
 TREE_FOR_COUNT="${TREE_FOR_COUNT:-$TREE}"
 export TREE_FOR_COUNT
-export -f judge_T1 judge_T2 judge_T3 judge_T4 judge_T5 2>/dev/null || true
+export -f judge_T1 judge_T2 judge_T3 judge_T4 judge_T5 \
+  judge_MA1 judge_MA2 judge_MA3 2>/dev/null || true
 
 # ---------- 运行 ----------
 MODEL_ARGS=()
@@ -67,6 +97,11 @@ for ((r = 1; r <= ROUNDS; r++)); do
   fi
   rm -f "$WT/grep-count.txt"
   cold_cache
+  if [ "$TASK" = MA3 ]; then
+    PRE_SUB=$(grep -r "wrapping_sub" "$WT" --include='*.rs' 2>/dev/null | wc -l)
+    PRE_ADD=$(grep -r "wrapping_add" "$WT" --include='*.rs' 2>/dev/null | wc -l)
+    export PRE_SUB PRE_ADD
+  fi
   local_rc=0
   t0=$(now_ms)
   ( cd "$WT" && $OPENCODE run "${MODEL_ARGS[@]}" "${!PROMPT_VAR}" ) \
