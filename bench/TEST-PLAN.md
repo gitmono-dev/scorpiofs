@@ -37,9 +37,14 @@
 | E1-STATUS ⏱ | status 延迟 | `git status`（fsmonitor on / off 两套） | — | `libra status`（effective diff） | 记录型 |
 | E1-COMMIT ⏱ | 小改动→远端 | edit+`git add/commit/push` | 同左 | edit+`libra sync` | 记录型 |
 | E1-NET ⏱📈 | 全程网络流量 | vnstat 差分 | 同左 | vnstat 差分 | 记录型 |
-| E1-A1 🤖 | T1 加函数 | opencode on clone | — | opencode on mount | 判分通过 + wall time |
-| E1-A2 🤖 | T2 全仓 grep 计数 | 同上 | — | 同上 | 判分 + wall time |
-| E1-A3 🤖 | T3 常量替换 | 同上 | — | 同上 | 判分 + wall time |
+| E1-A1 🤖 | D1 新功能：parse_timeout | opencode on clone | — | opencode on mount | 判分通过 + wall time |
+| E1-A2 🤖 | D2 补测试：parse_kv ×3 | 同上 | — | 同上 | 判分 + wall time |
+| E1-A3 🤖 | D3 修 bug：分钟分支 | 同上 | — | 同上 | 判分 + wall time |
+
+**开发型任务 D1–D3**（`gen-devlab.sh` 生成有真实逻辑的 Rust 配置解析 CLI seed 进
+mega2）：三个任务共享 `src/config.rs` 演进语境（加功能 → 补测试 → 修 bug），
+互不依赖、独立判分（静态内容校验）。D3 特意留一条"锁定 bug"的过时测试断言，
+正确的修复必须同时改实现与测试。prompt/判分内置在 `bin/bench-agent.sh`。
 
 ### 实验二：多仓库关联（workload: gen-multirepo 生成的 1 库 + 5 服务）
 
@@ -71,7 +76,7 @@ bench/
 ├── TEST-PLAN.md              ← 本文件
 ├── bin/
 │   ├── common.sh             公共库：计时/冷cache/JSONL落盘/env探测
-│   ├── bench-agent.sh        opencode 任务驱动（T1-T5 prompt+判分内置）
+│   ├── bench-agent.sh        opencode 任务驱动（T1-T5 + D1-D3 prompt/判分内置）
 │   ├── collect.sh            du/vnstat/prom 快照
 │   └── report.py             results/raw/*.jsonl → REPORT.md
 ├── workload/
