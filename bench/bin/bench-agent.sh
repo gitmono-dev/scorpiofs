@@ -8,7 +8,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=common.sh
 source "$HERE/common.sh"
 
-TASK="${1:?T1|T2|T3|T4|T5|MA1|MA2|MA3}"; SIDE="${2:?git|mono}"
+TASK="${1:?T1|T2|T3|T4|T5|D1|D2|D3}"; SIDE="${2:?git|mono}"
 WT="${WT:?WT env required (workdir or mountpoint)}"
 ROUNDS="${ROUNDS:-5}"
 EXP="${EXP:-E1}"
@@ -48,33 +48,32 @@ judge_T5() {
     && ! grep -rn "shim::dep(" "$WT" --include='*.rs' 2>/dev/null | grep -v dep_v2 >/dev/null
 }
 
-# ---------- MA1/MA2/MA3: 针对 mega2 合成 monorepo（synthsmoke）的三关联任务 ----------
-# 背景（三个任务共享同一语境，互不依赖、独立判分）：
-#   仓库是一个 Rust 合成工具库（synthsmoke/ 下按目录分模块，函数名 synth_<n>）。
-MA1_BG='本仓库是一个 Rust 合成工具库：synthsmoke/ 目录下按子目录分模块，绝大多数源文件定义了形如 `fn synth_<数字>(x: u64) -> u64` 的函数。'
-prompt_MA1="$MA1_BG 统计：(1) 整个仓库中 \`fn synth_\` 字符串出现的总次数（可用 grep -r 统计行数）；(2) 这些字符串分布在多少个不重复的目录（按文件所在目录计）。把结果写入仓库根目录的 answer.txt，恰好两行：第一行 count=<数字>，第二行 dirs=<数字>。不要改动其他任何文件。"
-judge_MA1() {
-  local expect_c expect_d
-  expect_c=$(grep -r "fn synth_" "$WT" --include='*.rs' 2>/dev/null | wc -l)
-  expect_d=$(grep -rl "fn synth_" "$WT" --include='*.rs' 2>/dev/null | xargs -n1 dirname 2>/dev/null | sort -u | wc -l)
-  local c d
-  c=$(sed -n 's/^count=\([0-9]*\)$/\1/p' "$WT/answer.txt" 2>/dev/null)
-  d=$(sed -n 's/^dirs=\([0-9]*\)$/\1/p' "$WT/answer.txt" 2>/dev/null)
-  [ "$c" = "$expect_c" ] && [ "$d" = "$expect_d" ]
+# ---------- D1/D2/D3: 针对mega2 monorepo 的开发型任务（workload: dev-lab） ----------
+# 三个任务围绕同一模块（src/config.rs）的演进链：加功能 → 写测试 → 修 bug。
+# 共享语境、互不依赖、独立判分（全部静态内容校验，无需 cargo）。
+DEV_BG='本仓库 dev-lab 是一个 Rust 配置解析工具。核心模块 src/config.rs 提供 parse_duration（解析 "10s"/"5m"/"2h" 为秒）、parse_kv（解析 "key = value" 行）、load_config/lookup。辅助模块 src/util.rs 提供 clamp_u64(v, lo, hi)。测试在 tests/config_test.rs。'
+prompt_D1="$DEV_BG 任务（新功能）：在 src/config.rs 中新增函数 \`pub fn parse_timeout(spec: &str) -> Option<u64>\`——语义：先调用 parse_duration 解析，解析结果用 util::clamp_u64 约束到 [1, 3600] 后返回；parse_duration 返回 None 时返回 None。保持与文件内现有代码风格一致，不要改动其他既有函数。"
+judge_D1() {
+  grep -q "pub fn parse_timeout" "$WT/src/config.rs" 2>/dev/null \
+    && grep -q "clamp_u64" "$WT/src/config.rs" 2>/dev/null \
+    && grep -q "3600" "$WT/src/config.rs" 2>/dev/null \
+    && grep -q "pub fn parse_duration" "$WT/src/config.rs" 2>/dev/null
 }
-prompt_MA2="$MA1_BG 你要在仓库根目录新增一个注册入口：创建文件 registry.rs，内容为如下函数（一字不差）：\`pub fn bench_registry() -> &'static str { \"bench\" }\`。只创建这一个文件，不要改动其他文件。"
-judge_MA2() {
-  grep -q 'pub fn bench_registry() -> &.static str { "bench" }' "$WT/registry.rs" 2>/dev/null
+prompt_D2="$DEV_BG 任务（补测试）：在 tests/config_test.rs 中为 parse_kv 新增恰好三个测试函数，函数名必须为：\`parse_kv_preserves_key_case\`（断言 key 的大小写被原样保留）、\`parse_kv_value_inner_spaces\`（断言 value 内部空格被保留）、\`parse_kv_empty_value_is_some\`（断言 \"key =\"（空 value）解析为 Some 且 value 为空字符串）。已有测试不要改动。"
+judge_D2() {
+  local f="$WT/tests/config_test.rs"
+  grep -q "fn parse_kv_preserves_key_case" "$f" 2>/dev/null \
+    && grep -q "fn parse_kv_value_inner_spaces" "$f" 2>/dev/null \
+    && grep -q "fn parse_kv_empty_value_is_some" "$f" 2>/dev/null \
+    && grep -q "fn parse_kv_basic" "$f" 2>/dev/null
 }
-prompt_MA3="$MA1_BG 你负责一次微小的行为变更：在 synthsmoke/ 下任选一个包含 \`wrapping_add\` 的源文件，把其中**第一处** \`wrapping_add\` 改为 \`wrapping_sub\`（只允许改这一处，其余内容保持不变）。"
-judge_MA3() {
-  # Baseline is a per-round pre-run snapshot (PRE_SUB/PRE_ADD) so leftover
-  # edits from previous rounds do not accumulate into the expectation.
-  [ -n "${PRE_SUB:-}" ] && [ -n "${PRE_ADD:-}" ] || { echo "MA3: no pre snapshot" >&2; return 1; }
-  local now_sub now_add
-  now_sub=$(grep -r "wrapping_sub" "$WT" --include='*.rs' 2>/dev/null | wc -l)
-  now_add=$(grep -r "wrapping_add" "$WT" --include='*.rs' 2>/dev/null | wc -l)
-  [ "$now_sub" = "$((PRE_SUB + 1))" ] && [ "$now_add" = "$((PRE_ADD - 1))" ]
+prompt_D3="$DEV_BG 任务（修 bug）：parse_duration 的分钟分支实现是 \`value * 6\`，这是历史 bug（分钟应为 60 秒）；tests/config_test.rs 里有一条错误断言 \`assert_eq!(config::parse_duration(\"5m\"), Some(30))\` 把该 bug 锁定了。修复实现（分钟分支改为 * 60），并把那条断言更新为正确期望值 Some(300)。其他分支（秒/小时）与其他测试不要改动。"
+judge_D3() {
+  grep -q "value \* 60" "$WT/src/config.rs" 2>/dev/null \
+    && ! grep -q "value \* 6)" "$WT/src/config.rs" 2>/dev/null \
+    && grep -q "Some(300)" "$WT/tests/config_test.rs" 2>/dev/null \
+    && ! grep -q "Some(30)); // outdated" "$WT/tests/config_test.rs" 2>/dev/null \
+    && grep -q "value \* 3600" "$WT/src/config.rs" 2>/dev/null
 }
 PROMPT_VAR="prompt_$TASK"; JUDGE_VAR="judge_$TASK"
 [ -n "${!PROMPT_VAR:-}" ] || { echo "unknown task $TASK" >&2; exit 1; }
@@ -83,7 +82,7 @@ PROMPT_VAR="prompt_$TASK"; JUDGE_VAR="judge_$TASK"
 TREE_FOR_COUNT="${TREE_FOR_COUNT:-$TREE}"
 export TREE_FOR_COUNT
 export -f judge_T1 judge_T2 judge_T3 judge_T4 judge_T5 \
-  judge_MA1 judge_MA2 judge_MA3 2>/dev/null || true
+  judge_D1 judge_D2 judge_D3 2>/dev/null || true
 
 # ---------- 运行 ----------
 MODEL_ARGS=()
@@ -97,11 +96,6 @@ for ((r = 1; r <= ROUNDS; r++)); do
   fi
   rm -f "$WT/grep-count.txt"
   cold_cache
-  if [ "$TASK" = MA3 ]; then
-    PRE_SUB=$(grep -r "wrapping_sub" "$WT" --include='*.rs' 2>/dev/null | wc -l)
-    PRE_ADD=$(grep -r "wrapping_add" "$WT" --include='*.rs' 2>/dev/null | wc -l)
-    export PRE_SUB PRE_ADD
-  fi
   local_rc=0
   t0=$(now_ms)
   ( cd "$WT" && $OPENCODE run "${MODEL_ARGS[@]}" "${!PROMPT_VAR}" ) \
