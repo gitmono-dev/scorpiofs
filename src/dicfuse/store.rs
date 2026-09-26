@@ -997,6 +997,13 @@ impl DictionaryStore {
         self.pinned_refs.as_deref()
     }
 
+    /// Whether this store serves an immutable pinned revision. An empty ref
+    /// string is treated as NOT pinned (a mount with no usable revision must
+    /// keep tracking the trunk), so every caller gets one consistent answer.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned_refs().is_some_and(|p| !p.is_empty())
+    }
+
     /// Create a new DictionaryStore with a base path for subdirectory mounting.
     ///
     /// When `base_path` is set (e.g., "/third-party/mega"), the store will:
@@ -1085,7 +1092,7 @@ impl DictionaryStore {
         if let Some(dir) = self.dirs.get(&parent_user_path) {
             // Pinned store: loaded directories can never change (immutable
             // revision), so lookup fast-path must not kick background refreshes.
-            if self.pinned_refs().is_some_and(|p| !p.is_empty()) {
+            if self.is_pinned() {
                 return Ok(!dir.loaded);
             }
             return Ok(dir_needs_refresh(&dir, self.dir_sync_ttl()));
@@ -2494,7 +2501,7 @@ pub async fn import_arc(store: Arc<DictionaryStore>) {
     // large monorepo saturates the remote while a finalize/remount is serving
     // user fetches concurrently — those fail fast, cache size 0, and reads come
     // back empty for seconds.
-    if store.max_depth() > 0 && store.pinned_refs().is_none() {
+    if store.max_depth() > 0 && !store.is_pinned() {
         let max_depth = store.max_depth() + 2;
         info!(
             "[import_arc] Prewarming directory tree (user_root={user_root:?} real_root={real_root:?} max_depth={max_depth} load_dir_depth={})",
@@ -2530,7 +2537,7 @@ pub async fn import_arc(store: Arc<DictionaryStore>) {
     // For Antares subdir mounts (default max_depth=0), we skip the watcher to avoid background
     // remote storms; directories are refreshed lazily when accessed.
     // Pinned stores serve an immutable revision — watching is meaningless there too.
-    if store.max_depth() > 0 && store.pinned_refs().is_none_or(|p| p.is_empty()) {
+    if store.max_depth() > 0 && !store.is_pinned() {
         let watch_path = user_root;
         tokio::spawn(async move {
             loop {
@@ -2621,7 +2628,7 @@ pub async fn load_dir(
     // A pinned store serves an immutable revision — once a directory is loaded its
     // hash can never change, so the periodic hash probe is pure network waste and
     // the refresh is skipped entirely (equivalent to an infinite TTL).
-    let pinned = store.pinned_refs().is_some_and(|p| !p.is_empty());
+    let pinned = store.is_pinned();
     let ttl = store.dir_sync_ttl();
     if pinned || ttl != Duration::from_secs(0) {
         if let Some(d) = dirs.get(&parent_path) {
