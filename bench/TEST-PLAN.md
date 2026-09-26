@@ -34,12 +34,26 @@
 | E1-TTFW ⏱ | 零→可编辑 | `cold; git clone $M2/project && git checkout`（+checkout 后首 touch 探测） | 同左，指向 gitea | `cold; attach；首写探测`（`libra worktree add` + `touch` 成功） | 记录型，报告 ms |
 | E1-DISK 💾 | 工作区占用 | `du -sb`（clone 目录含 .git） | 同左 | `du -sb` mount + scorpio store + size.db 之和 | 记录型 |
 | E1-READ ⏱ | 100 文件随机首读 | `cat` 100 随机文件（clone 后，本地） | 同左 | 同 100 文件（冷=drop_cache 后，热=第二次） | 记录型，冷/热分开 |
-| E1-STATUS ⏱ | status 延迟 | `git status`（fsmonitor on / off 两套） | — | `libra status`（effective diff） | 记录型 |
+| E1-STATUS ⏱ | status 延迟（全树、零改动） | `git status`（fsmonitor on / off 两套） | — | `libra status`（effective diff） | 记录型 |
+| E1-STATUS-1F ⏱ | status 延迟（全树、单文件改动） | 同上（改动后） | — | 同上 | 记录型 |
+| E1-STATUS-SCALE ⏱ | **结构性命中集对比**：树规模 × {0,1,100} 个改动 | `git status` 必须遍历/校验全树（fsmonitor on/off 双线） | — | `libra status` **ScorpioFS fast path**：只查 upper 触碰集，延迟与树大小无关 | **核心赢面**，随树规模放大 |
 | E1-COMMIT ⏱ | 小改动→远端 | edit+`git add/commit/push` | 同左 | edit+`libra sync` | 记录型 |
 | E1-NET ⏱📈 | 全程网络流量 | vnstat 差分 | 同左 | vnstat 差分 | 记录型 |
 | E1-A1 🤖 | D1 新功能：parse_timeout | opencode on clone | — | opencode on mount | 判分通过 + wall time |
 | E1-A2 🤖 | D2 补测试：parse_kv ×3 | 同上 | — | 同上 | 判分 + wall time |
 | E1-A3 🤖 | D3 修 bug：分钟分支 | 同上 | — | 同上 | 判分 + wall time |
+
+**E1-STATUS-SCALE 的设计（结构性对比，非调参对比）**：
+- git 侧：bare repo（本地盘，git 的最佳条件）+ 工作区 clone 到本地盘；
+  `git status` 的校验成本随树规模线性增长（fsmonitor 只省 stat、仍需遍历与
+  失效校验），三档树规模 × 三种改动量各测 5 轮。
+- mono 侧：同一棵树 seed 进 mega2 → attach → `libra status`（fast path）：
+  daemon 的 upper 触碰集即候选集，**延迟与树规模解耦**（O(触碰) + 一次 HTTP）。
+- 预期形状：git 是 O(树) 斜线，mono 是 O(触碰) 近水平线——交叉点与放大倍数
+  就是本项的结论。同时记录 fast path 的语义正确性（touch 判 clean 等，见
+  `verify-clean-fastpath.sh` 的四场景）。
+- 诚实边界：树很小时 git 的常数项更低（无 HTTP/index 加载）；报告如实给出
+  小树场景 git 持平或占优的数据点。
 
 **开发型任务 D1–D3**（`gen-devlab.sh` 生成有真实逻辑的 Rust 配置解析 CLI seed 进
 mega2）：三个任务共享 `src/config.rs` 演进语境（加功能 → 补测试 → 修 bug），

@@ -57,17 +57,19 @@ def main():
         if "note" in r["meta"]:
             notes[key].append(r["meta"]["note"])
 
+    # 动态列：所有出现过的 side（保证 git-off/git-on/mono 多线对比可分列）
+    all_sides = sorted({r["side"] for r in rows})
     lines = ["# GitMono vs Git — 结果报告", "",
-             "| 实验 | 用例 | 指标 | git 侧 | mono 侧 | 备注 |",
-             "|---|---|---|---|---|---|"]
+             "| 实验 | 用例 | 指标 | " + " | ".join(all_sides) + " | 备注 |",
+             "|---|---|---|" + "---|" * len(all_sides) + "---|"]
     for (exp, case, metric) in sorted(groups):
         sides = groups[(exp, case, metric)]
-        g = fmt(sides["git"], metric) if sides.get("git") else "—"
-        m = fmt(sides.get("mono", []), metric) if sides.get("mono") else "—"
-        if metric.endswith("_bytes"):
-            g = fmt(sides["git"], metric) if sides.get("git") else "—"
+        cells = []
+        for side in all_sides:
+            vals = sides.get(side)
+            cells.append(fmt(vals, metric) if vals else "—")
         note = "; ".join(sorted(set(notes.get((exp, case, metric), []))))[:80]
-        lines.append(f"| {exp} | {case} | {metric} | {g} | {m} | {note} |")
+        lines.append(f"| {exp} | {case} | {metric} | " + " | ".join(cells) + f" | {note} |")
     lines += ["", f"数据源: {len(rows)} 行原始记录（results/raw/）"]
     OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"wrote {OUT}")
