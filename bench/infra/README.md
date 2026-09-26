@@ -70,8 +70,33 @@ python3 bin/report.py
 
 ## 4. k8s 形态（可选）
 
-`mega2-k8s.yaml` 提供 mega2/gitea/prometheus 的 Deployment+Service manifests（k3s 即可）。
-runner 仍建议裸 ECS——容器化 FUSE（privileged + /dev/fuse + allow_other）引入的变量大于收益。
+`mega2-k8s.yaml` 提供 mega2/gitea/prometheus 的 Deployment+Service manifests；
+`runner-k8s.yaml` 是 runner pod 的 k8s 版本（privileged + `/dev/fuse`）。
+
+### FUSE runner 在 k8s 上的三个要点
+
+1. **特权**：FUSE 挂载需要 `CAP_SYS_ADMIN` + `/dev/fuse` —— pod 的
+   `securityContext.privileged: true` + hostPath 挂 `/dev/fuse`。
+   默认 PSA 会拒绝，给命名空间打标签豁免：
+   ```bash
+   kubectl label ns bench pod-security.kubernetes.io/enforce=privileged --overwrite
+   ```
+2. **"sudo" 的真相**：容器里 pod 默认就是 root，不需要容器内 sudo；
+   真正的问题是 **mount_owner** —— daemon 以 PID 1 root 跑时没有 `SUDO_USER`，
+   属主会退化成 `0:0`，导致 upper 节点 root:root、非 root 的 agent 写挂载点
+   EACCES。三种解法（见 `runner-k8s.yaml` 注释）：
+   - **A（推荐）**：容器里设 `SCORPIO_MOUNT_OWNER=1000:1000`，显式声明属主；
+   - **B（与本地一致）**：镜像装 sudo + 非 root 用户，以 `sudo scorpio serve`
+     启动让 `SUDO_USER` 生效；
+   - **C**：daemon 与 agent 同为 root（不推荐，agent 以 root 跑）。
+3. **挂载可见性**：只有同 pod 内的 agent/libra 使用挂载时无需宿主传播；
+   要让宿主机或其他 pod 看到挂载点，加 `mountPropagation: Bidirectional`。
+
+### 镜像
+
+`runner-k8s.yaml` 引用 `bench-runner-mono:local` / `bench-runner-git:local` ——
+由 `init-runner-mono.sh` / `init-runner-git.sh` 容器化而来（在 ECS 上先跑
+初始化脚本，再 `docker commit` 或据其步骤写 Dockerfile 均可）。
 
 ## 5. 实验完释放
 

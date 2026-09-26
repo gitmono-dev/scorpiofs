@@ -4,8 +4,16 @@
 //! worktree. Reporting the daemon's own uid/gid would make the union
 //! filesystem's copy-up create root-owned upper nodes (the overlay preserves
 //! the lower layer's ownership), after which the user cannot create files
-//! inside a copied-up directory. The mount owner is therefore derived from
-//! `SUDO_USER` (best-effort) and falls back to the effective ids.
+//! inside a copied-up directory. The mount owner is therefore:
+//!
+//! 1. `SCORPIO_MOUNT_OWNER` (`uid` or `uid:gid`) when set — container
+//!    orchestrators have no `SUDO_USER`: the daemon is PID 1 as root while
+//!    the worktree belongs to a non-root runtime user, so the owner must be
+//!    declared explicitly (see bench/infra runner manifests);
+//! 2. else the effective ids when not root;
+//! 3. else `SUDO_USER` (best-effort) when root — the local `sudo scorpio
+//!    serve` path;
+//! 4. else the effective ids (root).
 
 use std::sync::OnceLock;
 
@@ -22,9 +30,33 @@ impl Default for MountOwner {
     }
 }
 
+/// Parse an explicit owner override: `"uid"` (gid = uid) or `"uid:gid"`.
+fn parse_owner_override(spec: &str) -> Option<MountOwner> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let (uid_raw, gid_raw) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let uid: u32 = uid_raw.trim().parse().ok()?;
+    let gid: u32 = match gid_raw {
+        Some(g) => g.trim().parse().ok()?,
+        None => uid,
+    };
+    Some(MountOwner { uid, gid })
+}
+
 fn resolve() -> MountOwner {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
+    // Explicit override first: containers have no SUDO_USER to derive from.
+    if let Some(spec) = std::env::var_os("SCORPIO_MOUNT_OWNER") {
+        if let Some(owner) = spec.to_str().and_then(parse_owner_override) {
+            return owner;
+        }
+    }
     if euid != 0 {
         return MountOwner { uid: euid, gid: egid };
     }
@@ -55,5 +87,31 @@ mod tests {
     #[test]
     fn owner_is_stable_across_calls() {
         assert_eq!(mount_owner(), mount_owner());
+    }
+
+    #[test]
+    fn owner_override_parses_uid_and_uid_gid() {
+        assert_eq!(
+            parse_owner_override("1000"),
+            Some(MountOwner { uid: 1000, gid: 1000 })
+        );
+        assert_eq!(
+            parse_owner_override("1000:100"),
+            Some(MountOwner { uid: 1000, gid: 100 })
+        );
+        assert_eq!(
+            parse_owner_override(" 1000 : 100 "),
+            Some(MountOwner { uid: 1000, gid: 100 })
+        );
+    }
+
+    #[test]
+    fn owner_override_rejects_garbage() {
+        assert_eq!(parse_owner_override(""), None);
+        assert_eq!(parse_owner_override("  "), None);
+        assert_eq!(parse_owner_override("root"), None);
+        assert_eq!(parse_owner_override("1000:"), None);
+        assert_eq!(parse_owner_override(":100"), None);
+        assert_eq!(parse_owner_override("1000:x"), None);
     }
 }

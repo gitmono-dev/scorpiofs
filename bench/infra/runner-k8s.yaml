@@ -1,0 +1,97 @@
+# bench/infra/runner-k8s.yaml — runner pods（mono / git）在 k8s 上的形态
+#
+# ## 为什么需要特权（"如何开 sudo"）
+#
+# scorpiofs daemon 要挂 FUSE：需要 CAP_SYS_ADMIN + /dev/fuse，容器内必须以
+# root 运行（k8s 里 pod 默认就是 root，不需要容器内 sudo）。真正的问题不是
+# "拿到 root"，而是 **mount_owner**：daemon 以 root 直接跑（PID 1）时没有
+# SUDO_USER，mount_owner 会退化为 0:0 → upper 节点 root:root → 非 root 的
+# agent 写挂载点会 EACCES。三种解法按推荐顺序：
+#
+#   A. SCORPIO_MOUNT_OWNER=1000:1000（推荐，显式、不依赖 sudo）；
+#   B. 容器内建非 root 用户并以 `sudo` 起 daemon（SUDO_USER 生效，与本地一致）：
+#        sudo -E -u root scorpio serve        # 由 runner 用户执行
+#      —— 需要镜像里装 sudo 且配 NOPASSWD；
+#   C. daemon 与 agent 同为 root（最省事，但 agent 以 root 跑，不推荐）。
+#
+# ## PSS 豁免
+#
+# 默认的 Pod Security Admission 会拒绝 privileged pod，给命名空间打标签：
+#   kubectl label ns bench pod-security.kubernetes.io/enforce=privileged --overwrite
+#
+# ## FUSE 挂载的可见性
+#
+# 只在 pod 内使用挂载（opencode/libra 同 pod）时无需宿主传播；若要让宿主机
+# 或其他 pod 看到挂载点，加 mountPropagation: Bidirectional（见注释处）。
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: runner-mono
+  namespace: bench
+  labels: { app: runner-mono }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: runner
+      image: bench-runner-mono:local       # init-runner-mono.sh 的容器化版本（另行构建）
+      securityContext:
+        privileged: true                   # CAP_SYS_ADMIN + /dev/fuse
+      env:
+        # 解法 A：显式声明挂载属主（与镜像里 runner 用户的 uid/gid 一致）
+        - { name: SCORPIO_MOUNT_OWNER, value: "1000:1000" }
+        - { name: M2, value: "http://mega2.bench:19000" }
+        - { name: LIBRA_SCORPIOFS_ENDPOINT, value: "http://127.0.0.1:37251/antares" }
+        # 解法 B 的替代：镜像里 runner 用户 + 下方 command 以 sudo 起 daemon
+        # - { name: SCORPIO_SUDO_MODE, value: "1" }
+      volumeMounts:
+        - { name: fuse, mountPath: /dev/fuse }
+        - { name: bench, mountPath: /bench }
+        # 让宿主机看到挂载点（可选）：
+        # mountPropagation: Bidirectional
+      workingDir: /bench
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -e
+          # 容器内以 root（默认）起 daemon；mount_owner 由 SCORPIO_MOUNT_OWNER 决定。
+          # 解法 B（与本地 sudo 语义一致）改为：
+          #   su -s /bin/bash runner -c 'sudo -nE scorpio serve' &
+          scorpio serve --http-addr 127.0.0.1:37251 &
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:37251/antares/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # 以 runner 身份跑评测/agent（非 root，验证 copy-up 属主正确）
+          su -s /bin/bash runner -c 'bash /bench/cases/exp1-status-duel.sh'
+  volumes:
+    - name: fuse
+      hostPath: { path: /dev/fuse, type: CharDevice }
+    - name: bench
+      hostPath: { path: /bench, type: DirectoryOrCreate }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: runner-git
+  namespace: bench
+  labels: { app: runner-git }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: runner
+      image: bench-runner-git:local
+      env:
+        - { name: GITEA, value: "http://gitea.bench:3000" }
+      volumeMounts:
+        - { name: bench, mountPath: /bench }
+      workingDir: /bench
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          git config --global user.name bench
+          git config --global user.email bench@gitmono.local
+          git status --version || true
+  volumes:
+    - name: bench
+      hostPath: { path: /bench-git, type: DirectoryOrCreate }

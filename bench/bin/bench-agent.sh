@@ -52,14 +52,14 @@ judge_T5() {
 # 三个任务围绕同一模块（src/config.rs）的演进链：加功能 → 写测试 → 修 bug。
 # 共享语境、互不依赖、独立判分（全部静态内容校验，无需 cargo）。
 DEV_BG='本仓库 dev-lab 是一个 Rust 配置解析工具。核心模块 src/config.rs 提供 parse_duration（解析 "10s"/"5m"/"2h" 为秒）、parse_kv（解析 "key = value" 行）、load_config/lookup。辅助模块 src/util.rs 提供 clamp_u64(v, lo, hi)。测试在 tests/config_test.rs。'
-prompt_D1="$DEV_BG 任务（新功能）：在 src/config.rs 中新增函数 \`pub fn parse_timeout(spec: &str) -> Option<u64>\`——语义：先调用 parse_duration 解析，解析结果用 util::clamp_u64 约束到 [1, 3600] 后返回；parse_duration 返回 None 时返回 None。保持与文件内现有代码风格一致，不要改动其他既有函数。"
+prompt_D1="$DEV_BG 任务（新功能）：在 src/config.rs 中新增函数 \`pub fn parse_timeout(spec: &str) -> Option<u64>\`——语义：先调用 parse_duration 解析，解析结果用 util::clamp_u64 约束到 [1, 3600] 后返回；parse_duration 返回 None 时返回 None。保持与文件内现有代码风格一致，不要改动其他既有函数。（重要：不要运行任何编译或测试命令——评分只检查源文件内容，`cargo build`/`cargo test` 会浪费时间且不被计入。）"
 judge_D1() {
   grep -q "pub fn parse_timeout" "$WT/src/config.rs" 2>/dev/null \
     && grep -q "clamp_u64" "$WT/src/config.rs" 2>/dev/null \
     && grep -q "3600" "$WT/src/config.rs" 2>/dev/null \
     && grep -q "pub fn parse_duration" "$WT/src/config.rs" 2>/dev/null
 }
-prompt_D2="$DEV_BG 任务（补测试）：在 tests/config_test.rs 中为 parse_kv 新增恰好三个测试函数，函数名必须为：\`parse_kv_preserves_key_case\`（断言 key 的大小写被原样保留）、\`parse_kv_value_inner_spaces\`（断言 value 内部空格被保留）、\`parse_kv_empty_value_is_some\`（断言 \"key =\"（空 value）解析为 Some 且 value 为空字符串）。已有测试不要改动。"
+prompt_D2="$DEV_BG 任务（补测试）：在 tests/config_test.rs 中为 parse_kv 新增恰好三个测试函数，函数名必须为：\`parse_kv_preserves_key_case\`（断言 key 的大小写被原样保留）、\`parse_kv_value_inner_spaces\`（断言 value 内部空格被保留）、\`parse_kv_empty_value_is_some\`（断言 \"key =\"（空 value）解析为 Some 且 value 为空字符串）。已有测试不要改动。（重要：不要运行任何编译或测试命令——评分只检查源文件内容，`cargo build`/`cargo test` 会浪费时间且不被计入。）"
 judge_D2() {
   local f="$WT/tests/config_test.rs"
   grep -q "fn parse_kv_preserves_key_case" "$f" 2>/dev/null \
@@ -67,7 +67,7 @@ judge_D2() {
     && grep -q "fn parse_kv_empty_value_is_some" "$f" 2>/dev/null \
     && grep -q "fn parse_kv_basic" "$f" 2>/dev/null
 }
-prompt_D3="$DEV_BG 任务（修 bug）：parse_duration 的分钟分支实现是 \`value * 6\`，这是历史 bug（分钟应为 60 秒）；tests/config_test.rs 里有一条错误断言 \`assert_eq!(config::parse_duration(\"5m\"), Some(30))\` 把该 bug 锁定了。修复实现（分钟分支改为 * 60），并把那条断言更新为正确期望值 Some(300)。其他分支（秒/小时）与其他测试不要改动。"
+prompt_D3="$DEV_BG 任务（修 bug）：parse_duration 的分钟分支实现是 \`value * 6\`，这是历史 bug（分钟应为 60 秒）；tests/config_test.rs 里有一条错误断言 \`assert_eq!(config::parse_duration(\"5m\"), Some(30))\` 把该 bug 锁定了。修复实现（分钟分支改为 * 60），并把那条断言更新为正确期望值 Some(300)。其他分支（秒/小时）与其他测试不要改动。（重要：不要运行任何编译或测试命令——评分只检查源文件内容，`cargo build`/`cargo test` 会浪费时间且不被计入。）"
 judge_D3() {
   grep -q "value \* 60" "$WT/src/config.rs" 2>/dev/null \
     && ! grep -q "value \* 6)" "$WT/src/config.rs" 2>/dev/null \
