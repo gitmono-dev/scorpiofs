@@ -1,0 +1,197 @@
+# Mega2 + ScorpioFS on ACK, images pulled from the user's ACR *personal*
+# registry — an aliyun-managed endpoint the nodes can reach natively, which
+# is what the earlier attempt (VPC self-hosted registry) could not do.
+#
+# Prereq: imagePullSecret for the private ACR repo (created out-of-band by
+# ack-deploy.sh, which logs in with the ACR registry password).
+#
+# Component size is tuned for ONE 4c8g node:
+#   postgres 256Mi + redis 64Mi + rustfs 128Mi + rustfs-init 32Mi
+#   + mega2 1Gi + scorpiofs 1Gi  ≈ 2.5Gi of 8Gi
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitmono
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: acr-pull
+  namespace: gitmono
+type: kubernetes.io/dockerconfigjson
+stringData:
+  .dockerconfigjson: PLACEHOLDER_SUBSTITUTED_BY_SCRIPT
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      imagePullSecrets: [{ name: acr-pull }]
+      containers:
+        - name: postgres
+          image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:base-postgres
+          env:
+            - { name: POSTGRES_USER, value: mega2 }
+            - { name: POSTGRES_PASSWORD, value: mega2_local_password }
+            - { name: POSTGRES_DB, value: mega2 }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: d, mountPath: /var/lib/postgresql }]
+          readinessProbe:
+            exec: { command: ["pg_isready","-U","mega2","-d","mega2"] }
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 1Gi }
+      volumes: [{ name: d, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: gitmono }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      imagePullSecrets: [{ name: acr-pull }]
+      containers:
+        - name: redis
+          image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:base-redis
+          ports: [{ containerPort: 6379 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: gitmono }
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: rustfs } }
+  template:
+    metadata: { labels: { app: rustfs } }
+    spec:
+      imagePullSecrets: [{ name: acr-pull }]
+      # rustfs runs as uid 10001 and needs to own its data dir
+      securityContext: { fsGroup: 10001, runAsUser: 10001 }
+      containers:
+        - name: rustfs
+          image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:base-rustfs
+          args: ["/data"]
+          env:
+            - { name: RUSTFS_ACCESS_KEY, value: rustfs }
+            - { name: RUSTFS_SECRET_KEY, value: rustfs_secret }
+          ports: [{ containerPort: 9000 }]
+          volumeMounts: [{ name: d, mountPath: /data }]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+      volumes: [{ name: d, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: rustfs, namespace: gitmono }
+spec:
+  selector: { app: rustfs }
+  ports: [{ port: 9000, targetPort: 9000 }]
+---
+# Creates the S3 bucket once, then idles (same role as compose's rustfs-init).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rustfs-init
+  namespace: gitmono
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      imagePullSecrets: [{ name: acr-pull }]
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:base-rustfs-rc
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -e
+              # positional args: rc alias set <name> <endpoint> <ak> <sk>
+              rc alias set local http://rustfs:9000 rustfs rustfs_secret
+              rc bucket create local/mega2 || true
+              rc bucket list local
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mega2
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mega2 } }
+  template:
+    metadata: { labels: { app: mega2 } }
+    spec:
+      imagePullSecrets: [{ name: acr-pull }]
+      containers:
+        - name: mega2
+          image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:v0.3.0-mega2
+          env:
+            - { name: MEGA_BASE_DIR, value: /var/lib/mega2 }
+            - { name: MEGA_DATABASE__DB_TYPE, value: postgres }
+            - { name: MEGA_DATABASE__DB_URL, value: "postgres://mega2:mega2_local_password@postgres:5432/mega2" }
+            - { name: MEGA_DATABASE__MIN_CONNECTION, value: "1" }
+            - { name: MEGA_REDIS__URL, value: "redis://redis:6379" }
+            - { name: MEGA_MONOREPO__PUSH_POLICY, value: trunk }
+            - { name: MEGA_CEDAR__ENFORCEMENT, value: "off" }
+            - { name: MEGA_GIT__ANONYMOUS_ACCESS, value: "true" }
+            - { name: MEGA_GIT__PUSH_AUTH, value: none }
+            - { name: MEGA_GIT__SSH_RECEIVE_PACK, value: "false" }
+            - { name: MEGA_OBJECT_STORAGE__STORAGE_TYPE, value: s3compatible }
+            - { name: MEGA_OBJECT_STORAGE__S3__REGION, value: us-east-1 }
+            - { name: MEGA_OBJECT_STORAGE__S3__BUCKET, value: mega2 }
+            - { name: MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID, value: rustfs }
+            - { name: MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY, value: rustfs_secret }
+            # NOTE the _URL suffix — without it mega2 silently uses localhost:9000
+            - { name: MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL, value: "http://rustfs:9000" }
+          ports: [{ containerPort: 8000 }]
+          volumeMounts: [{ name: state, mountPath: /var/lib/mega2 }]
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: 1000m, memory: 2Gi }
+      volumes: [{ name: state, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mega2, namespace: gitmono }
+spec:
+  selector: { app: mega2 }
+  ports: [{ port: 8000, targetPort: 8000, nodePort: 30080 }]
+  type: NodePort
