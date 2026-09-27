@@ -1,0 +1,61 @@
+# Configure every node's containerd to trust the plain-HTTP registry at
+# 172.18.16.75:5000. Runs once per node via a privileged DaemonSet:
+# it patches /etc/containerd/config.toml on the NODE (hostPID+hostPath) and
+# restarts containerd.
+#
+# This is the standard ACK workaround for an HTTP (non-TLS) registry, which
+# otherwise fails with:
+#   failed to resolve reference: ... http: server gave HTTP response to HTTPS client
+#
+# Apply:  kubectl apply -f registry-trust-daemonset.yaml
+# Remove: kubectl delete -f registry-trust-daemonset.yaml   (after images are cached)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: registry-trust
+  namespace: kube-system
+  labels: { app: registry-trust }
+spec:
+  selector:
+    matchLabels: { app: registry-trust }
+  template:
+    metadata:
+      labels: { app: registry-trust }
+    spec:
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: patch
+          image: alpine:3.20
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              REG=172.18.16.75:5000
+              CFG=/host/etc/containerd/config.toml
+              MARK="# gitmono-registry-trust"
+              if grep -q "$MARK" "$CFG" 2>/dev/null; then
+                echo "already configured"; sleep infinity; exit 0
+              fi
+              echo "" >> "$CFG"
+              echo "$MARK" >> "$CFG"
+              echo "[plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"$REG\"]" >> "$CFG"
+              echo "  endpoint = [\"http://$REG\"]" >> "$CFG"
+              echo "[plugins.\"io.containerd.grpc.v1.cri\".registry.configs.\"$REG\".tls]" >> "$CFG"
+              echo "  insecure_skip_verify = true" >> "$CFG"
+              echo "patched $CFG"
+              nsenter -t 1 -m -u -i -n -p -- systemctl restart containerd
+              echo "containerd restarted"
+              sleep infinity
+          volumeMounts:
+            - { name: host-root, mountPath: /host, mountPropagation: HostToContainer }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+      volumes:
+        - name: host-root
+          hostPath: { path: / }

@@ -1,0 +1,201 @@
+# Mega2 + ScorpioFS demo stack on ACK, pulling images from the
+# self-hosted registry on the same VPC (172.18.16.75:5000, plain HTTP).
+#
+# Prereq on every node (ACK does not do this automatically for HTTP
+# registries) — see register-insecure-registry.sh:
+#   /etc/containerd/config.toml:
+#     [plugins."io.containerd.grpc.v1.cri".registry.mirrors."172.18.16.75:5000"]
+#       endpoint = ["http://172.18.16.75:5000"]
+#     [plugins."io.containerd.grpc.v1.cri".registry.configs."172.18.16.75:5000".tls]
+#       insecure_skip_verify = true
+#   then `systemctl restart containerd` (or use a K8s secret + imagePullSecrets
+#   with a TLS registry; plain HTTP needs the node-level config).
+#
+# The stack is deliberately small for a 4c8g node:
+#   postgres (200m) + redis (100m) + rustfs (200m) + mega2 (500m) + scorpiofs (500m)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitmono
+---
+# ---- stateful deps (single replica, emptyDir: this is a demo, not durable) ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18.6-alpine3.24
+          env:
+            - { name: POSTGRES_USER, value: mega2 }
+            - { name: POSTGRES_PASSWORD, value: mega2_local_password }
+            - { name: POSTGRES_DB, value: mega2 }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 1Gi }
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: gitmono }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:8.10.1-alpine3.23
+          ports: [{ containerPort: 6379 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: gitmono }
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: rustfs } }
+  template:
+    metadata: { labels: { app: rustfs } }
+    spec:
+      containers:
+        - name: rustfs
+          image: rustfs/rustfs:1.0.0
+          args: ["/data"]
+          env:
+            - { name: RUSTFS_ACCESS_KEY, value: rustfs }
+            - { name: RUSTFS_SECRET_KEY, value: rustfs_secret }
+          ports: [{ containerPort: 9000 }, { containerPort: 9001 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: rustfs, namespace: gitmono }
+spec:
+  selector: { app: rustfs }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+# ---- mega2 (git server) ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mega2
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mega2 } }
+  template:
+    metadata: { labels: { app: mega2 } }
+    spec:
+      containers:
+        - name: mega2
+          image: 172.18.16.75:5000/mega2:latest
+          env:
+            - { name: MEGA_BASE_DIR, value: /var/lib/mega2 }
+            - { name: MEGA_DATABASE__DB_TYPE, value: postgres }
+            - { name: MEGA_DATABASE__DB_URL, value: "postgres://mega2:mega2_local_password@postgres:5432/mega2" }
+            - { name: MEGA_DATABASE__MIN_CONNECTION, value: "1" }
+            - { name: MEGA_REDIS__URL, value: "redis://redis:6379" }
+            - { name: MEGA_MONOREPO__PUSH_POLICY, value: trunk }
+            - { name: MEGA_CEDAR__ENFORCEMENT, value: "off" }
+            - { name: MEGA_GIT__ANONYMOUS_ACCESS, value: "true" }
+            - { name: MEGA_GIT__PUSH_AUTH, value: none }
+            - { name: MEGA_GIT__SSH_RECEIVE_PACK, value: "false" }
+            - { name: MEGA_OBJECT_STORAGE__STORAGE_TYPE, value: s3compatible }
+            - { name: MEGA_OBJECT_STORAGE__S3__REGION, value: us-east-1 }
+            - { name: MEGA_OBJECT_STORAGE__S3__BUCKET, value: mega2 }
+            - { name: MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID, value: rustfs }
+            - { name: MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY, value: rustfs_secret }
+            - { name: MEGA_OBJECT_STORAGE__S3__ENDPOINT, value: "http://rustfs:9000" }
+          ports: [{ containerPort: 8000 }]
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: 1000m, memory: 2Gi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mega2, namespace: gitmono }
+spec:
+  selector: { app: mega2 }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+# ---- scorpiofs (FUSE daemon) ----
+# privileged + /dev/fuse: the mount happens inside the pod's namespace.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scorpiofs
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: scorpiofs } }
+  template:
+    metadata: { labels: { app: scorpiofs } }
+    spec:
+      containers:
+        - name: scorpiofs
+          image: 172.18.16.75:5000/scorpiofs:latest
+          securityContext:
+            privileged: true
+          env:
+            - { name: SCORPIO_BASE_URL, value: "http://mega2:8000" }
+            - { name: SCORPIO_LFS_URL, value: "http://mega2:8000/api/v1/lfs" }
+            # container runs as root with no SUDO_USER: declare the mount owner
+            # explicitly or copy-up produces root-owned upper nodes.
+            - { name: SCORPIO_MOUNT_OWNER, value: "0:0" }
+          ports: [{ containerPort: 2725 }]
+          volumeMounts:
+            - { name: fuse, mountPath: /dev/fuse }
+            - { name: state, mountPath: /var/lib/scorpiofs }
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: 1000m, memory: 2Gi }
+      volumes:
+        - name: fuse
+          hostPath: { path: /dev/fuse, type: CharDevice }
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: scorpiofs, namespace: gitmono }
+spec:
+  selector: { app: scorpiofs }
+  ports: [{ port: 2725, targetPort: 2725 }]
