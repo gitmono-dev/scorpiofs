@@ -33,6 +33,7 @@ for local_img in "${!SRC[@]}"; do
 done
 
 echo "== push all =="
+push_one "gitmono-git:local"               "base-git"
 push_one "postgres:18.6-alpine3.24"       "base-postgres"
 push_one "redis:8.10.1-alpine3.23"        "base-redis"
 push_one "rustfs/rustfs:1.0.0"            "base-rustfs"

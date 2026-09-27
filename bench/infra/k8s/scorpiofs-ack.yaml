@@ -1,0 +1,140 @@
+# ScorpioFS on ACK: FUSE daemon + git sidecar in ONE pod, sharing a volume so
+# the git container can operate on files served through the mount.
+#
+# Design notes (each one learned the hard way):
+#   * A FUSE mount lives in the mount namespace of the container that mounts
+#     it. The sidecar only sees it if the volume is mounted with
+#     mountPropagation: Bidirectional and the scorpiofs container mounts it at
+#     the SAME path (SCORPIO_ANTARES_MOUNT_ROOT stays at its default).
+#   * Kubernetes emptyDir does NOT inherit the image's directory contents the
+#     way a Docker named volume does, so the runtime tree the image ships has
+#     to be recreated by an initContainer.
+#   * The entrypoint hardcodes `--config-path /etc/scorpiofs/scorpio.toml`;
+#     SCORPIO_CONFIG_FILE is ignored, so there is no point overriding it.
+#   * privileged + host /dev/fuse are required (FUSE needs CAP_SYS_ADMIN), and
+#     the namespace must permit it:
+#       kubectl label ns gitmono pod-security.kubernetes.io/enforce=privileged
+#   * SCORPIO_MOUNT_OWNER: the container is root with no SUDO_USER, so
+#     mount_owner would fall back to 0:0; declaring it makes that intentional.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scorpiofs-git
+  namespace: gitmono
+  labels: { app: scorpiofs-git }
+spec:
+  imagePullSecrets: [{ name: acr-pull }]
+  restartPolicy: Never
+
+  initContainers:
+    # Recreate the runtime tree the image ships (emptyDir starts blank in k8s).
+    - name: mkdirs
+      image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:base-git
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -eux
+          mkdir -p /rt/mount /rt/store \
+                   /rt/antares/upper /rt/antares/cl /rt/antares/mnt
+          ls -la /rt
+      volumeMounts:
+        - { name: rt, mountPath: /rt }
+
+  containers:
+    # --- ScorpioFS: mounts the monorepo over FUSE into /var/lib/scorpiofs ---
+    - name: scorpiofs
+      image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:v0.3.0-scorpiofs
+      securityContext:
+        privileged: true
+      env:
+        - { name: SCORPIO_BASE_URL, value: "http://mega2:8000" }
+        - { name: SCORPIO_LFS_URL, value: "http://mega2:8000/api/v1/lfs" }
+        - { name: SCORPIO_MOUNT_OWNER, value: "0:0" }
+      volumeMounts:
+        - { name: fuse, mountPath: /dev/fuse }
+        - name: rt
+          mountPath: /var/lib/scorpiofs
+          mountPropagation: Bidirectional
+      resources:
+        requests: { cpu: 200m, memory: 512Mi }
+        limits:   { cpu: 1000m, memory: 2Gi }
+
+    # --- mount-init: ask the daemon to create the actual Antares mount ---
+    # `serve` alone only brings up the daemon; a mount appears when the
+    # /antares/mounts API is called (SCORPIO_ANTARES_MOUNT_ROOT is inside the
+    # shared volume, so the result propagates to the other containers).
+    - name: mount-init
+      image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:v0.3.0-scorpiofs
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -e
+          echo "waiting for the daemon..."
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:2725/antares/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+          echo "creating mount /project"
+          curl -fsS -X POST http://127.0.0.1:2725/antares/mounts             -H 'content-type: application/json'             -d '{"job_id":"ack-scorpiofs","path":"/project"}'
+          echo
+          sleep 3
+          ls -la /var/lib/scorpiofs/antares/mnt || true
+          echo "mount-init done"
+          sleep 3600
+      volumeMounts:
+        - name: rt
+          mountPath: /var/lib/scorpiofs
+          mountPropagation: HostToContainer
+      resources:
+        requests: { cpu: 20m, memory: 32Mi }
+        limits:   { cpu: 100m, memory: 128Mi }
+
+    # --- git: clones from mega2 and reads the tree through the FUSE mount ---
+    - name: git
+      image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:base-git
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -e
+          echo "=== 1) wait for the FUSE mount to appear ==="
+          for i in $(seq 1 90); do
+            if [ -d /var/lib/scorpiofs/antares/mnt ] && \
+               [ -n "$(ls -A /var/lib/scorpiofs/antares/mnt 2>/dev/null)" ]; then
+              echo "mount dir present"; break
+            fi
+            sleep 2
+          done
+          ls -la /var/lib/scorpiofs/antares/mnt || true
+
+          echo "=== 2) git clone from mega2 (git protocol) ==="
+          rm -rf /tmp/repo
+          git clone -q http://mega2:8000/project /tmp/repo && echo "clone ok"
+          cd /tmp/repo
+          git config user.name ack-demo
+          git config user.email ack@gitmono.local
+          echo "written by the git sidecar at $(date -u +%FT%TZ)" > from-git.txt
+          git add from-git.txt
+          git commit -qm "ack: from git sidecar"
+          git push -q origin HEAD:refs/heads/main && echo "push ok"
+          git log --oneline -1
+
+          echo "=== 3) read the SAME file through the ScorpioFS FUSE mount ==="
+          find /var/lib/scorpiofs/antares/mnt -name from-git.txt 2>/dev/null | head -3 | while read -r f; do
+            echo "  FUSE path: $f"; cat "$f"
+          done
+          echo "=== DONE ==="
+          sleep 3600
+      volumeMounts:
+        - name: rt
+          mountPath: /var/lib/scorpiofs
+          mountPropagation: HostToContainer
+      resources:
+        requests: { cpu: 50m, memory: 64Mi }
+        limits:   { cpu: 200m, memory: 256Mi }
+
+  volumes:
+    - name: fuse
+      hostPath: { path: /dev/fuse, type: CharDevice }
+    - name: rt
+      emptyDir: {}
