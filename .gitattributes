@@ -1,0 +1,11 @@
+# Keep shell scripts LF in the working tree on every platform.
+#
+# `core.autocrlf=true` (the common Windows default) rewrites checked-out files
+# to CRLF. For a script this is fatal when it is COPYed into an image: the
+# shebang becomes `#!/bin/sh\r`, the kernel looks for an interpreter named
+# "/bin/sh\r", and the container dies with
+#   exec /usr/local/bin/docker-entrypoint.sh: no such file or directory
+# even though the file is plainly there. Force LF so the image built from a
+# Windows checkout matches the image built from CI.
+*.sh text eol=lf
+deploy/docker-entrypoint.sh text eol=lf

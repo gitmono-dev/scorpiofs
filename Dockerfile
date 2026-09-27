@@ -56,7 +56,13 @@ RUN apt-get update \
 COPY --from=build /out/scorpio /usr/local/bin/scorpio
 COPY --from=build /out/antares /usr/local/bin/antares
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# Normalize CRLF before installing: a Windows checkout (core.autocrlf=true)
+# turns the shebang into `#!/bin/sh\r`, and the kernel then fails with
+#   exec /usr/local/bin/docker-entrypoint.sh: no such file or directory
+# even though the file exists. `.gitattributes` pins LF for the repo; this is
+# the build-time backstop so a stray CRLF can never brick the image.
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # A baseline config file must exist (it is parsed before env overrides apply).
 # Its values are overridden by the SCORPIO_* environment variables below and at
