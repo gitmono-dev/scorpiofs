@@ -63,9 +63,12 @@ if [ -x "$NEWLIBRA" ]; then LIBRA="$NEWLIBRA"; else LIBRA=libra; fi
 echo "  libra under test: $LIBRA ($($LIBRA --version 2>&1 | head -1))"
 
 rm -rf /tmp/gc /tmp/mc /tmp/mwt
+t0=$(ms)
 git clone -q "$M2/project" /tmp/gc 2>/dev/null
+t1=$(ms)
 git -C /tmp/gc config user.email w3@b.l; git -C /tmp/gc config user.name w3
-echo "  git clone: $(find /tmp/gc -type f -not -path '*/.git/*' | wc -l) files"
+echo "  git clone (W1 baseline): $((t1-t0)) ms, $(find /tmp/gc -type f -not -path '*/.git/*' | wc -l) files"
+res git_clone_w1_ms "$((t1-t0))"
 
 # NOTE: not --filter here yet. A filtered clone carries no blobs, and libra's
 # worktree-add populate path still reads blobs from the local pack, so attach fails
@@ -87,8 +90,13 @@ res w3_mount_files "$MNT"
 
 echo
 echo "=== [2] W3a: status on a clean tree (n=3, median) ==="
+# `libra <dir> <cmd>` is NOT a libra invocation: it exits 129 ('not a libra command')
+# in ~11 ms, which a timing harness happily records as a fast success. Everything on
+# the mono side must run with the worktree as CWD.
+mono_status(){ ( cd /tmp/mwt && $LIBRA status ); }
+mono_add(){ ( cd /tmp/mwt && $LIBRA add -A ); }
 timed git_status 3 git -C /tmp/gc status --porcelain
-timed mono_status 3 $LIBRA /tmp/mwt status
+timed mono_status 3 mono_status
 
 echo
 echo "=== [3] W3b: add with one changed file ==="
@@ -96,7 +104,7 @@ echo "=== [3] W3b: add with one changed file ==="
 echo "w3 change" >> /tmp/gc/bench50k/svc00/pkg000/mod00/f00000.rs
 echo "w3 change" >> /tmp/mwt/bench50k/svc00/pkg000/mod00/f00000.rs
 timed git_add 3 git -C /tmp/gc add -A
-timed mono_add 3 $LIBRA /tmp/mwt add -A
+timed mono_add 3 mono_add
 
 echo
 echo "=== [4] W3c: commit (n=1 each — commits move the tree) ==="
