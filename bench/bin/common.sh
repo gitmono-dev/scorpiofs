@@ -85,14 +85,18 @@ for_round() {
 }
 
 # ---- 通用采样循环：run_metric <exp> <case> <side> <rounds> <metric> -- <cmd...>
-#      cmd 需把测量值打到 stdout 最后一行 "<metric>_ms <value>"（timed 的格式）
+#      cmd 需把测量值打到 stdout 最后一行 "<label> <value>"，label 默认为
+#      "<metric>_ms"；若 metric 本身已以 _ms 结尾则直接用它（否则会去找
+#      "status_ms_ms"，永远匹配不上 —— 曾让 read/status/commit 静默不落盘）。
 run_metric() {
   local exp="$1" case_="$2" side="$3" rounds="$4" metric="$5"; shift 5
   [ "${1:-}" = "--" ] && shift
+  local label="$metric"
+  case "$metric" in *_ms) ;; *) label="${metric}_ms" ;; esac
   local r out val
   for ((r = 1; r <= rounds; r++)); do
     out=$("$@") || { echo "run failed (round $r), see meta" >&2; record "$exp" "$case_" "$side" "$r" "$metric" -1 "{\"note\":\"run failed\"}"; continue; }
-    val=$(echo "$out" | awk -v m="${metric}_ms" '$1==m{print $2}' | tail -1)
+    val=$(echo "$out" | awk -v m="$label" '$1==m{print $2}' | tail -1)
     echo "$out"
     [ -n "$val" ] && record "$exp" "$case_" "$side" "$r" "$metric" "$val" '{}'
   done

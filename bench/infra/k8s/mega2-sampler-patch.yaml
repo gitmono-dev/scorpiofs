@@ -1,0 +1,46 @@
+# Strategic-merge patch: add a resource sampler sidecar to the mega2 Deployment.
+#
+# shareProcessNamespace is what makes this possible: without it the sidecar lives in
+# its own PID namespace and cannot see (let alone read /proc for) the mega2 process.
+#
+# The sidecar only reads /proc at 1 Hz — no ptrace, no perf, nothing that would
+# perturb the thing under test. It streams to stdout so `kubectl logs` is the whole
+# collection mechanism.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mega2
+  namespace: gitmono
+spec:
+  template:
+    spec:
+      shareProcessNamespace: true
+      containers:
+        - name: sampler
+          image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:v0.3.0-ack-libra
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              echo "M2S waiting for the mega2 process..."
+              PID=""
+              for i in $(seq 1 120); do
+                PID=$(pgrep -x mega2 | head -1)
+                [ -n "$PID" ] && break
+                sleep 1
+              done
+              if [ -z "$PID" ]; then echo "M2S mega2 pid not found"; sleep infinity; fi
+              echo "M2S sampling pid=$PID at 1 Hz"
+              # Write to a file and stream it, so a slow reader cannot stall sampling.
+              bash /bench/sampler.sh /tmp/m2.tsv 1000 "mega2:$PID" >/dev/null 2>&1 &
+              sleep 2
+              exec tail -f /tmp/m2.tsv
+          volumeMounts:
+            - name: script
+              mountPath: /bench
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: script
+          configMap: { name: bench-script, defaultMode: 0755 }

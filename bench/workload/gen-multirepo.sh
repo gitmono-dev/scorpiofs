@@ -12,7 +12,14 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 [ -n "$OUT" ] || { echo "usage: $0 --out DIR [--services N]" >&2; exit 1; }
 rm -rf "$OUT"; mkdir -p "$OUT/git" "$OUT/mono"
-NAMES=(common); for i in $(seq 0 $((SVCS-1))); do NAMES+=("svc-$(printf '%c' $((97+i)))"); done
+# NB: `printf '%c' 97` prints the first character of the STRING "97" -> "9", not the
+# code point 97 -> "a". That silently produced repo names svc-9/svc-1, which collided
+# and made the submodule step die with "'common' already exists in the index".
+# Convert the number to a byte via an octal escape instead.
+NAMES=(common)
+for i in $(seq 0 $((SVCS-1))); do
+  NAMES+=("svc-$(printf '%b' "\\$(printf '%03o' $((97 + i)))")")
+done
 
 api_file() { # $1=repo  $2=func  $3=ver
   cat <<EOF

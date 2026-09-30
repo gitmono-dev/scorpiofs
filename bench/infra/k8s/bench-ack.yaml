@@ -1,0 +1,309 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitmono
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bench-script
+  namespace: gitmono
+data:
+  bench.sh: "#!/usr/bin/env bash\n# L-scale ACK benchmark driver (single monorepo,\
+    \ both sides).\n#\n# Design notes that matter:\n#   * ONE repo. mega2's own git\
+    \ endpoint serves the SAME repository the FUSE mount\n#     projects, so the git\
+    \ and mono sides read identical storage — the server\n#     variable is zeroed\
+    \ and only the client-side access pattern differs.\n#   * A 1 Hz resource sampler\
+    \ runs alongside (sampler.sh) and is phase-marked, so\n#     the curves can be\
+    \ aligned with the timings afterwards. It reads /proc only.\n#   * Seeding is\
+    \ the real bottleneck at this scale. One push of 500k files needs\n#     http.postBuffer\
+    \ raised past the pack size, otherwise git switches to chunked\n#     transfer-encoding\
+    \ and the server hangs up. We try ONE big push, then fall back\n#     to large\
+    \ batches.\nset -uo pipefail\n\nN=\"${NFILES:-500000}\"\nM2=\"${M2:-http://mega2:8000}\"\
+    \nAPI=\"http://127.0.0.1:2725/antares\"\nSAMP=/tmp/sampler.tsv\nexport HOME=/root\n\
+    export LIBRA_SCORPIOFS_ENDPOINT=\"$API\"\n\nnow(){ date +%s%3N; }\nmark(){ echo\
+    \ \"M $(now) $1\" >> \"$SAMP\"; echo \"[phase] $1\"; }\nres(){ echo \"R $(now)\
+    \ $1=$2\"; }   # machine-readable result line\n\n# Fail-fast: a failed prerequisite\
+    \ must end the run, not silently degrade every later\n# measurement. The last\
+    \ run's mono numbers were all garbage because one attach failed\n# and the script\
+    \ kept going (and `cd` failed silently on top of it).\nFAILED=0\nabort(){ echo\
+    \ \"ABORT: $*\" >&2; echo \"R $(now) aborted=1\"; FAILED=1; exit 1; }\nneed(){\
+    \ [ \"$1\" = 0 ] || abort \"$2 (rc=$1)\"; }\n\necho \"HOST=$(hostname)\"\necho\
+    \ \"NFILES=$N   M2=$M2\"\necho \"cpu=$(nproc)  mem_kb=$(awk '/MemTotal/{print\
+    \ $2}' /proc/meminfo)\"\n\necho\necho \"[0] start the scorpio daemon + the sampler\"\
+    \n/usr/local/bin/docker-entrypoint.sh serve --http-addr 0.0.0.0:2725 >/tmp/daemon.log\
+    \ 2>&1 &\nDAEMON_PID=$!\nfor i in $(seq 1 60); do curl -fsS \"$API/health\" >/dev/null\
+    \ 2>&1 && break; sleep 1; done\necho \"    daemon health : $(curl -sS -o /dev/null\
+    \ -w '%{http_code}' \"$API/health\")\"\necho \"    daemon pid    : $DAEMON_PID\"\
+    \necho \"    libra         : $(libra --version 2>&1 | head -1)\"\necho \"    git\
+    \           : $(git --version)\"\n\n# Sampler: the daemon, plus a placeholder\
+    \ label for the short-lived client commands\n# (they exit too fast to sample meaningfully,\
+    \ so the interesting series is the daemon\n# and the pod-level network).\nbash\
+    \ /bench/sampler.sh \"$SAMP\" 1000 \"scorpio:$DAEMON_PID\" >/dev/null 2>&1 &\n\
+    SAMPLER_PID=$!\nsleep 2\nmark \"setup-done\"\n\necho\necho \"[1] wait for mega2\"\
+    \nfor i in $(seq 1 150); do curl -fsS -o /dev/null \"$M2/api/v1/latest-commit?path=/project\"\
+    \ && break; sleep 2; done\nmark \"mega2-ready\"\n\necho\necho \"[2] seed ONE repo\
+    \ of $N files into mega2\"\ngit config --global user.name  ack-bench\ngit config\
+    \ --global user.email ack@bench.local\ngit config --global init.defaultBranch\
+    \ main\ngit config --global --add safe.directory '*'\n# A single huge push wedges\
+    \ (server stops reading at its buffer limit, TCP window\n# fills, both sides wait).\
+    \ Keep each push small and bound it with `timeout` so a\n# stalled batch fails\
+    \ loudly. postBuffer stays high so a batch never goes chunked.\ngit config --global\
+    \ http.postBuffer 1073741824\ngit config --global core.compression 1\ngit config\
+    \ --global pack.threads \"$(nproc)\"\nSEED_BATCH=\"${SEED_BATCH:-25000}\"    \
+    \ # files per push\nSEED_PUSH_TIMEOUT=\"${SEED_PUSH_TIMEOUT:-900}\"   # seconds;\
+    \ a stalled batch must die\n\n# Re-seeding is expensive (regenerate 500k files,\
+    \ re-push in batches). If the server\n# already holds a complete tree, skip straight\
+    \ to verification.\nPRESEED=$(curl -sS -m 30 \"$M2/api/v1/latest-commit?path=/project\"\
+    \ >/dev/null 2>&1 && echo ok || echo no)\nSEED_NEEDED=1\nif [ \"$PRESEED\" = ok\
+    \ ]; then\n  rm -rf /tmp/precheck\n  if git clone -q --depth 1 \"$M2/project\"\
+    \ /tmp/precheck 2>/dev/null      || git clone -q \"$M2/project\" /tmp/precheck\
+    \ 2>/dev/null; then\n    HAVE=$(find /tmp/precheck -type f -not -path '*/.git/*'\
+    \ 2>/dev/null | wc -l)\n    echo \"    /project already holds $HAVE files\"\n\
+    \    [ \"$HAVE\" -ge \"$N\" ] && { SEED_NEEDED=0; echo \"    seeding SKIPPED (tree\
+    \ already complete)\"; res seed_skipped 1; }\n  fi\n  rm -rf /tmp/precheck\nfi\n\
+    \nif [ \"$SEED_NEEDED\" = 1 ]; then\nrm -rf /seed && mkdir -p /seed && cd /seed\n\
+    if git clone -q \"$M2/project\" /seed/repo 2>/dev/null; then\n  echo \"    /project\
+    \ already existed; reusing\"\nelse\n  mkdir -p /seed/repo && cd /seed/repo &&\
+    \ git init -q\n  echo \"    /project absent; creating it via a push\"\nfi\ncd\
+    \ /seed/repo\n\nmark \"seed-generate-begin\"\n# python3 -c (no heredoc): this\
+    \ script is embedded in a ConfigMap, so every line is\n# indented and a heredoc\
+    \ terminator at column 0 would never match.\npython3 -c '\nimport os, sys\nn =\
+    \ int(sys.argv[1])\n# Monorepo-ish: 40 services x 125 packages x 100 modules ->\
+    \ 500k files at n=500000.\n# Structure matters: a flat 500k-file directory would\
+    \ not exercise tree walking.\nper = max(1, n // 40)\nfor i in range(n):\n    d\
+    \ = os.path.join(\"svc%02d\" % (i % 40),\n                     \"pkg%03d\" % ((i\
+    \ // per) % 125),\n                     \"mod%02d\" % (i % 100))\n    os.makedirs(d,\
+    \ exist_ok=True)\n    with open(os.path.join(d, \"f%06d.rs\" % i), \"w\") as fh:\n\
+    \        fh.write(\"// synth %d\\npub fn f%d(x: u64) -> u64 { x.wrapping_mul(%d)\
+    \ }\\n\"\n                 % (i, i, (i % 97) + 1))\nprint(\"    generated\", n,\
+    \ \"files\")\n' \"$N\"\nmark \"seed-generate-end\"\necho \"    tree on disk: $(du\
+    \ -sh . | cut -f1)\"\n\nmark \"seed-add-begin\"\nt0=$(now); git add -A; t1=$(now)\n\
+    echo \"    git add -A     : $((t1-t0)) ms\"\nres seed_add_ms $((t1-t0))\nmark\
+    \ \"seed-add-end\"\n\ngit commit -qm \"ack L-scale seed: $N files\" || true\n\
+    mark \"seed-push-begin\"\n# batch the whole seed: this is the only strategy that\
+    \ completed at smaller scales\nBATCH=\"$SEED_BATCH\"; i=0; nb=0; fails=0; t_all0=$(now)\n\
+    while [ \"$i\" -lt \"$N\" ]; do\n  hi=$(( i + BATCH )); [ \"$hi\" -gt \"$N\" ]\
+    \ && hi=\"$N\"\n  git add -A >/dev/null 2>&1\n  git commit -qm \"seed batch $nb\"\
+    \ >/dev/null 2>&1 || true\n  b0=$(now)\n  if timeout \"$SEED_PUSH_TIMEOUT\" git\
+    \ push -q \"$M2/project\" HEAD:refs/heads/main 2>/tmp/pusherr; then\n    b1=$(now);\
+    \ echo \"    batch $nb ($i..$hi): $((b1-b0)) ms\"\n    res seed_batch_ms $((b1-b0))\n\
+    \  else\n    rc=$?; b1=$(now); fails=$((fails+1))\n    echo \"    batch $nb ($i..$hi)\
+    \ FAILED rc=$rc after $((b1-b0)) ms: $(tail -1 /tmp/pusherr)\"\n    res seed_batch_failed\
+    \ 1\n  fi\n  i=\"$hi\"; nb=$((nb+1))\n  echo \"    progress: $i/$N batches=$nb\
+    \ failed=$fails elapsed=$(( $(now) - t_all0 )) ms\"\ndone\nt_all1=$(now)\necho\
+    \ \"    seed total: $((t_all1-t_all0)) ms  batches=$nb failed=$fails\"\nres seed_total_ms\
+    \ $((t_all1-t_all0)); res seed_batches \"$nb\"; res seed_failed \"$fails\"\nmark\
+    \ \"seed-push-end\"\n\n# The seed is only usable if the server really has the\
+    \ whole tree. A half-pushed\n# seed once produced a full set of \"clean\" numbers\
+    \ on a 1-file repo.\nmark \"seed-verify-begin\"\nrm -rf /tmp/verify\ngit clone\
+    \ -q \"$M2/project\" /tmp/verify 2>/dev/null\nSEEDED=$(find /tmp/verify -type\
+    \ f -not -path '*/.git/*' 2>/dev/null | wc -l)\necho \"    verified file count\
+    \ on the server: $SEEDED  (expected $N)\"\nres seed_verified_files \"$SEEDED\"\
+    \nrm -rf /tmp/verify\nmark \"seed-verify-end\"\n# A short seed means every later\
+    \ comparison is meaningless.\n[ \"$SEEDED\" -ge \"$N\" ] || abort \"seed incomplete:\
+    \ $SEEDED of $N files on the server\"\nfi   # end of \"if seeding was needed\"\
+    \n\necho\necho \"======== RESULTS ========\"\nmark \"bench-begin\"\n\necho \"\
+    [R-READY] git clone (whole tree, server on another node)\"\nrm -rf /tmp/gitclone\
+    \ /tmp/gclone2 /tmp/wt; sync\nt0=$(now); git clone -q \"$M2/project\" /tmp/gitclone\
+    \ || abort \"git clone failed\"\nt1=$(now)\nGIT_READY=$((t1-t0))\nGIT_FILES=$(find\
+    \ /tmp/gitclone -type f -not -path '*/.git/*' | wc -l)\necho \"    git-clone-ms=$GIT_READY\
+    \  files=$GIT_FILES  disk=$(du -sb /tmp/gitclone | cut -f1)\"\nres git_ready_ms\
+    \ \"$GIT_READY\"\nres git_clone_disk_bytes \"$(du -sb /tmp/gitclone | cut -f1)\"\
+    \n# A clone that came back short means the server gave us a partial tree; every\
+    \ later\n# measurement would be against the wrong baseline.\n[ \"$GIT_FILES\"\
+    \ -ge \"$N\" ] || abort \"git clone returned $GIT_FILES files, expected $N\"\n\
+    \necho \"[R-READY] libra worktree add (server on another node)\"\nrm -rf /tmp/main\
+    \ /tmp/wt\n# Time the main clone SEPARATELY. Comparing an attach-only figure against\
+    \ git's\n# full clone would overstate mono: both sides download the same objects\
+    \ here.\nt0=$(now); libra clone -q -b main --no-checkout \"$M2/project\" /tmp/main\
+    \ 2>/tmp/clone.err; RC=$?; t1=$(now)\nMONO_CLONE=$((t1-t0))\necho \"    libra-clone-ms=$MONO_CLONE\
+    \ (rc=$RC)\"\n[ \"$RC\" = 0 ] || { echo \"    clone stderr: $(tail -2 /tmp/clone.err)\"\
+    \ >&2; abort \"libra clone (main) failed\"; }\nres mono_clone_ms \"$MONO_CLONE\"\
+    \n( cd /tmp/main && libra config set user.name ack >/dev/null 2>&1 && libra config\
+    \ set user.email ack@b.l >/dev/null 2>&1 )\nt0=$(now); ( cd /tmp/main && libra\
+    \ worktree add --backend scorpiofs -b \"L-$$\" /tmp/wt ) 2>/tmp/attach.err; RC=$?;\
+    \ t1=$(now)\nMONO_ATTACH=$((t1-t0))\nMONO_READY=$((MONO_CLONE + MONO_ATTACH))\n\
+    echo \"    worktree-add-ms=$MONO_ATTACH  (mono total clone+attach=$MONO_READY)\
+    \  rc=$RC\"\nif [ \"$RC\" != 0 ] || [ ! -f /tmp/wt/.libra/scorpiofs_mount_id ];\
+    \ then\n  echo \"    attach stderr: $(tail -2 /tmp/attach.err)\" >&2\n  abort\
+    \ \"scorpiofs attach failed — the mono side cannot be measured\"\nfi\n\n# THE\
+    \ gate that was missing: an attach can \"succeed\" while projecting nothing, and\n\
+    # then worktree-add looks instantaneous and every later mono number is fiction.\n\
+    # Count what the mount actually exposes before trusting any of it.\nMOUNT_FILES=$(timeout\
+    \ 600 find /tmp/wt -type f 2>/dev/null | wc -l)\necho \"    files visible through\
+    \ the mount: $MOUNT_FILES (expected ~$N)\"\nres mono_mount_files \"$MOUNT_FILES\"\
+    \n[ \"$MOUNT_FILES\" -ge \"$((N / 2))\" ] || abort \"mount is empty ($MOUNT_FILES\
+    \ files) — refusing to measure the mono side\"\nres mono_attach_ms \"$MONO_ATTACH\"\
+    \n# Both figures are reported: the full one is the honest \"time to a working\n\
+    # workspace\", the attach-only one is the projection cost.\nres mono_ready_full_ms\
+    \ \"$MONO_READY\"\nif [ \"$GIT_READY\" -gt 0 ] && [ \"$MONO_READY\" -gt 0 ]; then\n\
+    \  res ready_ratio_x1000 \"$(( GIT_READY * 1000 / MONO_READY ))\"\nfi\nres git_ready_ms_vs_mono_clone_x1000\
+    \ \"$(( MONO_CLONE > 0 ? GIT_READY * 1000 / MONO_CLONE : 0 ))\"\n\necho \"[R-DISK]\
+    \ real backing (NOT du on the FUSE mountpoint)\"\n# The store is daemon-wide and\
+    \ cumulative; upper/sealed are the per-mount layers.\nres mono_store_bytes \"\
+    $(du -sb /var/lib/scorpiofs/store 2>/dev/null | cut -f1)\"\nres mono_upper_bytes\
+    \ \"$(du -sb /var/lib/scorpiofs/antares/upper 2>/dev/null | cut -f1)\"\nres mono_sealed_bytes\
+    \ \"$(du -sb /var/lib/scorpiofs/antares/cl 2>/dev/null | cut -f1)\"\n\ncd /tmp/wt\
+    \ || abort \"cannot enter the worktree\"\n\necho \"[R-STATUS] libra status vs\
+    \ git status\"\nfor r in 1 2 3; do\n  t0=$(now); libra status >/dev/null 2>&1;\
+    \ t1=$(now); echo \"    libra-status-ms r$r=$((t1-t0))\"; res libra_status_ms\
+    \ $((t1-t0))\ndone\nfor r in 1 2 3; do\n  t0=$(now); ( cd /tmp/gitclone && git\
+    \ status --porcelain >/dev/null 2>&1 ); t1=$(now)\n  echo \"    git-status-ms\
+    \   r$r=$((t1-t0))\"; res git_status_ms $((t1-t0))\ndone\n\necho \"[R-LSFILES]\
+    \ ls-files (index dump) vs -t (needs worktree state)\"\nt0=$(now); libra ls-files\
+    \ >/dev/null 2>&1; t1=$(now); echo \"    ls-files-ms=$((t1-t0))\";   res libra_lsfiles_ms\
+    \ $((t1-t0))\nt0=$(now); libra ls-files -t >/dev/null 2>&1; t1=$(now); echo \"\
+    \    ls-files-t-ms=$((t1-t0))\"; res libra_lsfiles_t_ms $((t1-t0))\n\necho \"\
+    [R-ADD] add -A\"\nt0=$(now); libra add -A >/dev/null 2>&1; t1=$(now); echo \"\
+    \    add-0change-ms=$((t1-t0))\"; res libra_add_0_ms $((t1-t0))\necho \"bench\
+    \ $(now)\" >> bench-notes.txt\nt0=$(now); libra add -A >/dev/null 2>&1; t1=$(now);\
+    \ echo \"    add-1change-ms=$((t1-t0))\"; res libra_add_1_ms $((t1-t0))\n\necho\
+    \ \"[R-COMMIT] commit\"\nt0=$(now); libra commit -m \"L bench\" >/tmp/commit.err;\
+    \ RC=$?; t1=$(now)\necho \"    commit-ms=$((t1-t0)) (rc=$RC)\"\n[ \"$RC\" = 0\
+    \ ] || { echo \"    commit stderr: $(tail -2 /tmp/commit.err)\" >&2; abort \"\
+    commit failed\"; }\nres libra_commit_ms $((t1-t0))\n\necho \"[R-READ] 100 random\
+    \ files, cold then hot\"\nhead -100 /dev/urandom >/dev/null 2>&1 || true\nfind\
+    \ /tmp/wt -type f 2>/dev/null | awk 'NR%5000==0' | head -100 > /tmp/readlist\n\
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true\nt0=$(now); while\
+    \ IFS= read -r f; do head -c 64 \"$f\" >/dev/null 2>&1; done < /tmp/readlist;\
+    \ t1=$(now)\necho \"    read-cold-ms=$((t1-t0))\"; res libra_read_cold_ms $((t1-t0))\n\
+    t0=$(now); while IFS= read -r f; do head -c 64 \"$f\" >/dev/null 2>&1; done <\
+    \ /tmp/readlist; t1=$(now)\necho \"    read-hot-ms=$((t1-t0))\";  res libra_read_hot_ms\
+    \ $((t1-t0))\n\necho \"[R-MULTI] 5 extra worktrees: git worktree vs libra chain\
+    \ fork\"\nN5=5\n# git side: one clone already exists; add 5 worktrees and measure\
+    \ the delta\nGIT_DISK_BEFORE=$(du -sb /tmp/gitclone | cut -f1)\nt0=$(now)\nfor\
+    \ i in 1 2 3 4 5; do git -C /tmp/gitclone worktree add -q \"/tmp/gwt$i\" -b \"\
+    gwt$i\" 2>/dev/null; done\nt1=$(now)\nGIT_MULTI_MS=$((t1-t0))\nGIT_DISK_AFTER=$(du\
+    \ -sb /tmp/gitclone | cut -f1)\nGIT_EXTRA=0\nfor i in 1 2 3 4 5; do GIT_EXTRA=$((GIT_EXTRA\
+    \ + $(du -sb \"/tmp/gwt$i\" 2>/dev/null | cut -f1))); done\necho \"    git:  \
+    \ multi-ms=$GIT_MULTI_MS  extra-disk=$GIT_EXTRA\"\nres git_multi_ms \"$GIT_MULTI_MS\"\
+    ; res git_multi_extra_disk_bytes \"$GIT_EXTRA\"\n\n# mono side: chain forks are\
+    \ zero-copy renames of the upper layer\nMONO_UPPER_BEFORE=$(du -sb /var/lib/scorpiofs/antares/upper\
+    \ 2>/dev/null | cut -f1)\nt0=$(now)\nfor i in 1 2 3 4 5; do libra /tmp/wt fork\
+    \ -b \"Lfork$i-$$\" \"/tmp/mfork$i\" >/dev/null 2>&1; done\nt1=$(now)\nMONO_MULTI_MS=$((t1-t0))\n\
+    MONO_UPPER_AFTER=$(du -sb /var/lib/scorpiofs/antares/upper 2>/dev/null | cut -f1)\n\
+    echo \"    mono:  multi-ms=$MONO_MULTI_MS  upper-delta=$((MONO_UPPER_AFTER-MONO_UPPER_BEFORE))\"\
+    \nres mono_multi_ms \"$MONO_MULTI_MS\"\nres mono_multi_extra_disk_bytes \"$((MONO_UPPER_AFTER-MONO_UPPER_BEFORE))\"\
+    \n\necho \"[R-SWITCH] baselines\"\n# git: switch between two branches that differ\
+    \ in 10% of files\n( cd /tmp/gitclone && git checkout -q -b variant 2>/dev/null\
+    \ \\\n  && find . -type f -name '*.rs' 2>/dev/null | head -10000 | awk 'NR%10==0'\
+    \ \\\n     | while IFS= read -r f; do echo \"SW\" >> \"$f\"; done \\\n  && git\
+    \ add -A >/dev/null 2>&1 && git commit -qm variant >/dev/null 2>&1 ) || true\n\
+    for r in 1 2; do\n  ( cd /tmp/gitclone && git checkout -q main 2>/dev/null )\n\
+    \  sync\n  t0=$(now); ( cd /tmp/gitclone && git checkout -q variant 2>/dev/null\
+    \ ); t1=$(now)\n  echo \"    git-switch-ms r$r=$((t1-t0))\"; res git_switch_ms\
+    \ $((t1-t0))\ndone\n\nmark \"bench-end\"\necho\necho \"[R-RESOURCE] sampler summary\
+    \ (from the phase-marked series)\"\necho \"    raw lines: $(wc -l < $SAMP)\"\n\
+    awk '\n  /^S / { if ($5 ~ /rss_kb=/) { split($5,a,\"=\"); if (a[2]+0>max) max=a[2]+0\
+    \ }\n           if ($6 ~ /fds=/)    { split($6,a,\"=\"); if (a[2]+0>fdmax) fdmax=a[2]+0\
+    \ } }\n  END { printf \"    peak rss_kb=%d  peak fds=%d\\n\", max, fdmax }\n'\
+    \ \"$SAMP\"\n\necho\necho \"======== PHASE MARKERS (ms epoch) ========\"\ngrep\
+    \ '^M ' \"$SAMP\" | head -30 | sed 's/^/    /'\n\necho\necho \"======== SAMPLER\
+    \ SERIES (1 Hz, full) ========\"\ncat \"$SAMP\" | sed 's/^/    /'\n\necho \"========\
+    \ DONE ========\"\nif [ \"${FAILED:-0}\" = 0 ]; then\n  echo \"RUN STATUS: COMPLETE\
+    \ — all prerequisites verified\"\nelse\n  echo \"RUN STATUS: INCOMPLETE\"\nfi\n\
+    kill $SAMPLER_PID 2>/dev/null || true\nkill $DAEMON_PID  2>/dev/null || true\n"
+  sampler.sh: "#!/usr/bin/env bash\n# Low-overhead resource sampler for the benchmark\
+    \ pods.\n#\n# Design constraints:\n#   * must NOT perturb what it measures ->\
+    \ one read of /proc per target per interval,\n#     no subprocess per sample beyond\
+    \ the tiny awk, no writes to the measured tree\n#   * output must be alignable\
+    \ with the benchmark's phase markers -> every line is\n#     prefixed with a monotonic-ish\
+    \ epoch-ms timestamp, and 1 Hz is enough to see\n#     curves without generating\
+    \ noise\n#\n# Emits ONE line per target per tick:\n#   S <ts_ms> <label> rss_kb=<n>\
+    \ fds=<n> cpu_ticks=<utime+stime> threads=<n>\n# and, once per tick:\n#   N <ts_ms>\
+    \ rx_bytes=<n> tx_bytes=<n>\n# Phase markers from the driver appear as:\n#   M\
+    \ <ts_ms> <phase-name>\nset -uo pipefail\n\nOUT=\"${1:?usage: sampler.sh <outfile>\
+    \ [interval_ms] [label:pid ...]}\"\nIVL_MS=\"${2:-1000}\"\nshift 2 2>/dev/null\
+    \ || true\n\n# Targets are passed as label:pid pairs. If a pid dies mid-run (e.g.\
+    \ a short-lived\n# libra/git command) we keep sampling the label with rss_kb=0\
+    \ so the series stays\n# regular instead of silently dropping points.\nTARGETS=(\"\
+    $@\")\n\nnet_sum() { # rx + tx bytes over non-loopback interfaces\n  awk 'NR>2\
+    \ && $1 !~ /^lo:/ {gsub(\":\", \"\", $1); rx+=$2; tx+=$10} END {printf \"%d %d\"\
+    , rx, tx}' /proc/net/dev\n}\n\n# /proc/PID/stat field 2 (comm) can contain spaces\
+    \ and parens, which breaks naive\n# awk field indexing. Strip it first so $14/$15\
+    \ are utime/stime.\nproc_stat() { # <pid> -> \"utime stime threads\"\n  awk '{\
+    \ for(i=3;i<=NF;i++) printf \"%s \", $i; print \"\" }' \"/proc/$1/stat\" 2>/dev/null\
+    \ \\\n    | awk '{ printf \"%s %s %s\", $12, $13, $16 }' 2>/dev/null\n}\n\nproc_rss()\
+    \ { awk '/^VmRSS:/{print $2}' \"/proc/$1/status\" 2>/dev/null | head -1; }\nproc_fds()\
+    \ { ls \"/proc/$1/fd\" 2>/dev/null | wc -l; }\n\n: > \"$OUT\"\n\nwhile :; do\n\
+    \  TS=$(date +%s%3N)\n\n  read -r RX TX <<<\"$(net_sum)\"\n  echo \"N $TS rx_bytes=$RX\
+    \ tx_bytes=$TX\" >> \"$OUT\"\n\n  for t in \"${TARGETS[@]}\"; do\n    label=\"\
+    ${t%%:*}\"; pid=\"${t#*:}\"\n    if [ -d \"/proc/$pid\" ] 2>/dev/null; then\n\
+    \      rss=$(proc_rss \"$pid\"); fds=$(proc_fds \"$pid\")\n      read -r ut st\
+    \ th <<<\"$(proc_stat \"$pid\")\"\n      cpu=$(( ${ut:-0} + ${st:-0} ))\n    \
+    \  echo \"S $TS $label rss_kb=${rss:-0} fds=${fds:-0} cpu_ticks=$cpu threads=${th:-0}\"\
+    \ >> \"$OUT\"\n    else\n      echo \"S $TS $label rss_kb=0 fds=0 cpu_ticks=0\
+    \ threads=0 dead=1\" >> \"$OUT\"\n    fi\n  done\n\n  sleep \"$(awk -v ms=\"$IVL_MS\"\
+    \ 'BEGIN{printf \"%.3f\", ms/1000}')\"\ndone\n"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench
+  namespace: gitmono
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 28800
+  template:
+    metadata:
+      labels:
+        app: bench
+    spec:
+      imagePullSecrets:
+      - name: acr-pull
+      restartPolicy: Never
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: mega2
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: bench
+        image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:v0.3.0-ack-libra
+        securityContext:
+          privileged: true
+        env:
+        - name: SCORPIO_BASE_URL
+          value: http://mega2:8000
+        - name: SCORPIO_LFS_URL
+          value: http://mega2:8000/api/v1/lfs
+        - name: SCORPIO_MOUNT_OWNER
+          value: 0:0
+        - name: LIBRA_SCORPIOFS_ENDPOINT
+          value: http://127.0.0.1:2725/antares
+        - name: NFILES
+          value: '50000'
+        - name: SEED_BATCH
+          value: '10000'
+        command:
+        - /bin/bash
+        - /bench/bench.sh
+        volumeMounts:
+        - name: fuse
+          mountPath: /dev/fuse
+        - name: script
+          mountPath: /bench
+        resources:
+          requests:
+            cpu: 2000m
+            memory: 8Gi
+          limits:
+            cpu: 7000m
+            memory: 26Gi
+      volumes:
+      - name: fuse
+        hostPath:
+          path: /dev/fuse
+          type: CharDevice
+      - name: script
+        configMap:
+          name: bench-script
+          defaultMode: 493

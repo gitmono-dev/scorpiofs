@@ -49,8 +49,8 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 3
           resources:
-            requests: { cpu: 100m, memory: 256Mi }
-            limits:   { cpu: 500m, memory: 1Gi }
+            requests: { cpu: 500m, memory: 1Gi }
+            limits:   { cpu: 2000m, memory: 4Gi }
       volumes: [{ name: d, emptyDir: {} }]
 ---
 apiVersion: v1
@@ -93,7 +93,10 @@ metadata:
   name: rustfs
   namespace: gitmono
 spec:
+  # attempt ran ONE replica at 0.5 CPU / 512Mi; it pinned at its limit and restarted
+  # while 500k objects were written, and mega2 logged 297 connect retries against it.
   replicas: 1
+  strategy: { type: Recreate }
   selector: { matchLabels: { app: rustfs } }
   template:
     metadata: { labels: { app: rustfs } }
@@ -101,6 +104,13 @@ spec:
       imagePullSecrets: [{ name: acr-pull }]
       # rustfs runs as uid 10001 and needs to own its data dir
       securityContext: { fsGroup: 10001, runAsUser: 10001 }
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector: { matchLabels: { app: mega2 } }
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: rustfs
           image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:base-rustfs
@@ -111,8 +121,8 @@ spec:
           ports: [{ containerPort: 9000 }]
           volumeMounts: [{ name: d, mountPath: /data }]
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
-            limits:   { cpu: 500m, memory: 512Mi }
+            requests: { cpu: 2000m, memory: 4Gi }
+            limits:   { cpu: 4000m, memory: 8Gi }
       volumes: [{ name: d, emptyDir: {} }]
 ---
 apiVersion: v1
@@ -129,7 +139,7 @@ metadata:
   name: rustfs-init
   namespace: gitmono
 spec:
-  backoffLimit: 10
+  backoffLimit: 20
   template:
     spec:
       imagePullSecrets: [{ name: acr-pull }]
@@ -142,6 +152,10 @@ spec:
             - |
               set -e
               # positional args: rc alias set <name> <endpoint> <ak> <sk>
+              for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+                if rc alias set local http://rustfs:9000 rustfs rustfs_secret 2>/dev/null; then break; fi
+                echo "waiting for rustfs... $i"; sleep 10;
+              done
               rc alias set local http://rustfs:9000 rustfs rustfs_secret
               rc bucket create local/mega2 || true
               rc bucket list local
@@ -160,6 +174,8 @@ spec:
     metadata: { labels: { app: mega2 } }
     spec:
       imagePullSecrets: [{ name: acr-pull }]
+      # Lets the sampler sidecar read /proc for the mega2 process.
+      shareProcessNamespace: true
       containers:
         - name: mega2
           image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:v0.3.0-mega2
@@ -184,9 +200,53 @@ spec:
           ports: [{ containerPort: 8000 }]
           volumeMounts: [{ name: state, mountPath: /var/lib/mega2 }]
           resources:
-            requests: { cpu: 200m, memory: 512Mi }
-            limits:   { cpu: 1000m, memory: 2Gi }
-      volumes: [{ name: state, emptyDir: {} }]
+            requests: { cpu: 1000m, memory: 2Gi }
+            limits:   { cpu: 4000m, memory: 8Gi }
+      # hostPath, not emptyDir: mega2 keeps vault key material under /var/lib/mega2
+      # and refuses to start without it ("vault core key file is missing ... run an
+      # explicit reset"). An emptyDir wipes it on every pod restart, so ANY rollout
+      # bricked the deployment. hostPath keeps it on the node.
+      #
+      # hostPath rather than a PVC for the same reason the rustfs StatefulSet never
+      # scheduled: this cluster has no default StorageClass.
+        # --- sampler sidecar: reads /proc at 1 Hz, streams to stdout ---
+        # Folded into the main manifest on purpose. Applying this AFTER the mega2
+        # container meant strategic-merge semantics silently dropped mega2's own
+        # volumeMounts, which cost a crash loop (vault key file vanished).
+        - name: sampler
+          image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:v0.3.0-ack-libra
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -uo pipefail
+              echo "M2S waiting for the mega2 process..."
+              PID=""
+              for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
+                for p in /proc/[0-9]*; do
+                  [ "$(cat "$p/comm" 2>/dev/null)" = "mega2" ] && { PID=${p#/proc/}; break 2; }
+                done
+                sleep 2
+              done
+              if [ -z "${PID:-}" ]; then echo "M2S mega2 pid not found"; sleep infinity; fi
+              echo "M2S sampling pid=$PID at 1 Hz"
+              bash /bench/sampler.sh /tmp/m2.tsv 1000 "mega2:$PID" >/dev/null 2>&1 &
+              sleep 2
+              exec tail -f /tmp/m2.tsv
+          volumeMounts:
+            - { name: script, mountPath: /bench }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: state
+          hostPath:
+            path: /var/lib/mega2-state
+            type: DirectoryOrCreate
+        # The sampler sidecar's script lives in the bench ConfigMap. Without this
+        # volume the API server rejects the whole Deployment:
+        #   containers[1].volumeMounts[0].name: Not found: "script"
+        - name: script
+          configMap: { name: bench-script, defaultMode: 0755 }
 ---
 apiVersion: v1
 kind: Service

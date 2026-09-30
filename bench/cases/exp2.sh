@@ -26,7 +26,9 @@ fresh_mono() {
   libra "$MONO_MAIN" config set user.email bench@gitmono.local >/dev/null
 }
 attach_mono() {
-  libra "$MONO_MAIN" worktree add --backend scorpiofs -b "$BR-$ROUND" "$MONO_WT" >/dev/null 2>&1 \
+  # attach_mono is called from several cases that are NOT driven by for_round,
+  # so ROUND may be unset (and `set -u` would abort).
+  libra "$MONO_MAIN" worktree add --backend scorpiofs -b "$BR-${ROUND:-1}" "$MONO_WT" >/dev/null 2>&1 \
     && [ -f "$MONO_WT/.libra/scorpiofs_mount_id" ]
 }
 
@@ -66,12 +68,18 @@ case_upgrade() {
     ( cd "$GIT_BASE/up/common" && git add -A && git commit -qm "common v$VER" \
       && git push -q origin main )
     steps=2   # commit + push
-    for name in $(printf 'svc-%c ' $(seq 97 $((96 + SVCS)))); do
-      git clone -q --recurse-submodules "$(gurl "$name")" "$GIT_BASE/up/$name" 2>/dev/null
+    # NB: `printf '%c' 97` prints the first char of the STRING "97" -> "9", so this
+    # used to iterate over svc-9/svc-1, fail every `cd`, and still record a bogus
+    # step count. Convert the number to a byte with an octal escape.
+    for i in $(seq 0 $((SVCS - 1))); do
+      name="svc-$(printf '%b' "\\$(printf '%03o' $((97 + i)))")"
+      git clone -q --recurse-submodules "$(gurl "$name")" "$GIT_BASE/up/$name" 2>/dev/null \
+        || { echo "  clone failed for $name" >&2; continue; }
       ( cd "$GIT_BASE/up/$name" \
         && git -c protocol.file.allow=always submodule update --remote common \
         && git add -A && git commit -qm "bump common -> v$VER" \
-        && git push -q origin HEAD:refs/heads/main )
+        && git push -q origin HEAD:refs/heads/main ) \
+        || { echo "  upgrade failed for $name" >&2; continue; }
       steps=$((steps + 4))  # clone+update+commit+push
     done
     t1=$(now_ms)

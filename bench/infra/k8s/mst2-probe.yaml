@@ -1,0 +1,70 @@
+# D1/D2 probe: MST/2-lowered mount, read + write, in the cluster.
+#
+# Why a Job and not the `tool` pod: the tool pod has NO /dev/fuse and no CAP_SYS_ADMIN
+# (CapEff=00000000a80425fb has bit 21 clear), so it cannot mount anything. This spec
+# mirrors bench-ack.yaml's bench container, which is the one known to be able to:
+# privileged: true + hostPath /dev/fuse (CharDevice).
+#
+# Pod anti-affinity against mega2 keeps the HTTP hop cross-node, matching the
+# topology the benchmark reports on.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mst2-probe
+  namespace: gitmono
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app: mst2-probe
+    spec:
+      imagePullSecrets:
+      - name: acr-pull
+      restartPolicy: Never
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: mega2
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: probe
+        image: crpi-r1oa3ys0csfxkdeq-vpc.cn-hangzhou.personal.cr.aliyuncs.com/gitmono/gitmono1:v0.3.0-ack-libra
+        securityContext:
+          privileged: true
+        env:
+        - name: M2
+          value: http://mega2:8000
+        # Scope must be the REPO ROOT. The mount root is the scope, while libra's
+        # index paths are repo-relative, so a subdirectory scope makes every index
+        # path invisible and `status` reports the whole tree as deleted. /project
+        # currently holds exactly the 50k fixture.
+        - name: SCOPE
+          value: /project
+        command:
+        - /bin/bash
+        - /bench/mst2-probe.sh
+        volumeMounts:
+        - name: fuse
+          mountPath: /dev/fuse
+        - name: script
+          mountPath: /bench
+        resources:
+          requests:
+            cpu: 2000m
+            memory: 8Gi
+          limits:
+            cpu: 7000m
+            memory: 26Gi
+      volumes:
+      - name: fuse
+        hostPath:
+          path: /dev/fuse
+          type: CharDevice
+      - name: script
+        configMap:
+          name: mst2-probe-script
+          defaultMode: 493

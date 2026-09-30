@@ -1,0 +1,29 @@
+# Syntax: OVERLAY on the scorpiofs runtime image.
+#
+# Why an overlay instead of adding cargo build stages:
+#   * The daemon (`scorpio`) is built by the repo's own Dockerfile, which keeps
+#     BuildKit cache mounts for the cargo registry and `target`. Re-implementing
+#     that here would duplicate it or lose the cache.
+#   * `libra` is built OUTSIDE, in the WSL workspace — its build.rs wants `pnpm`
+#     for a web asset (LIBRA_SKIP_WEB_BUILD bypasses it there). The produced
+#     binary is self-contained: it links only libgcc_s/libm/libc and has no libssl
+#     dependency, so it runs as-is on debian:bookworm-slim.
+#
+# git + python3 are added because this image is used as the benchmark driver:
+#   * git        - the comparison baseline (`git clone` from mega2) and the tool
+#                  that seeds the synthetic tree into mega2.
+#   * python3    - generates the seed tree (thousands of nested small files)
+#                  quickly; a shell loop for that is markedly slower.
+# The scorpiofs runtime image on its own has neither, which is why the earlier
+# version of this stack needed a separate `base-git` sidecar container.
+FROM gitmono-ack-scorpiofs:latest
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The fixed libra CLI (restore / add / ls-files / commit changes under test).
+COPY libra /usr/local/bin/libra
+RUN chmod 0755 /usr/local/bin/libra \
+    && /usr/local/bin/libra --version \
+    && git --version

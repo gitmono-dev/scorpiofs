@@ -99,7 +99,9 @@ case_multi() {
   cold_cache; t0=$(now_ms)
   fresh_mono || return 1
   for ((i = 1; i <= N; i++)); do
-    libra "$WT" fork -b "fork$i-$ROUND" "$B/mono-fork-$i" >/dev/null 2>&1
+    # case_multi is dispatched directly, not through for_round, so ROUND may be unset
+    # (and `set -u` would abort the whole case).
+    libra "$WT" fork -b "fork$i-${ROUND:-1}" "$B/mono-fork-$i" >/dev/null 2>&1
   done
   t1=$(now_ms)
   mwork=$(mono_total_bytes "$WT")
