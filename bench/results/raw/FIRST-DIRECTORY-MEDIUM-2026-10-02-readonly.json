@@ -1,0 +1,131 @@
+{
+  "status": "success",
+  "scope": "/project/bench50k",
+  "git_commit": "91e7e09dd762da47ad0c02b1292a5bc2325ad0df",
+  "root_directories": [
+    "svc00",
+    "svc01",
+    "svc02",
+    "svc03",
+    "svc04",
+    "svc05",
+    "svc06",
+    "svc07",
+    "svc08",
+    "svc09",
+    "svc10",
+    "svc11",
+    "svc12",
+    "svc13",
+    "svc14",
+    "svc15",
+    "svc16",
+    "svc17",
+    "svc18",
+    "svc19"
+  ],
+  "sample_files": [
+    {
+      "path": "svc00/pkg000/mod00/f00000.rs",
+      "bytes": 9,
+      "sha256": "a651e21a962fdfeed6327e6ebbcd2dabff7a5ea6601c7346c42feef8de3ad875"
+    },
+    {
+      "path": "svc01/pkg000/mod01/f00001.rs",
+      "bytes": 9,
+      "sha256": "6bf48347c164405e3f1d309b8fb255ee542b2f538ec4397da8f13ca3a9978dad"
+    },
+    {
+      "path": "svc02/pkg000/mod02/f00002.rs",
+      "bytes": 9,
+      "sha256": "e11a3c67d1057acfe4d9a9a3d9d993f8ed8297c10a14630cb7f1e45ba1aa94ff"
+    },
+    {
+      "path": "svc03/pkg000/mod03/f00003.rs",
+      "bytes": 9,
+      "sha256": "debc682ba4ca3224882a6f69cd8a1ffa5719354498d0f76171fe99fd34f5d343"
+    },
+    {
+      "path": "svc04/pkg000/mod04/f00004.rs",
+      "bytes": 9,
+      "sha256": "c3f49ffcb920bc9724f0cb622b6c0ee5e0d9a85fc5f387c7d27b275b25f5ddd0"
+    },
+    {
+      "path": "svc05/pkg000/mod05/f00005.rs",
+      "bytes": 9,
+      "sha256": "fc7ea76337aa61236dacc59b03abf6972b77da13d27a41fa8dcf2526a5768fd5"
+    },
+    {
+      "path": "svc06/pkg000/mod06/f00006.rs",
+      "bytes": 9,
+      "sha256": "30dbd708d7021ac1dedc7257c178408b95ef932363fed31e70d48e4ef3d66aae"
+    },
+    {
+      "path": "svc07/pkg000/mod07/f00007.rs",
+      "bytes": 9,
+      "sha256": "19fb6e126cf92d7f80c65bb0e3a9ff5e0866d7f80f6bd5246bcf611a7d65ccc1"
+    },
+    {
+      "path": "svc08/pkg000/mod08/f00008.rs",
+      "bytes": 9,
+      "sha256": "d7db6b5dbbbb2033939ad33dc754f42ed89eb6ab24adccf2cf57ddf377739c59"
+    },
+    {
+      "path": "svc09/pkg000/mod09/f00009.rs",
+      "bytes": 9,
+      "sha256": "391b2dfdf13614c8f75c61c64ab64e49945808582160d648c381234c437d55aa"
+    },
+    {
+      "path": "svc10/pkg000/mod10/f00010.rs",
+      "bytes": 10,
+      "sha256": "e399e5e7e70db597924242d85d81ad6146ef7b69dbf439e8ba28f59cfdf582c5"
+    },
+    {
+      "path": "svc11/pkg000/mod11/f00011.rs",
+      "bytes": 10,
+      "sha256": "fa6581c26b3b4e213a82bba4783add8e5fc73f1dc27b290b8f5130fb94b1dc06"
+    },
+    {
+      "path": "svc12/pkg000/mod12/f00012.rs",
+      "bytes": 10,
+      "sha256": "cd21ff37d7ba30179fcf1b43aa323d476c773e0e7689eee085e1baa859a66405"
+    },
+    {
+      "path": "svc13/pkg000/mod13/f00013.rs",
+      "bytes": 10,
+      "sha256": "923ff52e29f9a372e30fd0a75791d9f5238c78aeaddeb7e8a129d236fddcf1b9"
+    },
+    {
+      "path": "svc14/pkg000/mod14/f00014.rs",
+      "bytes": 10,
+      "sha256": "ed12d51645b294afd87b5754d9777a5b6fc93d481f4ff8b3845e030207e887df"
+    },
+    {
+      "path": "svc15/pkg000/mod15/f00015.rs",
+      "bytes": 10,
+      "sha256": "169f8d6c7151152022dde7620debb01b97488df0aa36ee76c5351e65ffe49adc"
+    },
+    {
+      "path": "svc16/pkg000/mod16/f00016.rs",
+      "bytes": 10,
+      "sha256": "a4beb5793b3eed2ade36f2854d844de850b01aaef1ebc5ea4581e4db76caa86c"
+    },
+    {
+      "path": "svc17/pkg000/mod17/f00017.rs",
+      "bytes": 10,
+      "sha256": "f661e87fcfcc9174e5fc2d1d013a7982ac10f74860e5dbf0ccfbdc858a2ccbb8"
+    },
+    {
+      "path": "svc18/pkg000/mod18/f00018.rs",
+      "bytes": 10,
+      "sha256": "be735ad81470c846dd61fe9cba34204178e167708ab1365ecb4603e1e9b39443"
+    },
+    {
+      "path": "svc19/pkg000/mod19/f00019.rs",
+      "bytes": 10,
+      "sha256": "15e58f8528bdf3a5e806592b7a033e0761f2d77064b2f1c315c0caee8a1b184f"
+    }
+  ],
+  "all_root_directories_match": true,
+  "all_sample_contents_match": true
+}

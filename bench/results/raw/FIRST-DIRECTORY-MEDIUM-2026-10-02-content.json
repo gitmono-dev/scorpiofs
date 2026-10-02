@@ -1,0 +1,30 @@
+{
+  "scope": "/project/bench50k",
+  "status": "failed",
+  "files": [
+    {
+      "path": "svc00/pkg000/mod00/f00000.rs",
+      "bytes": 9,
+      "sha256": "a651e21a962fdfeed6327e6ebbcd2dabff7a5ea6601c7346c42feef8de3ad875"
+    },
+    {
+      "path": "svc01/pkg000/mod01/f00001.rs",
+      "bytes": 9,
+      "sha256": "6bf48347c164405e3f1d309b8fb255ee542b2f538ec4397da8f13ca3a9978dad"
+    },
+    {
+      "path": "svc19/pkg019/mod19/f49999.rs",
+      "bytes": 13,
+      "sha256": "9d15923ee0b28d7838101c10113bc2d5c111b127d6471168bf22a2a29714a931"
+    }
+  ],
+  "truncate_restore": {
+    "expected_bytes": 9,
+    "actual_bytes": 32,
+    "expected_hex": "2f2f2073353020300a",
+    "actual_hex": "2f2f2073353020300a0a72656164696e6573732d77726974652d636865636b0a",
+    "after_2_seconds_bytes": 32,
+    "after_2_seconds_hex": "2f2f2073353020300a0a72656164696e6573732d77726974652d636865636b0a"
+  },
+  "mount_deleted": true
+}
