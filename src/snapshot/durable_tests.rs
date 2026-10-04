@@ -36,6 +36,76 @@ struct Fault {
 
 thread_local! {
     static FAULT: RefCell<Option<Fault>> = const { RefCell::new(None) };
+    static SYNC_COUNTS: RefCell<Option<SyncCounts>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct SyncCounts {
+    root: PathBuf,
+    // Captured immediately after the real sync_all returns successfully.
+    journal_chunks: Vec<(usize, usize)>,
+    journal_compactions: usize,
+    files: Vec<PathBuf>,
+}
+
+struct SyncCounter;
+
+impl SyncCounter {
+    fn install(root: &Path) -> Self {
+        SYNC_COUNTS.with(|counts| {
+            assert!(counts.borrow().is_none());
+            *counts.borrow_mut() = Some(SyncCounts {
+                root: root.into(),
+                journal_chunks: Vec::new(),
+                journal_compactions: 0,
+                files: Vec::new(),
+            });
+        });
+        Self
+    }
+
+    fn counts(&self) -> SyncCounts {
+        SYNC_COUNTS.with(|counts| counts.borrow().as_ref().unwrap().clone())
+    }
+}
+
+impl Drop for SyncCounter {
+    fn drop(&mut self) {
+        SYNC_COUNTS.with(|counts| *counts.borrow_mut() = None);
+    }
+}
+
+pub(super) fn record_journal_sync(root: &Path, bytes: &[u8]) {
+    SYNC_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            if counts.root == root {
+                counts.journal_chunks.push((
+                    bytes.len(),
+                    bytes.iter().filter(|byte| **byte == b'\n').count(),
+                ));
+            }
+        }
+    });
+}
+
+pub(super) fn record_journal_compaction(root: &Path) {
+    SYNC_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            if counts.root == root {
+                counts.journal_compactions += 1;
+            }
+        }
+    });
+}
+
+pub(super) fn record_file_sync(path: &Path) {
+    SYNC_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            if path.starts_with(&counts.root) {
+                counts.files.push(path.into());
+            }
+        }
+    });
 }
 
 pub(super) struct FaultGuard;
@@ -159,6 +229,213 @@ async fn hydrate(store: &DurableStore) -> HydrateReport {
         })
         .await
         .unwrap()
+}
+
+fn many_files(count: usize) -> Vec<SnapshotFile> {
+    (0..count)
+        .map(|index| {
+            let rel_path = format!("file-{index:04}");
+            SnapshotFile {
+                size: rel_path.len() as u64,
+                content_digest: digest_of(rel_path.as_bytes()),
+                rel_path,
+                fs_kind: "regular".into(),
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn warm_1151_file_resume_bounds_real_journal_syncs_and_syncs_every_blob() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = DurableStore::open(temp.path()).unwrap();
+    let manifest = many_files(1151);
+    // Seed unsynced bytes: the completion path must explicitly sync every
+    // cache hit even though the fetch callbacks are never used.
+    for file in &manifest {
+        fs::write(
+            store.blob_path(&file.content_digest).unwrap(),
+            file.rel_path.as_bytes(),
+        )
+        .unwrap();
+    }
+    store
+        .hydrate_with(&view(), &manifest, |_| async { panic!("seeded CAS hit") })
+        .await
+        .unwrap();
+    assert!(store.is_complete().unwrap());
+
+    let expected_synced: HashSet<_> = manifest
+        .iter()
+        .map(|file| store.blob_path(&file.content_digest).unwrap())
+        .collect();
+    for mode in ["sequential", "concurrent", "batches"] {
+        let counter = SyncCounter::install(temp.path());
+        let report = match mode {
+            "sequential" => {
+                store
+                    .hydrate_with(&view(), &manifest, |_| async { panic!("warm source read") })
+                    .await
+            }
+            "concurrent" => {
+                store
+                    .hydrate_concurrent(&view(), &manifest, 8, |_| {
+                        Box::pin(async { panic!("warm source read") })
+                    })
+                    .await
+            }
+            "batches" => {
+                store
+                    .hydrate_batches(
+                        &view(),
+                        &manifest,
+                        4,
+                        4,
+                        |_| Box::pin(async { panic!("warm objects read") }),
+                        |_| Box::pin(async { panic!("warm large read") }),
+                    )
+                    .await
+            }
+            _ => unreachable!(),
+        }
+        .unwrap();
+        let counts = counter.counts();
+        drop(counter);
+        assert_eq!(report.fetched, 0, "{mode}");
+        assert_eq!(report.resumed, 1151, "{mode}");
+        assert_eq!(report.total_files, 1151, "{mode}");
+        assert!(report.complete, "{mode}");
+        // The regression budget is independent of a predicted report field:
+        // each event was recorded after an actual journal sync_all succeeded.
+        assert!(
+            counts.journal_chunks.len() <= 9,
+            "{mode}: {} real journal syncs for 1151 files",
+            counts.journal_chunks.len()
+        );
+        assert_eq!(counts.journal_compactions, 1, "{mode}");
+        for (bytes, records) in &counts.journal_chunks {
+            assert!(*bytes > 0 && *bytes <= 256 * 1024, "{mode}");
+            assert!(*records > 0 && *records <= 128, "{mode}");
+        }
+        assert_eq!(counts.files.len(), 1151, "{mode}");
+        assert_eq!(
+            counts.files.into_iter().collect::<HashSet<_>>(),
+            expected_synced,
+            "{mode}: every unique CAS dependency must still be synced"
+        );
+        assert_eq!(store.read_journal().unwrap().len(), 1151, "{mode}");
+        assert_eq!(
+            fs::read(temp.path().join(JOURNAL_FILE))
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1151,
+            "{mode}: completed journal contains exactly one logical manifest"
+        );
+        assert_eq!(store.manifest().unwrap(), manifest, "{mode}");
+        assert!(store.is_complete().unwrap(), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_cold_appends_keep_complete_json_records_and_bounded_syncs() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = DurableStore::open(temp.path()).unwrap();
+    let manifest = many_files(257);
+    let counter = SyncCounter::install(temp.path());
+    let report = store
+        .hydrate_concurrent(&view(), &manifest, 16, |file| {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                Ok(Arc::new(file.rel_path.into_bytes()))
+            })
+        })
+        .await
+        .unwrap();
+    let counts = counter.counts();
+    drop(counter);
+    assert_eq!(report.fetched, 257);
+    assert_eq!(report.resumed, 0);
+    assert!(counts.journal_chunks.len() <= 8);
+    assert_eq!(counts.journal_compactions, 1);
+    assert!(counts
+        .journal_chunks
+        .iter()
+        .all(|(bytes, records)| *bytes <= 256 * 1024 && *records <= 128));
+    let journal = store.read_journal().unwrap();
+    assert_eq!(journal.len(), 257);
+    for file in &manifest {
+        assert_eq!(journal[&file.rel_path].digest, file.content_digest);
+        assert_eq!(journal[&file.rel_path].size, file.size);
+    }
+    assert_eq!(store.manifest().unwrap(), manifest);
+}
+
+#[tokio::test]
+async fn long_legal_paths_flush_at_the_byte_limit_before_the_record_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = DurableStore::open(temp.path()).unwrap();
+    let parent = vec!["x".repeat(255); 15].join("/");
+    let manifest: Vec<_> = (0..128)
+        .map(|index| SnapshotFile {
+            rel_path: format!("{parent}/file-{index:04}"),
+            fs_kind: "regular".into(),
+            size: 1,
+            content_digest: digest_of(b"a"),
+        })
+        .collect();
+    let counter = SyncCounter::install(temp.path());
+    store
+        .hydrate_with(&view(), &manifest, |_| async { Ok(b"a".to_vec()) })
+        .await
+        .unwrap();
+    let counts = counter.counts();
+    drop(counter);
+    assert!(counts
+        .journal_chunks
+        .iter()
+        .any(|(bytes, records)| { *bytes > 128 * 1024 && *records < 128 }));
+    assert!(counts
+        .journal_chunks
+        .iter()
+        .all(|(bytes, records)| *bytes <= 256 * 1024 && *records <= 128));
+    assert_eq!(store.read_journal().unwrap().len(), 128);
+    assert_eq!(counts.files.len(), 1, "alias content is synced once");
+    assert_eq!(store.manifest().unwrap(), manifest);
+}
+
+#[tokio::test]
+async fn journal_write_and_sync_failures_never_publish_complete() {
+    for phase in [
+        "journal-write",
+        "journal-file-sync",
+        "journal-chunk-durable",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(temp.path()).unwrap();
+        let fault = FaultGuard::install(temp.path(), phase, false);
+        let error = store
+            .hydrate_with(&view(), &files(), |file| {
+                let bytes = body(file);
+                async move { Ok(bytes) }
+            })
+            .await
+            .unwrap_err();
+        drop(fault);
+        assert_eq!(error.code, SnapshotErrorCode::Internal, "{phase}");
+        assert!(!store.is_complete().unwrap(), "{phase}");
+        assert!(!temp.path().join(COMPLETE_MARKER).exists(), "{phase}");
+        assert_eq!(store.verify_all(&files()).unwrap(), 2, "{phase}");
+        let report = store
+            .hydrate_with(&view(), &files(), |_| async {
+                panic!("journal failure must not discard valid CAS content")
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.fetched, 0, "{phase}");
+        assert!(store.is_complete().unwrap(), "{phase}");
+    }
 }
 
 #[tokio::test]
@@ -749,6 +1026,9 @@ fn killed_process_recovers_only_committed_dependencies_at_each_publication_bound
     use std::os::unix::process::ExitStatusExt;
     for phase in [
         "marker-revoked",
+        "journal-buffered",
+        "journal-written",
+        "journal-chunk-durable",
         "content-durable",
         "journal-compact-write",
         "journal-compact-file-sync",
@@ -793,6 +1073,38 @@ fn killed_process_recovers_only_committed_dependencies_at_each_publication_bound
         assert!(store.is_complete().unwrap());
         assert!(store.is_pinned().unwrap());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn lost_buffered_journal_hints_still_reverify_blob_bytes_after_process_crash() {
+    use std::os::unix::process::ExitStatusExt;
+    let temp = tempfile::tempdir().unwrap();
+    let mut child = worker(
+        temp.path(),
+        "SCORPIO_DURABLE_CRASH_PHASE",
+        "journal-buffered",
+    );
+    assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    let store = DurableStore::open(temp.path()).unwrap();
+    assert!(!temp.path().join(JOURNAL_FILE).exists());
+    assert!(!store.is_complete().unwrap());
+    let first = &files()[0];
+    let blob = store.blob_path(&first.content_digest).unwrap();
+    assert_eq!(fs::read(&blob).unwrap(), body(first));
+    // A durable blob with a lost buffered hint is still verified, never
+    // credited merely because it survived the killed writer.
+    fs::write(blob, b"x").unwrap();
+    let report = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(hydrate(&store));
+    assert_eq!(report.fetched, 2);
+    assert_eq!(report.repaired, 1);
+    assert_eq!(report.resumed, 0);
+    assert!(store.is_complete().unwrap());
+    assert_eq!(store.read_journal().unwrap().len(), 2);
 }
 
 #[cfg(unix)]
