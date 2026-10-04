@@ -948,21 +948,9 @@ impl DurableStore {
         }
         sync_dir(&self.content)?;
         durability_checkpoint(&self.root, "content-durable")?;
-        // OBJECT batches deduplicate content, but the journal still records
-        // every logical path (including aliases), with one final sync.
-        let journal_lines: Result<Vec<_>, _> = manifest
-            .iter()
-            .map(|file| {
-                serde_json::to_string(&FileRecord {
-                    rel_path: file.rel_path.clone(),
-                    digest: file.content_digest.clone(),
-                    size: file.size,
-                })
-            })
-            .collect();
-        self.append_journal_batch(&journal_lines.map_err(|error| {
-            SnapshotError::new(SnapshotErrorCode::Internal, error.to_string())
-        })?)?;
+        // Keep exactly one hint for each logical path after a successful
+        // pass. The old journal remains usable until the replacement commits.
+        self.compact_journal(manifest)?;
         let manifest_bytes = serde_json::to_vec_pretty(manifest)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         write_atomic(&self.root, MANIFEST_FILE, &manifest_bytes)?;
@@ -1192,6 +1180,47 @@ impl DurableStore {
         f.write_all(&buf).map_err(io_err)?;
         f.sync_all().map_err(io_err)?;
         sync_dir(&self.root)
+    }
+
+    fn compact_journal(&self, manifest: &[SnapshotFile]) -> Result<(), SnapshotError> {
+        let tmp = self.root.join(format!(
+            ".{JOURNAL_FILE}.tmp.{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let result = (|| {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)
+                .map_err(io_err)?;
+            let mut output = io::BufWriter::with_capacity(256 * 1024, &file);
+            durability_checkpoint(&self.root, "journal-compact-write")?;
+            for file in manifest {
+                serde_json::to_writer(
+                    &mut output,
+                    &FileRecord {
+                        rel_path: file.rel_path.clone(),
+                        digest: file.content_digest.clone(),
+                        size: file.size,
+                    },
+                )
+                .map_err(|error| {
+                    SnapshotError::new(SnapshotErrorCode::Internal, error.to_string())
+                })?;
+                output.write_all(b"\n").map_err(io_err)?;
+            }
+            output.flush().map_err(io_err)?;
+            durability_checkpoint(&self.root, "journal-compact-file-sync")?;
+            file.sync_all().map_err(io_err)?;
+            fs::rename(&tmp, self.root.join(JOURNAL_FILE)).map_err(io_err)?;
+            sync_dir(&self.root)?;
+            durability_checkpoint(&self.root, "journal-compacted")
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 
     fn truncate_journal_tail(&self) -> Result<(), SnapshotError> {
