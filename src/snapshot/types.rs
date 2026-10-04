@@ -42,6 +42,9 @@ pub enum SnapshotErrorCode {
     /// A durable local store already holds a different fixed view; hydration
     /// refuses rather than mixing two views in one store.
     DurableViewConflict,
+    /// A transport failure or temporary backend outage; retry within the
+    /// still-valid fixed view rather than permanently rejecting the reader.
+    TemporaryUnavailable,
     Internal,
 }
 
@@ -89,6 +92,7 @@ impl SnapshotErrorCode {
             "OBJECT_DIGEST_MISMATCH" => Self::DigestMismatch,
             "RANGE_NOT_SUPPORTED" => Self::RangeNotSupported,
             "SYMLINK_TRAVERSAL" => Self::SymlinkTraversal,
+            "TEMPORARY_UNAVAILABLE" => Self::TemporaryUnavailable,
             _ => Self::Internal,
         }
     }
