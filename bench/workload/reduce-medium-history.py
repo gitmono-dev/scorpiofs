@@ -40,11 +40,16 @@ backup.write_text(refs_path.read_text())
 commit = git("commit-tree", tree, "-p", parent, input=f"Reduce isolated benchmark to {a.files} files\n".encode())
 start = time.monotonic()
 git("-c", "http.postBuffer=1073741824", "push", remote, commit+":refs/heads/main")
-if git("ls-remote", remote, "refs/heads/main").split()[0] != commit:
+git("fetch", remote, "refs/heads/main")
+canonical = git("rev-parse", "FETCH_HEAD")
+if git("rev-parse", canonical+"^{tree}") != tree:
+    raise SystemExit("server content tree differs from reduction fixture")
+if git("ls-remote", remote, "refs/heads/main").split()[0] != canonical:
     raise SystemExit("new ref mismatch")
-row.update(previous_fixture_commit=row["commit"], commit=commit, tree=tree, reduced_from_commit=parent)
+row.update(previous_fixture_commit=row["commit"], commit=canonical, tree=tree, reduced_from_commit=parent)
 refs_path.write_text(json.dumps(refs, indent=2)+"\n")
-result = {"cluster": a.cluster, "files": a.files, "parent": parent, "commit": commit,
+result = {"cluster": a.cluster, "files": a.files, "parent": parent, "commit": canonical,
+          "client_commit": commit,
           "tree": tree, "push_ms": (time.monotonic()-start)*1000,
           "forward_history": True, "fixture_content_unchanged": True, "utc": time.time()}
 Path("/data/results/reduction.json").write_text(json.dumps(result, indent=2)+"\n")

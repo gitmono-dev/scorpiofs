@@ -84,6 +84,7 @@ def main():
                "medium-monorepo.py": Path(__file__).parents[1] / "workload/medium-monorepo.py",
                "medium-profile.py": Path(__file__).parents[1] / "cases/medium-profile.py",
                "git-shallow-gate.py": Path(__file__).parents[1] / "cases/git-shallow-gate.py",
+               "reduce-medium-history.py": Path(__file__).parents[1] / "workload/reduce-medium-history.py",
                "first-directory-ready.py": Path(__file__).parents[1] / "bin/first-directory-ready.py"}
     docs.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "medium-drivers", "namespace": "gitmono"},
                  "data": {name: path.read_text() for name, path in drivers.items()}})

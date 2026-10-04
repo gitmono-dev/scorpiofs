@@ -46,6 +46,26 @@ def require_shallow_gate(path, target, repo):
     return gate
 
 
+def publish_fixture_commit(fixture_git, repo, row, env):
+    def git(*args, **kw):
+        return command(["git", "--git-dir=" + str(fixture_git), *args], env=env, **kw).decode().strip()
+
+    tree = git("rev-parse", row["commit"] + "^{tree}")
+    tip = git("ls-remote", repo, "refs/heads/main").split()
+    parent = ["-p", tip[0]] if tip else []
+    commit = git("commit-tree", tree, *parent,
+                 input=f"medium fixture {row['files']} files\n".encode())
+    git("-c", "http.postBuffer=1073741824", "push", repo, commit + ":refs/heads/main")
+    git("fetch", repo, "refs/heads/main")
+    observed = git("rev-parse", "FETCH_HEAD")
+    if git("rev-parse", observed + "^{tree}") != tree:
+        raise RuntimeError("server content tree differs from immutable fixture")
+    if git("ls-remote", repo, "refs/heads/main").split()[0] != observed:
+        raise RuntimeError("server ref changed while freezing the fixture")
+    return dict(row, fixture_commit=row.get("fixture_commit", row["commit"]),
+                commit=observed, tree=tree)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("action", choices=["seed", "gate", "measure", "verify"])
@@ -79,6 +99,9 @@ def main():
     if args.action == "seed":
         # Source is an immutable repository embedded in the fixture image.
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        history_env = dict(env, GIT_AUTHOR_NAME="medium-benchmark", GIT_AUTHOR_EMAIL="medium@bench.invalid",
+                           GIT_COMMITTER_NAME="medium-benchmark", GIT_COMMITTER_EMAIL="medium@bench.invalid",
+                           GIT_AUTHOR_DATE="2026-10-03T00:00:00+0000", GIT_COMMITTER_DATE="2026-10-03T00:00:00+0000")
         remote = command(["git", "ls-remote", repo, "refs/heads/main"]).decode().split()
         current = next((r["files"] for r in refs if remote and r["commit"] == remote[0]), 0)
         if remote and current == 0:
@@ -105,9 +128,6 @@ def main():
                 # These are actual root commits, so the imported ancestry is complete.
                 # The backend receive-pack parser does not support the shallow header.
                 shallow.unlink()
-            history_env = dict(env, GIT_AUTHOR_NAME="medium-benchmark", GIT_AUTHOR_EMAIL="medium@bench.invalid",
-                               GIT_COMMITTER_NAME="medium-benchmark", GIT_COMMITTER_EMAIL="medium@bench.invalid",
-                               GIT_AUTHOR_DATE="2026-10-03T00:00:00+0000", GIT_COMMITTER_DATE="2026-10-03T00:00:00+0000")
             parent = oid
             derived = []
             for row in refs:
@@ -121,15 +141,18 @@ def main():
             target = next(x["commit"] for x in refs if x["files"] == args.files)
             emit({"phase": "isolated_bootstrap_audit", "initial_commit": oid, "initial_tree": tree,
                   "derived_history": refs, "content_trees_unchanged": True})
-        for row in refs:
+        for index, row in enumerate(refs):
             if row["files"] <= current:
                 continue
             if row["files"] > args.files:
                 break
             start = time.monotonic()
-            argv = ["git", "--git-dir=" + fixture_git, "-c", "http.postBuffer=1073741824", "push"]
-            command(argv + [repo, row["commit"] + ":refs/heads/main"], env=env)
-            emit({"phase": "seed_push", "batch_files": row["files"], "ms": (time.monotonic()-start)*1000})
+            refs[index] = publish_fixture_commit(fixture_git, repo, row, history_env)
+            Path("/fixture/manifest.refs.json").write_text(json.dumps(refs, indent=2) + "\n")
+            emit({"phase": "seed_push", "batch_files": row["files"],
+                  "canonical_commit": refs[index]["commit"], "content_tree_verified": True,
+                  "ms": (time.monotonic()-start)*1000})
+        target = next(x["commit"] for x in refs if x["files"] == args.files)
         observed = command(["git", "ls-remote", repo, "refs/heads/main"]).decode().split()[0]
         if observed != target:
             raise RuntimeError("seed ref mismatch")

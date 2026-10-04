@@ -107,6 +107,35 @@ class ShallowGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(output.read_text())["status"], "failed")
 
+    def test_seed_freezes_server_canonical_id_after_verifying_tree(self):
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "clone", "--bare", str(self.oracle), str(remote)],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = dict(os.environ, GIT_AUTHOR_NAME="Gate Test", GIT_AUTHOR_EMAIL="gate@example.invalid",
+                   GIT_COMMITTER_NAME="Gate Test", GIT_COMMITTER_EMAIL="gate@example.invalid")
+        pushed = []
+
+        def canonical_server(argv, **kw):
+            output = subprocess.check_output(argv, stderr=subprocess.PIPE, **kw)
+            if "push" in argv:
+                client = self.git(remote, "rev-parse", "HEAD")
+                pushed.append(client)
+                parent = self.git(remote, "rev-parse", "HEAD^")
+                tree = self.git(remote, "rev-parse", "HEAD^{tree}")
+                canonical = subprocess.check_output(
+                    ["git", "--git-dir=" + str(remote), "commit-tree", tree, "-p", parent,
+                     "-m", "server canonical commit"], env=env).decode().strip()
+                self.git(remote, "update-ref", "refs/heads/main", canonical)
+            return output
+
+        row = dict(files=1, commit=self.commits[1])
+        with mock.patch.object(driver, "command", side_effect=canonical_server):
+            frozen = driver.publish_fixture_commit(self.oracle / ".git", str(remote), row, env)
+        self.assertNotEqual(frozen["commit"], pushed[0])
+        self.assertEqual(frozen["commit"], self.git(remote, "rev-parse", "HEAD"))
+        self.assertEqual(frozen["tree"], self.git(self.oracle, "rev-parse", self.commits[1] + "^{tree}"))
+        self.assertEqual(row["commit"], self.commits[1])
+
 
 class DriverGateTests(unittest.TestCase):
     def test_missing_failed_stale_or_incomplete_gate_blocks_measurement(self):
