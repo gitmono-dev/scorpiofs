@@ -44,6 +44,7 @@ struct SyncCounts {
     root: PathBuf,
     // Captured immediately after the real sync_all returns successfully.
     journal_chunks: Vec<(usize, usize)>,
+    journal_compactions: usize,
     files: Vec<PathBuf>,
 }
 
@@ -56,6 +57,7 @@ impl SyncCounter {
             *counts.borrow_mut() = Some(SyncCounts {
                 root: root.into(),
                 journal_chunks: Vec::new(),
+                journal_compactions: 0,
                 files: Vec::new(),
             });
         });
@@ -81,6 +83,16 @@ pub(super) fn record_journal_sync(root: &Path, bytes: &[u8]) {
                     bytes.len(),
                     bytes.iter().filter(|byte| **byte == b'\n').count(),
                 ));
+            }
+        }
+    });
+}
+
+pub(super) fn record_journal_compaction(root: &Path) {
+    SYNC_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            if counts.root == root {
+                counts.journal_compactions += 1;
             }
         }
     });
@@ -296,10 +308,11 @@ async fn warm_1151_file_resume_bounds_real_journal_syncs_and_syncs_every_blob() 
         // The regression budget is independent of a predicted report field:
         // each event was recorded after an actual journal sync_all succeeded.
         assert!(
-            (9..=20).contains(&counts.journal_chunks.len()),
+            counts.journal_chunks.len() <= 9,
             "{mode}: {} real journal syncs for 1151 files",
             counts.journal_chunks.len()
         );
+        assert_eq!(counts.journal_compactions, 1, "{mode}");
         for (bytes, records) in &counts.journal_chunks {
             assert!(*bytes > 0 && *bytes <= 256 * 1024, "{mode}");
             assert!(*records > 0 && *records <= 128, "{mode}");
@@ -311,6 +324,15 @@ async fn warm_1151_file_resume_bounds_real_journal_syncs_and_syncs_every_blob() 
             "{mode}: every unique CAS dependency must still be synced"
         );
         assert_eq!(store.read_journal().unwrap().len(), 1151, "{mode}");
+        assert_eq!(
+            fs::read(temp.path().join(JOURNAL_FILE))
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1151,
+            "{mode}: completed journal contains exactly one logical manifest"
+        );
         assert_eq!(store.manifest().unwrap(), manifest, "{mode}");
         assert!(store.is_complete().unwrap(), "{mode}");
     }
@@ -336,6 +358,7 @@ async fn concurrent_cold_appends_keep_complete_json_records_and_bounded_syncs() 
     assert_eq!(report.fetched, 257);
     assert_eq!(report.resumed, 0);
     assert!(counts.journal_chunks.len() <= 8);
+    assert_eq!(counts.journal_compactions, 1);
     assert!(counts
         .journal_chunks
         .iter()

@@ -1241,6 +1241,8 @@ impl DurableStore {
             output.flush().map_err(io_err)?;
             durability_checkpoint(&self.root, "journal-compact-file-sync")?;
             file.sync_all().map_err(io_err)?;
+            #[cfg(test)]
+            durability_tests::record_journal_compaction(&self.root);
             fs::rename(&tmp, self.root.join(JOURNAL_FILE)).map_err(io_err)?;
             sync_dir(&self.root)?;
             durability_checkpoint(&self.root, "journal-compacted")

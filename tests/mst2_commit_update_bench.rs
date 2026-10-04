@@ -127,13 +127,12 @@ impl Scale {
             assert!((min..=max).contains(&value), "invalid {name}: {value}");
             value
         }
-        let scale = Self {
+        Self {
             rounds: setting("ROUNDS", 5, 5, 20),
             dirs: setting("DIRS", 16, 8, 32),
             files: setting("FILES", 64, 32, 128),
             bytes: setting("BYTES", 256, 128, 4096),
-        };
-        scale
+        }
     }
 
     fn baseline(&self) -> Files {
@@ -779,7 +778,7 @@ fn open_output(path: &Path) -> fs::File {
         .canonicalize()
         .unwrap();
     assert!(
-        !parent.starts_with(repository),
+        !parent.starts_with(&repository),
         "benchmark results must stay outside the Git checkout"
     );
     match fs::symlink_metadata(path) {
