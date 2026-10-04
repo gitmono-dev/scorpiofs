@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! <root>/view.json            descriptor binding (snapshot id, scope, view id)
-//! <root>/journal.log          one JSON record per completed file (fsync'd)
+//! <root>/journal.log          completed-file hints (fsync'd in bounded chunks)
 //! <root>/blobs/<hex>          file content, addressed by SHA-256
 //! <root>/DURABLE_COMPLETE     marker written only after every file verified
 //! <root>/pin.json             local pin bound to this view's file closure
@@ -27,6 +27,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -44,6 +45,8 @@ const BLOB_DIR: &str = "blobs";
 const TRANSACTION_LOCK: &str = ".hydrate.lock";
 const REPAIR_FILE: &str = "NEEDS_REPAIR";
 const VERIFICATION_REVISION: u32 = 2;
+const JOURNAL_MAX_RECORDS: usize = 128;
+const JOURNAL_MAX_BYTES: usize = 256 * 1024;
 
 /// The fixed-view binding a store was hydrated from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +62,71 @@ struct FileRecord {
     rel_path: String,
     digest: String,
     size: u64,
+}
+
+/// Resume hints may lag the durable CAS by one bounded chunk. Losing that
+/// chunk on cancellation/crash only requires re-hashing the CAS on resume.
+/// The per-view OS lock protects the transaction; this mutex serializes its
+/// concurrent fetchers' appends and is never held across an async await.
+struct JournalBatch<'a> {
+    store: &'a DurableStore,
+    pending: Mutex<JournalBuffer>,
+}
+
+#[derive(Default)]
+struct JournalBuffer {
+    bytes: Vec<u8>,
+    records: usize,
+}
+
+impl<'a> JournalBatch<'a> {
+    fn new(store: &'a DurableStore) -> Self {
+        Self {
+            store,
+            pending: Mutex::new(JournalBuffer::default()),
+        }
+    }
+
+    fn append(&self, record: &FileRecord) -> Result<(), SnapshotError> {
+        let mut line = serde_json::to_vec(record)
+            .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))?;
+        line.push(b'\n');
+        let mut pending = self.pending.lock().map_err(|_| {
+            SnapshotError::new(SnapshotErrorCode::Internal, "journal buffer lock poisoned")
+        })?;
+        if pending.records > 0
+            && (pending.records == JOURNAL_MAX_RECORDS
+                || pending.bytes.len().saturating_add(line.len()) > JOURNAL_MAX_BYTES)
+        {
+            self.flush_locked(&mut pending)?;
+        }
+        // Valid manifest paths fit well below the byte limit. Keep even an
+        // oversized internal record out of the shared buffer.
+        if line.len() > JOURNAL_MAX_BYTES {
+            return self.store.append_journal_bytes(&line);
+        }
+        pending.bytes.extend_from_slice(&line);
+        pending.records += 1;
+        durability_checkpoint(&self.store.root, "journal-buffered")?;
+        if pending.records == JOURNAL_MAX_RECORDS || pending.bytes.len() == JOURNAL_MAX_BYTES {
+            self.flush_locked(&mut pending)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), SnapshotError> {
+        let mut pending = self.pending.lock().map_err(|_| {
+            SnapshotError::new(SnapshotErrorCode::Internal, "journal buffer lock poisoned")
+        })?;
+        self.flush_locked(&mut pending)
+    }
+
+    fn flush_locked(&self, pending: &mut JournalBuffer) -> Result<(), SnapshotError> {
+        self.store.append_journal_bytes(&pending.bytes)?;
+        pending.bytes.clear();
+        pending.records = 0;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +401,7 @@ impl DurableStore {
         Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
     {
         let _transaction = self.prepare_hydration(view, manifest)?;
+        let journal = JournalBatch::new(self);
         let mut fetched = 0u64;
         let mut resumed = 0u64;
         let mut repaired = 0u64;
@@ -346,7 +415,7 @@ impl DurableStore {
             // a truncated or tampered object is repaired rather than served.
             match self.verify_blob(&f.content_digest, f.size) {
                 Ok(true) => {
-                    self.append_journal(&FileRecord {
+                    journal.append(&FileRecord {
                         rel_path: f.rel_path.clone(),
                         digest: f.content_digest.clone(),
                         size: f.size,
@@ -386,7 +455,7 @@ impl DurableStore {
                 ));
             }
             write_atomic(&self.content, &blob_name(&f.content_digest), &bytes)?;
-            self.append_journal(&FileRecord {
+            journal.append(&FileRecord {
                 rel_path: f.rel_path.clone(),
                 digest: f.content_digest.clone(),
                 size: f.size,
@@ -395,6 +464,7 @@ impl DurableStore {
             bytes_total += f.size;
         }
 
+        journal.flush()?;
         self.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
     }
 
@@ -423,14 +493,15 @@ impl DurableStore {
             + 'static,
     {
         let _transaction = self.prepare_hydration(view, manifest)?;
+        let journal = JournalBatch::new(self);
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
         let repaired = std::sync::atomic::AtomicU64::new(0);
         let bytes_total = std::sync::atomic::AtomicU64::new(0);
         let store = self;
 
-        // Plan: journal credit is decided up front (same snapshot of the
-        // journal for all tasks), then fetch+verify+write runs concurrently.
+        // Fetch+verify+write runs concurrently. Journal appends share one
+        // bounded buffer so worker writes cannot interleave JSON records.
         use futures::stream::{StreamExt, TryStreamExt};
         // Every file goes through the same CAS check: content reuse is a
         // property of the shared store, not of this view's journal.
@@ -443,6 +514,7 @@ impl DurableStore {
                 let resumed = &resumed;
                 let repaired = &repaired;
                 let bytes_total = &bytes_total;
+                let journal = &journal;
                 let fetch = fetch.clone();
                 async move {
                     use std::sync::atomic::Ordering::Relaxed;
@@ -477,7 +549,7 @@ impl DurableStore {
                         ));
                     }
                     write_atomic(&store.content, &blob_name(&f.content_digest), &bytes)?;
-                    store.append_journal(&FileRecord {
+                    journal.append(&FileRecord {
                         rel_path: f.rel_path.clone(),
                         digest: f.content_digest.clone(),
                         size: f.size,
@@ -489,6 +561,7 @@ impl DurableStore {
             })
             .await?;
 
+        journal.flush()?;
         let fetched = fetched.load(std::sync::atomic::Ordering::Relaxed);
         let resumed = resumed.load(std::sync::atomic::Ordering::Relaxed);
         let repaired = repaired.load(std::sync::atomic::Ordering::Relaxed);
@@ -539,6 +612,7 @@ impl DurableStore {
         use futures::stream::{StreamExt, TryStreamExt};
 
         let _transaction = self.prepare_hydration(view, manifest)?;
+        let journal = JournalBatch::new(self);
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
         let repaired = std::sync::atomic::AtomicU64::new(0);
@@ -553,7 +627,7 @@ impl DurableStore {
                 Ok(true) => {
                     resumed.fetch_add(1, Relaxed);
                     bytes_total.fetch_add(f.size, Relaxed);
-                    store.append_journal(&FileRecord {
+                    journal.append(&FileRecord {
                         rel_path: f.rel_path.clone(),
                         digest: f.content_digest.clone(),
                         size: f.size,
@@ -602,13 +676,13 @@ impl DurableStore {
             .map(Ok::<_, SnapshotError>)
             .try_for_each_concurrent(batch_concurrency.max(1), |batch| {
                 let fetch_batch = fetch_batch.clone();
+                let journal = &journal;
                 async move {
                     let bytes = fetch_batch(batch.clone()).await?;
                     let mut by_digest: BufMap<String, std::sync::Arc<Vec<u8>>> = BufMap::new();
                     for (digest, data) in bytes {
                         by_digest.insert(digest, data);
                     }
-                    let mut journal_lines: Vec<String> = Vec::new();
                     for f in &batch {
                         let data = by_digest.remove(&f.content_digest).ok_or_else(|| {
                             SnapshotError::new(
@@ -644,20 +718,14 @@ impl DurableStore {
                             &blob_name(&f.content_digest),
                             data.as_slice(),
                         )?;
-                        journal_lines.push(
-                            serde_json::to_string(&FileRecord {
-                                rel_path: f.rel_path.clone(),
-                                digest: f.content_digest.clone(),
-                                size: f.size,
-                            })
-                            .map_err(|e| {
-                                SnapshotError::new(SnapshotErrorCode::Internal, e.to_string())
-                            })?,
-                        );
+                        journal.append(&FileRecord {
+                            rel_path: f.rel_path.clone(),
+                            digest: f.content_digest.clone(),
+                            size: f.size,
+                        })?;
                         fetched_b.fetch_add(1, Relaxed);
                         bytes_b.fetch_add(f.size, Relaxed);
                     }
-                    store.append_journal_batch(&journal_lines)?;
                     sync_dir(store.content_dir())?;
                     Ok(())
                 }
@@ -671,6 +739,7 @@ impl DurableStore {
             .map(Ok::<_, SnapshotError>)
             .try_for_each_concurrent(large_concurrency.max(1), |f| {
                 let fetch_large = fetch_large.clone();
+                let journal = &journal;
                 async move {
                     let bytes: std::sync::Arc<Vec<u8>> = fetch_large(f.clone()).await?;
                     let got = digest_of(&bytes);
@@ -692,7 +761,7 @@ impl DurableStore {
                         ));
                     }
                     write_atomic(&store.content, &blob_name(&f.content_digest), &bytes)?;
-                    store.append_journal(&FileRecord {
+                    journal.append(&FileRecord {
                         rel_path: f.rel_path.clone(),
                         digest: f.content_digest.clone(),
                         size: f.size,
@@ -704,6 +773,7 @@ impl DurableStore {
             })
             .await?;
 
+        journal.flush()?;
         let fetched = fetched.load(Relaxed);
         let resumed = resumed.load(Relaxed);
         let repaired = repaired.load(Relaxed);
@@ -912,21 +982,18 @@ impl DurableStore {
         }
         sync_dir(&self.content)?;
         durability_checkpoint(&self.root, "content-durable")?;
-        // OBJECT batches deduplicate content, but the journal still records
-        // every logical path (including aliases), with one final sync.
-        let journal_lines: Result<Vec<_>, _> = manifest
-            .iter()
-            .map(|file| {
-                serde_json::to_string(&FileRecord {
-                    rel_path: file.rel_path.clone(),
-                    digest: file.content_digest.clone(),
-                    size: file.size,
-                })
-            })
-            .collect();
-        self.append_journal_batch(&journal_lines.map_err(|error| {
-            SnapshotError::new(SnapshotErrorCode::Internal, error.to_string())
-        })?)?;
+        // OBJECT batches deduplicate content, but the final journal still
+        // records every logical path (including aliases). Bound this pass's
+        // memory and syncs as well, then flush before publishing metadata.
+        let journal = JournalBatch::new(self);
+        for file in manifest {
+            journal.append(&FileRecord {
+                rel_path: file.rel_path.clone(),
+                digest: file.content_digest.clone(),
+                size: file.size,
+            })?;
+        }
+        journal.flush()?;
         let manifest_bytes = serde_json::to_vec_pretty(manifest)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         write_atomic(&self.root, MANIFEST_FILE, &manifest_bytes)?;
@@ -1130,32 +1197,26 @@ impl DurableStore {
         Ok(out)
     }
 
-    fn append_journal(&self, rec: &FileRecord) -> Result<(), SnapshotError> {
-        let line = serde_json::to_string(rec)
-            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
-        self.append_journal_batch(&[line])
-    }
-
-    /// Append journal lines with a single write + fsync. Used by the batched
-    /// hydration. This syncs the journal itself, never the referenced blob
-    /// files; the blob publishers and final closure audit sync those first.
-    fn append_journal_batch(&self, lines: &[String]) -> Result<(), SnapshotError> {
-        if lines.is_empty() {
+    /// Append one serialized chunk with a write + fsync, never relying on
+    /// the journal to sync blob data. Concurrent callers share JournalBatch.
+    fn append_journal_bytes(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        if bytes.is_empty() {
             return Ok(());
-        }
-        let mut buf = Vec::new();
-        for rec_line in lines {
-            buf.extend_from_slice(rec_line.as_bytes());
-            buf.extend_from_slice(b"\n");
         }
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.root.join(JOURNAL_FILE))
             .map_err(io_err)?;
-        f.write_all(&buf).map_err(io_err)?;
+        durability_checkpoint(&self.root, "journal-write")?;
+        f.write_all(bytes).map_err(io_err)?;
+        durability_checkpoint(&self.root, "journal-written")?;
+        durability_checkpoint(&self.root, "journal-file-sync")?;
         f.sync_all().map_err(io_err)?;
-        sync_dir(&self.root)
+        #[cfg(test)]
+        durability_tests::record_journal_sync(&self.root, bytes);
+        sync_dir(&self.root)?;
+        durability_checkpoint(&self.root, "journal-chunk-durable")
     }
 
     fn truncate_journal_tail(&self) -> Result<(), SnapshotError> {
@@ -1224,7 +1285,13 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
 
 fn sync_file(path: &Path) -> Result<(), SnapshotError> {
     durability_checkpoint(path, "file-sync")?;
-    File::open(path).map_err(io_err)?.sync_all().map_err(io_err)
+    File::open(path)
+        .map_err(io_err)?
+        .sync_all()
+        .map_err(io_err)?;
+    #[cfg(test)]
+    durability_tests::record_file_sync(path);
+    Ok(())
 }
 
 fn sync_dir(path: &Path) -> Result<(), SnapshotError> {
@@ -1715,7 +1782,9 @@ mod tests {
             digest: digest_of(b"a"),
             size: 1,
         };
-        store.append_journal(&rec).unwrap();
+        let journal = JournalBatch::new(&store);
+        journal.append(&rec).unwrap();
+        journal.flush().unwrap();
 
         // Torn tail: a partial JSON fragment without a newline. This is what a
         // crash between write and fsync leaves behind, so the earlier records
