@@ -146,10 +146,17 @@ pub(super) fn checkpoint(path: &Path, phase: &str) -> Result<(), SnapshotError> 
         if std::env::var("SCORPIO_DURABLE_CRASH_PHASE").as_deref() == Ok(phase) {
             // SIGKILL does not run unwinding, destructors or exit handlers.
             // SAFETY: only the dedicated test child opts into this hook.
-            unsafe {
-                libc::kill(libc::getpid(), libc::SIGKILL);
+            if unsafe { libc::kill(libc::getpid(), libc::SIGKILL) } != 0 {
+                return Err(io_err(io::Error::last_os_error()));
             }
-            std::process::exit(91);
+            // Darwin can return from kill before delivering the signal.
+            // Wait for actual termination instead of racing a normal exit.
+            loop {
+                // SAFETY: the dedicated crash worker has a pending SIGKILL.
+                unsafe {
+                    libc::pause();
+                }
+            }
         }
         if std::env::var("SCORPIO_DURABLE_PAUSE_PHASE").as_deref() == Ok(phase) {
             fs::write(path.join("worker-ready"), b"ready").map_err(io_err)?;
