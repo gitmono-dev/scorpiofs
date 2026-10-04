@@ -971,7 +971,9 @@ mod tests {
                 let witnesses = Page::pages_along_route(entries, &route).unwrap();
                 let current = witnesses.last().unwrap();
                 let current_id = format!("sha256:{}", hex::encode(page_id(current)));
-                fixture.routes.insert((path.to_string(), route.clone()), current_id);
+                fixture
+                    .routes
+                    .insert((path.to_string(), route.clone()), current_id);
                 if let Page::Branch { children, .. } = decode_page(current).unwrap() {
                     for child in children {
                         let mut next = route.clone();
@@ -980,36 +982,62 @@ mod tests {
                     }
                 }
                 for bytes in witnesses {
-                    fixture.pages.insert(format!("sha256:{}", hex::encode(page_id(&bytes))), bytes);
+                    fixture
+                        .pages
+                        .insert(format!("sha256:{}", hex::encode(page_id(&bytes))), bytes);
                 }
             }
             root
         }
         let mut fixture = ClosureHttpFixture {
             descriptor: mst2_codec::descriptor::ServingDescriptor {
-                instance_uuid: *uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap().as_bytes(),
-                namespace_view_id: [0x22; 32], scope: "/project".into(), metadata_root: [0; 32],
+                instance_uuid: *uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555")
+                    .unwrap()
+                    .as_bytes(),
+                namespace_view_id: [0x22; 32],
+                scope: "/project".into(),
+                metadata_root: [0; 32],
             },
-            pages: BTreeMap::new(), routes: BTreeMap::new(), requested: StdMutex::new(Vec::new()),
-            omit: None, extra: None,
+            pages: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            requested: StdMutex::new(Vec::new()),
+            omit: None,
+            extra: None,
         };
         let empty = add_directory(&mut fixture, "/empty", &[]);
-        let entries: Vec<_> = (0..192u16).map(|i| Entry::file(
-            EntryKind::Regular, format!("{}{:03}", (b'a' + (i / 64) as u8) as char, i).as_bytes(),
-            1, [0x44; 32],
-        )).collect();
+        let entries: Vec<_> = (0..192u16)
+            .map(|i| {
+                Entry::file(
+                    EntryKind::Regular,
+                    format!("{}{:03}", (b'a' + (i / 64) as u8) as char, i).as_bytes(),
+                    1,
+                    [0x44; 32],
+                )
+            })
+            .collect();
         let shared = add_directory(&mut fixture, "/left", &entries);
         assert_eq!(add_directory(&mut fixture, "/right", &entries), shared);
-        fixture.descriptor.metadata_root = add_directory(&mut fixture, "/", &[
-            Entry::dir(b"empty", empty), Entry::dir(b"left", shared), Entry::dir(b"right", shared),
-        ]);
+        fixture.descriptor.metadata_root = add_directory(
+            &mut fixture,
+            "/",
+            &[
+                Entry::dir(b"empty", empty),
+                Entry::dir(b"left", shared),
+                Entry::dir(b"right", shared),
+            ],
+        );
         fixture
     }
 
     async fn serve_closure_fixture(
         fixture: ClosureHttpFixture,
     ) -> (String, Arc<ClosureHttpFixture>, tokio::task::JoinHandle<()>) {
-        use axum::{body::Bytes, extract::State, routing::{get, post}, Json, Router};
+        use axum::{
+            body::Bytes,
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
         use mst2_codec::treeframe::{EndPayload, MetaPayload};
         use serde_json::{json, Value};
         async fn capabilities() -> Json<Value> {
@@ -1035,32 +1063,59 @@ mod tests {
         }
         async fn metadata(State(fixture): State<Arc<ClosureHttpFixture>>, body: Bytes) -> Vec<u8> {
             let request: Value = serde_json::from_slice(&body).unwrap();
-            let items: Vec<MetadataPageItem> = request["items"].as_array().unwrap().iter().map(|item| MetadataPageItem {
-                directory_path: item["directory_path"].as_str().unwrap().to_string(),
-                route: serde_json::from_value(item["route"].clone()).unwrap(),
-                expected_digest: Some(item["expected_digest"].as_str().unwrap().to_string()),
-            }).collect();
+            let items: Vec<MetadataPageItem> = request["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| MetadataPageItem {
+                    directory_path: item["directory_path"].as_str().unwrap().to_string(),
+                    route: serde_json::from_value(item["route"].clone()).unwrap(),
+                    expected_digest: Some(item["expected_digest"].as_str().unwrap().to_string()),
+                })
+                .collect();
             let mut response = BTreeMap::new();
             for item in &items {
-                assert_eq!(fixture.routes.get(&(item.directory_path.clone(), item.route.clone())), item.expected_digest.as_ref());
+                assert_eq!(
+                    fixture
+                        .routes
+                        .get(&(item.directory_path.clone(), item.route.clone())),
+                    item.expected_digest.as_ref()
+                );
                 for depth in 0..=item.route.len() {
-                    let id = &fixture.routes[&(item.directory_path.clone(), item.route[..depth].to_vec())];
+                    let id = &fixture.routes
+                        [&(item.directory_path.clone(), item.route[..depth].to_vec())];
                     if fixture.omit.as_ref() != Some(id) {
                         response.insert(id.clone(), fixture.pages[id].clone());
                     }
                 }
             }
-            if let Some((id, bytes)) = &fixture.extra { response.insert(id.clone(), bytes.clone()); }
+            if let Some((id, bytes)) = &fixture.extra {
+                response.insert(id.clone(), bytes.clone());
+            }
             fixture.requested.lock().unwrap().push(items.clone());
-            let pages: Vec<_> = response.into_iter().rev().map(|(id, bytes)| (
-                crate::snapshot::frames::parse_digest(&id).unwrap(), bytes,
-            )).collect();
+            let pages: Vec<_> = response
+                .into_iter()
+                .rev()
+                .map(|(id, bytes)| (crate::snapshot::frames::parse_digest(&id).unwrap(), bytes))
+                .collect();
             let logical_bytes = pages.iter().map(|(_, bytes)| bytes.len() as u64).sum();
-            let mut wire = MetaPayload { pages: pages.clone() }.encode(7, 0).unwrap();
-            wire.extend(EndPayload {
-                request_item_count: items.len() as u32, unique_unit_count: pages.len() as u32, logical_bytes,
-                request_body_sha256: crate::snapshot::frames::parse_digest(&crate::snapshot::durable::digest_of(&body)).unwrap(),
-            }.encode(7, 1));
+            let mut wire = MetaPayload {
+                pages: pages.clone(),
+            }
+            .encode(7, 0)
+            .unwrap();
+            wire.extend(
+                EndPayload {
+                    request_item_count: items.len() as u32,
+                    unique_unit_count: pages.len() as u32,
+                    logical_bytes,
+                    request_body_sha256: crate::snapshot::frames::parse_digest(
+                        &crate::snapshot::durable::digest_of(&body),
+                    )
+                    .unwrap(),
+                }
+                .encode(7, 1),
+            );
             wire
         }
         let fixture = Arc::new(fixture);
@@ -1078,18 +1133,37 @@ mod tests {
     #[tokio::test]
     async fn snapshot_closure_fetches_unique_pages_and_preserves_empty_and_aliased_directories() {
         let (url, fixture, server) = serve_closure_fixture(closure_http_fixture()).await;
-        let reader = SnapshotReader::resolve(Mst2Client::new(url), "/project", 600).await.unwrap();
+        let reader = SnapshotReader::resolve(Mst2Client::new(url), "/project", 600)
+            .await
+            .unwrap();
         let closure = reader.snapshot_closure().await.unwrap();
         assert_eq!(closure.pages(), &fixture.pages);
-        assert_eq!(closure.directories().iter().map(|d| d.rel_path.as_str()).collect::<Vec<_>>(), ["", "empty", "left", "right"]);
+        assert_eq!(
+            closure
+                .directories()
+                .iter()
+                .map(|d| d.rel_path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "empty", "left", "right"]
+        );
         assert_eq!(closure.files().len(), 384);
         for prefix in ["left/", "right/"] {
-            assert_eq!(closure.files().iter().filter(|f| f.rel_path.starts_with(prefix)).count(), 192);
+            assert_eq!(
+                closure
+                    .files()
+                    .iter()
+                    .filter(|f| f.rel_path.starts_with(prefix))
+                    .count(),
+                192
+            );
         }
         let requests = fixture.requested.lock().unwrap();
         assert!(requests.iter().all(|batch| batch.len() <= PAGES_BATCH));
-        assert_eq!(requests.iter().map(Vec::len).sum::<usize>(), fixture.pages.len(),
-            "aliases and ancestor witnesses must not cause duplicate physical page requests");
+        assert_eq!(
+            requests.iter().map(Vec::len).sum::<usize>(),
+            fixture.pages.len(),
+            "aliases and ancestor witnesses must not cause duplicate physical page requests"
+        );
         drop(requests);
         server.abort();
     }
@@ -1101,13 +1175,26 @@ mod tests {
             if omit {
                 fixture.omit = Some(fixture.routes[&("/left".into(), vec![b'a'])].clone());
             } else {
-                let bytes = mst2_codec::metapage::Page::build(&[
-                    mst2_codec::metapage::Entry::file(mst2_codec::metapage::EntryKind::Regular, b"foreign", 1, [8; 32]),
-                ]).unwrap();
-                fixture.extra = Some((format!("sha256:{}", hex::encode(mst2_codec::metapage::page_id(&bytes))), bytes));
+                let bytes =
+                    mst2_codec::metapage::Page::build(&[mst2_codec::metapage::Entry::file(
+                        mst2_codec::metapage::EntryKind::Regular,
+                        b"foreign",
+                        1,
+                        [8; 32],
+                    )])
+                    .unwrap();
+                fixture.extra = Some((
+                    format!(
+                        "sha256:{}",
+                        hex::encode(mst2_codec::metapage::page_id(&bytes))
+                    ),
+                    bytes,
+                ));
             }
             let (url, _, server) = serve_closure_fixture(fixture).await;
-            let reader = SnapshotReader::resolve(Mst2Client::new(url), "/project", 600).await.unwrap();
+            let reader = SnapshotReader::resolve(Mst2Client::new(url), "/project", 600)
+                .await
+                .unwrap();
             let error = reader.snapshot_closure().await.unwrap_err();
             assert_eq!(error.code, SnapshotErrorCode::DigestMismatch);
             server.abort();

@@ -3,8 +3,10 @@
 //! The constructor verifies bytes and walks from the committed root. Cached
 //! directory lists or file manifests are never evidence of completeness.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 use mst2_codec::{
     descriptor::{
@@ -14,7 +16,9 @@ use mst2_codec::{
     metapage::{page_id, Entry, EntryKind, Page, MAX_DEPTH},
 };
 
-use crate::snapshot::{frames::parse_digest, Descriptor, SnapshotError, SnapshotErrorCode, SnapshotFile};
+use crate::snapshot::{
+    frames::parse_digest, Descriptor, SnapshotError, SnapshotErrorCode, SnapshotFile,
+};
 
 const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 
@@ -70,7 +74,9 @@ impl ValidatedSnapshotClosure {
         if validator.reached.len() != pages.len() {
             return Err(integrity("metadata closure contains unreachable pages"));
         }
-        validator.directories.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        validator
+            .directories
+            .sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         validator.files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let directories = std::mem::take(&mut validator.directories);
         let files = std::mem::take(&mut validator.files);
@@ -101,7 +107,11 @@ impl ValidatedSnapshotClosure {
             fs_semantics: FS_SEMANTICS_LINUX_CODE_V1,
             access_projection: ACCESS_PROJECTION_EXACT_FULL,
             metadata_root: digest(&serving.metadata_root),
-            snapshot_id: digest(&serving.snapshot_id().map_err(|e| integrity(e.to_string()))?),
+            snapshot_id: digest(
+                &serving
+                    .snapshot_id()
+                    .map_err(|e| integrity(e.to_string()))?,
+            ),
         };
         let closure = Self::from_pages(&descriptor, pages)?;
         if closure.descriptor_bytes != descriptor_bytes {
@@ -157,7 +167,11 @@ fn canonical_descriptor(descriptor: &Descriptor) -> Result<Vec<u8>, SnapshotErro
         metadata_root: parse_digest(&descriptor.metadata_root)?,
     };
     if descriptor.snapshot_id
-        != digest(&serving.snapshot_id().map_err(|e| integrity(e.to_string()))?)
+        != digest(
+            &serving
+                .snapshot_id()
+                .map_err(|e| integrity(e.to_string()))?,
+        )
     {
         return Err(integrity("snapshot_id does not match canonical descriptor"));
     }
@@ -191,17 +205,25 @@ impl ClosureValidator<'_> {
         if !active.insert(id.to_string()) {
             return Err(integrity("cycle in metadata radix pages"));
         }
-        let page = self.decoded.get(id).cloned()
+        let page = self
+            .decoded
+            .get(id)
+            .cloned()
             .ok_or_else(|| integrity(format!("missing committed metadata page {id}")))?;
         self.reached.insert(id.to_string());
         let mut entries = match page {
             Page::Leaf { entries } => entries,
-            Page::Branch { terminal, children, .. } => {
+            Page::Branch {
+                terminal, children, ..
+            } => {
                 let mut entries: Vec<_> = terminal.into_iter().collect();
                 for child in children {
-                    let child_entries = self.radix_entries(&digest(&child.child_page_id), depth + 1, active)?;
+                    let child_entries =
+                        self.radix_entries(&digest(&child.child_page_id), depth + 1, active)?;
                     if child_entries.len() as u64 != child.subtree_entries {
-                        return Err(integrity("branch child subtree_entries does not match its entries"));
+                        return Err(integrity(
+                            "branch child subtree_entries does not match its entries",
+                        ));
                     }
                     entries.extend(child_entries.iter().cloned());
                 }
@@ -212,7 +234,9 @@ impl ClosureValidator<'_> {
         let rebuilt = Page::build(&entries)
             .map_err(|e| integrity(format!("invalid metadata entry partition: {e}")))?;
         if rebuilt != self.bytes[id] {
-            return Err(integrity("metadata page is not the canonical partition of its entries"));
+            return Err(integrity(
+                "metadata page is not the canonical partition of its entries",
+            ));
         }
         active.remove(id);
         let entries = Arc::new(entries);
@@ -240,8 +264,8 @@ impl ClosureValidator<'_> {
         });
         let entries = self.radix_entries(root, 0, &mut HashSet::new())?;
         for entry in entries.iter() {
-            let name = std::str::from_utf8(&entry.name)
-                .map_err(|_| integrity("non-UTF-8 entry name"))?;
+            let name =
+                std::str::from_utf8(&entry.name).map_err(|_| integrity("non-UTF-8 entry name"))?;
             let child_path = if rel_path.is_empty() {
                 name.to_string()
             } else {
@@ -260,7 +284,10 @@ impl ClosureValidator<'_> {
                     return Err(integrity("duplicate logical path in metadata closure"));
                 }
                 let content_digest = digest(&entry.content_id);
-                if let Some(size) = self.content_sizes.insert(content_digest.clone(), entry.size) {
+                if let Some(size) = self
+                    .content_sizes
+                    .insert(content_digest.clone(), entry.size)
+                {
                     if size != entry.size {
                         return Err(integrity("one content digest has conflicting sizes"));
                     }
@@ -272,7 +299,8 @@ impl ClosureValidator<'_> {
                         EntryKind::Executable => "executable",
                         EntryKind::Symlink => "symlink",
                         EntryKind::Directory => unreachable!(),
-                    }.to_string(),
+                    }
+                    .to_string(),
                     size: entry.size,
                     content_digest,
                 });
@@ -312,7 +340,9 @@ pub(crate) fn decode_page(bytes: &[u8]) -> Result<Page, SnapshotError> {
         let payload = &bytes[20..];
         let prefix_len = read_u16(payload, 0)? as usize;
         let mut offset = 2 + prefix_len;
-        let terminal = *payload.get(offset).ok_or_else(|| integrity("truncated branch terminal flag"))?;
+        let terminal = *payload
+            .get(offset)
+            .ok_or_else(|| integrity("truncated branch terminal flag"))?;
         offset += 1;
         if terminal == 1 {
             Entry::decode(payload, &mut offset).map_err(|e| integrity(e.to_string()))?;
@@ -323,23 +353,29 @@ pub(crate) fn decode_page(bytes: &[u8]) -> Result<Page, SnapshotError> {
         }
         let mut sum = u64::from(terminal);
         for _ in 0..count {
-            let count_bytes: [u8; 8] = payload.get(offset + 1..offset + 9)
+            let count_bytes: [u8; 8] = payload
+                .get(offset + 1..offset + 9)
                 .ok_or_else(|| integrity("truncated branch child count"))?
-                .try_into().map_err(|_| integrity("invalid branch child count"))?;
-            sum = sum.checked_add(u64::from_le_bytes(count_bytes))
+                .try_into()
+                .map_err(|_| integrity("invalid branch child count"))?;
+            sum = sum
+                .checked_add(u64::from_le_bytes(count_bytes))
                 .filter(|total| *total <= i64::MAX as u64)
                 .ok_or_else(|| integrity("branch entry count overflow"))?;
             offset += 41;
         }
     }
-    Page::decode(bytes).map(|(page, _)| page)
+    Page::decode(bytes)
+        .map(|(page, _)| page)
         .map_err(|e| integrity(format!("invalid metadata page: {e}")))
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, SnapshotError> {
-    let value: [u8; 2] = bytes.get(offset..offset + 2)
+    let value: [u8; 2] = bytes
+        .get(offset..offset + 2)
         .ok_or_else(|| integrity("truncated metadata page"))?
-        .try_into().map_err(|_| integrity("invalid metadata integer"))?;
+        .try_into()
+        .map_err(|_| integrity("invalid metadata integer"))?;
     Ok(u16::from_le_bytes(value))
 }
 
@@ -357,13 +393,15 @@ fn limit(message: impl Into<String>) -> SnapshotError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use mst2_codec::metapage::BranchChild;
+
+    use super::*;
 
     fn serving(scope: &str, root: [u8; 32]) -> ServingDescriptor {
         ServingDescriptor {
             instance_uuid: *uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555")
-                .unwrap().as_bytes(),
+                .unwrap()
+                .as_bytes(),
             namespace_view_id: [0x22; 32],
             scope: scope.to_string(),
             metadata_root: root,
@@ -406,24 +444,52 @@ mod tests {
     fn aliases() -> (ServingDescriptor, BTreeMap<String, Vec<u8>>) {
         let mut pages = BTreeMap::new();
         let empty = directory(&mut pages, Vec::new());
-        let shared = directory(&mut pages, vec![Entry::dir(b"nested", empty), file("x", 4, 0x44)]);
-        let root = directory(&mut pages, vec![
-            Entry::dir(b"empty", empty), Entry::dir(b"left", shared), Entry::dir(b"right", shared),
-        ]);
+        let shared = directory(
+            &mut pages,
+            vec![Entry::dir(b"nested", empty), file("x", 4, 0x44)],
+        );
+        let root = directory(
+            &mut pages,
+            vec![
+                Entry::dir(b"empty", empty),
+                Entry::dir(b"left", shared),
+                Entry::dir(b"right", shared),
+            ],
+        );
         (serving("/project", root), pages)
     }
 
     #[test]
     fn closure_preserves_root_empty_directories_and_logical_aliases() {
         let (descriptor, pages) = aliases();
-        let closure = ValidatedSnapshotClosure::from_canonical_pages(&descriptor.encode().unwrap(), pages).unwrap();
+        let closure =
+            ValidatedSnapshotClosure::from_canonical_pages(&descriptor.encode().unwrap(), pages)
+                .unwrap();
         assert_eq!(closure.pages().len(), 3, "physical pages are unique");
-        assert_eq!(closure.directories().iter().map(|d| d.rel_path.as_str()).collect::<Vec<_>>(),
-            ["", "empty", "left", "left/nested", "right", "right/nested"]);
-        assert_eq!(closure.files().iter().map(|f| f.rel_path.as_str()).collect::<Vec<_>>(),
-            ["left/x", "right/x"]);
-        assert_eq!(closure.directories()[2].directory_root, closure.directories()[4].directory_root);
-        assert_eq!(closure.snapshot_id(), digest(&descriptor.snapshot_id().unwrap()));
+        assert_eq!(
+            closure
+                .directories()
+                .iter()
+                .map(|d| d.rel_path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "empty", "left", "left/nested", "right", "right/nested"]
+        );
+        assert_eq!(
+            closure
+                .files()
+                .iter()
+                .map(|f| f.rel_path.as_str())
+                .collect::<Vec<_>>(),
+            ["left/x", "right/x"]
+        );
+        assert_eq!(
+            closure.directories()[2].directory_root,
+            closure.directories()[4].directory_root
+        );
+        assert_eq!(
+            closure.snapshot_id(),
+            digest(&descriptor.snapshot_id().unwrap())
+        );
         assert_eq!(closure.descriptor_bytes(), descriptor.encode().unwrap());
     }
 
@@ -446,13 +512,26 @@ mod tests {
     #[test]
     fn canonical_radix_children_are_all_required() {
         let mut pages = BTreeMap::new();
-        let entries = (0..192u16).map(|i| file(&format!("{}{:03}", (b'a' + (i / 64) as u8) as char, i), 1, 8)).collect();
+        let entries = (0..192u16)
+            .map(|i| {
+                file(
+                    &format!("{}{:03}", (b'a' + (i / 64) as u8) as char, i),
+                    1,
+                    8,
+                )
+            })
+            .collect();
         let root = directory(&mut pages, entries);
         let descriptor = serving("/", root).encode().unwrap();
-        let closure = ValidatedSnapshotClosure::from_canonical_pages(&descriptor, pages.clone()).unwrap();
+        let closure =
+            ValidatedSnapshotClosure::from_canonical_pages(&descriptor, pages.clone()).unwrap();
         assert_eq!(closure.pages().len(), 4);
         assert_eq!(closure.files().len(), 192);
-        let child = pages.keys().find(|id| **id != digest(&root)).unwrap().clone();
+        let child = pages
+            .keys()
+            .find(|id| **id != digest(&root))
+            .unwrap()
+            .clone();
         pages.remove(&child);
         assert!(ValidatedSnapshotClosure::from_canonical_pages(&descriptor, pages).is_err());
     }
@@ -465,13 +544,27 @@ mod tests {
             let right = directory(&mut pages, vec![file("b", 1, 8)]);
             // A branch for two entries is decodable but not Build(S). The
             // second variant also lies about a child's actual entry count.
-            let root = insert_page(&mut pages, Page::Branch {
-                prefix: Vec::new(), terminal: None,
-                children: vec![
-                    BranchChild { label: b'a', subtree_entries: if wrong_count { 2 } else { 1 }, child_page_id: left },
-                    BranchChild { label: b'b', subtree_entries: 1, child_page_id: right },
-                ],
-            }.encode().unwrap());
+            let root = insert_page(
+                &mut pages,
+                Page::Branch {
+                    prefix: Vec::new(),
+                    terminal: None,
+                    children: vec![
+                        BranchChild {
+                            label: b'a',
+                            subtree_entries: if wrong_count { 2 } else { 1 },
+                            child_page_id: left,
+                        },
+                        BranchChild {
+                            label: b'b',
+                            subtree_entries: 1,
+                            child_page_id: right,
+                        },
+                    ],
+                }
+                .encode()
+                .unwrap(),
+            );
             let bytes = serving("/", root).encode().unwrap();
             let error = ValidatedSnapshotClosure::from_canonical_pages(&bytes, pages).unwrap_err();
             assert_eq!(error.code, SnapshotErrorCode::IntegrityError);
@@ -481,13 +574,22 @@ mod tests {
     #[test]
     fn wrong_radix_prefix_is_rejected_even_with_valid_hashes_and_counts() {
         let mut pages = BTreeMap::new();
-        let root = directory(&mut pages, (0..192).map(|i| file(&format!("n{i:03}"), 1, 8)).collect());
+        let root = directory(
+            &mut pages,
+            (0..192).map(|i| file(&format!("n{i:03}"), 1, 8)).collect(),
+        );
         let mut root_page = decode_page(&pages.remove(&digest(&root)).unwrap()).unwrap();
         if let Page::Branch { prefix, .. } = &mut root_page {
             *prefix = b"wrong".to_vec();
-        } else { panic!("wide fixture must be a branch"); }
+        } else {
+            panic!("wide fixture must be a branch");
+        }
         let wrong = insert_page(&mut pages, root_page.encode().unwrap());
-        assert!(ValidatedSnapshotClosure::from_canonical_pages(&serving("/", wrong).encode().unwrap(), pages).is_err());
+        assert!(ValidatedSnapshotClosure::from_canonical_pages(
+            &serving("/", wrong).encode().unwrap(),
+            pages
+        )
+        .is_err());
     }
 
     #[test]
@@ -497,23 +599,53 @@ mod tests {
         let root = directory(&mut pages, vec![Entry::dir("é".as_bytes(), empty)]);
         // 15 components of 255 bytes, then 252 bytes: prefix is 4093
         // bytes and the empty child's slash + two-byte name reaches 4096.
-        let scope = format!("/{}/{}", vec!["x".repeat(255); 15].join("/"), "x".repeat(252));
+        let scope = format!(
+            "/{}/{}",
+            vec!["x".repeat(255); 15].join("/"),
+            "x".repeat(252)
+        );
         assert_eq!(scope.len(), 4093);
-        ValidatedSnapshotClosure::from_canonical_pages(&serving(&scope, root).encode().unwrap(), pages.clone()).unwrap();
+        ValidatedSnapshotClosure::from_canonical_pages(
+            &serving(&scope, root).encode().unwrap(),
+            pages.clone(),
+        )
+        .unwrap();
         let oversized = format!("{scope}x");
-        assert_eq!(ValidatedSnapshotClosure::from_canonical_pages(&serving(&oversized, root).encode().unwrap(), pages.clone()).unwrap_err().code,
-            SnapshotErrorCode::LimitExceeded);
+        assert_eq!(
+            ValidatedSnapshotClosure::from_canonical_pages(
+                &serving(&oversized, root).encode().unwrap(),
+                pages.clone()
+            )
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::LimitExceeded
+        );
         let scope = format!("/{}", vec!["x"; 255].join("/"));
-        ValidatedSnapshotClosure::from_canonical_pages(&serving(&scope, root).encode().unwrap(), pages.clone()).unwrap();
+        ValidatedSnapshotClosure::from_canonical_pages(
+            &serving(&scope, root).encode().unwrap(),
+            pages.clone(),
+        )
+        .unwrap();
         let scope = format!("{scope}/x");
-        assert_eq!(ValidatedSnapshotClosure::from_canonical_pages(&serving(&scope, root).encode().unwrap(), pages).unwrap_err().code,
-            SnapshotErrorCode::LimitExceeded);
+        assert_eq!(
+            ValidatedSnapshotClosure::from_canonical_pages(
+                &serving(&scope, root).encode().unwrap(),
+                pages
+            )
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::LimitExceeded
+        );
     }
 
     #[test]
     fn descriptor_profile_uuid_and_snapshot_identity_are_checked() {
         let (serving, pages) = aliases();
-        let closure = ValidatedSnapshotClosure::from_canonical_pages(&serving.encode().unwrap(), pages.clone()).unwrap();
+        let closure = ValidatedSnapshotClosure::from_canonical_pages(
+            &serving.encode().unwrap(),
+            pages.clone(),
+        )
+        .unwrap();
         for case in 0..4 {
             let mut descriptor = closure.descriptor().clone();
             match case {
@@ -539,7 +671,11 @@ mod tests {
         ] {
             let mut pages = BTreeMap::new();
             let root = directory(&mut pages, entries);
-            assert!(ValidatedSnapshotClosure::from_canonical_pages(&serving("/", root).encode().unwrap(), pages).is_err());
+            assert!(ValidatedSnapshotClosure::from_canonical_pages(
+                &serving("/", root).encode().unwrap(),
+                pages
+            )
+            .is_err());
         }
     }
 
@@ -547,13 +683,27 @@ mod tests {
     fn overflowing_untrusted_branch_counts_return_error_without_codec_panic() {
         let child = page_id(&Page::build(&[file("a", 1, 8)]).unwrap());
         let mut bytes = Page::Branch {
-            prefix: Vec::new(), terminal: None,
+            prefix: Vec::new(),
+            terminal: None,
             children: vec![
-                BranchChild { label: b'a', subtree_entries: 1, child_page_id: child },
-                BranchChild { label: b'b', subtree_entries: 1, child_page_id: child },
+                BranchChild {
+                    label: b'a',
+                    subtree_entries: 1,
+                    child_page_id: child,
+                },
+                BranchChild {
+                    label: b'b',
+                    subtree_entries: 1,
+                    child_page_id: child,
+                },
             ],
-        }.encode().unwrap();
+        }
+        .encode()
+        .unwrap();
         bytes[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert_eq!(decode_page(&bytes).unwrap_err().code, SnapshotErrorCode::IntegrityError);
+        assert_eq!(
+            decode_page(&bytes).unwrap_err().code,
+            SnapshotErrorCode::IntegrityError
+        );
     }
 }

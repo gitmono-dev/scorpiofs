@@ -500,7 +500,8 @@ impl Mst2Fuse {
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         use crate::snapshot::{SnapshotError, SnapshotErrorCode};
 
-        let invalid = |message: String| SnapshotError::new(SnapshotErrorCode::IntegrityError, message);
+        let invalid =
+            |message: String| SnapshotError::new(SnapshotErrorCode::IntegrityError, message);
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
@@ -540,7 +541,11 @@ impl Mst2Fuse {
                 let Some(Node::Dir(parent_dir)) = state.nodes.get_mut(&parent) else {
                     return Err(invalid(format!("snapshot parent inode {parent} missing")));
                 };
-                if parent_dir.children.insert(name.to_string(), inode).is_some() {
+                if parent_dir
+                    .children
+                    .insert(name.to_string(), inode)
+                    .is_some()
+                {
                     return Err(invalid(format!("duplicate snapshot entry {path:?}")));
                 }
             }
@@ -552,9 +557,9 @@ impl Mst2Fuse {
         for file in closure.files() {
             let path = file.rel_path.as_str();
             let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path));
-            let parent = *directory_inodes.get(parent_path).ok_or_else(|| {
-                invalid(format!("snapshot file parent {parent_path:?} missing"))
-            })?;
+            let parent = *directory_inodes
+                .get(parent_path)
+                .ok_or_else(|| invalid(format!("snapshot file parent {parent_path:?} missing")))?;
             let Some(Node::Dir(parent_dir)) = state.nodes.get_mut(&parent) else {
                 return Err(invalid(format!("snapshot parent inode {parent} missing")));
             };
@@ -1593,7 +1598,10 @@ mod tests {
             .unwrap()
             .contents
             .insert(link, Arc::new(b"plain".to_vec()));
-        assert_eq!(fs.readlink(req, link).await.unwrap().data.as_ref(), b"plain");
+        assert_eq!(
+            fs.readlink(req, link).await.unwrap().data.as_ref(),
+            b"plain"
+        );
         let listing = fs
             .readdir(req, left, left, 0)
             .await
