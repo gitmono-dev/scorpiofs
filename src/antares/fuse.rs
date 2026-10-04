@@ -164,15 +164,13 @@ impl AntaresFuse {
         let mut lower_layers: Vec<Arc<dyn Layer>> = Vec::new();
 
         if let Some(cl_dir) = &self.cl_dir {
-            let cl_layer =
-                new_antares_passthrough_layer(cl_dir).await?;
+            let cl_layer = new_antares_passthrough_layer(cl_dir).await?;
             lower_layers.push(Arc::new(cl_layer) as Arc<dyn Layer>);
         }
 
         // Sealed chain layers, nearest first — each shadows the layers below it.
         for frozen in &self.frozen_dirs {
-            let frozen_layer =
-                new_antares_passthrough_layer(frozen).await?;
+            let frozen_layer = new_antares_passthrough_layer(frozen).await?;
             lower_layers.push(Arc::new(frozen_layer) as Arc<dyn Layer>);
         }
 
@@ -184,9 +182,8 @@ impl AntaresFuse {
         }
 
         // Upper layer mirrors upper_dir to keep writes separated from lower layers.
-        let upper_layer: Arc<dyn Layer> = Arc::new(
-            new_antares_passthrough_layer(&self.upper_dir).await?,
-        );
+        let upper_layer: Arc<dyn Layer> =
+            Arc::new(new_antares_passthrough_layer(&self.upper_dir).await?);
 
         // passthrough Upper  - readwrite file system over upper dir
         // passthrough CL  - readwrite file system over upper dir
@@ -2414,7 +2411,9 @@ mod tests {
     #[tokio::test]
     async fn antares_passthrough_layer_reports_oci_whiteout() {
         let dir = tempfile::tempdir().unwrap();
-        let layer = super::new_antares_passthrough_layer(dir.path()).await.unwrap();
+        let layer = super::new_antares_passthrough_layer(dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(
             libfuse_fs::unionfs::layer::Layer::whiteout_format(&layer),

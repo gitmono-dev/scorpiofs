@@ -1844,7 +1844,11 @@ impl DictionaryStore {
             return sz;
         }
 
-        tracing::warn!(inode, oid, "get_or_fetch_file_size: probe failed, reporting size 0");
+        tracing::warn!(
+            inode,
+            oid,
+            "get_or_fetch_file_size: probe failed, reporting size 0"
+        );
         0
     }
 

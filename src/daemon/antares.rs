@@ -40,19 +40,18 @@ use uuid::Uuid;
 
 use crate::{
     antares::fuse::AntaresFuse,
-    daemon::lower_view::DicfuseLower,
-    daemon::upper_fork::{fork_upper, ForkCopyError, ForkCopyStats},
-    daemon::worktree_v2::{
-        effective_changes, flatten_chain_into_upper, generation_of, lower_item_for,
-        remove_committed_upper_entries,
-        resolve_latest_revision, AttachWorktreeRequest, AttachWorktreeResponse,
-        CommitFinalizeRequest, CommitFinalizeResponse, CommittedPath, EffectiveKind,
-        RefreshDisposition, RefreshRequest, RefreshResponse, WorktreeStateV2,
+    daemon::{
+        lower_view::DicfuseLower,
+        upper_fork::{fork_upper, ForkCopyError, ForkCopyStats},
+        worktree_v2::{
+            effective_changes, flatten_chain_into_upper, generation_of, lower_item_for,
+            remove_committed_upper_entries, resolve_latest_revision, AttachWorktreeRequest,
+            AttachWorktreeResponse, CommitFinalizeRequest, CommitFinalizeResponse, CommittedPath,
+            EffectiveKind, RefreshDisposition, RefreshRequest, RefreshResponse, WorktreeStateV2,
+        },
     },
-    dicfuse::store::DictionaryStore,
-    dicfuse::{Dicfuse, DicfuseManager},
-    snapshot::fuse::Mst2Fuse,
-    snapshot::{Mst2Client, SnapshotReader},
+    dicfuse::{store::DictionaryStore, Dicfuse, DicfuseManager},
+    snapshot::{fuse::Mst2Fuse, Mst2Client, SnapshotReader},
     util::config,
 };
 
@@ -101,21 +100,6 @@ fn lower_view_for(entry: &MountEntry) -> Arc<dyn crate::daemon::lower_view::Lowe
         Some(view) => Arc::new(Mst2Lower(view.clone())),
         None => Arc::new(DicfuseLower(entry.fuse.dic.store.clone())),
     }
-}
-
-/// MST/2-lowered mounts do not support the worktree-v2 mutations yet: their
-/// lower moves by resolving a new snapshot, not by re-pinning the Dicfuse
-/// projection, and the finalize/refresh plumbing for that is not in place.
-/// Refuse explicitly rather than executing the Dicfuse semantics against the
-/// wrong projection (spec 15 §3).
-fn reject_mst2_mutation(entry: &MountEntry, op: &str) -> Result<(), ServiceError> {
-    if entry.mst2_lower.is_some() {
-        return Err(ServiceError::InvalidRequest(format!(
-            "{op} is not supported on an MST/2-lowered mount yet; re-attach without \
-             mst2_lower_enabled or wait for the snapshot-side finalize/refresh"
-        )));
-    }
-    Ok(())
 }
 
 /// High-level HTTP daemon that exposes Antares orchestration capabilities.
@@ -2167,7 +2151,7 @@ impl AntaresServiceImpl {
 
         // Idempotency: re-resolving the same snapshot is a no-op.
         let new_id = new_view.snapshot_id().map(str::to_string);
-        if old_view.snapshot_id() == new_view.snapshot_id().as_deref() {
+        if old_view.snapshot_id() == new_view.snapshot_id() {
             return Ok(RefreshResponse {
                 disposition: RefreshDisposition::AlreadyAtTarget,
                 base_revision: base_revision.clone().unwrap_or_default(),
@@ -2373,29 +2357,29 @@ impl AntaresServiceImpl {
             }
         }
 
-        let cleaned = match remove_committed_upper_entries(Path::new(upper_dir), &request.committed_paths)
-        {
-            Ok(cleaned) => cleaned,
-            Err(e) => {
-                let _ = Self::remount_with_mst2_lower(
-                    mountpoint,
-                    old_view.clone(),
-                    dicfuse.clone(),
-                    upper_dir,
-                    cl_dir,
-                )
-                .await;
-                return Ok(CommitFinalizeResponse {
-                    state: "failed".into(),
-                    code: Some("SWITCH_FAILED".into()),
-                    detail: Some(format!("upper cleanup failed: {e}")),
-                    base_revision: base_revision.clone().unwrap_or_default(),
-                    lower_revision: None,
-                    generation,
-                    cleaned_paths: Vec::new(),
-                });
-            }
-        };
+        let cleaned =
+            match remove_committed_upper_entries(Path::new(upper_dir), &request.committed_paths) {
+                Ok(cleaned) => cleaned,
+                Err(e) => {
+                    let _ = Self::remount_with_mst2_lower(
+                        mountpoint,
+                        old_view.clone(),
+                        dicfuse.clone(),
+                        upper_dir,
+                        cl_dir,
+                    )
+                    .await;
+                    return Ok(CommitFinalizeResponse {
+                        state: "failed".into(),
+                        code: Some("SWITCH_FAILED".into()),
+                        detail: Some(format!("upper cleanup failed: {e}")),
+                        base_revision: base_revision.clone().unwrap_or_default(),
+                        lower_revision: None,
+                        generation,
+                        cleaned_paths: Vec::new(),
+                    });
+                }
+            };
 
         match Self::remount_with_mst2_lower(
             mountpoint,
@@ -2476,7 +2460,7 @@ impl AntaresServiceImpl {
         source_path: String,
         source_upper: PathBuf,
         source_pinned: String,
-        mut source_chain: Vec<String>,
+        source_chain: Vec<String>,
         inherited_base: String,
         start: Instant,
     ) -> Result<ForkMountResponse, ServiceError> {
@@ -2484,7 +2468,7 @@ impl AntaresServiceImpl {
         let frozen = upper_root.join(format!("sealed-{}", Uuid::new_v4()));
         let source_new_upper = upper_root.join(Uuid::new_v4().to_string());
         // Parent's VCS pointer target (host gitdir), captured while sealing.
-        let mut source_pointer_target: Option<PathBuf> = None;
+        let source_pointer_target: Option<PathBuf>;
 
         // 1. Quiesce the source and seal its upper with one rename (same filesystem,
         //    atomic). Rollback restores the rename and the mount.
@@ -3205,7 +3189,8 @@ impl AntaresService for AntaresServiceImpl {
         // against the projection that is actually being served.
         let mst2_lower = mst2_lower_layer().await?;
         if let Some(view) = &mst2_lower {
-            fuse = fuse.with_lower_override(view.clone() as Arc<dyn libfuse_fs::unionfs::layer::Layer>);
+            fuse = fuse
+                .with_lower_override(view.clone() as Arc<dyn libfuse_fs::unionfs::layer::Layer>);
         }
 
         // 7. Mount the filesystem
@@ -3619,7 +3604,15 @@ impl AntaresService for AntaresServiceImpl {
         // subtree, so the caller does not get to point it somewhere else. Note that
         // `path` here is the monorepo path (as on `POST /mounts`), **not** a filesystem
         // location — the child's mountpoint is generated by `create_mount`.
-        let (source_path, source_upper, source_cl, source_cl_path, source_base, source_pinned, source_chain) = {
+        let (
+            source_path,
+            source_upper,
+            source_cl,
+            source_cl_path,
+            source_base,
+            source_pinned,
+            source_chain,
+        ) = {
             let mounts = self.mounts.read().await;
             let entry = mounts
                 .get(&source_mount_id)
@@ -3861,9 +3854,13 @@ impl AntaresService for AntaresServiceImpl {
                 .iter()
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            let changes = effective_changes(lower_view_for(entry).as_ref(), Path::new(&entry.upper_dir), &chain_dirs)
-                .await
-                .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+            let changes = effective_changes(
+                lower_view_for(entry).as_ref(),
+                Path::new(&entry.upper_dir),
+                &chain_dirs,
+            )
+            .await
+            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
             generation_of(&changes)
         };
 
@@ -3937,7 +3934,17 @@ impl AntaresService for AntaresServiceImpl {
 
         // Phase A — reads and builds only. Every failure below this point leaves
         // the mount, the upper layer, and the bound revision untouched.
-        let (path, upper_dir, cl_dir, mountpoint, base_revision, pinned_refs, sealed_chain, mount_state, mst2_lower) = {
+        let (
+            path,
+            upper_dir,
+            cl_dir,
+            mountpoint,
+            base_revision,
+            pinned_refs,
+            sealed_chain,
+            mount_state,
+            mst2_lower,
+        ) = {
             let mounts = self.mounts.read().await;
             let entry = mounts
                 .get(&mount_id)
@@ -3982,9 +3989,13 @@ impl AntaresService for AntaresServiceImpl {
         let current = self
             .lower_dicfuse_for(&path, pinned_refs.as_deref())
             .await?;
-        let changes = effective_changes(&DicfuseLower(current.store.clone()), &upper_dir, &chain_dirs)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let changes = effective_changes(
+            &DicfuseLower(current.store.clone()),
+            &upper_dir,
+            &chain_dirs,
+        )
+        .await
+        .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
         let generation = generation_of(&changes);
 
         if let Some(expected) = request.expected_generation {
@@ -4071,12 +4082,9 @@ impl AntaresService for AntaresServiceImpl {
         }
 
         let new_dicfuse = DicfuseManager::for_base_path_and_refs(&path, &new_refs).await;
-        if tokio::time::timeout(
-            Duration::from_secs(180),
-            new_dicfuse.store.wait_for_ready(),
-        )
-        .await
-        .is_err()
+        if tokio::time::timeout(Duration::from_secs(180), new_dicfuse.store.wait_for_ready())
+            .await
+            .is_err()
         {
             return Ok(CommitFinalizeResponse {
                 state: "failed".into(),
@@ -4123,8 +4131,7 @@ impl AntaresService for AntaresServiceImpl {
             }
         }
 
-        let cleaned = match remove_committed_upper_entries(&upper_dir, &request.committed_paths)
-        {
+        let cleaned = match remove_committed_upper_entries(&upper_dir, &request.committed_paths) {
             Ok(cleaned) => cleaned,
             Err(e) => {
                 let _ = Self::remount_with_lower(
@@ -4147,7 +4154,7 @@ impl AntaresService for AntaresServiceImpl {
             }
         };
 
-        let mut new_fuse = match Self::remount_with_lower(
+        let new_fuse = match Self::remount_with_lower(
             &mountpoint,
             new_dicfuse.clone(),
             &upper_dir,
@@ -4240,7 +4247,17 @@ impl AntaresService for AntaresServiceImpl {
         request: RefreshRequest,
     ) -> Result<RefreshResponse, ServiceError> {
         let start = Instant::now();
-        let (path, upper_dir, cl_dir, mountpoint, base_revision, pinned_refs, sealed_chain, mount_state, mst2_lower) = {
+        let (
+            path,
+            upper_dir,
+            cl_dir,
+            mountpoint,
+            base_revision,
+            pinned_refs,
+            sealed_chain,
+            mount_state,
+            mst2_lower,
+        ) = {
             let mounts = self.mounts.read().await;
             let entry = mounts
                 .get(&mount_id)
@@ -4284,9 +4301,13 @@ impl AntaresService for AntaresServiceImpl {
         let current = self
             .lower_dicfuse_for(&path, pinned_refs.as_deref())
             .await?;
-        let changes = effective_changes(&DicfuseLower(current.store.clone()), &upper_dir, &chain_dirs)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
+        let changes = effective_changes(
+            &DicfuseLower(current.store.clone()),
+            &upper_dir,
+            &chain_dirs,
+        )
+        .await
+        .map_err(|e| ServiceError::Internal(format!("effective scan failed: {e}")))?;
         let generation = generation_of(&changes);
 
         if request.require_clean && !changes.is_empty() {
@@ -4333,12 +4354,9 @@ impl AntaresService for AntaresServiceImpl {
         }
 
         let new_dicfuse = DicfuseManager::for_base_path_and_refs(&path, &target).await;
-        if tokio::time::timeout(
-            Duration::from_secs(180),
-            new_dicfuse.store.wait_for_ready(),
-        )
-        .await
-        .is_err()
+        if tokio::time::timeout(Duration::from_secs(180), new_dicfuse.store.wait_for_ready())
+            .await
+            .is_err()
         {
             return Ok(RefreshResponse {
                 disposition: RefreshDisposition::BaseMismatch,
@@ -4365,7 +4383,7 @@ impl AntaresService for AntaresServiceImpl {
             }
         }
 
-        let mut new_fuse = match Self::remount_with_lower(
+        let new_fuse = match Self::remount_with_lower(
             &mountpoint,
             new_dicfuse.clone(),
             &upper_dir,
@@ -5972,7 +5990,7 @@ mod tests {
                         mountpoint: None,
 
                         pinned_refs: None,
-                    
+
                         sealed_chain: Vec::new(),
                     })
                     .await
@@ -6005,7 +6023,7 @@ mod tests {
             mountpoint: None,
 
             pinned_refs: None,
-        
+
             sealed_chain: Vec::new(),
         };
 
@@ -6034,7 +6052,7 @@ mod tests {
             mountpoint: None,
 
             pinned_refs: None,
-        
+
             sealed_chain: Vec::new(),
         };
 
@@ -6061,7 +6079,7 @@ mod tests {
             mountpoint: None,
 
             pinned_refs: None,
-        
+
             sealed_chain: Vec::new(),
         };
 
@@ -6094,7 +6112,7 @@ mod tests {
             mountpoint: None,
 
             pinned_refs: None,
-        
+
             sealed_chain: Vec::new(),
         };
         let req2 = CreateMountRequest {
@@ -6109,7 +6127,7 @@ mod tests {
             mountpoint: None,
 
             pinned_refs: None,
-        
+
             sealed_chain: Vec::new(),
         };
 
@@ -6140,7 +6158,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await
@@ -6175,7 +6193,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await;
@@ -6195,7 +6213,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await;
@@ -6230,7 +6248,7 @@ mod tests {
                     mountpoint: None,
 
                     pinned_refs: None,
-                
+
                     sealed_chain: Vec::new(),
                 };
                 svc.create_mount(request).await
@@ -6283,7 +6301,7 @@ mod tests {
             mountpoint: None,
 
             pinned_refs: None,
-        
+
             sealed_chain: Vec::new(),
         };
         let created = service.create_mount(request).await.unwrap();
@@ -6327,7 +6345,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await
@@ -6358,7 +6376,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await
@@ -6391,7 +6409,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await
@@ -6436,7 +6454,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await
@@ -6469,7 +6487,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await
@@ -6499,7 +6517,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await
@@ -6534,7 +6552,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await
@@ -6583,7 +6601,7 @@ mod tests {
                 mountpoint: None,
 
                 pinned_refs: None,
-            
+
                 sealed_chain: Vec::new(),
             })
             .await

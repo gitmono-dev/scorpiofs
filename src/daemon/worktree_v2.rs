@@ -14,15 +14,18 @@
 //! that pins the lower to the committed revision and removes exactly the committed
 //! upper entries. See `docs/scorpiofs-libra-complete-spec-v1.md`.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
-use crate::daemon::lower_view::{hash_content, LowerHashKind, LowerView};
-use crate::dicfuse::store::DictionaryStore;
-use crate::dicfuse::tree_store::StorageItem;
+use crate::{
+    daemon::lower_view::{hash_content, LowerHashKind, LowerView},
+    dicfuse::{store::DictionaryStore, tree_store::StorageItem},
+};
 
 /// Effective change kinds, in Git terms. `added`/`modified` compare upper content
 /// against the lower projection; `deleted` is an OCI whiteout over a lower entry.
@@ -267,7 +270,11 @@ fn chain_base_for(chain: &[PathBuf], rel_path: &str, kind: LowerHashKind) -> Opt
                 continue;
             }
             Ok(meta) if meta.file_type().is_symlink() => {
-                let bytes = fs::read_link(&entry).ok()?.as_os_str().as_encoded_bytes().to_vec();
+                let bytes = fs::read_link(&entry)
+                    .ok()?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec();
                 return Some(ChainBase::Hash(hash_content(kind, &bytes)));
             }
             Ok(_) => {
