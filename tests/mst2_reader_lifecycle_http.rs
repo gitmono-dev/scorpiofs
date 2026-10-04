@@ -17,9 +17,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use mst2_codec::descriptor::ServingDescriptor;
 use scorpiofs::snapshot::{Mst2Client, SnapshotErrorCode, SnapshotReader};
 use serde_json::{json, Value};
 use tokio::{sync::Notify, task::JoinHandle};
+
+const INSTANCE_ID: &str = "11111111-2222-4333-8444-555555555556";
+const NAMESPACE_VIEW_ID: [u8; 32] = [0x22; 32];
+const METADATA_ROOT: [u8; 32] = [0x01; 32];
 
 #[derive(Clone, Copy)]
 enum Expiry {
@@ -208,13 +213,13 @@ async fn resolve(
         f.resolve_release.notified().await;
     }
     let sequence = f.resolve_count.fetch_add(1, Ordering::SeqCst) + 1;
-    let snapshot = format!(
-        "sha256:{}",
-        hex::encode(ring::digest::digest(
-            &ring::digest::SHA256,
-            scope.as_bytes()
-        ))
-    );
+    let descriptor = ServingDescriptor {
+        instance_uuid: *uuid::Uuid::parse_str(INSTANCE_ID).unwrap().as_bytes(),
+        namespace_view_id: NAMESPACE_VIEW_ID,
+        scope: scope.into(),
+        metadata_root: METADATA_ROOT,
+    };
+    let snapshot = format!("sha256:{}", hex::encode(descriptor.snapshot_id().unwrap()));
     let lease = format!("lease-{sequence}");
     f.bindings.lock().unwrap().insert(
         lease.clone(),
@@ -225,12 +230,12 @@ async fn resolve(
     );
     let mut response = json!({
         "descriptor": {
-            "schema_version": 2, "metadata_codec": 1, "instance_id": "lease-fixture",
-            "namespace_view_id": "fixed-view", "scope": scope,
-            "materialization_policy": 1, "fs_semantics": 1, "access_projection": 1,
-            "metadata_root": format!("sha256:{}", "01".repeat(32)), "snapshot_id": snapshot
+            "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE_ID,
+            "namespace_view_id": format!("sha256:{}", hex::encode(NAMESPACE_VIEW_ID)), "scope": scope,
+            "materialization_policy": 1, "fs_semantics": 1, "access_projection": 0,
+            "metadata_root": format!("sha256:{}", hex::encode(METADATA_ROOT)), "snapshot_id": snapshot
         },
-        "lease_id": lease, "publication_sequence": sequence.to_string()
+        "lease_id": lease, "publication_sequence": sequence.to_string(), "authorization_epoch": "1"
     });
     add_expiry(&mut response, f.initial_expiry);
     Json(response)
@@ -348,7 +353,7 @@ async fn concurrent_resolves_keep_distinct_snapshot_and_lease_bindings() {
     );
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_ne!(a.snapshot_id(), b.snapshot_id());
-    assert_ne!(a.lease_id, b.lease_id);
+    assert_ne!(a.lease_id(), b.lease_id());
     tokio::join!(probe(&a), probe(&b));
     probe(&a.clone()).await;
     for request in fixture.requests.lock().unwrap().iter() {
@@ -360,11 +365,11 @@ async fn concurrent_resolves_keep_distinct_snapshot_and_lease_bindings() {
             );
         } else if request.kind == "lookup" {
             let expected = if request.id == a.snapshot_id() {
-                &a.lease_id
+                a.lease_id()
             } else {
-                &b.lease_id
+                b.lease_id()
             };
-            assert_eq!(request.lease.as_ref(), Some(expected));
+            assert_eq!(request.lease.as_deref(), Some(expected));
         }
     }
 }
@@ -393,11 +398,11 @@ async fn rotation_during_resolve_freezes_the_actor_for_the_existing_reader() {
     let next = SnapshotReader::resolve(client.clone(), "/beta", 600)
         .await
         .unwrap();
-    assert_eq!(original.client.credential_partition(), original_partition);
-    assert_ne!(next.client.credential_partition(), original_partition);
-    original.client.set_token(Some("unrelated-actor".into()));
-    original.client.bind_lease("unrelated-lease");
-    assert_eq!(original.client.credential_partition(), original_partition);
+    assert_eq!(original.client().credential_partition(), original_partition);
+    assert_ne!(next.client().credential_partition(), original_partition);
+    original.client().set_token(Some("unrelated-actor".into()));
+    original.client().bind_lease("unrelated-lease");
+    assert_eq!(original.client().credential_partition(), original_partition);
     tokio::join!(probe(&original), probe(&next));
     let requests = fixture.requests.lock().unwrap();
     let original_lookup = requests
@@ -442,9 +447,9 @@ async fn server_grants_control_both_initial_and_renewed_windows() {
         .iter()
         .filter(|r| r.kind == "renew")
     {
-        assert_eq!(request.id, reader.lease_id);
+        assert_eq!(request.id, reader.lease_id());
         assert_eq!(request.actor.as_deref(), Some("Bearer actor-a"));
-        assert_eq!(request.lease.as_deref(), Some(reader.lease_id.as_str()));
+        assert_eq!(request.lease.as_deref(), Some(reader.lease_id()));
         assert_eq!(request.requested_seconds, Some(600));
     }
 }

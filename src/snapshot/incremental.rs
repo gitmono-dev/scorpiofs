@@ -47,8 +47,7 @@ pub const POLICY_REVISION: u16 = 2;
 /// One verified subtree: the pages that were verified and what they proved.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClosureRecord {
-    /// Deployment identity (descriptor `instance_id`): content verified by a
-    /// different deployment is never reused.
+    /// Fixed deployment/credential/authorization-epoch/profile partition.
     pub auth_domain: String,
     pub metadata_codec: u16,
     pub policy_revision: u16,
@@ -231,8 +230,8 @@ impl<'a> IncrementalSync<'a> {
         IncrementalSync {
             reader,
             cache,
-            auth_domain: reader.descriptor.instance_id.clone(),
-            codec: reader.descriptor.metadata_codec,
+            auth_domain: reader.authorized_context().cache_domain().id().to_string(),
+            codec: reader.descriptor().metadata_codec,
             meters: SyncMeters::default(),
             reused_page_ids: HashSet::new(),
         }
@@ -250,6 +249,9 @@ impl<'a> IncrementalSync<'a> {
     /// page tree and all of its child directories have finished.
     pub async fn sync(&mut self) -> Result<Vec<SnapshotFile>, SnapshotError> {
         const PAGE_BATCH: usize = 64;
+        self.reader
+            .authorized_context()
+            .bind_scope_cache(self.cache.dir())?;
         self.meters = SyncMeters::default();
         self.reused_page_ids.clear();
 
@@ -346,7 +348,7 @@ impl<'a> IncrementalSync<'a> {
 
         enqueue_dir!(
             "/".to_string(),
-            self.reader.descriptor.metadata_root.clone(),
+            self.reader.descriptor().metadata_root.clone(),
             None,
             String::new()
         );
@@ -365,6 +367,9 @@ impl<'a> IncrementalSync<'a> {
                     route,
                     expected,
                 } = it;
+                self.reader
+                    .authorized_context()
+                    .validate_relative_path(dir)?;
                 route_ids.insert((dir.clone(), route.clone()), expected.clone());
                 if by_id.contains_key(expected) {
                     continue;
@@ -573,6 +578,11 @@ impl<'a> IncrementalSync<'a> {
         }
 
         self.meters.reused_pages = self.reused_page_ids.len() as u64;
+        for file in &files_out {
+            self.reader
+                .authorized_context()
+                .validate_relative_path(&file.rel_path)?;
+        }
         Ok(files_out)
     }
 
@@ -583,6 +593,9 @@ impl<'a> IncrementalSync<'a> {
         root_page_id: &str,
         dir: &str,
     ) -> Result<Option<ClosureRecord>, SnapshotError> {
+        self.reader
+            .authorized_context()
+            .validate_relative_path(dir)?;
         let Some(record) = self.cache.record_for(root_page_id) else {
             return Ok(None);
         };

@@ -124,6 +124,7 @@ impl Mst2Fuse {
         reader: SnapshotReader,
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        store.bind_reader(&reader)?;
         let manifest = reader.file_manifest().await?;
         Self::build(Some(reader), Some(store), manifest)
     }
@@ -135,6 +136,12 @@ impl Mst2Fuse {
         store: Arc<DurableStore>,
         manifest: Vec<SnapshotFile>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        store.bind_reader(&reader)?;
+        for file in &manifest {
+            reader
+                .authorized_context()
+                .validate_relative_path(&file.rel_path)?;
+        }
         Self::build(Some(reader), Some(store), manifest)
     }
 
@@ -157,7 +164,10 @@ impl Mst2Fuse {
         reader: SnapshotReader,
         store: Option<Arc<DurableStore>>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
-        let root_page_id = reader.descriptor.metadata_root.clone();
+        if let Some(store) = &store {
+            store.bind_reader(&reader)?;
+        }
+        let root_page_id = reader.descriptor().metadata_root.clone();
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),

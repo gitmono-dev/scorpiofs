@@ -74,13 +74,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let snapshot_id = reader.snapshot_id().to_string();
             eprintln!("snapshot {snapshot_id}");
 
-            let dir =
-                DurableStore::path_for(std::path::Path::new(&store_root), &scope, &snapshot_id);
+            let context = reader.authorized_context();
+            let dir = context.view_cache_dir(std::path::Path::new(&store_root))?;
             // Content is shared by every view of the scope (spec 11 §3), and
             // verified subtrees are reused across versions (spec 11 §10).
             let scope_dir = dir.parent().expect("snapshot dir has a scope parent");
+            context.bind_scope_cache(scope_dir)?;
             let content_dir = scope_dir.join("blobs");
             let store = Arc::new(DurableStore::open_with_content(&dir, &content_dir)?);
+            store.bind_reader(&reader)?;
             let was_complete = store.is_complete()?;
 
             if lazy {
@@ -101,9 +103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
                 let view = scorpiofs::snapshot::ViewMeta {
                     snapshot_id: snapshot_id.clone(),
-                    namespace_view_id: reader.descriptor.namespace_view_id.clone(),
-                    scope: reader.descriptor.scope.clone(),
-                    lease_id: reader.lease_id.clone(),
+                    namespace_view_id: reader.descriptor().namespace_view_id.clone(),
+                    scope: reader.descriptor().scope.clone(),
+                    lease_id: reader.lease_id().to_string(),
                 };
                 // Frame transport when advertised (OBJECT for small files,
                 // chunk-map/CHUNK for >256 KiB); raw blob otherwise.
@@ -116,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let report = if use_frames {
                     // Batched: small files ride OBJECT batches (128/request),
                     // large files use chunk-map + CHUNK frames per file.
-                    let client = reader.client.clone();
+                    let client = reader.client().clone();
                     let encoding = reader.encoding_hint().map(str::to_string);
                     let sid = reader.snapshot_id().to_string();
                     let reader_large = reader.clone();

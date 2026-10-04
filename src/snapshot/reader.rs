@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::snapshot::{
+    auth::AuthorizedSnapshotContext,
     client::Mst2Client,
     frames::MetadataPageItem,
     types::{Capabilities, Descriptor, DirEntry, LookupResult, SnapshotError, SnapshotErrorCode},
@@ -354,9 +355,9 @@ fn parse_rfc3339_timestamp(value: &str) -> Option<Duration> {
 /// A fixed view plus everything needed to read its content.
 #[derive(Clone)]
 pub struct SnapshotReader {
-    pub client: Mst2Client,
-    pub descriptor: Descriptor,
-    pub lease_id: String,
+    pub(crate) client: Mst2Client,
+    lease_id: String,
+    context: AuthorizedSnapshotContext,
     caps: Capabilities,
     lease: Arc<LeaseKeeper>,
 }
@@ -383,6 +384,14 @@ impl SnapshotReader {
             ));
         }
         let res = client.resolve(scope, lease_seconds).await?;
+        let context = AuthorizedSnapshotContext::new(
+            client.base(),
+            &client.credential_partition(),
+            scope,
+            res.descriptor.clone(),
+            &res.authorization_epoch,
+            &res.publication_sequence,
+        )?;
         // Retention is bound independently of the actor's bearer credential.
         // Cloned clients resolving another view cannot overwrite this pair.
         let client = client.with_snapshot_lease(&res.lease_id);
@@ -401,7 +410,7 @@ impl SnapshotReader {
         }
         Ok(Self {
             client,
-            descriptor: res.descriptor,
+            context,
             lease_id: res.lease_id,
             caps,
             lease,
@@ -413,6 +422,22 @@ impl SnapshotReader {
     /// so a mount can also keep it warm while idle.
     pub async fn ensure_lease(&self) -> Result<(), SnapshotError> {
         self.lease.state.ensure(&self.client).await
+    }
+
+    pub fn client(&self) -> &Mst2Client {
+        &self.client
+    }
+
+    pub fn descriptor(&self) -> &Descriptor {
+        self.context.descriptor()
+    }
+
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    pub fn authorized_context(&self) -> &AuthorizedSnapshotContext {
+        &self.context
     }
 
     /// Capabilities captured at resolve time; callers gate frame
@@ -438,11 +463,14 @@ impl SnapshotReader {
     }
 
     pub fn snapshot_id(&self) -> &str {
-        &self.descriptor.snapshot_id
+        &self.descriptor().snapshot_id
     }
 
     /// Batch lookup of scope-relative paths.
     pub async fn lookup(&self, paths: &[String]) -> Result<Vec<LookupResult>, SnapshotError> {
+        for path in paths {
+            self.context.validate_relative_path(path)?;
+        }
         self.ensure_lease().await?;
         Ok(self.client.lookup(self.snapshot_id(), paths).await?.results)
     }
@@ -450,6 +478,7 @@ impl SnapshotReader {
     /// Fetch one file's verified bytes (digest checked on both server and
     /// client sides).
     pub async fn read_file(&self, rel_path: &str, digest: &str) -> Result<Vec<u8>, SnapshotError> {
+        self.context.validate_relative_path(rel_path)?;
         let request_path = if rel_path.is_empty() || rel_path == "/" {
             "/".to_string()
         } else if rel_path.starts_with('/') {
@@ -471,6 +500,7 @@ impl SnapshotReader {
         dir: &str,
         limit: u32,
     ) -> Result<crate::snapshot::types::DirectoryResponse, SnapshotError> {
+        self.context.validate_relative_path(dir)?;
         self.ensure_lease().await?;
         let mut cursor: Option<String> = None;
         let mut merged: Option<crate::snapshot::types::DirectoryResponse> = None;
@@ -527,7 +557,7 @@ impl SnapshotReader {
         let mut frontier = vec![PageFrontier {
             dir: "/".to_string(),
             route: Vec::new(),
-            expected: self.descriptor.metadata_root.clone(),
+            expected: self.descriptor().metadata_root.clone(),
         }];
         // Immutable page bytes may be shared, but each logical directory
         // must still be expanded. Identical directories have identical page
@@ -539,6 +569,7 @@ impl SnapshotReader {
             let batch: Vec<PageFrontier> = frontier.drain(..take).collect();
             let mut items = Vec::with_capacity(batch.len());
             for f in &batch {
+                self.context.validate_relative_path(&f.dir)?;
                 route_ids.insert((f.dir.clone(), f.route.clone()), f.expected.clone());
                 if !decoded.contains_key(&f.expected) {
                     items.push(MetadataPageItem {
@@ -636,6 +667,9 @@ impl SnapshotReader {
                 }
             }
         }
+        for file in &out {
+            self.context.validate_relative_path(&file.rel_path)?;
+        }
         Ok(out)
     }
 
@@ -650,6 +684,7 @@ impl SnapshotReader {
     }
 
     async fn walk_dir(&self, dir: &str, out: &mut Vec<SnapshotFile>) -> Result<(), SnapshotError> {
+        self.context.validate_relative_path(dir)?;
         let mut cursor: Option<String> = None;
         loop {
             let page = self
@@ -662,6 +697,7 @@ impl SnapshotReader {
                 } else {
                     format!("{}/{}", dir.trim_start_matches('/'), e.name)
                 };
+                self.context.validate_relative_path(&rel)?;
                 if e.directory_root.is_some() {
                     Box::pin(self.walk_dir(&format!("/{rel}"), out)).await?;
                 } else if let Some(digest) = e.content_digest {
@@ -703,6 +739,7 @@ impl SnapshotReader {
         digest: &str,
         size: u64,
     ) -> Result<Vec<u8>, SnapshotError> {
+        self.context.validate_relative_path(rel_path)?;
         self.ensure_lease().await?;
         let sid = self.snapshot_id();
         let request_path = if rel_path.starts_with('/') {

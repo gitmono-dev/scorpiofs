@@ -46,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     let snapshot_id = reader.snapshot_id().to_string();
-    let cache = ScopeCache::open(&cache_dir)?;
+    let context = reader.authorized_context();
+    let cache_path = context.scope_cache_dir(std::path::Path::new(&cache_dir));
+    context.bind_scope_cache(&cache_path)?;
+    let cache = ScopeCache::open(&cache_path)?;
     let mut sync = IncrementalSync::new(&reader, &cache);
     let manifest = sync.sync().await?;
     let meters = sync.meters();
@@ -75,21 +78,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Hydrate into the scope-shared content store and pin, exactly like the
     // mount does — this is what makes content reuse observable and what
     // backs the closure records with a live pin.
-    let cache_path = std::path::Path::new(&cache_dir);
     let view_dir = cache_path.join(snapshot_id.trim_start_matches("sha256:"));
     let store = Arc::new(DurableStore::open_with_content(
         &view_dir,
         cache_path.join("blobs"),
     )?);
+    store.bind_reader(&reader)?;
     let view = ViewMeta {
         snapshot_id: snapshot_id.clone(),
-        namespace_view_id: reader.descriptor.namespace_view_id.clone(),
-        scope: reader.descriptor.scope.clone(),
-        lease_id: reader.lease_id.clone(),
+        namespace_view_id: reader.descriptor().namespace_view_id.clone(),
+        scope: reader.descriptor().scope.clone(),
+        lease_id: reader.lease_id().to_string(),
     };
     // Hydrate from the *incremental* manifest (never a second full walk):
     // small files ride OBJECT batches, large files use chunk frames.
-    let client = reader.client.clone();
+    let client = reader.client().clone();
     let encoding = reader.encoding_hint().map(str::to_string);
     let sid = reader.snapshot_id().to_string();
     let report = store
