@@ -454,18 +454,25 @@ fn check_end(
 }
 
 pub fn parse_digest(s: &str) -> Result<[u8; 32], SnapshotError> {
-    let hex = s.strip_prefix("sha256:").unwrap_or(s);
+    let hex = s.strip_prefix("sha256:").ok_or_else(|| {
+        SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            "digest must start with sha256:",
+        )
+    })?;
     let mut out = [0u8; 32];
-    if hex.len() != 64 {
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(SnapshotError::new(
             SnapshotErrorCode::DigestMismatch,
-            format!("digest must be 32 bytes hex: {s}"),
+            "digest must contain exactly 64 lowercase hex digits",
         ));
     }
-    for i in 0..32 {
-        out[i] = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
-            .map_err(|_| SnapshotError::new(SnapshotErrorCode::DigestMismatch, "bad digest hex"))?;
-    }
+    hex::decode_to_slice(hex.as_bytes(), &mut out)
+        .map_err(|_| SnapshotError::new(SnapshotErrorCode::DigestMismatch, "bad digest hex"))?;
     Ok(out)
 }
 
@@ -516,4 +523,63 @@ pub fn check_merkle_root(leaves: &[[u8; 32]], root: [u8; 32]) -> Result<(), Snap
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_digest_rejects_unicode_without_panicking() {
+        for payload in [
+            format!("0\u{e9}{}", "0".repeat(61)),
+            format!("\u{20ac}{}", "0".repeat(61)),
+            format!("\u{1f600}{}", "0".repeat(60)),
+            "\u{e9}".repeat(32),
+        ] {
+            assert_eq!(payload.len(), 64);
+            let parsed = std::panic::catch_unwind(|| parse_digest(&format!("sha256:{payload}")));
+            assert!(parsed.is_ok(), "a Unicode digest must return an error");
+            assert_eq!(
+                parsed.unwrap().unwrap_err().code,
+                SnapshotErrorCode::DigestMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn parse_digest_requires_canonical_prefix_and_hex_length() {
+        for invalid in [
+            String::new(),
+            "0".repeat(64),
+            format!("SHA256:{}", "0".repeat(64)),
+            format!("sha256:{}", "0".repeat(63)),
+            format!("sha256:{}", "0".repeat(65)),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}g", "0".repeat(63)),
+            format!("sha256:{} ", "0".repeat(63)),
+        ] {
+            assert_eq!(
+                parse_digest(&invalid).unwrap_err().code,
+                SnapshotErrorCode::DigestMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn parse_digest_decodes_all_canonical_byte_values() {
+        for start in (0..=224).step_by(32) {
+            let bytes = std::array::from_fn(|i| (start + i) as u8);
+            let digest = format!("sha256:{}", hex32(&bytes));
+            assert_eq!(parse_digest(&digest).unwrap(), bytes);
+        }
+        assert_eq!(
+            parse_digest(&format!("sha256:{}", "0".repeat(64))).unwrap(),
+            [0; 32]
+        );
+        assert_eq!(
+            parse_digest(&format!("sha256:{}", "f".repeat(64))).unwrap(),
+            [255; 32]
+        );
+    }
 }

@@ -18,9 +18,49 @@ use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotReader};
 
 type FetchResult = Result<Arc<Vec<u8>>, Arc<SnapshotError>>;
 
-enum Role {
-    Leader,
-    Waiter(oneshot::Receiver<FetchResult>),
+struct FlightGuard {
+    coordinator: Arc<FetchCoordinator>,
+    key: String,
+    completed: bool,
+}
+
+impl FlightGuard {
+    fn complete(mut self, result: Result<Arc<Vec<u8>>, SnapshotError>) {
+        let waiters = self
+            .coordinator
+            .inflight
+            .lock()
+            .unwrap()
+            .remove(&self.key)
+            .unwrap_or_default();
+        self.completed = true;
+        let shared = result.map_err(Arc::new);
+        for waiter in waiters {
+            let _ = waiter.send(shared.clone());
+        }
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let waiters = self
+            .coordinator
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key)
+            .unwrap_or_default();
+        let error = Arc::new(SnapshotError::new(
+            crate::snapshot::SnapshotErrorCode::Internal,
+            "fetch task ended without a result",
+        ));
+        for waiter in waiters {
+            let _ = waiter.send(Err(error.clone()));
+        }
+    }
 }
 
 /// Coordinates verified file fetches over one [`SnapshotReader`].
@@ -50,48 +90,41 @@ impl FetchCoordinator {
         use_frames: bool,
     ) -> Result<Arc<Vec<u8>>, SnapshotError> {
         let key = format!("{}:{}", file.content_digest, file.size);
-        let role = {
+        let (tx, rx) = oneshot::channel();
+        let leader = {
             let mut map = self.inflight.lock().unwrap();
             match map.get_mut(&key) {
                 Some(waiters) => {
-                    let (tx, rx) = oneshot::channel();
                     waiters.push(tx);
-                    Role::Waiter(rx)
+                    false
                 }
                 None => {
-                    map.insert(key.clone(), Vec::new());
-                    Role::Leader
+                    map.insert(key.clone(), vec![tx]);
+                    true
                 }
             }
         };
-        match role {
-            Role::Waiter(rx) => rx
-                .await
-                .map_err(|_| {
-                    SnapshotError::new(
-                        crate::snapshot::SnapshotErrorCode::Internal,
-                        "fetch leader disappeared without a result",
-                    )
-                })?
-                .map_err(|e| (*e).clone()),
-            Role::Leader => {
-                let result = self.lead(&file, use_frames).await;
-                let waiters = self
-                    .inflight
-                    .lock()
-                    .unwrap()
-                    .remove(&key)
-                    .unwrap_or_default();
-                for tx in waiters {
-                    let shared = result
-                        .as_ref()
-                        .map(|b| b.clone())
-                        .map_err(|e| Arc::new(e.clone()));
-                    let _ = tx.send(shared);
-                }
-                result
-            }
+        if leader {
+            let guard = FlightGuard {
+                coordinator: self.clone(),
+                key,
+                completed: false,
+            };
+            // The first caller is a waiter too: dropping its future must not
+            // cancel a download that another caller still needs.
+            tokio::spawn(async move {
+                let result = guard.coordinator.lead(&file, use_frames).await;
+                guard.complete(result);
+            });
         }
+        rx.await
+            .map_err(|_| {
+                SnapshotError::new(
+                    crate::snapshot::SnapshotErrorCode::Internal,
+                    "fetch task disappeared without a result",
+                )
+            })?
+            .map_err(|e| (*e).clone())
     }
 
     async fn lead(
