@@ -166,24 +166,7 @@ impl Mst2Fuse {
         closure: ValidatedSnapshotClosure,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         store.bind_reader(&reader)?;
-        let actual = closure.descriptor();
-        let expected = reader.descriptor();
-        if actual.snapshot_id != expected.snapshot_id
-            || actual.schema_version != expected.schema_version
-            || actual.metadata_codec != expected.metadata_codec
-            || actual.instance_id != expected.instance_id
-            || actual.namespace_view_id != expected.namespace_view_id
-            || actual.scope != expected.scope
-            || actual.materialization_policy != expected.materialization_policy
-            || actual.fs_semantics != expected.fs_semantics
-            || actual.access_projection != expected.access_projection
-            || actual.metadata_root != expected.metadata_root
-        {
-            return Err(crate::snapshot::SnapshotError::new(
-                crate::snapshot::SnapshotErrorCode::ScopeForbidden,
-                "snapshot closure differs from the reader's authorized descriptor",
-            ));
-        }
+        closure.matches_descriptor(reader.descriptor())?;
         for directory in closure.directories() {
             reader
                 .authorized_context()

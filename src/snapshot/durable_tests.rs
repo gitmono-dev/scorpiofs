@@ -48,10 +48,10 @@ struct SyncCounts {
     files: Vec<PathBuf>,
 }
 
-struct SyncCounter;
+pub(super) struct SyncCounter;
 
 impl SyncCounter {
-    fn install(root: &Path) -> Self {
+    pub(super) fn install(root: &Path) -> Self {
         SYNC_COUNTS.with(|counts| {
             assert!(counts.borrow().is_none());
             *counts.borrow_mut() = Some(SyncCounts {
@@ -66,6 +66,10 @@ impl SyncCounter {
 
     fn counts(&self) -> SyncCounts {
         SYNC_COUNTS.with(|counts| counts.borrow().as_ref().unwrap().clone())
+    }
+
+    pub(super) fn synced_files(&self) -> Vec<PathBuf> {
+        self.counts().files
     }
 }
 

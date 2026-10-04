@@ -29,6 +29,7 @@ use axum::{
     Router,
 };
 use mst2_codec::{
+    descriptor::ServingDescriptor,
     metapage::{page_id, Entry, EntryKind, Page},
     treeframe::{EndPayload, MetaPayload, ObjectPayload},
 };
@@ -247,8 +248,17 @@ impl Version {
         }
     }
 
+    fn serving_descriptor(&self) -> ServingDescriptor {
+        ServingDescriptor {
+            instance_uuid: *uuid::Uuid::from_u128(1).as_bytes(),
+            namespace_view_id: [0x22; 32],
+            scope: "/project".into(),
+            metadata_root: self.root,
+        }
+    }
+
     fn snapshot_id(&self) -> String {
-        id_string(&self.root)
+        id_string(&self.serving_descriptor().snapshot_id().unwrap())
     }
 }
 
@@ -377,6 +387,7 @@ async fn resolve(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
     assert_eq!(request["target"]["kind"], "latest");
     let generation = f.latest.load(Ordering::SeqCst);
     let version = &f.versions[generation];
+    let descriptor = version.serving_descriptor();
     let sid = version.snapshot_id();
     let mut leases = f.leases.lock().unwrap();
     let lease = format!("bench-lease-{}", leases.len() + 1);
@@ -384,11 +395,12 @@ async fn resolve(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
     drop(leases);
     f.json_response("resolve", body.len(), json!({
         "descriptor": {"schema_version": 2, "metadata_codec": 1,
-            "instance_id": "reference-update-fixture", "namespace_view_id": "reference-project",
+            "instance_id": uuid::Uuid::from_bytes(descriptor.instance_uuid).to_string(),
+            "namespace_view_id": id_string(&descriptor.namespace_view_id),
             "scope": "/project", "materialization_policy": 1, "fs_semantics": 1,
-            "access_projection": 1, "metadata_root": id_string(&version.root), "snapshot_id": sid},
+            "access_projection": 0, "metadata_root": id_string(&version.root), "snapshot_id": sid},
         "lease_id": lease, "lease_expires_at": lease_expiry(),
-        "publication_sequence": (generation + 1).to_string()
+        "publication_sequence": (generation + 1).to_string(), "authorization_epoch": "1"
     }))
 }
 
@@ -655,11 +667,11 @@ async fn hydrate(
     .unwrap();
     let view = ViewMeta {
         snapshot_id: reader.snapshot_id().into(),
-        namespace_view_id: reader.descriptor.namespace_view_id.clone(),
-        scope: reader.descriptor.scope.clone(),
-        lease_id: reader.lease_id.clone(),
+        namespace_view_id: reader.descriptor().namespace_view_id.clone(),
+        scope: reader.descriptor().scope.clone(),
+        lease_id: reader.lease_id().to_owned(),
     };
-    let client = reader.client.clone();
+    let client = reader.client().clone();
     let sid = reader.snapshot_id().to_string();
     let report = store
         .hydrate_batches(
@@ -946,7 +958,7 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
             let latest_resolve_ms = ms(update_start);
             let resolve_process_work = process.delta();
             assert_ne!(old_reader.snapshot_id(), reader.snapshot_id());
-            assert_ne!(old_reader.lease_id, reader.lease_id);
+            assert_ne!(old_reader.lease_id(), reader.lease_id());
             let mut sync = IncrementalSync::new(&reader, &cache);
             let manifest = sync.sync().await.unwrap();
             let metadata_ready_ms = ms(update_start);
@@ -1053,7 +1065,7 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
             );
             let old_file = &http.state.versions[0].expected[0];
             let mismatch = reader
-                .client
+                .client()
                 .blob_verified(
                     old_reader.snapshot_id(),
                     &format!("/{}", old_file.rel_path),

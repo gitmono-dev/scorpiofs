@@ -536,18 +536,49 @@ impl DurableStore {
     ) -> Result<HydrateReport, SnapshotError> {
         self.bind_reader(reader)?;
         let closure = reader.snapshot_closure().await?;
-        let view = ViewMeta {
+        self.hydrate_snapshot_from_closure(reader, &closure).await
+    }
+
+    /// Hydrate an incrementally acquired, fully proved closure without a
+    /// second metadata RPC. Integrity alone cannot select a different view
+    /// from the fixed authorized reader.
+    pub async fn hydrate_snapshot_from_closure(
+        &self,
+        reader: &SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+    ) -> Result<HydrateReport, SnapshotError> {
+        let view = self.snapshot_view(reader, closure).await?;
+        let use_frames =
+            reader.capabilities().features.objects && reader.capabilities().features.chunk_reads;
+        self.hydrate_snapshot_with(&view, closure, |file| {
+            let path = file.rel_path.clone();
+            let digest = file.content_digest.clone();
+            let size = file.size;
+            async move {
+                if use_frames {
+                    reader.read_file_frames(&path, &digest, size).await
+                } else {
+                    reader.read_file(&path, &digest).await
+                }
+            }
+        })
+        .await
+    }
+
+    async fn snapshot_view(
+        &self,
+        reader: &SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+    ) -> Result<ViewMeta, SnapshotError> {
+        closure.matches_descriptor(reader.descriptor())?;
+        self.bind_reader(reader)?;
+        reader.ensure_lease().await?;
+        Ok(ViewMeta {
             snapshot_id: reader.snapshot_id().to_string(),
             namespace_view_id: reader.descriptor().namespace_view_id.clone(),
             scope: reader.descriptor().scope.clone(),
             lease_id: reader.lease_id().to_string(),
-        };
-        self.hydrate_snapshot_with(&view, &closure, |file| {
-            let path = file.rel_path.clone();
-            let digest = file.content_digest.clone();
-            async move { reader.read_file(&path, &digest).await }
         })
-        .await
     }
 
     /// Local integrity primitive with an independently root-validated closure.
@@ -693,7 +724,58 @@ impl DurableStore {
             + Clone
             + 'static,
     {
-        let _transaction = self.prepare_hydration(view, manifest)?;
+        self.hydrate_concurrent_closure(view, manifest, None, concurrency, fetch)
+            .await
+    }
+
+    /// Concurrent hydration of a complete closure selected by a fixed online
+    /// reader. Metadata and content share one full-snapshot publication.
+    pub async fn hydrate_snapshot_concurrent<F>(
+        &self,
+        reader: &SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+        concurrency: usize,
+        fetch: F,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        F: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let view = self.snapshot_view(reader, closure).await?;
+        self.hydrate_concurrent_closure(&view, closure.files(), Some(closure), concurrency, fetch)
+            .await
+    }
+
+    async fn hydrate_concurrent_closure<F>(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        closure: Option<&ValidatedSnapshotClosure>,
+        concurrency: usize,
+        fetch: F,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        F: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        if let Some(closure) = closure {
+            validate_snapshot_view(view, closure)?;
+        }
+        let _transaction = self.prepare_hydration_for_kind(view, manifest, closure.is_some())?;
         let journal = JournalBatch::new(self);
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
@@ -766,8 +848,7 @@ impl DurableStore {
         let fetched = fetched.load(std::sync::atomic::Ordering::Relaxed);
         let resumed = resumed.load(std::sync::atomic::Ordering::Relaxed);
         let repaired = repaired.load(std::sync::atomic::Ordering::Relaxed);
-        let bytes_total = bytes_total.load(std::sync::atomic::Ordering::Relaxed);
-        store.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
+        store.finish_hydration_commit(view, manifest, closure, (fetched, resumed, repaired))
     }
 
     /// Batched hydration: same verification, write-ahead, resume and journal
@@ -808,11 +889,99 @@ impl DurableStore {
             + Clone
             + 'static,
     {
+        self.hydrate_batches_closure(
+            view,
+            manifest,
+            None,
+            (batch_concurrency, large_concurrency),
+            fetch_batch,
+            fetch_large,
+        )
+        .await
+    }
+
+    /// OBJECT batches and concurrent large-file fetches for a complete fixed
+    /// closure. Reuses the file-only fetch core, then durably publishes all
+    /// descriptor/page/content dependencies before one FullSnapshot marker.
+    pub async fn hydrate_snapshot_batches<FBatch, FLarge>(
+        &self,
+        reader: &SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+        batch_concurrency: usize,
+        large_concurrency: usize,
+        fetch_batch: FBatch,
+        fetch_large: FLarge,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        FBatch: Fn(
+                Vec<SnapshotFile>,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+        FLarge: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let view = self.snapshot_view(reader, closure).await?;
+        self.hydrate_batches_closure(
+            &view,
+            closure.files(),
+            Some(closure),
+            (batch_concurrency, large_concurrency),
+            fetch_batch,
+            fetch_large,
+        )
+        .await
+    }
+
+    async fn hydrate_batches_closure<FBatch, FLarge>(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        closure: Option<&ValidatedSnapshotClosure>,
+        concurrency: (usize, usize),
+        fetch_batch: FBatch,
+        fetch_large: FLarge,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        FBatch: Fn(
+                Vec<SnapshotFile>,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+        FLarge: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
         use std::{collections::HashMap as BufMap, sync::atomic::Ordering::Relaxed};
 
         use futures::stream::{StreamExt, TryStreamExt};
 
-        let _transaction = self.prepare_hydration(view, manifest)?;
+        let (batch_concurrency, large_concurrency) = concurrency;
+        if let Some(closure) = closure {
+            validate_snapshot_view(view, closure)?;
+        }
+        let _transaction = self.prepare_hydration_for_kind(view, manifest, closure.is_some())?;
         let journal = JournalBatch::new(self);
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
@@ -848,11 +1017,13 @@ impl DurableStore {
         const OBJECT_CAP: u64 = 256 * 1024;
         const BATCH_MAX_FILES: usize = 128;
         const BATCH_MAX_BYTES: u64 = 7 * 1024 * 1024;
-        let (mut small, large): (Vec<SnapshotFile>, Vec<SnapshotFile>) =
+        let (mut small, mut large): (Vec<SnapshotFile>, Vec<SnapshotFile>) =
             need.into_iter().partition(|f| f.size <= OBJECT_CAP);
         // Deduplicate small files by digest: one fetch unit per content.
         small.sort_by(|a, b| a.content_digest.cmp(&b.content_digest));
         small.dedup_by(|a, b| a.content_digest == b.content_digest);
+        large.sort_by(|a, b| a.content_digest.cmp(&b.content_digest));
+        large.dedup_by(|a, b| a.content_digest == b.content_digest);
 
         // Group into batches under the server's per-request limits.
         let mut batches: Vec<Vec<SnapshotFile>> = Vec::new();
@@ -978,8 +1149,7 @@ impl DurableStore {
         let fetched = fetched.load(Relaxed);
         let resumed = resumed.load(Relaxed);
         let repaired = repaired.load(Relaxed);
-        let bytes_total = bytes_total.load(Relaxed);
-        store.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
+        store.finish_hydration_commit(view, manifest, closure, (fetched, resumed, repaired))
     }
 
     // A file lock is held for the whole publication transaction, including
@@ -1008,14 +1178,6 @@ impl DurableStore {
                 "another local hydration transaction is active",
             )
         })
-    }
-
-    fn prepare_hydration(
-        &self,
-        view: &ViewMeta,
-        manifest: &[SnapshotFile],
-    ) -> Result<TransactionGuard, SnapshotError> {
-        self.prepare_hydration_for_kind(view, manifest, false)
     }
 
     fn prepare_hydration_for_kind(
