@@ -19,7 +19,8 @@ done
 mkdir -p "$RUN/runtime-context"
 cp "$MEDIUM_RELEASE_DIR/scorpio" "$MEDIUM_RELEASE_DIR/antares" "$RUN/runtime-context/"
 cp "$ROOT/bench/bin/first-directory-ready.py" "$ROOT/bench/cases/medium-profile.py" \
-   "$ROOT/bench/workload/medium-monorepo.py" "$ROOT/bench/infra/medium-cloud-run.py" "$RUN/runtime-context/"
+   "$ROOT/bench/workload/medium-monorepo.py" "$ROOT/bench/infra/medium-cloud-run.py" \
+   "$ROOT/bench/cases/git-shallow-gate.py" "$RUN/runtime-context/"
 cat > "$RUN/runtime-context/Dockerfile" <<'EOF'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import random
+import runpy
 import shutil
 import subprocess
 import threading
@@ -81,6 +82,8 @@ def main():
     tip = cmd(["git", "ls-remote", repo, "refs/heads/main"])[1].decode().split()[0]
     if tip != target:
         raise RuntimeError("ref mismatch")
+    require_gate = runpy.run_path(str(Path(__file__).with_name("medium-cloud-run.py")))["require_shallow_gate"]
+    require_gate(out / f"{a.cluster}-{a.files}-git-shallow-gate.json", target, repo)
     sample = random.Random(20261003).sample(rows, 50)
     failed = False
     if a.action == "workspaces":

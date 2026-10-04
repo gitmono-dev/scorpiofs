@@ -24,6 +24,14 @@ def cli(*args, body=None):
     return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
+def require_time_remaining(state):
+    deadline = state.get("deadline_utc")
+    if not deadline:
+        raise RuntimeError("a run deadline is required before provisioning")
+    if dt.datetime.now(dt.timezone.utc) >= dt.datetime.fromisoformat(deadline):
+        raise RuntimeError("run deadline reached; refusing new resources")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("action", choices=["preflight", "create", "status", "nodepools", "kubeconfig", "destroy"])
@@ -66,6 +74,11 @@ def main():
         evidence["eip_before"] = cli("vpc", "DescribeEipAddresses", "--RegionId", REGION, "--PageSize", "100")
         evidence["disks_before"] = cli("ecs", "DescribeDisks", "--RegionId", REGION, "--PageSize", "100")
         evidence["ecs_before"] = cli("ecs", "DescribeInstances", "--RegionId", REGION, "--PageSize", "100")
+        for name, page in (("nat_before", 50), ("eip_before", 100),
+                           ("disks_before", 100), ("ecs_before", 100)):
+            data = evidence[name]
+            if data.get("TotalCount", 0) > page or data.get("NextToken"):
+                raise RuntimeError("preflight inventory requires pagination: " + name)
         node_price = evidence["nodes_quote"]["PriceInfo"]["Price"]["TradePrice"]
         disk_price = evidence["disk_quote"]["PriceInfo"]["Price"]["TradePrice"]
         # Two NAT gateways / endpoints / control-plane miscellaneous reserve 6 CNY/h;
@@ -89,6 +102,7 @@ def main():
         state.setdefault("deadline_utc", (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=state["max_hours"])).isoformat())
         save()
         for letter in ("a", "b"):
+            require_time_remaining(state)
             name = f"mst2-medium-{letter}-{RUN}"
             if any(c["name"] == name for c in state["clusters"]):
                 continue
@@ -124,9 +138,11 @@ def main():
             print(json.dumps({"id": c["id"], "name": c["name"], "state": c["last_state"], "pools": pools}))
     elif args.action == "nodepools":
         for c in state["clusters"]:
+            require_time_remaining(state)
             if c.get("last_state") != "running":
                 raise SystemExit("cluster must be running before creating pools")
             for role in ("storage", "service", "runner"):
+                require_time_remaining(state)
                 existing = cli("cs", "GET", f'/clusters/{c["id"]}/nodepools', "--region", REGION)
                 pools = existing.get("nodepools", []) if isinstance(existing, dict) else existing
                 names = [p.get("nodepool_info", {}).get("name") for p in pools]

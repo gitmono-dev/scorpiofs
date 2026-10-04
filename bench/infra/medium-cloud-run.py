@@ -37,6 +37,15 @@ def load_readiness():
     return module
 
 
+def require_shallow_gate(path, target, repo):
+    gate = json.loads(path.read_text())
+    if (gate.get("status") != "success" or gate.get("head") != target
+            or gate.get("repo") != repo or gate.get("depth") != 1
+            or not gate.get("strict_object_set_verified")):
+        raise RuntimeError("measure requires a successful strict gate for the fixed repository tip")
+    return gate
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("action", choices=["seed", "gate", "measure", "verify"])
@@ -165,7 +174,14 @@ def main():
         return {"ms": ms, "count": len(seen), "verified": True}
 
     check_ref()
+    gate_path = args.out / f"{args.cluster}-{args.files}-git-shallow-gate.json"
     if args.action in ("gate", "verify"):
+        if not gate_path.exists():
+            command([sys.executable, "/bench-medium/git-shallow-gate.py", "--repo", repo,
+                     "--oracle", fixture_git, "--commit", target, "--out", str(gate_path)], timeout=900)
+        gate = require_shallow_gate(gate_path, target, repo)
+        emit({"phase": "git_shallow_gate", "result": gate,
+              "status": "success", "excluded_from_measurement": True})
         checkout = Path("/data/oracle-" + str(args.files))
         if not checkout.exists():
             command(["git", "clone", "--depth", "1", repo, str(checkout)])
@@ -230,6 +246,7 @@ def main():
             http("/mounts/" + m["mount_id"], method="DELETE")
         return
 
+    require_shallow_gate(gate_path, target, repo)
     readiness = load_readiness()
     rng = random.Random(20261003)
     sample = rng.sample(rows, 1100)
@@ -343,4 +360,5 @@ if __name__ == "__main__":
         main()
     except Exception as error:
         print(json.dumps({"status": "failed", "error": str(error)}), flush=True)
+        raise SystemExit(1)
         raise
