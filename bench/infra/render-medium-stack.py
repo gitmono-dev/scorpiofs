@@ -27,6 +27,9 @@ def main():
         if d["kind"] in ("Deployment", "Job"):
             name = d["metadata"]["name"]
             spec = d["spec"]["template"]["spec"]
+            for container in spec.get("containers", []) + spec.get("initContainers", []):
+                if container.get("image") == "mega2:local":
+                    container["image"] = a.backend
             role = "storage" if name in ("postgres", "rustfs", "rustfs-init") else "service"
             spec["nodeSelector"] = {"bench-role": role}
             spec.pop("affinity", None)
@@ -72,6 +75,7 @@ def main():
                 "SCORPIO_MST2_BASE_URL": "http://mega2:8000", "SCORPIO_MST2_SCOPE": "/project",
                 "SCORPIO_MST2_LOWER_ENABLED": "true", "SCORPIO_MOUNT_OWNER": "0:0",
                 "SCORPIO_WORKSPACE": "/data/scorpio/mount", "SCORPIO_STORE_PATH": "/data/scorpio/store",
+                "SCORPIO_CONFIG_FILE": "/data/scorpio/config.toml",
                 "SCORPIO_ANTARES_UPPER_ROOT": "/data/scorpio/upper", "SCORPIO_ANTARES_CL_ROOT": "/data/scorpio/cl",
                 "SCORPIO_ANTARES_MOUNT_ROOT": "/data/scorpio/mounts", "SCORPIO_ANTARES_STATE_FILE": "/data/scorpio/state.toml",
                 "RUST_LOG": "warn"}.items()],
