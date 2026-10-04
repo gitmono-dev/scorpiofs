@@ -26,17 +26,29 @@ fn resolve() -> MountOwner {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
     if euid != 0 {
-        return MountOwner { uid: euid, gid: egid };
+        return MountOwner {
+            uid: euid,
+            gid: egid,
+        };
     }
     let Some(user) = std::env::var_os("SUDO_USER") else {
-        return MountOwner { uid: euid, gid: egid };
+        return MountOwner {
+            uid: euid,
+            gid: egid,
+        };
     };
     let Ok(cuser) = std::ffi::CString::new(user.as_os_str().as_encoded_bytes()) else {
-        return MountOwner { uid: euid, gid: egid };
+        return MountOwner {
+            uid: euid,
+            gid: egid,
+        };
     };
     let pw = unsafe { libc::getpwnam(cuser.as_ptr()) };
     if pw.is_null() {
-        return MountOwner { uid: euid, gid: egid };
+        return MountOwner {
+            uid: euid,
+            gid: egid,
+        };
     }
     let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
     MountOwner { uid, gid }
