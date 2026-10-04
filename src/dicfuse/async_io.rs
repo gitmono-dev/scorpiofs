@@ -489,7 +489,10 @@ impl Filesystem for Dicfuse {
                 let _offset = offset as usize;
                 let end = (_offset + size as usize).min(datas.len());
                 if datas.is_empty() {
-                    tracing::warn!(inode, "dicfuse read: memory cache still empty after refetch");
+                    tracing::warn!(
+                        inode,
+                        "dicfuse read: memory cache still empty after refetch"
+                    );
                 }
                 let slice = &datas[_offset..end];
                 return Ok(ReplyData {

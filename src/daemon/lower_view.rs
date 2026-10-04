@@ -13,9 +13,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::daemon::worktree_v2::{git_blob_oid, lower_item_for};
-use crate::dicfuse::store::DictionaryStore;
-use crate::snapshot::fuse::Mst2Fuse;
+use crate::{
+    daemon::worktree_v2::{git_blob_oid, lower_item_for},
+    dicfuse::store::DictionaryStore,
+    snapshot::fuse::Mst2Fuse,
+};
 
 /// Which content-identity domain a lower projection speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,7 +55,9 @@ pub struct DicfuseLower(pub Arc<DictionaryStore>);
 #[async_trait]
 impl LowerView for DicfuseLower {
     async fn base_hash(&self, rel_path: &str) -> Option<String> {
-        lower_item_for(&self.0, rel_path).await.map(|item| item.hash)
+        lower_item_for(&self.0, rel_path)
+            .await
+            .map(|item| item.hash)
     }
 
     fn hash_kind(&self) -> LowerHashKind {
