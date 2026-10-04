@@ -10,6 +10,23 @@ use std::{
 
 use super::*;
 
+#[test]
+fn duplicated_descriptor_cannot_extend_transaction_lifetime() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = DurableStore::open(temp.path()).unwrap();
+    let guard = store.transaction().unwrap();
+    let duplicate = guard.0.try_clone().unwrap();
+    assert!(store.try_transaction().unwrap().is_none());
+    drop(guard);
+    let next = store.try_transaction().unwrap();
+    assert!(
+        next.is_some(),
+        "a fork/dup descriptor cannot retain a completed transaction's lock"
+    );
+    drop(next);
+    drop(duplicate);
+}
+
 struct Fault {
     path: PathBuf,
     phase: &'static str,
