@@ -4,6 +4,9 @@
 //! Optional MST2_UPDATE_BENCH_{ROUNDS,DIRS,FILES,BYTES,OUTPUT} controls scale
 //! and a private JSONL result path. No result file is written by default.
 
+// The structured diagnostic record exceeds serde_json's default macro depth.
+#![recursion_limit = "256"]
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
@@ -810,6 +813,7 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
         "lock_sha256": digest_of(&fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock")).unwrap()),
         "cache_conditions": "new private app cache for each scenario/round; V1 hydrated/pinned before V2; OS cache uncontrolled; prebuilt fixture",
         "counter_limits": "SyncMeters traversal counts decoded logical pages; closure-file reads, page rehashes and full CAS validation are additional work; process CPU/IO includes fixture",
+        "reuse_policy": "a subtree requires a pin backed by a current COMPLETE dependency audit; deliberately missing old CAS content revokes its COMPLETE and forces metadata traversal using verified individual cached pages; reuse counters for this damage scenario are not comparable with the former pin-JSON policy",
         "server_publication": "NOT_RUN", "server_rebuilt_pages": null, "server_scan_traversal_nodes": null,
         "crash_gc_offline_authorization": "NOT_RUN", "durable_complete": "current client completion plus real pin; no power-loss claim"}),
     );
@@ -855,6 +859,8 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
             assert_manifest(&old_manifest, &http.state.versions[0].expected);
             let baseline_wire = http.state.wire(baseline_mark);
             assert_eq!(old_hydrate.fetched as usize, baseline.len());
+            let old_complete_before_update = old_store.root().join("DURABLE_COMPLETE").exists();
+            assert!(old_complete_before_update);
             http.state.latest.store(1, Ordering::SeqCst);
 
             let cold = ScopeCache::open(tmp.path().join("cold-v2")).unwrap();
@@ -902,6 +908,12 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
                 durable_complete_ms,
             ));
             let process_work = process.delta();
+            // Observe repair evidence outside the measured work. The V2
+            // hydration can restore the shared body, but it cannot restore
+            // the V1 marker that its pin audit revoked before metadata sync.
+            let old_complete_after_update = old_store.root().join("DURABLE_COMPLETE").exists();
+            let old_pin_repair_reason =
+                fs::read_to_string(old_store.root().join("NEEDS_REPAIR")).ok();
             assert_manifest(&manifest, &http.state.versions[1].expected);
             let update_wire = http.state.wire(warm_mark);
             let changed_files: Vec<_> = manifest
@@ -923,8 +935,32 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
                 report.resumed as usize + report.fetched as usize,
                 manifest.len()
             );
-            assert!(sync.meters().reused_subtrees > 0);
-            assert!(sync.meters().traversal_nodes < cold_sync.meters().traversal_nodes);
+            if matches!(scenario, Scenario::CacheMissing) {
+                assert!(
+                    !old_complete_after_update,
+                    "a damaged dependency revokes the old commit"
+                );
+                assert!(old_pin_repair_reason.as_deref().is_some_and(
+                    |reason| reason.contains("completion dependency missing or corrupt")
+                ));
+                assert_eq!(
+                    sync.meters().reused_subtrees,
+                    0,
+                    "a damaged old pin cannot authorize subtree reuse"
+                );
+                assert_eq!(
+                    sync.meters().traversal_nodes,
+                    cold_sync.meters().traversal_nodes,
+                    "without an audited pin the client must walk the full metadata tree"
+                );
+                assert_eq!(metadata_wire.requested_pages, 3,
+                    "individual cached pages still limit fetching to two changed pages and one missing page");
+            } else {
+                assert!(old_complete_after_update);
+                assert!(old_pin_repair_reason.is_none());
+                assert!(sync.meters().reused_subtrees > 0);
+                assert!(sync.meters().traversal_nodes < cold_sync.meters().traversal_nodes);
+            }
             assert!(metadata_wire.requested_pages < cold_wire.requested_pages);
             assert_eq!(
                 sync.meters().fetched_pages as usize,
@@ -1005,6 +1041,8 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
                 "client_fetched_pages": meters.fetched_pages, "client_reused_pages": meters.reused_pages,
                 "client_traversal_nodes": meters.traversal_nodes, "client_reused_subtrees": meters.reused_subtrees,
                 "hydrate_manifest_logical_files": manifest.len(), "cas_verification_read_calls": null, "reuse_page_rehash_calls": null,
+                "old_complete_before_update": old_complete_before_update, "old_complete_after_update": old_complete_after_update,
+                "old_pin_repair_reason": old_pin_repair_reason,
                 "hydrate_fetched": report.fetched, "hydrate_resumed": report.resumed, "changed_input_bytes": changed_bytes,
                 "resolve_process_work": resolve_process_work, "metadata_ready_process_work": metadata_process_work,
                 "process_work": process_work, "correctness_verification_ms": verification_ms,
