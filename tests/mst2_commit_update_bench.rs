@@ -34,7 +34,7 @@ use mst2_codec::{
 };
 use scorpiofs::snapshot::{
     durable::digest_of, frames::parse_digest, DurableStore, HydrateReport, IncrementalSync,
-    Mst2Client, ScopeCache, SnapshotErrorCode, SnapshotFile, SnapshotReader, ViewMeta,
+    Mst2Client, ScopeCache, SnapshotErrorCode, SnapshotFile, SnapshotReader, SyncMeters, ViewMeta,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -773,6 +773,19 @@ fn ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+fn local_sync_work(meters: SyncMeters) -> Value {
+    json!({
+        "closure_index_reads": meters.closure_index_reads,
+        "closure_index_read_bytes": meters.closure_index_read_bytes,
+        "closure_index_writes": meters.closure_index_writes,
+        "closure_index_write_bytes": meters.closure_index_write_bytes,
+        "pin_set_reads": meters.pin_set_reads,
+        "page_rehashes": meters.page_rehashes,
+        "unique_page_rehashes": meters.unique_page_rehashes,
+        "page_rehash_bytes": meters.page_rehash_bytes,
+    })
+}
+
 fn emit(value: &Value) {
     let line = serde_json::to_string(value).unwrap();
     println!("MST2_UPDATE_BENCH {line}");
@@ -880,7 +893,7 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
         "benchmark_sha256": digest_of(include_bytes!("mst2_commit_update_bench.rs")),
         "lock_sha256": digest_of(&fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock")).unwrap()),
         "cache_conditions": "new private app cache for each scenario/round; V1 hydrated/pinned before V2; OS cache uncontrolled; prebuilt fixture",
-        "counter_limits": "SyncMeters traversal counts decoded logical pages; closure-file reads, page rehashes and full CAS validation are additional work; process CPU/IO includes fixture",
+        "counter_limits": "SyncMeters traversal counts decoded logical pages; local_sync_work counts index read attempts/bytes, published writes/bytes, pin scans, actual cached-page hash calls/bytes including repeats and corrupt pages, and unique hashed page ids; missing pages and initial network-page validation are excluded from rehash counts; pin COMPLETE audits and hydration CAS verification are not separately instrumented; process CPU/IO includes fixture",
         "reuse_policy": "a subtree requires a pin backed by a current COMPLETE dependency audit; deliberately missing old CAS content revokes its COMPLETE and forces metadata traversal using verified individual cached pages; reuse counters for this damage scenario are not comparable with the former pin-JSON policy",
         "server_publication": "NOT_RUN", "server_rebuilt_pages": null, "server_scan_traversal_nodes": null,
         "crash_gc_offline_authorization": "NOT_RUN", "durable_complete": "current client completion plus real pin; no power-loss claim"}),
@@ -927,6 +940,9 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
             assert_manifest(&old_manifest, &http.state.versions[0].expected);
             let baseline_wire = http.state.wire(baseline_mark);
             assert_eq!(old_hydrate.fetched as usize, baseline.len());
+            assert_eq!(old_sync.meters().closure_index_reads, 1);
+            assert_eq!(old_sync.meters().closure_index_writes, 1);
+            assert_eq!(old_sync.meters().pin_set_reads, 1);
             let old_complete_before_update = old_store.root().join("DURABLE_COMPLETE").exists();
             assert!(old_complete_before_update);
             http.state.latest.store(1, Ordering::SeqCst);
@@ -941,6 +957,9 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
             let cold_metadata_ready_ms = ms(cold_start);
             assert_manifest(&cold_manifest, &http.state.versions[1].expected);
             let cold_wire = http.state.wire(cold_mark);
+            assert_eq!(cold_sync.meters().closure_index_reads, 1);
+            assert_eq!(cold_sync.meters().closure_index_writes, 1);
+            assert_eq!(cold_sync.meters().pin_set_reads, 1);
 
             let mut missing_page = None;
             if matches!(scenario, Scenario::CacheMissing) {
@@ -1003,6 +1022,9 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
                 report.resumed as usize + report.fetched as usize,
                 manifest.len()
             );
+            assert_eq!(sync.meters().closure_index_reads, 1);
+            assert_eq!(sync.meters().closure_index_writes, 1);
+            assert_eq!(sync.meters().pin_set_reads, 1);
             if matches!(scenario, Scenario::CacheMissing) {
                 assert!(
                     !old_complete_after_update,
@@ -1102,13 +1124,16 @@ async fn commit_update_costs_preserve_views_and_separate_work() {
                 "reference_new_page_ids": new_page_ids, "reference_unchanged_page_ids": unchanged_pages,
                 "old_snapshot": old_reader.snapshot_id(), "new_snapshot": reader.snapshot_id(),
                 "baseline_hydrate_ms": baseline_ms, "baseline_wire": baseline_wire,
+                "baseline_local_sync_work": local_sync_work(old_sync.meters()),
                 "cold_latest_resolve_ms": cold_resolve_ms, "cold_metadata_ready_ms": cold_metadata_ready_ms,
                 "cold_wire": cold_wire, "cold_traversal_nodes": cold_sync.meters().traversal_nodes,
+                "cold_local_sync_work": local_sync_work(cold_sync.meters()),
                 "latest_resolve_ms": latest_resolve_ms, "metadata_ready_ms": metadata_ready_ms,
                 "durable_complete_ms": durable_complete_ms, "metadata_wire": metadata_wire, "update_wire": update_wire,
                 "client_fetched_pages": meters.fetched_pages, "client_reused_pages": meters.reused_pages,
                 "client_traversal_nodes": meters.traversal_nodes, "client_reused_subtrees": meters.reused_subtrees,
-                "hydrate_manifest_logical_files": manifest.len(), "cas_verification_read_calls": null, "reuse_page_rehash_calls": null,
+                "client_local_sync_work": local_sync_work(meters),
+                "hydrate_manifest_logical_files": manifest.len(), "cas_verification_read_calls": null, "reuse_page_rehash_calls": meters.page_rehashes,
                 "old_complete_before_update": old_complete_before_update, "old_complete_after_update": old_complete_after_update,
                 "old_pin_repair_reason": old_pin_repair_reason,
                 "hydrate_fetched": report.fetched, "hydrate_resumed": report.resumed, "changed_input_bytes": changed_bytes,
