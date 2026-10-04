@@ -542,6 +542,56 @@ async fn resume_removes_a_torn_journal_tail_before_appending_new_records() {
 }
 
 #[tokio::test]
+async fn repeated_hydration_compacts_journal_to_one_logical_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = DurableStore::open(temp.path()).unwrap();
+    hydrate(&store).await;
+    let first = fs::read(temp.path().join(JOURNAL_FILE)).unwrap();
+    assert_eq!(
+        first.iter().filter(|byte| **byte == b'\n').count(),
+        files().len()
+    );
+    for _ in 0..4 {
+        let report = hydrate(&DurableStore::open(temp.path()).unwrap()).await;
+        assert_eq!(report.fetched, 0);
+        assert_eq!(fs::read(temp.path().join(JOURNAL_FILE)).unwrap(), first);
+        assert!(store.is_complete().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn journal_compaction_failure_preserves_old_hints_and_revokes_complete() {
+    for phase in ["journal-compact-write", "journal-compact-file-sync"] {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(temp.path()).unwrap();
+        hydrate(&store).await;
+        let first = fs::read(temp.path().join(JOURNAL_FILE)).unwrap();
+        let fault = FaultGuard::install(temp.path(), phase, false);
+        let error = store
+            .hydrate_with(&view(), &files(), |_| async {
+                panic!("warm dependencies must not fetch")
+            })
+            .await
+            .unwrap_err();
+        drop(fault);
+        assert_eq!(error.code, SnapshotErrorCode::Internal);
+        let hints = fs::read(temp.path().join(JOURNAL_FILE)).unwrap();
+        assert!(hints.starts_with(&first));
+        assert_eq!(store.read_journal().unwrap().len(), files().len());
+        assert!(!store.is_complete().unwrap());
+        assert!(!fs::read_dir(temp.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".journal.log.tmp.")
+        }));
+        hydrate(&store).await;
+        assert_eq!(fs::read(temp.path().join(JOURNAL_FILE)).unwrap(), first);
+    }
+}
+
+#[tokio::test]
 async fn blob_sync_and_directory_sync_errors_cannot_publish_a_batch_complete() {
     for phase in ["object-file-sync", "directory-sync"] {
         let temp = tempfile::tempdir().unwrap();
@@ -700,6 +750,9 @@ fn killed_process_recovers_only_committed_dependencies_at_each_publication_bound
     for phase in [
         "marker-revoked",
         "content-durable",
+        "journal-compact-write",
+        "journal-compact-file-sync",
+        "journal-compacted",
         "manifest-durable",
         "view-durable",
         "pin-durable",
