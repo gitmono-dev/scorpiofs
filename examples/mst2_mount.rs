@@ -81,8 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let scope_dir = dir.parent().expect("snapshot dir has a scope parent");
             context.bind_scope_cache(scope_dir)?;
             let content_dir = scope_dir.join("blobs");
-            let store = Arc::new(DurableStore::open_with_content(&dir, &content_dir)?);
-            store.bind_reader(&reader)?;
+            let store = Arc::new(DurableStore::open_for_reader(&dir, &content_dir, &reader)?);
             let was_complete = store.is_complete()?;
 
             if lazy {

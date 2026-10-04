@@ -182,6 +182,16 @@ const AUTHORITY_FILE: &str = "authority.json";
 const AUTHORITY_LOCK: &str = "authority.lock";
 const AUTHORITY_TMP: &str = "authority.json.tmp";
 
+struct AuthorityLock(File);
+
+impl Drop for AuthorityLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to release cache authority lock");
+        }
+    }
+}
+
 fn bind_directory(dir: &Path, binding: &CacheBinding) -> Result<(), SnapshotError> {
     let io_error =
         |error: std::io::Error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string());
@@ -194,6 +204,7 @@ fn bind_directory(dir: &Path, binding: &CacheBinding) -> Result<(), SnapshotErro
         .open(dir.join(AUTHORITY_LOCK))
         .map_err(io_error)?;
     lock.lock().map_err(io_error)?;
+    let _guard = AuthorityLock(lock);
     let path = dir.join(AUTHORITY_FILE);
     match fs::read(&path) {
         Ok(bytes) => {

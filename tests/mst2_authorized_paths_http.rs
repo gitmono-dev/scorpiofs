@@ -29,6 +29,45 @@ const SCOPE: &str = "/project";
 const INSTANCE: &str = "11111111-2222-4333-8444-555555555557";
 const CONTENT: &[u8] = b"verified fixture content";
 
+#[tokio::test]
+async fn foreign_or_legacy_store_is_rejected_before_recovery_mutates_its_marker() {
+    let fixture = Arc::new(Fixture::default());
+    let server = serve(fixture).await;
+    let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), SCOPE, 600)
+        .await
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    for bound in [false, true] {
+        let root = temp.path().join(if bound { "foreign" } else { "legacy" });
+        let content = temp.path().join(if bound {
+            "foreign-blobs"
+        } else {
+            "legacy-blobs"
+        });
+        if bound {
+            reader.authorized_context().bind_view_cache(&root).unwrap();
+            let path = root.join("authority.json");
+            let mut identity: Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            identity["domain"] = "different-actor".into();
+            std::fs::write(path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        } else {
+            std::fs::create_dir_all(&root).unwrap();
+        }
+        let marker = b"malformed complete marker owned elsewhere";
+        std::fs::write(root.join("DURABLE_COMPLETE"), marker).unwrap();
+        let result = scorpiofs::snapshot::DurableStore::open_for_reader(&root, &content, &reader);
+        assert!(matches!(result, Err(error) if error.code == SnapshotErrorCode::ScopeForbidden));
+        assert_eq!(
+            std::fs::read(root.join("DURABLE_COMPLETE")).unwrap(),
+            marker
+        );
+        assert!(!root.join("NEEDS_REPAIR").exists());
+        assert!(!root.join(".hydrate.lock").exists());
+        assert!(!content.exists());
+    }
+}
+
 #[derive(Default)]
 struct Fixture {
     blob_requests: AtomicUsize,

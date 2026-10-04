@@ -79,11 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // mount does — this is what makes content reuse observable and what
     // backs the closure records with a live pin.
     let view_dir = cache_path.join(snapshot_id.trim_start_matches("sha256:"));
-    let store = Arc::new(DurableStore::open_with_content(
+    let store = Arc::new(DurableStore::open_for_reader(
         &view_dir,
         cache_path.join("blobs"),
+        &reader,
     )?);
-    store.bind_reader(&reader)?;
     let view = ViewMeta {
         snapshot_id: snapshot_id.clone(),
         namespace_view_id: reader.descriptor().namespace_view_id.clone(),

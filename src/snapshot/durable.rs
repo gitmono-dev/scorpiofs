@@ -148,6 +148,22 @@ impl Drop for TransactionGuard {
 }
 
 impl DurableStore {
+    /// Check authority before the constructor can recover or alter a marker.
+    pub fn open_for_reader(
+        root: impl Into<PathBuf>,
+        content: impl Into<PathBuf>,
+        reader: &SnapshotReader,
+    ) -> Result<Self, SnapshotError> {
+        let root = root.into();
+        let content = content.into();
+        let context = reader.authorized_context();
+        context.bind_view_cache(&root)?;
+        context.bind_scope_cache(&content)?;
+        let store = Self::open_with_content(root, content)?;
+        store.bind_reader(reader)?;
+        Ok(store)
+    }
+
     /// Open (creating if needed) the store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
         let root = root.into();
