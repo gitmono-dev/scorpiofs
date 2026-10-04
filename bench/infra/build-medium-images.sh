@@ -6,7 +6,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${MEDIUM_TAG:?Unique tag prefix for this run}"
 : "${MEDIUM_RELEASE_DIR:?Directory containing release scorpio and antares}"
 : "${MEDIUM_LIBRA_BINARY:?Path to the Linux Libra executable for development tests}"
-: "${MEDIUM_BASE_IMAGE:?Runner base image with Git, Python and FUSE runtime}"
+: "${MEDIUM_BASE_IMAGE:?Linux base with Bash, Git, Python, curl, GNU coreutils and FUSE runtime}"
 : "${MEDIUM_BACKEND_IMAGE:?Backend image built from the frozen source version}"
 RUN="$MEDIUM_WORKDIR"
 REG="$MEDIUM_REGISTRY"
@@ -42,7 +42,9 @@ ENV SCORPIO_WORKSPACE=/var/lib/scorpiofs/mount \
     SCORPIO_ANTARES_CL_ROOT=/var/lib/scorpiofs/antares/cl \
     SCORPIO_ANTARES_MOUNT_ROOT=/var/lib/scorpiofs/antares/mnt \
     SCORPIO_ANTARES_STATE_FILE=/var/lib/scorpiofs/antares/state.toml
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh && \
+RUN bash --version >/dev/null && git --version >/dev/null && curl --version >/dev/null && \
+    fusermount3 --version >/dev/null && timeout --kill-after=1 1 true && du -sB1 /tmp >/dev/null && \
+    chmod +x /usr/local/bin/docker-entrypoint.sh && \
     mkdir -p "$SCORPIO_WORKSPACE" "$SCORPIO_STORE_PATH" "$SCORPIO_ANTARES_UPPER_ROOT" \
         "$SCORPIO_ANTARES_CL_ROOT" "$SCORPIO_ANTARES_MOUNT_ROOT" && \
     /usr/local/bin/docker-entrypoint.sh --help >/dev/null && antares --help >/dev/null && \

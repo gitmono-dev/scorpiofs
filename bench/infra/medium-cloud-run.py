@@ -66,6 +66,19 @@ def publish_fixture_commit(fixture_git, repo, row, env):
                 commit=observed, tree=tree)
 
 
+def audit_initial_checkout(repo, audit, expected_oid):
+    # Clone into a new path; never trust an operator's stale checkout as evidence.
+    command(["git", "clone", "--depth", "1", "--no-checkout", repo, str(audit)])
+    def git(*args):
+        return command(["git", "-C", str(audit), *args]).decode().strip()
+    oid = git("rev-parse", "HEAD")
+    tree = [x.split() for x in git("ls-tree", "-r", "-l", "HEAD").splitlines()]
+    expected = [["100644", "blob", "afff6026cbd0c96177c593ff71f92a563f354c3b", "39", ".gitkeep"]]
+    if oid != expected_oid or tree != expected or git("log", "-1", "--format=%s") != "Init Mega Directory":
+        raise RuntimeError("bootstrap audit differs from known fresh initialization")
+    return oid, tree
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("action", choices=["seed", "gate", "measure", "verify"])
@@ -107,13 +120,8 @@ def main():
         if remote and current == 0:
             if not args.bootstrap_initial:
                 raise RuntimeError("unknown remote tip; explicit isolated bootstrap required")
-            audit = "/data/bootstrap-audit"
-            oid = command(["git", "-C", audit, "rev-parse", "HEAD"]).decode().strip()
-            tree = [x.split() for x in command(["git", "-C", audit, "ls-tree", "-r", "-l", "HEAD"]).decode().splitlines()]
-            expected = [["100644", "blob", "afff6026cbd0c96177c593ff71f92a563f354c3b", "39", ".gitkeep"]]
-            subject = command(["git", "-C", audit, "log", "-1", "--format=%s"]).decode().strip()
-            if oid != remote[0] or tree != expected or subject != "Init Mega Directory":
-                raise RuntimeError("bootstrap audit differs from known fresh initialization")
+            audit = "/data/bootstrap-audit-" + uuid.uuid4().hex
+            oid, tree = audit_initial_checkout(repo, audit, remote[0])
             # Trunk policy requires first-parent ancestry. Reuse immutable fixture trees,
             # but parent its history to this cluster's audited initialization commit.
             # Import the already verified bootstrap object via local Git transport.

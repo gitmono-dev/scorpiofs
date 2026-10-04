@@ -138,6 +138,35 @@ class ShallowGateTests(unittest.TestCase):
 
 
 class DriverGateTests(unittest.TestCase):
+    def test_bootstrap_materializes_and_audits_fresh_remote(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote = root / "remote"
+            subprocess.run(["git", "init", "-b", "main", str(remote)], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            def git(*args):
+                return subprocess.check_output(["git", "-C", str(remote), *args]).decode().strip()
+            git("config", "user.name", "Gate Test")
+            git("config", "user.email", "gate@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            (remote / ".gitkeep").write_text("Placeholder file for /project directory")
+            git("add", ".gitkeep")
+            git("commit", "-m", "Init Mega Directory")
+            oid = git("rev-parse", "HEAD")
+            audit = root / "audit"
+            self.assertFalse(audit.exists())
+            result, tree = driver.audit_initial_checkout(remote.as_uri(), audit, oid)
+            self.assertEqual(result, oid)
+            self.assertEqual(tree[0][-1], ".gitkeep")
+            self.assertTrue((audit / ".git").is_dir())
+            with self.assertRaisesRegex(RuntimeError, "bootstrap audit differs"):
+                driver.audit_initial_checkout(remote.as_uri(), root / "stale-tip", "0" * 40)
+            (remote / "unexpected").write_text("user data")
+            git("add", "unexpected")
+            git("commit", "-m", "Init Mega Directory")
+            with self.assertRaisesRegex(RuntimeError, "bootstrap audit differs"):
+                driver.audit_initial_checkout(remote.as_uri(), root / "nonempty", git("rev-parse", "HEAD"))
+
     def test_missing_failed_stale_or_incomplete_gate_blocks_measurement(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "gate.json"
