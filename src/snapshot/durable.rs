@@ -267,6 +267,28 @@ impl DurableStore {
         self.is_complete()
     }
 
+    /// A pin file written during prepare is not a committed retention claim.
+    /// Cache discovery uses the same dependency audit and view lock as reopen.
+    pub(crate) fn committed_snapshot_at(
+        root: &Path,
+        content: &Path,
+    ) -> Result<Option<String>, SnapshotError> {
+        if !root.join(COMPLETE_MARKER).exists() {
+            return Ok(None);
+        }
+        let store = Self {
+            root: root.to_path_buf(),
+            content: content.to_path_buf(),
+        };
+        let Some(_transaction) = store.try_transaction()? else {
+            return Ok(None);
+        };
+        if store.completed_manifest_locked()?.is_none() {
+            return Ok(None);
+        }
+        Ok(store.stored_view()?.map(|view| view.snapshot_id))
+    }
+
     /// Hydrate (or resume hydrating) a fixed view from a live reader.
     ///
     /// The manifest is walked in full first: an incomplete listing is an

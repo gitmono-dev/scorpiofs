@@ -610,6 +610,12 @@ async fn failure_after_pin_publication_cannot_leave_complete() {
     drop(fault);
     assert_eq!(error.code, SnapshotErrorCode::Internal);
     assert!(temp.path().join(PIN_FILE).exists());
+    assert!(
+        DurableStore::committed_snapshot_at(temp.path(), store.content_dir())
+            .unwrap()
+            .is_none(),
+        "prepare pin must not be discoverable for incremental reuse"
+    );
     assert!(!store.is_complete().unwrap());
     assert!(!store.is_pinned().unwrap());
     assert!(!DurableStore::open(temp.path())
@@ -688,6 +694,13 @@ fn killed_process_recovers_only_committed_dependencies_at_each_publication_bound
         let committed = matches!(phase, "complete-renamed" | "complete-durable");
         assert_eq!(store.is_complete().unwrap(), committed, "{phase}");
         assert_eq!(store.is_pinned().unwrap(), committed, "{phase}");
+        assert_eq!(
+            DurableStore::committed_snapshot_at(temp.path(), store.content_dir())
+                .unwrap()
+                .is_some(),
+            committed,
+            "cache pin discovery: {phase}"
+        );
         if committed {
             assert_eq!(store.manifest().unwrap(), files());
             assert_eq!(store.verify_all(&files()).unwrap(), 2);
