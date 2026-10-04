@@ -373,6 +373,24 @@ async fn cold_nested_manifest_has_exact_paths_and_descendant_closure_pages() {
     assert_manifest(&sync.sync().await.unwrap(), &http.fixture.expected);
     assert_eq!(sync.meters().fetched_pages, 4);
     assert_eq!(sync.meters().traversal_nodes, 4);
+    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(
+        sync.meters().closure_index_writes,
+        1,
+        "all four records publish together"
+    );
+    assert_eq!(sync.meters().pin_set_reads, 1);
+    assert_eq!(
+        sync.meters().page_rehashes,
+        0,
+        "cold pages are initially verified on receipt"
+    );
+    assert_eq!(
+        sync.meters().closure_index_write_bytes,
+        std::fs::metadata(cache.dir().join("closures.json"))
+            .unwrap()
+            .len()
+    );
     let root = cache.record_for(&id_string(&http.fixture.root)).unwrap();
     assert_eq!(root.total_entries, 6, "three directories and three files");
     assert_eq!(root.page_ids.len(), http.fixture.pages.len());
@@ -408,6 +426,15 @@ async fn mixed_reused_and_new_children_preserve_both_manifests() {
     );
     assert_eq!(sync.meters().fetched_pages, 2);
     assert_eq!(sync.meters().traversal_nodes, 2);
+    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(
+        sync.meters().closure_index_writes,
+        1,
+        "pin transfer and new records share one commit"
+    );
+    assert_eq!(sync.meters().pin_set_reads, 1);
+    assert_eq!(sync.meters().page_rehashes, 2);
+    assert_eq!(sync.meters().unique_page_rehashes, 2);
     assert_eq!(
         cache
             .record_for(&id_string(&next.fixture.root))
@@ -466,6 +493,15 @@ async fn identical_page_ids_expand_under_every_logical_directory() {
     assert_manifest(&warm.sync().await.unwrap(), &http.fixture.expected);
     assert_eq!(warm.meters().fetched_pages, 0);
     assert_eq!(warm.meters().traversal_nodes, 0);
+    assert_eq!(warm.meters().closure_index_reads, 1);
+    assert_eq!(
+        warm.meters().closure_index_writes,
+        0,
+        "same pinned view needs no index mutation"
+    );
+    assert_eq!(warm.meters().pin_set_reads, 1);
+    assert_eq!(warm.meters().page_rehashes, 2);
+    assert_eq!(warm.meters().unique_page_rehashes, 2);
 }
 
 #[tokio::test]
@@ -506,12 +542,16 @@ async fn missing_server_page_is_an_error_and_never_writes_a_closure_record() {
     let reader = http.reader().await;
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path()).unwrap();
-    let err = IncrementalSync::new(&reader, &cache)
-        .sync()
-        .await
-        .unwrap_err();
+    let mut sync = IncrementalSync::new(&reader, &cache);
+    let err = sync.sync().await.unwrap_err();
     assert_eq!(err.code, SnapshotErrorCode::DigestMismatch);
     assert!(cache.record_for(&id_string(&http.fixture.root)).is_none());
+    assert!(
+        !cache.dir().join("closures.json").exists(),
+        "even completed sibling records stay uncommitted on failure"
+    );
+    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(sync.meters().closure_index_writes, 0);
     assert_eq!(
         reader.file_manifest_pages().await.unwrap_err().code,
         SnapshotErrorCode::DigestMismatch
