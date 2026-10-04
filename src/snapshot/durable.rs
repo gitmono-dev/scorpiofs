@@ -7,7 +7,7 @@
 //! <root>/journal.log          one JSON record per completed file (fsync'd)
 //! <root>/blobs/<hex>          file content, addressed by SHA-256
 //! <root>/DURABLE_COMPLETE     marker written only after every file verified
-//! <root>/pin.json             local pin (GC-lease governance is a later WP)
+//! <root>/pin.json             local pin bound to this view's file closure
 //! ```
 //!
 //! Two invariants drive the design:
@@ -16,12 +16,14 @@
 //!   last, after every manifest file has been fetched, digest-checked and
 //!   fsync'd. An interrupted hydration leaves the marker absent and is
 //!   resumed, not accepted.
+//! * **Reopen re-verifies.** The marker binds the view, manifest and pin, and
+//!   every referenced CAS object is checked before completeness is accepted.
 //! * **Resume re-verifies.** A journal entry is a hint, not proof: on resume
 //!   each recorded blob is re-hashed before it counts as hydrated, so a
 //!   truncated, torn or tampered CAS object is re-fetched rather than served.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -39,6 +41,9 @@ const JOURNAL_FILE: &str = "journal.log";
 const COMPLETE_MARKER: &str = "DURABLE_COMPLETE";
 const PIN_FILE: &str = "pin.json";
 const BLOB_DIR: &str = "blobs";
+const TRANSACTION_LOCK: &str = ".hydrate.lock";
+const REPAIR_FILE: &str = "NEEDS_REPAIR";
+const VERIFICATION_REVISION: u32 = 2;
 
 /// The fixed-view binding a store was hydrated from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,20 +62,49 @@ struct FileRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompleteMarker {
+    #[serde(default)]
+    verification_revision: u32,
     snapshot_id: String,
     namespace_view_id: String,
+    #[serde(default)]
+    view_digest: String,
+    #[serde(default)]
+    manifest_digest: String,
+    #[serde(default)]
+    pin_digest: String,
     files: u64,
     bytes: u64,
     hydrated_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PinRecord {
+    #[serde(default)]
+    verification_revision: u32,
+    #[serde(default)]
+    pin_id: String,
     snapshot_id: String,
+    #[serde(default)]
+    namespace_view_id: String,
     scope: String,
     lease_id: String,
+    #[serde(default)]
+    view_digest: String,
+    #[serde(default)]
+    manifest_digest: String,
+    #[serde(default)]
+    blobs: Vec<BlobDependency>,
     pinned_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BlobDependency {
+    digest: String,
+    size: u64,
 }
 
 /// Outcome of one hydration pass.
@@ -78,7 +112,8 @@ struct PinRecord {
 pub struct HydrateReport {
     pub snapshot_id: String,
     pub total_files: u64,
-    /// Files downloaded from the server in this pass.
+    /// Content fetch units downloaded in this pass. OBJECT batches merge
+    /// paths sharing a digest, so this can be smaller than logical files.
     pub fetched: u64,
     /// Files that were already hydrated and re-verified.
     pub resumed: u64,
@@ -101,6 +136,17 @@ pub struct DurableStore {
     content: PathBuf,
 }
 
+/// Transaction lifetime owns the lock, even if fork/dup retains a descriptor.
+struct TransactionGuard(File);
+
+impl Drop for TransactionGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to release local hydration lock");
+        }
+    }
+}
+
 impl DurableStore {
     /// Open (creating if needed) the store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
@@ -117,9 +163,15 @@ impl DurableStore {
     ) -> Result<Self, SnapshotError> {
         let root = root.into();
         let content = content.into();
-        fs::create_dir_all(&root).map_err(io_err)?;
-        fs::create_dir_all(&content).map_err(io_err)?;
-        Ok(Self { root, content })
+        create_dirs_durable(&root)?;
+        create_dirs_durable(&content)?;
+        let store = Self { root, content };
+        // Recovery uses the same lock as publication: an active writer must
+        // never have its in-progress state invalidated by another opener.
+        if let Some(_transaction) = store.try_transaction()? {
+            store.completed_manifest_locked()?;
+        }
+        Ok(store)
     }
 
     /// The content-addressed cache backing this view (shared across the
@@ -159,25 +211,14 @@ impl DurableStore {
         Ok(self.content.join(hex))
     }
 
-    /// True only when the marker exists *and* names this view. A marker that
-    /// exists at all is proof that every file was verified at write time.
+    /// True only when the committed view, manifest, pin and all referenced
+    /// content still verify. Damaged/legacy markers become NEEDS_REPAIR;
+    /// a concurrent hydration is not reported complete.
     pub fn is_complete(&self) -> Result<bool, SnapshotError> {
-        let marker = self.root.join(COMPLETE_MARKER);
-        if !marker.exists() {
-            return Ok(false);
-        }
-        let bytes = fs::read(&marker).map_err(io_err)?;
-        let parsed: CompleteMarker = serde_json::from_slice(&bytes).map_err(|e| {
-            SnapshotError::new(
-                SnapshotErrorCode::Internal,
-                format!("corrupt {COMPLETE_MARKER}: {e}"),
-            )
-        })?;
-        // A marker without a matching view.json binding is not proof.
-        let Some(view) = self.stored_view()? else {
+        let Some(_transaction) = self.try_transaction()? else {
             return Ok(false);
         };
-        Ok(parsed.snapshot_id == view.snapshot_id)
+        Ok(self.completed_manifest_locked()?.is_some())
     }
 
     /// The view this store was hydrated from, if any.
@@ -201,8 +242,9 @@ impl DurableStore {
     /// refused instead of writing a marker that would claim protection the
     /// store cannot back.
     pub fn pin(&self, view: &ViewMeta) -> Result<(), SnapshotError> {
+        let _transaction = self.transaction()?;
         match self.stored_view()? {
-            Some(stored) if stored.snapshot_id == view.snapshot_id => {}
+            Some(stored) if stored == *view => {}
             Some(stored) => {
                 return Err(SnapshotError::new(
                     SnapshotErrorCode::DurableViewConflict,
@@ -221,33 +263,41 @@ impl DurableStore {
                 ))
             }
         }
-        let record = PinRecord {
-            snapshot_id: view.snapshot_id.clone(),
-            scope: view.scope.clone(),
-            lease_id: view.lease_id.clone(),
-            pinned_at_unix: now_unix(),
-        };
-        let bytes = serde_json::to_vec_pretty(&record)
-            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
-        write_atomic(&self.root, PIN_FILE, &bytes)
+        // Hydration publishes its pin before its commit record. Repeating
+        // pin() is idempotent; rewriting it would break the marker's binding.
+        self.completed_manifest_locked()?.ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "a pin requires a complete, verified file closure",
+            )
+        })?;
+        Ok(())
     }
 
     pub fn is_pinned(&self) -> Result<bool, SnapshotError> {
-        let path = self.root.join(PIN_FILE);
-        if !path.exists() {
-            return Ok(false);
+        self.is_complete()
+    }
+
+    /// A pin file written during prepare is not a committed retention claim.
+    /// Cache discovery uses the same dependency audit and view lock as reopen.
+    pub(crate) fn committed_snapshot_at(
+        root: &Path,
+        content: &Path,
+    ) -> Result<Option<String>, SnapshotError> {
+        if !root.join(COMPLETE_MARKER).exists() {
+            return Ok(None);
         }
-        let bytes = fs::read(&path).map_err(io_err)?;
-        let rec: PinRecord = serde_json::from_slice(&bytes).map_err(|e| {
-            SnapshotError::new(
-                SnapshotErrorCode::Internal,
-                format!("corrupt {PIN_FILE}: {e}"),
-            )
-        })?;
-        match self.stored_view()? {
-            Some(v) => Ok(rec.snapshot_id == v.snapshot_id),
-            None => Ok(false),
+        let store = Self {
+            root: root.to_path_buf(),
+            content: content.to_path_buf(),
+        };
+        let Some(_transaction) = store.try_transaction()? else {
+            return Ok(None);
+        };
+        if store.completed_manifest_locked()?.is_none() {
+            return Ok(None);
         }
+        Ok(store.stored_view()?.map(|view| view.snapshot_id))
     }
 
     /// Hydrate (or resume hydrating) a fixed view from a live reader.
@@ -262,15 +312,12 @@ impl DurableStore {
             lease_id: reader.lease_id.clone(),
         };
         let manifest = reader.file_manifest().await?;
-        let report = self
-            .hydrate_with(&view, &manifest, |f| {
-                let digest = f.content_digest.clone();
-                let path = f.rel_path.clone();
-                async move { reader.read_file(&path, &digest).await }
-            })
-            .await?;
-        self.pin(&view)?;
-        Ok(report)
+        self.hydrate_with(&view, &manifest, |f| {
+            let digest = f.content_digest.clone();
+            let path = f.rel_path.clone();
+            async move { reader.read_file(&path, &digest).await }
+        })
+        .await
     }
 
     /// Hydration core, parameterised over the byte source so the write-ahead,
@@ -285,24 +332,7 @@ impl DurableStore {
         F: Fn(&SnapshotFile) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
     {
-        // A different view must never be grafted onto existing durable state.
-        if let Some(stored) = self.stored_view()? {
-            if stored.snapshot_id != view.snapshot_id {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::DurableViewConflict,
-                    format!(
-                        "store at {} holds view {}, refusing to hydrate {}",
-                        self.root.display(),
-                        stored.snapshot_id,
-                        view.snapshot_id
-                    ),
-                ));
-            }
-        }
-
-        // Structural check only: a corrupt journal is still an error, but the
-        // reuse decision below is made against the CAS, not the journal.
-        let _journal = self.read_journal()?;
+        let _transaction = self.prepare_hydration(view, manifest)?;
         let mut fetched = 0u64;
         let mut resumed = 0u64;
         let mut repaired = 0u64;
@@ -327,8 +357,7 @@ impl DurableStore {
                 }
                 Ok(false) => {
                     if self.blob_path(&f.content_digest)?.exists() {
-                        // Present but wrong: drop it and refetch.
-                        let _ = fs::remove_file(self.blob_path(&f.content_digest)?);
+                        // Present but wrong: refetch and atomically replace it.
                         repaired += 1;
                     }
                 }
@@ -393,20 +422,7 @@ impl DurableStore {
             + Clone
             + 'static,
     {
-        if let Some(stored) = self.stored_view()? {
-            if stored.snapshot_id != view.snapshot_id {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::DurableViewConflict,
-                    format!(
-                        "store at {} holds view {}, refusing to hydrate {}",
-                        self.root.display(),
-                        stored.snapshot_id,
-                        view.snapshot_id
-                    ),
-                ));
-            }
-        }
-        let _journal = self.read_journal()?;
+        let _transaction = self.prepare_hydration(view, manifest)?;
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
         let repaired = std::sync::atomic::AtomicU64::new(0);
@@ -436,8 +452,7 @@ impl DurableStore {
                         return Ok(());
                     }
                     if store.blob_path(&f.content_digest)?.exists() {
-                        // Present but wrong: drop it and refetch.
-                        let _ = fs::remove_file(store.blob_path(&f.content_digest)?);
+                        // Present but wrong: refetch and atomically replace it.
                         repaired.fetch_add(1, Relaxed);
                     }
                     let bytes: std::sync::Arc<Vec<u8>> = fetch(f.clone()).await?;
@@ -523,20 +538,7 @@ impl DurableStore {
 
         use futures::stream::{StreamExt, TryStreamExt};
 
-        if let Some(stored) = self.stored_view()? {
-            if stored.snapshot_id != view.snapshot_id {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::DurableViewConflict,
-                    format!(
-                        "store at {} holds view {}, refusing to hydrate {}",
-                        self.root.display(),
-                        stored.snapshot_id,
-                        view.snapshot_id
-                    ),
-                ));
-            }
-        }
-        let _journal = self.read_journal()?;
+        let _transaction = self.prepare_hydration(view, manifest)?;
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
         let repaired = std::sync::atomic::AtomicU64::new(0);
@@ -559,7 +561,6 @@ impl DurableStore {
                 }
                 Ok(false) => {
                     if store.blob_path(&f.content_digest)?.exists() {
-                        let _ = fs::remove_file(store.blob_path(&f.content_digest)?);
                         repaired.fetch_add(1, Relaxed);
                     }
                     need.push(f.clone());
@@ -636,14 +637,12 @@ impl DurableStore {
                                 ),
                             ));
                         }
-                        // No per-file fsync: the journal fsync at the end of
-                        // this batch is the durability point, and resume
-                        // re-hashes every object regardless.
-                        write_atomic_opts(
+                        // The journal cannot make another file's data durable.
+                        // Each CAS object is synced before the batch journal.
+                        write_atomic(
                             &store.content,
                             &blob_name(&f.content_digest),
                             data.as_slice(),
-                            false,
                         )?;
                         journal_lines.push(
                             serde_json::to_string(&FileRecord {
@@ -659,9 +658,7 @@ impl DurableStore {
                         bytes_b.fetch_add(f.size, Relaxed);
                     }
                     store.append_journal_batch(&journal_lines)?;
-                    if let Ok(d) = std::fs::File::open(store.content_dir()) {
-                        let _ = d.sync_all();
-                    }
+                    sync_dir(store.content_dir())?;
                     Ok(())
                 }
             })
@@ -714,36 +711,275 @@ impl DurableStore {
         store.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
     }
 
-    /// Shared DURABLE_COMPLETE tail for the sequential and concurrent cores.
+    // A file lock is held for the whole publication transaction, including
+    // network awaits. It is nonblocking: unrelated async tasks never wait on
+    // a short critical-section lock held by a downloading task. Dropping the
+    // handle (including after process exit) releases the OS lock.
+    fn try_transaction(&self) -> Result<Option<TransactionGuard>, SnapshotError> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join(TRANSACTION_LOCK))
+            .map_err(io_err)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(TransactionGuard(lock))),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(e)) => Err(io_err(e)),
+        }
+    }
+
+    fn transaction(&self) -> Result<TransactionGuard, SnapshotError> {
+        self.try_transaction()?.ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "another local hydration transaction is active",
+            )
+        })
+    }
+
+    fn prepare_hydration(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+    ) -> Result<TransactionGuard, SnapshotError> {
+        let transaction = self.transaction()?;
+        validate_view(view)?;
+        // Check identity before revoking anything: a conflicting caller must
+        // leave the existing view's complete commitment untouched. A renewed
+        // remote lease does not change the fixed view's identity.
+        if let Some(stored) = self.stored_view()? {
+            if stored.snapshot_id != view.snapshot_id
+                || stored.namespace_view_id != view.namespace_view_id
+                || stored.scope != view.scope
+            {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DurableViewConflict,
+                    format!(
+                        "store at {} holds a different fixed view",
+                        self.root.display()
+                    ),
+                ));
+            }
+        }
+        validate_manifest(manifest)?;
+        if let Some(mut previous) = self.bound_manifest()? {
+            let mut incoming = manifest.to_vec();
+            previous.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+            incoming.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+            if previous != incoming {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DurableViewConflict,
+                    "a fixed view cannot be hydrated with a different file closure",
+                ));
+            }
+        }
+        // COMPLETE is a current claim, not a historical flag. Revoke it
+        // durably before a repair can fail or be cancelled partway through.
+        self.invalidate_complete()?;
+        // Persist the fixed-view binding even for an interrupted first pass.
+        // A later caller cannot graft a different scope/view onto its journal.
+        let view_bytes = serde_json::to_vec_pretty(view)
+            .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))?;
+        write_atomic(&self.root, VIEW_FILE, &view_bytes)?;
+        durability_checkpoint(&self.root, "marker-revoked")?;
+        let _journal = self.read_journal()?;
+        self.truncate_journal_tail()?;
+        Ok(transaction)
+    }
+
+    fn bound_manifest(&self) -> Result<Option<Vec<SnapshotFile>>, SnapshotError> {
+        let Some(marker_bytes) = read_optional(&self.root.join(COMPLETE_MARKER))? else {
+            return Ok(None);
+        };
+        let Ok(marker) = serde_json::from_slice::<CompleteMarker>(&marker_bytes) else {
+            return Ok(None);
+        };
+        if marker.verification_revision != VERIFICATION_REVISION {
+            return Ok(None);
+        }
+        let Some(bytes) = read_optional(&self.root.join(MANIFEST_FILE))? else {
+            return Ok(None);
+        };
+        if digest_of(&bytes) != marker.manifest_digest {
+            return Ok(None);
+        }
+        Ok(Some(decode_commit(&bytes, MANIFEST_FILE)?))
+    }
+
+    fn invalidate_complete(&self) -> Result<(), SnapshotError> {
+        match fs::remove_file(self.root.join(COMPLETE_MARKER)) {
+            Ok(()) => sync_dir(&self.root),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    // The lock must be held by the caller. Recovery does not rely on the
+    // append-only journal: that is only a hint, not a committed dependency.
+    fn completed_manifest_locked(&self) -> Result<Option<Vec<SnapshotFile>>, SnapshotError> {
+        let Some(marker_bytes) = read_optional(&self.root.join(COMPLETE_MARKER))? else {
+            return Ok(None);
+        };
+        match self.verify_commit(&marker_bytes) {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(error)
+                if matches!(
+                    error.code,
+                    SnapshotErrorCode::IntegrityError | SnapshotErrorCode::DigestMismatch
+                ) =>
+            {
+                self.invalidate_complete()?;
+                write_atomic(&self.root, REPAIR_FILE, error.message.as_bytes())?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn verify_commit(&self, marker_bytes: &[u8]) -> Result<Vec<SnapshotFile>, SnapshotError> {
+        let marker: CompleteMarker = decode_commit(marker_bytes, COMPLETE_MARKER)?;
+        if marker.verification_revision != VERIFICATION_REVISION {
+            return Err(integrity_err("legacy or unsupported completion revision"));
+        }
+        let view_bytes = required_dependency(&self.root.join(VIEW_FILE))?;
+        let manifest_bytes = required_dependency(&self.root.join(MANIFEST_FILE))?;
+        let pin_bytes = required_dependency(&self.root.join(PIN_FILE))?;
+        if digest_of(&view_bytes) != marker.view_digest
+            || digest_of(&manifest_bytes) != marker.manifest_digest
+            || digest_of(&pin_bytes) != marker.pin_digest
+        {
+            return Err(integrity_err("completion metadata digest mismatch"));
+        }
+        let view: ViewMeta = decode_commit(&view_bytes, VIEW_FILE)?;
+        validate_view(&view)?;
+        let manifest: Vec<SnapshotFile> = decode_commit(&manifest_bytes, MANIFEST_FILE)?;
+        let pin: PinRecord = decode_commit(&pin_bytes, PIN_FILE)?;
+        let (dependencies, bytes_total) = validate_manifest(&manifest)?;
+        if marker.snapshot_id != view.snapshot_id
+            || marker.namespace_view_id != view.namespace_view_id
+            || marker.files != manifest.len() as u64
+            || marker.bytes != bytes_total
+            || pin.verification_revision != VERIFICATION_REVISION
+            || pin.pin_id.is_empty()
+            || pin.snapshot_id != view.snapshot_id
+            || pin.namespace_view_id != view.namespace_view_id
+            || pin.scope != view.scope
+            || pin.lease_id != view.lease_id
+            || pin.view_digest != marker.view_digest
+            || pin.manifest_digest != marker.manifest_digest
+            || pin.blobs != dependencies
+        {
+            return Err(integrity_err(
+                "completion view, pin or file closure mismatch",
+            ));
+        }
+        for blob in dependencies {
+            if !self.verify_blob(&blob.digest, blob.size)? {
+                return Err(integrity_err(format!(
+                    "completion dependency missing or corrupt: {}",
+                    blob.digest
+                )));
+            }
+        }
+        Ok(manifest)
+    }
+
+    /// Shared completion tail. This commits the file closure supplied by the
+    /// current API; canonical descriptor, metadata pages and empty directories
+    /// require a richer manifest API before full spec 11 closure can be claimed.
     fn finish_hydration(
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
-        bytes_total: u64,
+        _bytes_total: u64,
         fetched: u64,
         resumed: u64,
         repaired: u64,
     ) -> Result<HydrateReport, SnapshotError> {
-        // Persist the manifest before the marker: an offline reopen must
-        // serve exactly the view that was hydrated, not a guess rebuilt from
-        // the journal.
+        let (dependencies, bytes_total) = validate_manifest(manifest)?;
+        // Reuse is not a durability certificate. Sync every unique dependency
+        // (including cache hits), then its directory, before metadata/pin.
+        for blob in &dependencies {
+            if !self.verify_blob(&blob.digest, blob.size)? {
+                return Err(integrity_err(format!(
+                    "hydration dependency missing or corrupt: {}",
+                    blob.digest
+                )));
+            }
+            sync_file(&self.blob_path(&blob.digest)?)?;
+        }
+        sync_dir(&self.content)?;
+        durability_checkpoint(&self.root, "content-durable")?;
+        // OBJECT batches deduplicate content, but the journal still records
+        // every logical path (including aliases), with one final sync.
+        let journal_lines: Result<Vec<_>, _> = manifest
+            .iter()
+            .map(|file| {
+                serde_json::to_string(&FileRecord {
+                    rel_path: file.rel_path.clone(),
+                    digest: file.content_digest.clone(),
+                    size: file.size,
+                })
+            })
+            .collect();
+        self.append_journal_batch(&journal_lines.map_err(|error| {
+            SnapshotError::new(SnapshotErrorCode::Internal, error.to_string())
+        })?)?;
         let manifest_bytes = serde_json::to_vec_pretty(manifest)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         write_atomic(&self.root, MANIFEST_FILE, &manifest_bytes)?;
+        durability_checkpoint(&self.root, "manifest-durable")?;
 
-        let marker = CompleteMarker {
+        let view_bytes = serde_json::to_vec_pretty(view)
+            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
+        write_atomic(&self.root, VIEW_FILE, &view_bytes)?;
+        durability_checkpoint(&self.root, "view-durable")?;
+        let view_digest = digest_of(&view_bytes);
+        let manifest_digest = digest_of(&manifest_bytes);
+        let pin = PinRecord {
+            verification_revision: VERIFICATION_REVISION,
+            pin_id: uuid::Uuid::new_v4().to_string(),
             snapshot_id: view.snapshot_id.clone(),
             namespace_view_id: view.namespace_view_id.clone(),
+            scope: view.scope.clone(),
+            lease_id: view.lease_id.clone(),
+            view_digest: view_digest.clone(),
+            manifest_digest: manifest_digest.clone(),
+            blobs: dependencies,
+            pinned_at_unix: now_unix(),
+        };
+        let pin_bytes = serde_json::to_vec_pretty(&pin)
+            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
+        write_atomic(&self.root, PIN_FILE, &pin_bytes)?;
+        durability_checkpoint(&self.root, "pin-durable")?;
+        match fs::remove_file(self.root.join(REPAIR_FILE)) {
+            Ok(()) => sync_dir(&self.root)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(e)),
+        }
+
+        let marker = CompleteMarker {
+            verification_revision: VERIFICATION_REVISION,
+            snapshot_id: view.snapshot_id.clone(),
+            namespace_view_id: view.namespace_view_id.clone(),
+            view_digest,
+            manifest_digest,
+            pin_digest: digest_of(&pin_bytes),
             files: manifest.len() as u64,
             bytes: bytes_total,
             hydrated_at_unix: now_unix(),
         };
-        let view_bytes = serde_json::to_vec_pretty(view)
-            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
-        write_atomic(&self.root, VIEW_FILE, &view_bytes)?;
         let marker_bytes = serde_json::to_vec_pretty(&marker)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
-        write_atomic(&self.root, COMPLETE_MARKER, &marker_bytes)?;
+        // The final rename+directory sync is the linearization point. An
+        // error must not leave a visible COMPLETE from a failed repair.
+        if let Err(error) = write_atomic(&self.root, COMPLETE_MARKER, &marker_bytes) {
+            self.invalidate_complete()?;
+            return Err(error);
+        }
+        durability_checkpoint(&self.root, "complete-durable")?;
 
         Ok(HydrateReport {
             snapshot_id: view.snapshot_id.clone(),
@@ -759,19 +995,20 @@ impl DurableStore {
     /// The persisted manifest of a completed hydration. Refuses to hand out a
     /// manifest when the completeness marker is absent or names another view.
     pub fn manifest(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
-        if !self.is_complete()? {
-            return Err(SnapshotError::new(
-                SnapshotErrorCode::SnapshotNotReady,
-                format!("{}: no complete hydration to reopen", self.root.display()),
-            ));
+        let _transaction = self.transaction()?;
+        if let Some(manifest) = self.completed_manifest_locked()? {
+            return Ok(manifest);
         }
-        let bytes = fs::read(self.root.join(MANIFEST_FILE)).map_err(io_err)?;
-        serde_json::from_slice(&bytes).map_err(|e| {
-            SnapshotError::new(
-                SnapshotErrorCode::Internal,
-                format!("corrupt {MANIFEST_FILE}: {e}"),
-            )
-        })
+        let detail = read_optional(&self.root.join(REPAIR_FILE))?
+            .map(|bytes| format!("; NEEDS_REPAIR: {}", String::from_utf8_lossy(&bytes)))
+            .unwrap_or_default();
+        Err(SnapshotError::new(
+            SnapshotErrorCode::SnapshotNotReady,
+            format!(
+                "{}: no complete hydration to reopen{detail}",
+                self.root.display()
+            ),
+        ))
     }
 
     /// Bounded range read of one CAS object: `None` when the object is not in
@@ -842,12 +1079,12 @@ impl DurableStore {
     /// True when the blob exists, has the advertised size and hashes correctly.
     fn verify_blob(&self, digest: &str, expected_size: u64) -> Result<bool, SnapshotError> {
         let path = self.blob_path(digest)?;
-        let meta = match fs::metadata(&path) {
+        let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(io_err(e)),
         };
-        if meta.len() != expected_size {
+        if !meta.is_file() || meta.len() != expected_size {
             return Ok(false);
         }
         let bytes = fs::read(&path).map_err(io_err)?;
@@ -900,10 +1137,8 @@ impl DurableStore {
     }
 
     /// Append journal lines with a single write + fsync. Used by the batched
-    /// hydration: per-file fsyncs dominated cold-mount time on real trees
-    /// (3 fsyncs per file). Recovery does not depend on the per-file fsync —
-    /// resume re-hashes every CAS object before crediting it, so a batch
-    /// boundary is the only durability point that matters.
+    /// hydration. This syncs the journal itself, never the referenced blob
+    /// files; the blob publishers and final closure audit sync those first.
     fn append_journal_batch(&self, lines: &[String]) -> Result<(), SnapshotError> {
         if lines.is_empty() {
             return Ok(());
@@ -919,7 +1154,26 @@ impl DurableStore {
             .open(self.root.join(JOURNAL_FILE))
             .map_err(io_err)?;
         f.write_all(&buf).map_err(io_err)?;
-        f.sync_all().map_err(io_err)
+        f.sync_all().map_err(io_err)?;
+        sync_dir(&self.root)
+    }
+
+    fn truncate_journal_tail(&self) -> Result<(), SnapshotError> {
+        let path = self.root.join(JOURNAL_FILE);
+        let Some(bytes) = read_optional(&path)? else {
+            return Ok(());
+        };
+        if bytes.ends_with(b"\n") || bytes.is_empty() {
+            return Ok(());
+        }
+        let end = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |idx| idx + 1);
+        let file = OpenOptions::new().write(true).open(&path).map_err(io_err)?;
+        file.set_len(end as u64).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+        sync_dir(&self.root)
     }
 }
 
@@ -934,17 +1188,10 @@ pub fn digest_of(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(cx.finish().as_ref()))
 }
 
-/// Write `data` to `dir/name` atomically: temp file, fsync, rename, fsync dir.
-/// A crash leaves either the old object or nothing — never a half-written one.
+/// Write `data` to `dir/name`: unique temp, data fsync, rename, directory
+/// fsync. No successful return is possible when either sync fails.
 fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
-    write_atomic_opts(dir, name, data, true)
-}
-
-/// [`write_atomic`] without the fsyncs: for batched hydration the journal
-/// fsync at the batch boundary is the durability point, and resume re-hashes
-/// every object anyway — per-file fsyncs only burn wall time.
-fn write_atomic_opts(dir: &Path, name: &str, data: &[u8], sync: bool) -> Result<(), SnapshotError> {
-    fs::create_dir_all(dir).map_err(io_err)?;
+    create_dirs_durable(dir)?;
     // Random per writer: concurrent hydrations of identical content may race
     // on the same final name but must not share a tmp path.
     let tmp = dir.join(format!(
@@ -952,19 +1199,202 @@ fn write_atomic_opts(dir: &Path, name: &str, data: &[u8], sync: bool) -> Result<
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    {
+    let result = (|| {
         let mut f = File::create(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
-        if sync {
-            f.sync_all().map_err(io_err)?;
+        durability_checkpoint(dir, "object-file-sync")?;
+        f.sync_all().map_err(io_err)?;
+        fs::rename(&tmp, dir.join(name)).map_err(io_err)?;
+        if name == COMPLETE_MARKER {
+            durability_checkpoint(dir, "complete-renamed")?;
+        }
+        sync_dir(dir)
+    })();
+    if result.is_err() {
+        // Only the unpublished temporary file is disposable. An already
+        // renamed completion record is revoked by the transaction caller.
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {} // Cleanup must not mask the original I/O failure.
         }
     }
-    fs::rename(&tmp, dir.join(name)).map_err(io_err)?;
-    if sync {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
+    result
+}
+
+fn sync_file(path: &Path) -> Result<(), SnapshotError> {
+    durability_checkpoint(path, "file-sync")?;
+    File::open(path).map_err(io_err)?.sync_all().map_err(io_err)
+}
+
+fn sync_dir(path: &Path) -> Result<(), SnapshotError> {
+    durability_checkpoint(path, "directory-sync")?;
+    File::open(path).map_err(io_err)?.sync_all().map_err(io_err)
+}
+
+// New directory names also need their parents persisted. Existing directory
+// chains need no new entry sync until a file is published in them.
+fn create_dirs_durable(path: &Path) -> Result<(), SnapshotError> {
+    let mut missing = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match fs::metadata(&cursor) {
+            Ok(meta) if meta.is_dir() => break,
+            Ok(_) => {
+                return Err(io_err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "store path is not a directory",
+                )))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor.clone());
+                cursor = parent_dir(&cursor).to_path_buf();
+            }
+            Err(e) => return Err(io_err(e)),
         }
     }
+    fs::create_dir_all(path).map_err(io_err)?;
+    for directory in missing.iter().rev() {
+        sync_dir(directory)?;
+        sync_dir(parent_dir(directory))?;
+    }
+    Ok(())
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SnapshotError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err(e)),
+    }
+}
+
+fn required_dependency(path: &Path) -> Result<Vec<u8>, SnapshotError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(integrity_err("completion metadata is not a regular file"))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(integrity_err(format!(
+                "completion dependency missing: {}",
+                path.display()
+            )))
+        }
+        Err(e) => return Err(io_err(e)),
+    }
+    read_optional(path)?
+        .ok_or_else(|| integrity_err(format!("completion dependency missing: {}", path.display())))
+}
+
+fn decode_commit<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    name: &str,
+) -> Result<T, SnapshotError> {
+    serde_json::from_slice(bytes).map_err(|e| integrity_err(format!("corrupt {name}: {e}")))
+}
+
+fn integrity_err(message: impl Into<String>) -> SnapshotError {
+    SnapshotError::new(SnapshotErrorCode::IntegrityError, message)
+}
+
+fn validate_view(view: &ViewMeta) -> Result<(), SnapshotError> {
+    if view.snapshot_id.is_empty()
+        || view.namespace_view_id.is_empty()
+        || view.lease_id.is_empty()
+        || !view.scope.starts_with('/')
+        || view.scope.len() > 4096
+        || (view.scope != "/"
+            && view.scope[1..].split('/').any(|part| {
+                part.is_empty()
+                    || part == "."
+                    || part == ".."
+                    || part.len() > 255
+                    || part.contains(['\\', '\0'])
+            }))
+    {
+        return Err(integrity_err("invalid fixed-view binding"));
+    }
+    Ok(())
+}
+
+// Only the supplied file closure is available here. Directory metadata and
+// empty-directory entries are intentionally not inferred from file paths.
+fn validate_manifest(
+    manifest: &[SnapshotFile],
+) -> Result<(Vec<BlobDependency>, u64), SnapshotError> {
+    let mut paths = HashSet::new();
+    let mut blobs = BTreeMap::new();
+    let mut total = 0u64;
+    for file in manifest {
+        let components: Vec<_> = file.rel_path.split('/').collect();
+        if file.rel_path.len() > 4096
+            || components.len() > 256
+            || components.iter().any(|part| {
+                part.is_empty()
+                    || *part == "."
+                    || *part == ".."
+                    || part.len() > 255
+                    || part.contains(['\\', '\0'])
+            })
+            || !matches!(
+                file.fs_kind.as_str(),
+                "file" | "regular" | "executable" | "symlink"
+            )
+            || !paths.insert(file.rel_path.as_str())
+        {
+            return Err(integrity_err(format!(
+                "invalid or duplicate file path/kind: {:?}",
+                file.rel_path
+            )));
+        }
+        let hex = file
+            .content_digest
+            .strip_prefix("sha256:")
+            .ok_or_else(|| integrity_err("manifest digest lacks sha256 prefix"))?;
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(integrity_err("manifest digest is not canonical SHA-256"));
+        }
+        if let Some(size) = blobs.insert(file.content_digest.clone(), file.size) {
+            if size != file.size {
+                return Err(integrity_err(
+                    "the same content digest has conflicting sizes",
+                ));
+            }
+        }
+        total = total
+            .checked_add(file.size)
+            .ok_or_else(|| integrity_err("manifest byte count overflow"))?;
+    }
+    for path in &paths {
+        for (offset, _) in path.match_indices('/') {
+            if paths.contains(&path[..offset]) {
+                return Err(integrity_err("a manifest file is another file's ancestor"));
+            }
+        }
+    }
+    Ok((
+        blobs
+            .into_iter()
+            .map(|(digest, size)| BlobDependency { digest, size })
+            .collect(),
+        total,
+    ))
+}
+
+fn durability_checkpoint(_path: &Path, _phase: &str) -> Result<(), SnapshotError> {
+    #[cfg(test)]
+    durability_tests::checkpoint(_path, _phase)?;
     Ok(())
 }
 
@@ -978,6 +1408,10 @@ fn now_unix() -> u64 {
 fn io_err(e: io::Error) -> SnapshotError {
     SnapshotError::new(SnapshotErrorCode::Internal, format!("local store: {e}"))
 }
+
+#[cfg(test)]
+#[path = "durable_tests.rs"]
+mod durability_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1052,7 +1486,12 @@ mod tests {
         assert_eq!(first.resumed, 0);
         assert!(first.complete);
         assert_eq!(calls.borrow().len(), 3);
-        assert!(store.is_complete().unwrap());
+        assert!(
+            store.is_complete().unwrap(),
+            "completion marker exists={}, repair={:?}",
+            store.root.join(COMPLETE_MARKER).exists(),
+            fs::read_to_string(store.root.join(REPAIR_FILE))
+        );
 
         // Re-open: journal + re-hash verification means zero network traffic.
         let store2 = DurableStore::open(tmp.path()).unwrap();

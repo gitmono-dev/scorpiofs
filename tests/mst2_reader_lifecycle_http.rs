@@ -13,6 +13,7 @@ use std::{
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -53,7 +54,10 @@ struct Binding {
 struct Fixture {
     initial_expiry: Expiry,
     renewal_expiry: Expiry,
-    renewal_identity: RenewalIdentity,
+    renewal_identity: Mutex<RenewalIdentity>,
+    fail_renewal: AtomicBool,
+    plain_retry_errors: bool,
+    malformed_renewal_json: AtomicBool,
     pause_next_resolve: AtomicBool,
     pause_renewal: AtomicBool,
     resolve_count: AtomicUsize,
@@ -71,7 +75,10 @@ impl Default for Fixture {
         Self {
             initial_expiry: Expiry::After(Duration::from_secs(30)),
             renewal_expiry: Expiry::After(Duration::from_secs(30)),
-            renewal_identity: RenewalIdentity::Correct,
+            renewal_identity: Mutex::new(RenewalIdentity::Correct),
+            fail_renewal: AtomicBool::new(false),
+            plain_retry_errors: false,
+            malformed_renewal_json: AtomicBool::new(false),
             pause_next_resolve: AtomicBool::new(false),
             pause_renewal: AtomicBool::new(false),
             resolve_count: AtomicUsize::new(0),
@@ -107,7 +114,7 @@ impl Fixture {
     }
 
     async fn wait_for_renewals(&self, count: usize) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let changed = self.renewal_changed.notified();
                 if self.renewal_count.load(Ordering::SeqCst) >= count {
@@ -260,33 +267,41 @@ async fn renew(
     Path(lease): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Response {
     f.record("renew", &lease, &headers, body["lease_seconds"].as_u64());
-    let binding = f
-        .bindings
-        .lock()
-        .unwrap()
-        .get(&lease)
-        .cloned()
-        .ok_or(StatusCode::FORBIDDEN)?;
+    let binding = f.bindings.lock().unwrap().get(&lease).cloned();
+    let Some(binding) = binding else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
     if binding.actor != header(&headers, "authorization")
         || header(&headers, "x-mega-snapshot-lease").as_deref() != Some(lease.as_str())
     {
-        return Err(StatusCode::FORBIDDEN);
+        return StatusCode::FORBIDDEN.into_response();
     }
     f.renewal_count.fetch_add(1, Ordering::SeqCst);
     f.renewal_changed.notify_one();
+    if f.fail_renewal.load(Ordering::SeqCst) {
+        if f.plain_retry_errors {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error": {"code": "TEMPORARY_UNAVAILABLE", "message": "fixture backend is temporarily unavailable"}
+        }))).into_response();
+    }
+    if f.malformed_renewal_json.load(Ordering::SeqCst) {
+        return ([("content-type", "application/json")], "{broken-json").into_response();
+    }
     if f.pause_renewal.load(Ordering::SeqCst) {
         f.renewal_release.notified().await;
     }
-    let (returned_lease, snapshot) = match f.renewal_identity {
+    let (returned_lease, snapshot) = match *f.renewal_identity.lock().unwrap() {
         RenewalIdentity::Correct => (lease, binding.snapshot),
         RenewalIdentity::WrongLease => ("other-lease".into(), binding.snapshot),
         RenewalIdentity::WrongSnapshot => (lease, format!("sha256:{}", "ff".repeat(32))),
     };
     let mut response = json!({"lease_id": returned_lease, "snapshot_id": snapshot});
     add_expiry(&mut response, f.renewal_expiry);
-    Ok(Json(response))
+    Json(response).into_response()
 }
 
 struct Server {
@@ -496,7 +511,7 @@ async fn invalid_renewals_fail_closed_without_fetching_or_resolving_latest() {
         let fixture = Arc::new(Fixture {
             initial_expiry: Expiry::After(Duration::from_millis(1500)),
             renewal_expiry: expiry,
-            renewal_identity: identity,
+            renewal_identity: Mutex::new(identity),
             ..Fixture::default()
         });
         let server = serve(fixture.clone()).await;
@@ -575,5 +590,179 @@ async fn last_reader_drop_cancels_renewal_while_the_server_response_is_blocked()
         fixture.renewal_count.load(Ordering::SeqCst),
         1,
         "blocked renewal continued after last reader drop"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_503_retries_return_a_typed_error_and_recover_within_the_original_grant() {
+    let fixture = Arc::new(Fixture {
+        initial_expiry: Expiry::After(Duration::from_secs(6)),
+        fail_renewal: AtomicBool::new(true),
+        // Exercise the fallback response path: a missing error envelope must
+        // not discard the 503 status needed for bounded recovery.
+        plain_retry_errors: true,
+        ..Fixture::default()
+    });
+    let server = serve(fixture.clone()).await;
+    let client = Mst2Client::new(&server.url);
+    let reader = SnapshotReader::resolve(client.clone(), "/alpha", 600)
+        .await
+        .unwrap();
+    fixture.wait_for_renewals(4).await;
+    let error = reader
+        .lookup(&["/probe".into()])
+        .await
+        .expect_err("failed renewal was silently ignored");
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert_eq!(error.http_status, 503);
+    assert_eq!(
+        fixture.count("lookup"),
+        0,
+        "source read bypassed failed renewal"
+    );
+    assert!(
+        client.retry_count() >= 3,
+        "fixture did not exhaust the transport retry batch"
+    );
+    let failed_requests = fixture.renewal_count.load(Ordering::SeqCst);
+    fixture.fail_renewal.store(false, Ordering::SeqCst);
+    fixture.wait_for_renewals(failed_requests + 1).await;
+    probe(&reader).await;
+    assert_eq!(
+        fixture.resolve_count.load(Ordering::SeqCst),
+        1,
+        "recovery changed the fixed view"
+    );
+    assert_eq!(fixture.count("lookup"), 1);
+}
+
+#[tokio::test]
+async fn persistent_transient_failures_stop_at_the_original_deadline() {
+    let fixture = Arc::new(Fixture {
+        initial_expiry: Expiry::After(Duration::from_secs(6)),
+        fail_renewal: AtomicBool::new(true),
+        ..Fixture::default()
+    });
+    let server = serve(fixture.clone()).await;
+    let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), "/alpha", 600)
+        .await
+        .unwrap();
+    fixture.wait_for_renewals(4).await;
+    let error = reader
+        .lookup(&["/probe".into()])
+        .await
+        .expect_err("temporary outage was treated as a successful renewal");
+    assert_eq!(error.code, SnapshotErrorCode::TemporaryUnavailable);
+    assert_eq!(error.http_status, 503);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let expired = reader
+        .lookup(&["/probe".into()])
+        .await
+        .expect_err("requested seconds extended the old server grant");
+    assert_eq!(expired.code, SnapshotErrorCode::LeaseExpired);
+    let stopped = fixture.renewal_count.load(Ordering::SeqCst);
+    assert!(
+        (4..=20).contains(&stopped),
+        "renewals did not stay within the bounded retry budget: {stopped}"
+    );
+    fixture.fail_renewal.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fixture.renewal_count.load(Ordering::SeqCst),
+        stopped,
+        "expired lease continued renewing after backend recovery"
+    );
+    assert_eq!(
+        reader.lookup(&["/probe".into()]).await.unwrap_err().code,
+        SnapshotErrorCode::LeaseExpired
+    );
+    assert_eq!(fixture.count("lookup"), 0);
+    assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn wrong_renewal_identity_is_terminal_after_the_backend_is_corrected() {
+    let fixture = Arc::new(Fixture {
+        initial_expiry: Expiry::After(Duration::from_secs(3)),
+        renewal_identity: Mutex::new(RenewalIdentity::WrongLease),
+        ..Fixture::default()
+    });
+    let server = serve(fixture.clone()).await;
+    let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), "/alpha", 600)
+        .await
+        .unwrap();
+    fixture.wait_for_renewals(1).await;
+    let error = reader.lookup(&["/probe".into()]).await.unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::IntegrityError);
+    *fixture.renewal_identity.lock().unwrap() = RenewalIdentity::Correct;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        reader.lookup(&["/probe".into()]).await.unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(
+        fixture.renewal_count.load(Ordering::SeqCst),
+        1,
+        "identity failure was treated as a retryable outage"
+    );
+    assert_eq!(fixture.count("lookup"), 0);
+    assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn malformed_success_json_is_terminal_instead_of_a_network_outage() {
+    let fixture = Arc::new(Fixture {
+        initial_expiry: Expiry::After(Duration::from_secs(3)),
+        malformed_renewal_json: AtomicBool::new(true),
+        ..Fixture::default()
+    });
+    let server = serve(fixture.clone()).await;
+    let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), "/alpha", 600)
+        .await
+        .unwrap();
+    fixture.wait_for_renewals(1).await;
+    let error = reader.lookup(&["/probe".into()]).await.unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::IntegrityError);
+    fixture
+        .malformed_renewal_json
+        .store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        reader.lookup(&["/probe".into()]).await.unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(
+        fixture.renewal_count.load(Ordering::SeqCst),
+        1,
+        "invalid JSON became a recoverable grant"
+    );
+    assert_eq!(fixture.count("lookup"), 0);
+}
+
+#[tokio::test]
+async fn renewal_waiting_for_http_is_cancelled_at_the_original_deadline() {
+    let fixture = Arc::new(Fixture {
+        initial_expiry: Expiry::After(Duration::from_millis(1500)),
+        pause_renewal: AtomicBool::new(true),
+        ..Fixture::default()
+    });
+    let server = serve(fixture.clone()).await;
+    let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), "/alpha", 600)
+        .await
+        .unwrap();
+    fixture.wait_for_renewals(1).await;
+    let error = tokio::time::timeout(Duration::from_secs(2), reader.lookup(&["/probe".into()]))
+        .await
+        .expect("source read hung on renewal after the original deadline")
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::LeaseExpired);
+    fixture.pause_renewal.store(false, Ordering::SeqCst);
+    fixture.renewal_release.notify_one();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(fixture.renewal_count.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.count("lookup"), 0);
+    assert_eq!(
+        reader.lookup(&["/probe".into()]).await.unwrap_err().code,
+        SnapshotErrorCode::LeaseExpired
     );
 }
