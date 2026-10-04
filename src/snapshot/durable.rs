@@ -136,6 +136,17 @@ pub struct DurableStore {
     content: PathBuf,
 }
 
+/// Transaction lifetime owns the lock, even if fork/dup retains a descriptor.
+struct TransactionGuard(File);
+
+impl Drop for TransactionGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to release local hydration lock");
+        }
+    }
+}
+
 impl DurableStore {
     /// Open (creating if needed) the store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
@@ -704,7 +715,7 @@ impl DurableStore {
     // network awaits. It is nonblocking: unrelated async tasks never wait on
     // a short critical-section lock held by a downloading task. Dropping the
     // handle (including after process exit) releases the OS lock.
-    fn try_transaction(&self) -> Result<Option<File>, SnapshotError> {
+    fn try_transaction(&self) -> Result<Option<TransactionGuard>, SnapshotError> {
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -713,13 +724,13 @@ impl DurableStore {
             .open(self.root.join(TRANSACTION_LOCK))
             .map_err(io_err)?;
         match lock.try_lock() {
-            Ok(()) => Ok(Some(lock)),
+            Ok(()) => Ok(Some(TransactionGuard(lock))),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(e)) => Err(io_err(e)),
         }
     }
 
-    fn transaction(&self) -> Result<File, SnapshotError> {
+    fn transaction(&self) -> Result<TransactionGuard, SnapshotError> {
         self.try_transaction()?.ok_or_else(|| {
             SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
@@ -732,7 +743,7 @@ impl DurableStore {
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
-    ) -> Result<File, SnapshotError> {
+    ) -> Result<TransactionGuard, SnapshotError> {
         let transaction = self.transaction()?;
         validate_view(view)?;
         // Check identity before revoking anything: a conflicting caller must
@@ -1475,7 +1486,12 @@ mod tests {
         assert_eq!(first.resumed, 0);
         assert!(first.complete);
         assert_eq!(calls.borrow().len(), 3);
-        assert!(store.is_complete().unwrap());
+        assert!(
+            store.is_complete().unwrap(),
+            "completion marker exists={}, repair={:?}",
+            store.root.join(COMPLETE_MARKER).exists(),
+            fs::read_to_string(store.root.join(REPAIR_FILE))
+        );
 
         // Re-open: journal + re-hash verification means zero network traffic.
         let store2 = DurableStore::open(tmp.path()).unwrap();
