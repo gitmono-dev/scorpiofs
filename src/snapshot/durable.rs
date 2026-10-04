@@ -6,8 +6,11 @@
 //! <root>/view.json            descriptor binding (snapshot id, scope, view id)
 //! <root>/journal.log          one JSON record per completed file (fsync'd)
 //! <root>/blobs/<hex>          file content, addressed by SHA-256
-//! <root>/DURABLE_COMPLETE     marker written only after every file verified
-//! <root>/pin.json             local pin bound to this view's file closure
+//! <root>/descriptor.bin       canonical descriptor for a full snapshot
+//! <root>/metadata/<hex>       private canonical pages for a full snapshot
+//! <root>/metadata.json        full snapshot page/directory closure index
+//! <root>/DURABLE_COMPLETE     typed file-closure or full-snapshot commitment
+//! <root>/pin.json             local retention bound to the committed closure
 //! ```
 //!
 //! Two invariants drive the design:
@@ -33,7 +36,10 @@ use std::{
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 
-use crate::snapshot::{SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader};
+use crate::snapshot::{
+    closure::{SnapshotDirectory, ValidatedSnapshotClosure},
+    SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
+};
 
 const VIEW_FILE: &str = "view.json";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -44,6 +50,19 @@ const BLOB_DIR: &str = "blobs";
 const TRANSACTION_LOCK: &str = ".hydrate.lock";
 const REPAIR_FILE: &str = "NEEDS_REPAIR";
 const VERIFICATION_REVISION: u32 = 2;
+const SNAPSHOT_VERIFICATION_REVISION: u32 = 3;
+const DESCRIPTOR_FILE: &str = "descriptor.bin";
+const METADATA_INDEX_FILE: &str = "metadata.json";
+const METADATA_DIR: &str = "metadata";
+
+/// What a local completion record actually proves. Neither kind grants access.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKind {
+    #[default]
+    FileClosure,
+    FullSnapshot,
+}
 
 /// The fixed-view binding a store was hydrated from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +85,8 @@ struct FileRecord {
 struct CompleteMarker {
     #[serde(default)]
     verification_revision: u32,
+    #[serde(default)]
+    completion_kind: CompletionKind,
     snapshot_id: String,
     namespace_view_id: String,
     #[serde(default)]
@@ -107,6 +128,64 @@ struct BlobDependency {
     size: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PageDependency {
+    page_id: String,
+    size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataIndex {
+    verification_revision: u32,
+    pages: Vec<PageDependency>,
+    directories: Vec<SnapshotDirectory>,
+}
+
+struct MetadataCommit {
+    descriptor_digest: String,
+    metadata_index_digest: String,
+    pages: Vec<PageDependency>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotPinRecord {
+    verification_revision: u32,
+    pin_id: String,
+    snapshot_id: String,
+    namespace_view_id: String,
+    scope: String,
+    lease_id: String,
+    view_digest: String,
+    manifest_digest: String,
+    descriptor_digest: String,
+    metadata_index_digest: String,
+    pages: Vec<PageDependency>,
+    blobs: Vec<BlobDependency>,
+    pinned_at_unix: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotCompleteMarker {
+    verification_revision: u32,
+    completion_kind: CompletionKind,
+    snapshot_id: String,
+    namespace_view_id: String,
+    view_digest: String,
+    manifest_digest: String,
+    descriptor_digest: String,
+    metadata_index_digest: String,
+    pin_digest: String,
+    files: u64,
+    directories: u64,
+    pages: u64,
+    bytes: u64,
+    hydrated_at_unix: u64,
+}
+
 /// Outcome of one hydration pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HydrateReport {
@@ -120,7 +199,10 @@ pub struct HydrateReport {
     /// Resumed files whose CAS object failed re-verification and were refetched.
     pub repaired: u64,
     pub bytes_total: u64,
+    /// Complete for `completion_kind`, not necessarily a full snapshot.
     pub complete: bool,
+    /// File-only APIs cannot claim a full metadata/content closure.
+    pub completion_kind: CompletionKind,
 }
 
 /// One snapshot's durable local store.
@@ -246,14 +328,35 @@ impl DurableStore {
         Ok(self.content.join(hex))
     }
 
-    /// True only when the committed view, manifest, pin and all referenced
-    /// content still verify. Damaged/legacy markers become NEEDS_REPAIR;
-    /// a concurrent hydration is not reported complete.
+    /// True when the recorded completion kind verifies. Revision 2 proves only
+    /// files; use `is_snapshot_complete` for the full metadata/content contract.
     pub fn is_complete(&self) -> Result<bool, SnapshotError> {
         let Some(_transaction) = self.try_transaction()? else {
             return Ok(false);
         };
         Ok(self.completed_manifest_locked()?.is_some())
+    }
+
+    /// The exact audited guarantee, without treating a file list as a snapshot.
+    pub fn completion_kind(&self) -> Result<Option<CompletionKind>, SnapshotError> {
+        let Some(_transaction) = self.try_transaction()? else {
+            return Ok(None);
+        };
+        if self.completed_manifest_locked()?.is_none() {
+            return Ok(None);
+        }
+        let bytes = required_dependency(&self.root.join(COMPLETE_MARKER))?;
+        Ok(Some(if completion_revision(&bytes)? == SNAPSHOT_VERIFICATION_REVISION {
+            CompletionKind::FullSnapshot
+        } else {
+            CompletionKind::FileClosure
+        }))
+    }
+
+    /// True only for a root-verified descriptor, metadata graph and content.
+    /// This is a local retention/integrity claim, never an authorization grant.
+    pub fn is_snapshot_complete(&self) -> Result<bool, SnapshotError> {
+        Ok(self.completion_kind()? == Some(CompletionKind::FullSnapshot))
     }
 
     /// The view this store was hydrated from, if any.
@@ -356,6 +459,43 @@ impl DurableStore {
         .await
     }
 
+    /// Hydrate the complete fixed graph selected by an authorized online reader.
+    pub async fn hydrate_snapshot(
+        &self,
+        reader: &SnapshotReader,
+    ) -> Result<HydrateReport, SnapshotError> {
+        self.bind_reader(reader)?;
+        let closure = reader.snapshot_closure().await?;
+        let view = ViewMeta {
+            snapshot_id: reader.snapshot_id().to_string(),
+            namespace_view_id: reader.descriptor().namespace_view_id.clone(),
+            scope: reader.descriptor().scope.clone(),
+            lease_id: reader.lease_id().to_string(),
+        };
+        self.hydrate_snapshot_with(&view, &closure, |file| {
+            let path = file.rel_path.clone();
+            let digest = file.content_digest.clone();
+            async move { reader.read_file(&path, &digest).await }
+        })
+        .await
+    }
+
+    /// Local integrity primitive with an independently root-validated closure.
+    /// The caller must establish its own authority; no offline grant is created.
+    pub async fn hydrate_snapshot_with<F, Fut>(
+        &self,
+        view: &ViewMeta,
+        closure: &ValidatedSnapshotClosure,
+        fetch: F,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        F: Fn(&SnapshotFile) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
+    {
+        validate_snapshot_view(view, closure)?;
+        self.hydrate_file_closure(view, closure.files(), Some(closure), fetch).await
+    }
+
     /// Hydration core, parameterised over the byte source so the write-ahead,
     /// resume and verification rules can be regression-tested without HTTP.
     pub async fn hydrate_with<F, Fut>(
@@ -368,7 +508,21 @@ impl DurableStore {
         F: Fn(&SnapshotFile) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
     {
-        let _transaction = self.prepare_hydration(view, manifest)?;
+        self.hydrate_file_closure(view, manifest, None, fetch).await
+    }
+
+    async fn hydrate_file_closure<F, Fut>(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        closure: Option<&ValidatedSnapshotClosure>,
+        fetch: F,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        F: Fn(&SnapshotFile) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
+    {
+        let _transaction = self.prepare_hydration_for_kind(view, manifest, closure.is_some())?;
         let mut fetched = 0u64;
         let mut resumed = 0u64;
         let mut repaired = 0u64;
@@ -431,7 +585,12 @@ impl DurableStore {
             bytes_total += f.size;
         }
 
-        self.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired)
+        match closure {
+            Some(closure) => self.finish_hydration_commit(
+                view, manifest, Some(closure), (fetched, resumed, repaired),
+            ),
+            None => self.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired),
+        }
     }
 
     /// Concurrent hydration (spec 11 §7): identical verification/write-ahead
@@ -780,8 +939,17 @@ impl DurableStore {
         view: &ViewMeta,
         manifest: &[SnapshotFile],
     ) -> Result<TransactionGuard, SnapshotError> {
+        self.prepare_hydration_for_kind(view, manifest, false)
+    }
+
+    fn prepare_hydration_for_kind(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        full_snapshot: bool,
+    ) -> Result<TransactionGuard, SnapshotError> {
         let transaction = self.transaction()?;
-        validate_view(view)?;
+        validate_view_policy(view, full_snapshot)?;
         // Check identity before revoking anything: a conflicting caller must
         // leave the existing view's complete commitment untouched. A renewed
         // remote lease does not change the fixed view's identity.
@@ -799,7 +967,14 @@ impl DurableStore {
                 ));
             }
         }
-        validate_manifest(manifest)?;
+        validate_manifest_policy(manifest, full_snapshot)?;
+        if !full_snapshot && read_optional(&self.root.join(COMPLETE_MARKER))?
+            .is_some_and(|marker| completion_revision(&marker)
+                .is_ok_and(|revision| revision == SNAPSHOT_VERIFICATION_REVISION))
+        {
+            return Err(SnapshotError::new(SnapshotErrorCode::DurableViewConflict,
+                "file-only hydration cannot downgrade a full snapshot completion"));
+        }
         if let Some(mut previous) = self.bound_manifest()? {
             let mut incoming = manifest.to_vec();
             previous.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -829,16 +1004,25 @@ impl DurableStore {
         let Some(marker_bytes) = read_optional(&self.root.join(COMPLETE_MARKER))? else {
             return Ok(None);
         };
-        let Ok(marker) = serde_json::from_slice::<CompleteMarker>(&marker_bytes) else {
-            return Ok(None);
+        let manifest_digest = match completion_revision(&marker_bytes) {
+            Ok(VERIFICATION_REVISION) => {
+                let Ok(marker) = serde_json::from_slice::<CompleteMarker>(&marker_bytes) else {
+                    return Ok(None);
+                };
+                marker.manifest_digest
+            }
+            Ok(SNAPSHOT_VERIFICATION_REVISION) => {
+                let Ok(marker) = serde_json::from_slice::<SnapshotCompleteMarker>(&marker_bytes) else {
+                    return Ok(None);
+                };
+                marker.manifest_digest
+            }
+            _ => return Ok(None),
         };
-        if marker.verification_revision != VERIFICATION_REVISION {
-            return Ok(None);
-        }
         let Some(bytes) = read_optional(&self.root.join(MANIFEST_FILE))? else {
             return Ok(None);
         };
-        if digest_of(&bytes) != marker.manifest_digest {
+        if digest_of(&bytes) != manifest_digest {
             return Ok(None);
         }
         Ok(Some(decode_commit(&bytes, MANIFEST_FILE)?))
@@ -875,8 +1059,13 @@ impl DurableStore {
     }
 
     fn verify_commit(&self, marker_bytes: &[u8]) -> Result<Vec<SnapshotFile>, SnapshotError> {
+        if completion_revision(marker_bytes)? == SNAPSHOT_VERIFICATION_REVISION {
+            return Ok(self.verify_snapshot_commit(marker_bytes)?.files().to_vec());
+        }
         let marker: CompleteMarker = decode_commit(marker_bytes, COMPLETE_MARKER)?;
-        if marker.verification_revision != VERIFICATION_REVISION {
+        if marker.verification_revision != VERIFICATION_REVISION
+            || marker.completion_kind != CompletionKind::FileClosure
+        {
             return Err(integrity_err("legacy or unsupported completion revision"));
         }
         let view_bytes = required_dependency(&self.root.join(VIEW_FILE))?;
@@ -922,6 +1111,131 @@ impl DurableStore {
         Ok(manifest)
     }
 
+    fn metadata_page_path(&self, page_id: &str) -> Result<PathBuf, SnapshotError> {
+        let id = crate::snapshot::frames::parse_digest(page_id)
+            .map_err(|error| integrity_err(error.message))?;
+        Ok(self.root.join(METADATA_DIR).join(hex::encode(id)))
+    }
+
+    // These pages are private copies of this view. No shared-page GC or pin
+    // transfer is implied, and no path deletes another view's dependencies.
+    fn persist_snapshot_metadata(
+        &self,
+        closure: &ValidatedSnapshotClosure,
+    ) -> Result<MetadataCommit, SnapshotError> {
+        let mut pages = Vec::with_capacity(closure.pages().len());
+        for (page_id, bytes) in closure.pages() {
+            let path = self.metadata_page_path(page_id)?;
+            let name = path.file_name().and_then(|name| name.to_str())
+                .ok_or_else(|| integrity_err("invalid metadata page name"))?;
+            write_atomic(&self.root.join(METADATA_DIR), name, bytes)?;
+            pages.push(PageDependency { page_id: page_id.clone(), size: bytes.len() as u64 });
+        }
+        sync_dir(&self.root.join(METADATA_DIR))?;
+        durability_checkpoint(&self.root, "metadata-pages-durable")?;
+        write_atomic(&self.root, DESCRIPTOR_FILE, closure.descriptor_bytes())?;
+        durability_checkpoint(&self.root, "descriptor-durable")?;
+        let index = MetadataIndex {
+            verification_revision: SNAPSHOT_VERIFICATION_REVISION,
+            pages: pages.clone(),
+            directories: closure.directories().to_vec(),
+        };
+        let bytes = encode_record(&index)?;
+        write_atomic(&self.root, METADATA_INDEX_FILE, &bytes)?;
+        durability_checkpoint(&self.root, "metadata-index-durable")?;
+        Ok(MetadataCommit {
+            descriptor_digest: digest_of(closure.descriptor_bytes()),
+            metadata_index_digest: digest_of(&bytes),
+            pages,
+        })
+    }
+
+    fn verify_snapshot_commit(
+        &self,
+        marker_bytes: &[u8],
+    ) -> Result<ValidatedSnapshotClosure, SnapshotError> {
+        let marker: SnapshotCompleteMarker = decode_commit(marker_bytes, COMPLETE_MARKER)?;
+        if marker.verification_revision != SNAPSHOT_VERIFICATION_REVISION
+            || marker.completion_kind != CompletionKind::FullSnapshot
+        {
+            return Err(integrity_err("record does not prove a full snapshot"));
+        }
+        let view_bytes = required_dependency(&self.root.join(VIEW_FILE))?;
+        let manifest_bytes = required_dependency(&self.root.join(MANIFEST_FILE))?;
+        let pin_bytes = required_dependency(&self.root.join(PIN_FILE))?;
+        let descriptor_bytes = required_dependency(&self.root.join(DESCRIPTOR_FILE))?;
+        let index_bytes = required_dependency(&self.root.join(METADATA_INDEX_FILE))?;
+        if digest_of(&view_bytes) != marker.view_digest
+            || digest_of(&manifest_bytes) != marker.manifest_digest
+            || digest_of(&pin_bytes) != marker.pin_digest
+            || digest_of(&descriptor_bytes) != marker.descriptor_digest
+            || digest_of(&index_bytes) != marker.metadata_index_digest
+        {
+            return Err(integrity_err("snapshot completion metadata digest mismatch"));
+        }
+        let view: ViewMeta = decode_commit(&view_bytes, VIEW_FILE)?;
+        validate_view_policy(&view, true)?;
+        let manifest: Vec<SnapshotFile> = decode_commit(&manifest_bytes, MANIFEST_FILE)?;
+        let (blobs, bytes_total) = validate_manifest_policy(&manifest, true)?;
+        let pin: SnapshotPinRecord = decode_commit(&pin_bytes, PIN_FILE)?;
+        let index: MetadataIndex = decode_commit(&index_bytes, METADATA_INDEX_FILE)?;
+        if index.verification_revision != SNAPSHOT_VERIFICATION_REVISION
+            || marker.snapshot_id != view.snapshot_id
+            || marker.namespace_view_id != view.namespace_view_id
+            || marker.files != manifest.len() as u64
+            || marker.bytes != bytes_total
+            || marker.directories != index.directories.len() as u64
+            || marker.pages != index.pages.len() as u64
+            || pin.verification_revision != SNAPSHOT_VERIFICATION_REVISION
+            || pin.pin_id.is_empty()
+            || pin.snapshot_id != view.snapshot_id
+            || pin.namespace_view_id != view.namespace_view_id
+            || pin.scope != view.scope
+            || pin.lease_id != view.lease_id
+            || pin.view_digest != marker.view_digest
+            || pin.manifest_digest != marker.manifest_digest
+            || pin.descriptor_digest != marker.descriptor_digest
+            || pin.metadata_index_digest != marker.metadata_index_digest
+            || pin.pages != index.pages
+            || pin.blobs != blobs
+        {
+            return Err(integrity_err("snapshot view, pin or closure index mismatch"));
+        }
+        let mut pages = BTreeMap::new();
+        for dependency in &index.pages {
+            let bytes = required_dependency(&self.metadata_page_path(&dependency.page_id)?)?;
+            if bytes.len() as u64 != dependency.size
+                || pages.insert(dependency.page_id.clone(), bytes).is_some()
+            {
+                return Err(integrity_err("metadata page size or identity repeated"));
+            }
+        }
+        let closure = ValidatedSnapshotClosure::from_canonical_pages(&descriptor_bytes, pages)
+            .map_err(|error| integrity_err(format!("metadata root graph: {}", error.message)))?;
+        validate_snapshot_view(&view, &closure)
+            .map_err(|error| integrity_err(error.message))?;
+        if closure.files() != manifest.as_slice() || closure.directories() != index.directories.as_slice() {
+            return Err(integrity_err("manifest does not match the descriptor's metadata graph"));
+        }
+        for blob in blobs {
+            if !self.verify_blob(&blob.digest, blob.size)? {
+                return Err(integrity_err(format!("snapshot blob missing or corrupt: {}", blob.digest)));
+            }
+        }
+        self.verify_snapshot_links(&closure)?;
+        Ok(closure)
+    }
+
+    fn verify_snapshot_links(&self, closure: &ValidatedSnapshotClosure) -> Result<(), SnapshotError> {
+        for file in closure.files().iter().filter(|file| file.fs_kind == "symlink") {
+            let bytes = self.read_blob(&file.content_digest, file.size)?;
+            if bytes.contains(&0) {
+                return Err(integrity_err("symlink target contains NUL"));
+            }
+        }
+        Ok(())
+    }
+
     /// Shared completion tail. This commits the file closure supplied by the
     /// current API; canonical descriptor, metadata pages and empty directories
     /// require a richer manifest API before full spec 11 closure can be claimed.
@@ -934,7 +1248,22 @@ impl DurableStore {
         resumed: u64,
         repaired: u64,
     ) -> Result<HydrateReport, SnapshotError> {
-        let (dependencies, bytes_total) = validate_manifest(manifest)?;
+        self.finish_hydration_commit(view, manifest, None, (fetched, resumed, repaired))
+    }
+
+    fn finish_hydration_commit(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        closure: Option<&ValidatedSnapshotClosure>,
+        counts: (u64, u64, u64),
+    ) -> Result<HydrateReport, SnapshotError> {
+        let (fetched, resumed, repaired) = counts;
+        let (dependencies, bytes_total) = validate_manifest_policy(manifest, closure.is_some())?;
+        if let Some(closure) = closure {
+            validate_snapshot_view(view, closure)?;
+            self.verify_snapshot_links(closure)?;
+        }
         // Reuse is not a durability certificate. Sync every unique dependency
         // (including cache hits), then its directory, before metadata/pin.
         for blob in &dependencies {
@@ -974,20 +1303,42 @@ impl DurableStore {
         durability_checkpoint(&self.root, "view-durable")?;
         let view_digest = digest_of(&view_bytes);
         let manifest_digest = digest_of(&manifest_bytes);
-        let pin = PinRecord {
-            verification_revision: VERIFICATION_REVISION,
-            pin_id: uuid::Uuid::new_v4().to_string(),
-            snapshot_id: view.snapshot_id.clone(),
-            namespace_view_id: view.namespace_view_id.clone(),
-            scope: view.scope.clone(),
-            lease_id: view.lease_id.clone(),
-            view_digest: view_digest.clone(),
-            manifest_digest: manifest_digest.clone(),
-            blobs: dependencies,
-            pinned_at_unix: now_unix(),
+        let completion_kind = if closure.is_some() {
+            CompletionKind::FullSnapshot
+        } else {
+            CompletionKind::FileClosure
         };
-        let pin_bytes = serde_json::to_vec_pretty(&pin)
-            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
+        let metadata = closure.map(|closure| self.persist_snapshot_metadata(closure)).transpose()?;
+        let pin_bytes = if let Some(metadata) = &metadata {
+            encode_record(&SnapshotPinRecord {
+                verification_revision: SNAPSHOT_VERIFICATION_REVISION,
+                pin_id: uuid::Uuid::new_v4().to_string(),
+                snapshot_id: view.snapshot_id.clone(),
+                namespace_view_id: view.namespace_view_id.clone(),
+                scope: view.scope.clone(),
+                lease_id: view.lease_id.clone(),
+                view_digest: view_digest.clone(),
+                manifest_digest: manifest_digest.clone(),
+                descriptor_digest: metadata.descriptor_digest.clone(),
+                metadata_index_digest: metadata.metadata_index_digest.clone(),
+                pages: metadata.pages.clone(),
+                blobs: dependencies,
+                pinned_at_unix: now_unix(),
+            })?
+        } else {
+            encode_record(&PinRecord {
+                verification_revision: VERIFICATION_REVISION,
+                pin_id: uuid::Uuid::new_v4().to_string(),
+                snapshot_id: view.snapshot_id.clone(),
+                namespace_view_id: view.namespace_view_id.clone(),
+                scope: view.scope.clone(),
+                lease_id: view.lease_id.clone(),
+                view_digest: view_digest.clone(),
+                manifest_digest: manifest_digest.clone(),
+                blobs: dependencies,
+                pinned_at_unix: now_unix(),
+            })?
+        };
         write_atomic(&self.root, PIN_FILE, &pin_bytes)?;
         durability_checkpoint(&self.root, "pin-durable")?;
         match fs::remove_file(self.root.join(REPAIR_FILE)) {
@@ -996,26 +1347,48 @@ impl DurableStore {
             Err(e) => return Err(io_err(e)),
         }
 
-        let marker = CompleteMarker {
-            verification_revision: VERIFICATION_REVISION,
-            snapshot_id: view.snapshot_id.clone(),
-            namespace_view_id: view.namespace_view_id.clone(),
-            view_digest,
-            manifest_digest,
-            pin_digest: digest_of(&pin_bytes),
-            files: manifest.len() as u64,
-            bytes: bytes_total,
-            hydrated_at_unix: now_unix(),
+        let marker_bytes = if let Some(metadata) = metadata {
+            let closure = closure.ok_or_else(|| integrity_err("snapshot closure missing"))?;
+            encode_record(&SnapshotCompleteMarker {
+                verification_revision: SNAPSHOT_VERIFICATION_REVISION,
+                completion_kind,
+                snapshot_id: view.snapshot_id.clone(),
+                namespace_view_id: view.namespace_view_id.clone(),
+                view_digest,
+                manifest_digest,
+                descriptor_digest: metadata.descriptor_digest,
+                metadata_index_digest: metadata.metadata_index_digest,
+                pin_digest: digest_of(&pin_bytes),
+                files: manifest.len() as u64,
+                directories: closure.directories().len() as u64,
+                pages: metadata.pages.len() as u64,
+                bytes: bytes_total,
+                hydrated_at_unix: now_unix(),
+            })?
+        } else {
+            encode_record(&CompleteMarker {
+                verification_revision: VERIFICATION_REVISION,
+                completion_kind,
+                snapshot_id: view.snapshot_id.clone(),
+                namespace_view_id: view.namespace_view_id.clone(),
+                view_digest,
+                manifest_digest,
+                pin_digest: digest_of(&pin_bytes),
+                files: manifest.len() as u64,
+                bytes: bytes_total,
+                hydrated_at_unix: now_unix(),
+            })?
         };
-        let marker_bytes = serde_json::to_vec_pretty(&marker)
-            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         // The final rename+directory sync is the linearization point. An
         // error must not leave a visible COMPLETE from a failed repair.
         if let Err(error) = write_atomic(&self.root, COMPLETE_MARKER, &marker_bytes) {
             self.invalidate_complete()?;
             return Err(error);
         }
-        durability_checkpoint(&self.root, "complete-durable")?;
+        if let Err(error) = durability_checkpoint(&self.root, "complete-durable") {
+            self.invalidate_complete()?;
+            return Err(error);
+        }
 
         Ok(HydrateReport {
             snapshot_id: view.snapshot_id.clone(),
@@ -1025,6 +1398,7 @@ impl DurableStore {
             repaired,
             bytes_total,
             complete: true,
+            completion_kind,
         })
     }
 
@@ -1045,6 +1419,31 @@ impl DurableStore {
                 self.root.display()
             ),
         ))
+    }
+
+    /// Root-verifies the committed local graph without contacting a server.
+    /// Integrity/retention evidence does not constitute an offline permission.
+    pub fn snapshot_manifest(&self) -> Result<ValidatedSnapshotClosure, SnapshotError> {
+        let _transaction = self.transaction()?;
+        let Some(bytes) = read_optional(&self.root.join(COMPLETE_MARKER))? else {
+            return Err(SnapshotError::new(SnapshotErrorCode::SnapshotNotReady,
+                "no full snapshot completion record"));
+        };
+        // Revision 2 remains explicitly file-only, including empty file lists.
+        if completion_revision(&bytes).is_ok_and(|revision| revision == VERIFICATION_REVISION) {
+            return Err(SnapshotError::new(SnapshotErrorCode::SnapshotNotReady,
+                "file-closure completion does not prove metadata completeness"));
+        }
+        match self.verify_snapshot_commit(&bytes) {
+            Ok(closure) => Ok(closure),
+            Err(error) if matches!(error.code,
+                SnapshotErrorCode::IntegrityError | SnapshotErrorCode::DigestMismatch) => {
+                self.invalidate_complete()?;
+                write_atomic(&self.root, REPAIR_FILE, error.message.as_bytes())?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Bounded range read of one CAS object: `None` when the object is not in
@@ -1336,11 +1735,43 @@ fn decode_commit<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(bytes).map_err(|e| integrity_err(format!("corrupt {name}: {e}")))
 }
 
+fn encode_record<T: Serialize>(record: &T) -> Result<Vec<u8>, SnapshotError> {
+    serde_json::to_vec_pretty(record)
+        .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))
+}
+
+fn completion_revision(bytes: &[u8]) -> Result<u32, SnapshotError> {
+    #[derive(Deserialize)]
+    struct Header {
+        verification_revision: u32,
+    }
+    Ok(decode_commit::<Header>(bytes, COMPLETE_MARKER)?.verification_revision)
+}
+
+fn validate_snapshot_view(
+    view: &ViewMeta,
+    closure: &ValidatedSnapshotClosure,
+) -> Result<(), SnapshotError> {
+    let descriptor = closure.descriptor();
+    if view.snapshot_id != descriptor.snapshot_id
+        || view.namespace_view_id != descriptor.namespace_view_id
+        || view.scope != descriptor.scope
+    {
+        return Err(SnapshotError::new(SnapshotErrorCode::DurableViewConflict,
+            "supplied view differs from the validated snapshot descriptor"));
+    }
+    Ok(())
+}
+
 fn integrity_err(message: impl Into<String>) -> SnapshotError {
     SnapshotError::new(SnapshotErrorCode::IntegrityError, message)
 }
 
 fn validate_view(view: &ViewMeta) -> Result<(), SnapshotError> {
+    validate_view_policy(view, false)
+}
+
+fn validate_view_policy(view: &ViewMeta, full_snapshot: bool) -> Result<(), SnapshotError> {
     if view.snapshot_id.is_empty()
         || view.namespace_view_id.is_empty()
         || view.lease_id.is_empty()
@@ -1352,7 +1783,8 @@ fn validate_view(view: &ViewMeta) -> Result<(), SnapshotError> {
                     || part == "."
                     || part == ".."
                     || part.len() > 255
-                    || part.contains(['\\', '\0'])
+                    || part.contains('\0')
+                    || (!full_snapshot && part.contains('\\'))
             }))
     {
         return Err(integrity_err("invalid fixed-view binding"));
@@ -1364,6 +1796,13 @@ fn validate_view(view: &ViewMeta) -> Result<(), SnapshotError> {
 // empty-directory entries are intentionally not inferred from file paths.
 fn validate_manifest(
     manifest: &[SnapshotFile],
+) -> Result<(Vec<BlobDependency>, u64), SnapshotError> {
+    validate_manifest_policy(manifest, false)
+}
+
+fn validate_manifest_policy(
+    manifest: &[SnapshotFile],
+    full_snapshot: bool,
 ) -> Result<(Vec<BlobDependency>, u64), SnapshotError> {
     let mut paths = HashSet::new();
     let mut blobs = BTreeMap::new();
@@ -1377,7 +1816,8 @@ fn validate_manifest(
                     || *part == "."
                     || *part == ".."
                     || part.len() > 255
-                    || part.contains(['\\', '\0'])
+                    || part.contains('\0')
+                    || (!full_snapshot && part.contains('\\'))
             })
             || !matches!(
                 file.fs_kind.as_str(),
@@ -1448,6 +1888,10 @@ fn io_err(e: io::Error) -> SnapshotError {
 #[cfg(test)]
 #[path = "durable_tests.rs"]
 mod durability_tests;
+
+#[cfg(test)]
+#[path = "durable_snapshot_tests.rs"]
+mod snapshot_durability_tests;
 
 #[cfg(test)]
 mod tests {

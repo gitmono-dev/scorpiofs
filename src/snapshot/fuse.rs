@@ -29,7 +29,9 @@ use bytes::Bytes;
 use futures::stream::iter;
 
 use crate::{
-    snapshot::{durable::DurableStore, SnapshotFile, SnapshotReader},
+    snapshot::{
+        closure::ValidatedSnapshotClosure, durable::DurableStore, SnapshotFile, SnapshotReader,
+    },
     util::file_attr::make_file_attr,
 };
 
@@ -153,6 +155,57 @@ impl Mst2Fuse {
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         let manifest = store.manifest()?;
         Self::build(None, Some(store), manifest)
+    }
+
+    /// Build from a verified complete snapshot closure without walking its
+    /// pages again. Explicit directories preserve empty directories and
+    /// give each alias path its own inode.
+    pub fn from_snapshot_manifest(
+        reader: SnapshotReader,
+        store: Arc<DurableStore>,
+        closure: ValidatedSnapshotClosure,
+    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        store.bind_reader(&reader)?;
+        let actual = closure.descriptor();
+        let expected = reader.descriptor();
+        if actual.snapshot_id != expected.snapshot_id
+            || actual.schema_version != expected.schema_version
+            || actual.metadata_codec != expected.metadata_codec
+            || actual.instance_id != expected.instance_id
+            || actual.namespace_view_id != expected.namespace_view_id
+            || actual.scope != expected.scope
+            || actual.materialization_policy != expected.materialization_policy
+            || actual.fs_semantics != expected.fs_semantics
+            || actual.access_projection != expected.access_projection
+            || actual.metadata_root != expected.metadata_root
+        {
+            return Err(crate::snapshot::SnapshotError::new(
+                crate::snapshot::SnapshotErrorCode::ScopeForbidden,
+                "snapshot closure differs from the reader's authorized descriptor",
+            ));
+        }
+        for directory in closure.directories() {
+            reader
+                .authorized_context()
+                .validate_relative_path(&directory.rel_path)?;
+        }
+        for file in closure.files() {
+            reader
+                .authorized_context()
+                .validate_relative_path(&file.rel_path)?;
+        }
+        Self::build_snapshot_closure(Some(reader), Some(store), &closure)
+    }
+
+    /// Reopen the store's complete snapshot closure using only verified local
+    /// metadata and content. This constructor does not grant offline access
+    /// authority; the caller must establish any required local access policy.
+    /// Legacy file-only completion is accepted only by [`Self::from_store`].
+    pub fn from_snapshot_store(
+        store: Arc<DurableStore>,
+    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        let closure = store.snapshot_manifest()?;
+        Self::build_snapshot_closure(None, Some(store), &closure)
     }
 
     /// Lazy mount: the tree starts at the scope root's verified page tree,
@@ -432,6 +485,94 @@ impl Mst2Fuse {
                     if is_file { Some(&f) } else { None },
                 )?;
             }
+        }
+        Ok(Mst2Fuse {
+            reader,
+            store,
+            state: StdMutex::new(state),
+        })
+    }
+
+    fn build_snapshot_closure(
+        reader: Option<SnapshotReader>,
+        store: Option<Arc<DurableStore>>,
+        closure: &ValidatedSnapshotClosure,
+    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        use crate::snapshot::{SnapshotError, SnapshotErrorCode};
+
+        let invalid = |message: String| SnapshotError::new(SnapshotErrorCode::IntegrityError, message);
+        let mut state = State {
+            next_inode: ROOT_INODE,
+            nodes: HashMap::new(),
+            contents: HashMap::new(),
+            chunked: HashMap::new(),
+            lazy: false,
+        };
+        let mut directories: Vec<_> = closure.directories().iter().collect();
+        directories.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let mut directory_inodes: HashMap<&str, u64> = HashMap::new();
+        for directory in directories {
+            let path = directory.rel_path.as_str();
+            if directory_inodes.contains_key(path) {
+                return Err(invalid(format!("duplicate snapshot directory {path:?}")));
+            }
+            let (inode, parent, name) = if path.is_empty() {
+                (ROOT_INODE, ROOT_INODE, "")
+            } else {
+                let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path));
+                let parent = *directory_inodes.get(parent_path).ok_or_else(|| {
+                    invalid(format!("snapshot directory parent {parent_path:?} missing"))
+                })?;
+                state.next_inode += 1;
+                (state.next_inode, parent, name)
+            };
+            state.nodes.insert(
+                inode,
+                Node::Dir(DirNode {
+                    path: path.to_string(),
+                    children: HashMap::new(),
+                    parent,
+                    loaded: true,
+                    page_id: Some(directory.directory_root.clone()),
+                }),
+            );
+            if !path.is_empty() {
+                let Some(Node::Dir(parent_dir)) = state.nodes.get_mut(&parent) else {
+                    return Err(invalid(format!("snapshot parent inode {parent} missing")));
+                };
+                if parent_dir.children.insert(name.to_string(), inode).is_some() {
+                    return Err(invalid(format!("duplicate snapshot entry {path:?}")));
+                }
+            }
+            directory_inodes.insert(path, inode);
+        }
+        if !directory_inodes.contains_key("") {
+            return Err(invalid("snapshot root directory missing".to_string()));
+        }
+        for file in closure.files() {
+            let path = file.rel_path.as_str();
+            let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let parent = *directory_inodes.get(parent_path).ok_or_else(|| {
+                invalid(format!("snapshot file parent {parent_path:?} missing"))
+            })?;
+            let Some(Node::Dir(parent_dir)) = state.nodes.get_mut(&parent) else {
+                return Err(invalid(format!("snapshot parent inode {parent} missing")));
+            };
+            if parent_dir.children.contains_key(name) {
+                return Err(invalid(format!("duplicate snapshot entry {path:?}")));
+            }
+            state.next_inode += 1;
+            let inode = state.next_inode;
+            parent_dir.children.insert(name.to_string(), inode);
+            state.nodes.insert(
+                inode,
+                Node::File(FileNode {
+                    path: path.to_string(),
+                    fs_kind: file.fs_kind.clone(),
+                    size: file.size,
+                    digest: file.content_digest.clone(),
+                }),
+            );
         }
         Ok(Mst2Fuse {
             reader,
@@ -1225,7 +1366,249 @@ fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use futures::StreamExt;
+    use mst2_codec::{
+        descriptor::ServingDescriptor,
+        metapage::{page_id, Entry, EntryKind, Page},
+    };
+
     use super::*;
+
+    fn insert_page(pages: &mut BTreeMap<String, Vec<u8>>, entries: &[Entry]) -> [u8; 32] {
+        let bytes = Page::build(entries).unwrap();
+        let id = page_id(&bytes);
+        pages.insert(format!("sha256:{}", hex::encode(id)), bytes);
+        id
+    }
+
+    fn closure_for_pages(
+        root: [u8; 32],
+        pages: BTreeMap<String, Vec<u8>>,
+    ) -> ValidatedSnapshotClosure {
+        let descriptor = ServingDescriptor {
+            instance_uuid: *uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555")
+                .unwrap()
+                .as_bytes(),
+            namespace_view_id: [0x22; 32],
+            scope: "/project".into(),
+            metadata_root: root,
+        };
+        ValidatedSnapshotClosure::from_canonical_pages(&descriptor.encode().unwrap(), pages)
+            .unwrap()
+    }
+
+    fn directory_closure() -> ValidatedSnapshotClosure {
+        let mut pages = BTreeMap::new();
+        let empty = insert_page(&mut pages, &[]);
+        let content = |kind, name: &[u8], bytes: &[u8]| {
+            Entry::file(
+                kind,
+                name,
+                bytes.len() as u64,
+                crate::snapshot::frames::parse_digest(&crate::snapshot::durable::digest_of(bytes))
+                    .unwrap(),
+            )
+        };
+        let shared = insert_page(
+            &mut pages,
+            &[
+                content(EntryKind::Executable, b"exec", b"#!/bin/sh\n"),
+                content(EntryKind::Symlink, b"link", b"plain"),
+                Entry::dir(b"nested", empty),
+                content(EntryKind::Regular, b"plain", b"data"),
+            ],
+        );
+        let root = insert_page(
+            &mut pages,
+            &[
+                Entry::dir(b"empty", empty),
+                Entry::dir(b"left", shared),
+                Entry::dir(b"right", shared),
+            ],
+        );
+        closure_for_pages(root, pages)
+    }
+
+    async fn directory_names(fs: &Mst2Fuse, inode: u64) -> Vec<String> {
+        fs.readdir(Request::default(), inode, inode, 0)
+            .await
+            .unwrap()
+            .entries
+            .map(|entry| entry.unwrap().name.to_string_lossy().into_owned())
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn complete_snapshot_preserves_an_empty_scope_root() {
+        let mut pages = BTreeMap::new();
+        let root = insert_page(&mut pages, &[]);
+        let closure = closure_for_pages(root, pages);
+        assert!(closure.files().is_empty());
+        let fs = Mst2Fuse::build_snapshot_closure(None, None, &closure).unwrap();
+        assert_eq!(directory_names(&fs, ROOT_INODE).await, [".", ".."]);
+        let attr = fs
+            .getattr(Request::default(), ROOT_INODE, None, 0)
+            .await
+            .unwrap()
+            .attr;
+        assert_eq!(attr.kind, FileType::Directory);
+        let Node::Dir(directory) = fs.node(ROOT_INODE).unwrap() else {
+            panic!("scope root is not a directory");
+        };
+        assert_eq!(directory.parent, ROOT_INODE);
+        assert_eq!(
+            directory.page_id.as_deref(),
+            Some(closure.descriptor().metadata_root.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_snapshot_preserves_empty_directories_and_alias_inodes() {
+        let closure = directory_closure();
+        let fs = Mst2Fuse::build_snapshot_closure(None, None, &closure).unwrap();
+        let req = Request::default();
+        assert_eq!(
+            directory_names(&fs, ROOT_INODE).await,
+            [".", "..", "empty", "left", "right"]
+        );
+        let empty = fs
+            .lookup(req, ROOT_INODE, OsStr::new("empty"))
+            .await
+            .unwrap();
+        assert_eq!(empty.attr.kind, FileType::Directory);
+        assert_eq!(directory_names(&fs, empty.attr.ino).await, [".", ".."]);
+        let left = fs
+            .lookup(req, ROOT_INODE, OsStr::new("left"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        let right = fs
+            .lookup(req, ROOT_INODE, OsStr::new("right"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        assert_ne!(left, right);
+        let left_nested = fs
+            .lookup(req, left, OsStr::new("nested"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        let right_nested = fs
+            .lookup(req, right, OsStr::new("nested"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        assert_ne!(left_nested, right_nested);
+        for (inode, parent, path) in [
+            (left_nested, left, "left/nested"),
+            (right_nested, right, "right/nested"),
+        ] {
+            assert_eq!(directory_names(&fs, inode).await, [".", ".."]);
+            let entries = fs
+                .readdir(req, inode, inode, 0)
+                .await
+                .unwrap()
+                .entries
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(entries[1].as_ref().unwrap().inode, parent);
+            let Node::Dir(directory) = fs.node(inode).unwrap() else {
+                panic!("nested empty directory became a file");
+            };
+            assert_eq!(directory.path, path);
+            let expected = closure
+                .directories()
+                .iter()
+                .find(|directory| directory.rel_path == path)
+                .unwrap();
+            assert_eq!(
+                directory.page_id.as_deref(),
+                Some(expected.directory_root.as_str())
+            );
+        }
+        let left_plain = fs
+            .lookup(req, left, OsStr::new("plain"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        let right_plain = fs
+            .lookup(req, right, OsStr::new("plain"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        assert_ne!(left_plain, right_plain);
+        assert_eq!(
+            fs.digest_for_path("left/plain").await,
+            Some(crate::snapshot::durable::digest_of(b"data"))
+        );
+        assert_eq!(
+            fs.digest_for_path("right/plain").await,
+            Some(crate::snapshot::durable::digest_of(b"data"))
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_snapshot_preserves_executable_and_symlink_semantics() {
+        let closure = directory_closure();
+        let fs = Mst2Fuse::build_snapshot_closure(None, None, &closure).unwrap();
+        let req = Request::default();
+        let left = fs
+            .lookup(req, ROOT_INODE, OsStr::new("left"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        for (name, kind, permissions) in [
+            ("plain", FileType::RegularFile, 0o644),
+            ("exec", FileType::RegularFile, 0o755),
+            ("link", FileType::Symlink, 0o777),
+        ] {
+            let attr = fs.lookup(req, left, OsStr::new(name)).await.unwrap().attr;
+            assert_eq!(attr.kind, kind);
+            assert_eq!(attr.perm, permissions);
+        }
+        let link = fs
+            .lookup(req, left, OsStr::new("link"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        assert_eq!(
+            fs.digest_for_path("left/link").await,
+            Some(crate::snapshot::durable::digest_of(b"plain"))
+        );
+        let error = fs.open(req, link, libc::O_RDONLY as u32).await.unwrap_err();
+        assert_eq!(i32::from(error), -libc::ELOOP);
+        fs.state
+            .lock()
+            .unwrap()
+            .contents
+            .insert(link, Arc::new(b"plain".to_vec()));
+        assert_eq!(fs.readlink(req, link).await.unwrap().data.as_ref(), b"plain");
+        let listing = fs
+            .readdir(req, left, left, 0)
+            .await
+            .unwrap()
+            .entries
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            listing.iter().find_map(|entry| {
+                let entry = entry.as_ref().unwrap();
+                (entry.name.as_os_str() == OsStr::new("link")).then_some(entry.kind)
+            }),
+            Some(FileType::Symlink)
+        );
+    }
 
     fn file_view(size: u64) -> Mst2Fuse {
         Mst2Fuse::build(
