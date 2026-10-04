@@ -43,6 +43,13 @@ def main():
             raise RuntimeError("step failed: " + str(argv[:4]))
 
     def driver(action, files, rounds=5, cache="existing-server", label=None, timeout=1800, backend="both"):
+        if action == "seed":
+            # Applying the stack does not imply protocol readiness. Bound startup
+            # retries before writing the non-repeatable seed evidence.
+            kube(["wait", "--for=condition=Ready", "pod/medium-runner", "--timeout=300s"], 330)
+            kube(["wait", "--for=condition=complete", "job/rustfs-init", "--timeout=300s"], 330)
+            kube(["exec", "medium-runner", "-c", "runner", "--", "bash", "-ec",
+                  "for i in $(seq 1 60); do curl -fsS http://mega2:8000/api/v2/snapshots/capabilities && exit 0; sleep 2; done; exit 1"], 180)
         extra = ["--bootstrap-initial"] if action == "seed" and files == 100000 else []
         kube(["exec", "medium-runner", "-c", "runner", "--", "timeout", "--kill-after=30", str(timeout),
               "python3", "/bench-medium/medium-cloud-run.py", action, "--cluster", a.cluster,
