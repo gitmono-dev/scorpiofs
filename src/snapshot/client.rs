@@ -354,10 +354,11 @@ async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, Snaps
             http_status: status.as_u16(),
         });
     }
-    Err(SnapshotError::new(
-        SnapshotErrorCode::Internal,
-        format!("HTTP {status} without error envelope"),
-    ))
+    Err(SnapshotError {
+        code: SnapshotErrorCode::Internal,
+        message: format!("HTTP {status} without error envelope"),
+        http_status: status.as_u16(),
+    })
 }
 
 /// Statuses worth another attempt: throttling and transient server faults.
@@ -384,10 +385,19 @@ async fn sleep_backoff(attempt: u32) {
 }
 
 fn net_err(e: reqwest::Error) -> SnapshotError {
-    SnapshotError::new(SnapshotErrorCode::Internal, format!("network: {e}"))
+    let code = if retryable_transport(&e) || e.is_body() {
+        SnapshotErrorCode::TemporaryUnavailable
+    } else {
+        SnapshotErrorCode::Internal
+    };
+    SnapshotError::new(code, format!("network: {e}"))
 }
 fn de_err(e: reqwest::Error) -> SnapshotError {
-    SnapshotError::new(SnapshotErrorCode::Internal, format!("decode: {e}"))
+    if !e.is_decode() && (retryable_transport(&e) || e.is_body()) {
+        net_err(e)
+    } else {
+        SnapshotError::new(SnapshotErrorCode::IntegrityError, format!("decode: {e}"))
+    }
 }
 
 fn hex_lower(b: &[u8]) -> String {

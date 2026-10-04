@@ -57,6 +57,8 @@ struct LeaseWindow {
     deadline: Instant,
     renew_at: Instant,
     failure: Option<SnapshotError>,
+    transient_error: Option<SnapshotError>,
+    renewal_failures: u32,
 }
 
 /// The task owns only this state, not LeaseKeeper. Dropping the last reader
@@ -72,7 +74,28 @@ struct LeaseState {
 impl LeaseState {
     fn fail(&self, error: SnapshotError) -> SnapshotError {
         let mut window = self.window.lock().unwrap();
-        window.failure.get_or_insert(error).clone()
+        if let Some(failure) = &window.failure {
+            return failure.clone();
+        }
+        let now = Instant::now();
+        if recoverable_renewal_error(&error) && now < window.deadline {
+            window.renewal_failures = window.renewal_failures.saturating_add(1);
+            let delay = Duration::from_millis(100 << (window.renewal_failures - 1).min(3));
+            window.renew_at = (now + delay).min(window.deadline);
+            window.transient_error = Some(error.clone());
+            error
+        } else {
+            let failure = if recoverable_renewal_error(&error) {
+                SnapshotError::new(
+                    SnapshotErrorCode::LeaseExpired,
+                    "snapshot retention lease expired during renewal",
+                )
+            } else {
+                error
+            };
+            window.failure = Some(failure.clone());
+            failure
+        }
     }
 
     fn needs_renewal(&self) -> Result<bool, SnapshotError> {
@@ -80,13 +103,19 @@ impl LeaseState {
         if let Some(error) = &window.failure {
             return Err(error.clone());
         }
-        if Instant::now() >= window.deadline {
+        let now = Instant::now();
+        if now >= window.deadline {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LeaseExpired,
                 "snapshot retention lease expired",
             ));
         }
-        Ok(Instant::now() >= window.renew_at)
+        if now < window.renew_at {
+            if let Some(error) = &window.transient_error {
+                return Err(error.clone());
+            }
+        }
+        Ok(now >= window.renew_at)
     }
 
     async fn ensure(&self, client: &Mst2Client) -> Result<(), SnapshotError> {
@@ -98,9 +127,24 @@ impl LeaseState {
             return Ok(());
         }
         let result = async {
-            let renewed = client
-                .renew_lease(&self.lease_id, self.lease_seconds)
-                .await?;
+            let deadline = self.window.lock().unwrap().deadline;
+            let renewed = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                client.renew_lease(&self.lease_id, self.lease_seconds),
+            )
+            .await
+            .map_err(|_| {
+                SnapshotError::new(
+                    SnapshotErrorCode::LeaseExpired,
+                    "renewal did not finish before the granted deadline",
+                )
+            })??;
+            if Instant::now() >= deadline {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::LeaseExpired,
+                    "renewal arrived after the granted deadline",
+                ));
+            }
             if renewed.get("lease_id").and_then(|v| v.as_str()) != Some(self.lease_id.as_str())
                 || renewed.get("snapshot_id").and_then(|v| v.as_str())
                     != Some(self.snapshot_id.as_str())
@@ -120,6 +164,12 @@ impl LeaseState {
                     )
                 })?;
             let window = lease_window(expiry)?;
+            if Instant::now() >= deadline {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::LeaseExpired,
+                    "renewal validation exceeded the granted deadline",
+                ));
+            }
             *self.window.lock().unwrap() = window;
             Ok(())
         }
@@ -160,8 +210,12 @@ impl LeaseKeeper {
                 let renew_at = state.window.lock().unwrap().renew_at;
                 tokio::time::sleep_until(tokio::time::Instant::from_std(renew_at)).await;
                 if let Err(error) = state.ensure(&client).await {
-                    tracing::warn!(code = ?error.code, "snapshot lease renewal failed; stopping renewer");
-                    return;
+                    if recoverable_renewal_error(&error) {
+                        tracing::warn!(code = ?error.code, "snapshot lease renewal temporarily unavailable; retrying within the grant");
+                    } else {
+                        tracing::warn!(code = ?error.code, "snapshot lease renewal failed; stopping renewer");
+                        return;
+                    }
                 }
             }
         });
@@ -176,6 +230,9 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
             "lease expiry is not a valid UTC RFC3339 timestamp",
         )
     })?;
+    // Sample the monotonic clock first: scheduling delay between clock reads
+    // can shorten this local window, but must never extend the server grant.
+    let instant = Instant::now();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
         SnapshotError::new(
             SnapshotErrorCode::Internal,
@@ -191,7 +248,6 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
                 "server returned an expired snapshot lease",
             )
         })?;
-    let instant = Instant::now();
     let deadline = instant.checked_add(remaining).ok_or_else(|| {
         SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
@@ -202,7 +258,21 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
         deadline,
         renew_at: instant + remaining.mul_f64(2.0 / 3.0),
         failure: None,
+        transient_error: None,
+        renewal_failures: 0,
     })
+}
+
+fn recoverable_renewal_error(error: &SnapshotError) -> bool {
+    match error.code {
+        SnapshotErrorCode::TemporaryUnavailable if error.http_status == 0 => true,
+        SnapshotErrorCode::TemporaryUnavailable
+        | SnapshotErrorCode::Internal
+        | SnapshotErrorCode::SnapshotNotReady => {
+            matches!(error.http_status, 429 | 500 | 502 | 503 | 504)
+        }
+        _ => false,
+    }
 }
 
 impl Drop for LeaseKeeper {
@@ -840,6 +910,33 @@ fn collect_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_errors_use_typed_transport_status_and_keep_terminal_failures_terminal() {
+        for (code, status, recoverable) in [
+            (SnapshotErrorCode::TemporaryUnavailable, 0, true),
+            (SnapshotErrorCode::TemporaryUnavailable, 503, true),
+            (SnapshotErrorCode::Internal, 503, true),
+            (SnapshotErrorCode::Internal, 429, true),
+            (SnapshotErrorCode::SnapshotNotReady, 503, true),
+            (SnapshotErrorCode::Internal, 0, false),
+            (SnapshotErrorCode::TemporaryUnavailable, 403, false),
+            (SnapshotErrorCode::IntegrityError, 503, false),
+            (SnapshotErrorCode::ScopeForbidden, 503, false),
+            (SnapshotErrorCode::LeaseExpired, 503, false),
+        ] {
+            let error = SnapshotError {
+                code,
+                http_status: status,
+                message: "same message".into(),
+            };
+            assert_eq!(
+                recoverable_renewal_error(&error),
+                recoverable,
+                "{code:?}/{status}"
+            );
+        }
+    }
 
     #[test]
     fn rfc3339_parser_matches_known_values() {
