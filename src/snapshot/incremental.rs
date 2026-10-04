@@ -252,6 +252,7 @@ impl<'a> IncrementalSync<'a> {
         const PAGE_BATCH: usize = 64;
         self.meters = SyncMeters::default();
         self.reused_page_ids.clear();
+        let live_pins: HashSet<_> = self.cache.live_pins().into_iter().collect();
 
         enum Item {
             /// One page of a directory's own page tree. The route grows one
@@ -285,7 +286,7 @@ impl<'a> IncrementalSync<'a> {
         // the parent (or the result) without fetching anything.
         macro_rules! finish_from_record {
             ($dir:expr, $expected:expr, $parent:expr, $base:expr) => {{
-                if let Some(record) = self.try_reuse(&$expected, &$dir).await? {
+                if let Some(record) = self.try_reuse(&$expected, &$dir, &live_pins).await? {
                     match &$parent {
                         Some(parent_path) => {
                             if let Some(ps) = states.get_mut(parent_path) {
@@ -582,6 +583,7 @@ impl<'a> IncrementalSync<'a> {
         &mut self,
         root_page_id: &str,
         dir: &str,
+        live_pins: &HashSet<String>,
     ) -> Result<Option<ClosureRecord>, SnapshotError> {
         let Some(record) = self.cache.record_for(root_page_id) else {
             return Ok(None);
@@ -590,8 +592,7 @@ impl<'a> IncrementalSync<'a> {
             return Ok(None);
         }
         // The record must be backed by a pin that is still live here.
-        let live = self.cache.live_pins();
-        if !live.iter().any(|p| p == &record.pin_ref) {
+        if !live_pins.contains(&record.pin_ref) {
             return Ok(None);
         }
         // A record that names no pages proves nothing: refuse it outright

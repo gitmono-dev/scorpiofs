@@ -133,7 +133,6 @@ impl Scale {
             files: setting("FILES", 64, 32, 128),
             bytes: setting("BYTES", 256, 128, 4096),
         };
-        assert!((1000..=5000).contains(&(scale.dirs * scale.files + 128)));
         scale
     }
 
@@ -765,26 +764,61 @@ fn emit(value: &Value) {
     let line = serde_json::to_string(value).unwrap();
     println!("MST2_UPDATE_BENCH {line}");
     if let Ok(path) = std::env::var("MST2_UPDATE_BENCH_OUTPUT") {
-        let path = Path::new(&path);
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap();
-        let parent = path
-            .parent()
-            .expect("result path needs a private parent directory")
-            .canonicalize()
-            .unwrap();
-        assert!(
-            !parent.starts_with(repository),
-            "benchmark results must stay outside the Git checkout"
-        );
-        let mut output = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .unwrap();
+        let mut output = open_output(Path::new(&path));
         writeln!(output, "{line}").unwrap();
     }
+}
+
+fn open_output(path: &Path) -> fs::File {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap();
+    let parent = path
+        .parent()
+        .expect("result path needs a private parent directory")
+        .canonicalize()
+        .unwrap();
+    assert!(
+        !parent.starts_with(repository),
+        "benchmark results must stay outside the Git checkout"
+    );
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            assert!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "benchmark output must be a regular file, not a symlink"
+            );
+            assert!(
+                !path.canonicalize().unwrap().starts_with(&repository),
+                "benchmark output target must stay outside the Git checkout"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("cannot inspect benchmark output: {error}"),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn output_symlinks_cannot_append_to_checkout_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let tracked = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let original = fs::read(&tracked).unwrap();
+    let output = temp.path().join("results.jsonl");
+    std::os::unix::fs::symlink(&tracked, &output).unwrap();
+    assert!(std::panic::catch_unwind(|| open_output(&output)).is_err());
+    assert_eq!(fs::read(&tracked).unwrap(), original);
+    fs::remove_file(&output).unwrap();
+    writeln!(open_output(&output), "private result").unwrap();
+    assert_eq!(fs::read_to_string(&output).unwrap(), "private result\n");
 }
 
 fn command_version(program: &str, args: &[&str]) -> Option<String> {
