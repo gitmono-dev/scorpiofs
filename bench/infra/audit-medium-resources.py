@@ -17,6 +17,7 @@ def main():
     api = runpy.run_path(str(Path(__file__).with_name("ack-medium.py")))["cli"]
     ids = {c["id"] for c in state["clusters"]}
     run = state["run_id"]
+    names = {f"mst2-medium-{letter}-{run}" for letter in ("a", "b")}
     inventory_path = a.state.parent / "audit-pre-cleanup.json"
     inventory = json.loads(inventory_path.read_text()) if inventory_path.exists() else {}
     identity_fields = {"nat": "NatGatewayId", "eip": "AllocationId", "slb": "LoadBalancerId",
@@ -38,7 +39,8 @@ def main():
     clusters = api("cs", "GET", "/clusters", "--region", state["region"])
     rows = clusters if isinstance(clusters, list) else clusters.get("clusters", [])
     result = {"utc": dt.datetime.now(dt.timezone.utc).isoformat(), "run_id": run,
-              "clusters": [r for r in rows if r.get("cluster_id") in ids],
+              # A timed-out create can succeed without recording its ID in state.
+              "clusters": [r for r in rows if r.get("cluster_id") in ids or r.get("name") in names],
               "instances": [r for r in instances["Instances"]["Instance"] if (owned(r) or known("instances", r)) and r["InstanceId"] not in before_instances],
               "disks": [r for r in disks["Disks"]["Disk"] if owned(r) and r["DiskId"] not in before_disks]}
     active_disks = a.state.parent/"disks-active.json"

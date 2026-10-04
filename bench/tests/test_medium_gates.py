@@ -26,6 +26,7 @@ def load(name, path):
 gate = load("shallow_gate", BENCH / "cases/git-shallow-gate.py")
 driver = load("medium_driver", BENCH / "infra/medium-cloud-run.py")
 controller = load("ack_controller", BENCH / "infra/ack-medium.py")
+auditor = load("resource_auditor", BENCH / "infra/audit-medium-resources.py")
 
 
 class ShallowGateTests(unittest.TestCase):
@@ -142,6 +143,34 @@ class DriverGateTests(unittest.TestCase):
             controller.require_time_remaining({})
         future = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
         controller.require_time_remaining({"deadline_utc": future.isoformat()})
+
+    def test_unrecorded_cluster_from_timed_out_create_blocks_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_path = Path(temp) / "state.json"
+            output = Path(temp) / "audit.json"
+            inventory = {key: {item: []} for key, item in (
+                ("Disks", "Disk"), ("Instances", "Instance"), ("NatGateways", "NatGateway"),
+                ("EipAddresses", "EipAddress"), ("LoadBalancers", "LoadBalancer"),
+                ("SecurityGroups", "SecurityGroup"), ("Snapshots", "Snapshot"),
+                ("ScalingGroups", "ScalingGroup"))}
+            state_path.write_text(json.dumps(dict(
+                clusters=[], run_id="test", region="test-region",
+                preflight=dict(disks_before=inventory, ecs_before=inventory))))
+
+            def api(*args):
+                if args[:3] == ("cs", "GET", "/clusters"):
+                    return [dict(cluster_id="unrecorded", name="mst2-medium-a-test")]
+                return inventory
+
+            argv = ["audit", "--state", str(state_path), "--out", str(output), "--mark-clean"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(auditor.runpy, "run_path", return_value={"cli": api}), \
+                    self.assertRaises(SystemExit):
+                auditor.main()
+            result = json.loads(output.read_text())
+            self.assertEqual(result["remaining_counts"]["clusters"], 1)
+            self.assertFalse(result["cleanup_verified"])
+            self.assertNotIn("cleanup_verified", json.loads(state_path.read_text()))
 
 
 if __name__ == "__main__":

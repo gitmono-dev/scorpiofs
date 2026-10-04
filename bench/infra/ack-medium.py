@@ -124,6 +124,7 @@ def main():
                                {"name": "logtail-ds", "disabled": True},
                                {"name": "nginx-ingress-controller", "disabled": True}],
                     "tags": [{"key": "purpose", "value": RUN}], "timeout_mins": 30}
+            require_time_remaining(state)
             response = cli("cs", "POST", "/clusters", "--region", REGION, body=body)
             state["clusters"].append({"name": name, "id": response["cluster_id"], "create_response": response})
             save()
@@ -161,6 +162,7 @@ def main():
                            "system_disk_performance_level": "PL1", "spot_strategy": "NoSpot",
                            "login_password": "M2!" + secrets.token_hex(10) + "a9",
                            "image_type": "Ubuntu", "tags": [{"key": "purpose", "value": RUN}]}}
+                require_time_remaining(state)
                 response = cli("cs", "POST", f'/clusters/{c["id"]}/nodepools', "--region", REGION, body=body)
                 c.setdefault("pool_responses", {})[role] = response
                 save()
