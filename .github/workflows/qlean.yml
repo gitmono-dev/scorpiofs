@@ -63,6 +63,21 @@ jobs:
       - name: Build release fixture
         run: cargo build --release --locked --bin scorpio --bin antares
 
+      - name: Build exact workspace launcher test fixture
+        run: |
+          set -euo pipefail
+          cargo test --release --locked --test mst2_workspace_launcher_http --no-run --message-format=json > launcher-build.jsonl
+          python3 - <<'PY'
+          import json, os
+          artifacts = [json.loads(line) for line in open('launcher-build.jsonl')]
+          paths = [a['executable'] for a in artifacts if a.get('reason') == 'compiler-artifact'
+                   and a.get('target', {}).get('name') == 'mst2_workspace_launcher_http'
+                   and a.get('profile', {}).get('test') and a.get('executable')]
+          assert len(paths) == 1, paths
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('SCORPIO_LAUNCHER_TEST_EXE=' + paths[0] + '\n')
+          PY
+
       - name: Run installer inside Qlean VM
         env:
           QLEAN_QEMU_TIMEOUT_SECS: 1200

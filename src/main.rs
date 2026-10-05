@@ -43,7 +43,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the workspace daemon (FUSE mount + HTTP API). Default when no subcommand is given.
+    /// Run the workspace HTTP control daemon. Mounts are created by explicit requests.
     Serve,
     /// Mount an Antares job instance.
     Mount {
