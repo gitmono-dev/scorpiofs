@@ -17,9 +17,10 @@ use axum::{
     Json, Router,
 };
 use mst2_codec::{
+    chunkmap::{ChunkLeaf, ChunkMap, CHUNK_SIZE},
     descriptor::ServingDescriptor,
     metapage::{page_id, Entry, EntryKind, Page},
-    treeframe::{EndPayload, MetaPayload, ObjectPayload},
+    treeframe::{ChunkPayload, EndPayload, MetaPayload, ObjectPayload},
 };
 use serde_json::{json, Value};
 
@@ -36,6 +37,58 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
 fn id(digest: &[u8; 32]) -> String {
     format!("sha256:{}", hex::encode(digest))
 }
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    for part in bytes.chunks(3) {
+        let bits = u32::from(part[0]) << 16
+            | u32::from(part.get(1).copied().unwrap_or(0)) << 8
+            | u32::from(part.get(2).copied().unwrap_or(0));
+        result.push(ALPHABET[(bits >> 18) as usize] as char);
+        result.push(ALPHABET[((bits >> 12) & 63) as usize] as char);
+        result.push(if part.len() > 1 {
+            ALPHABET[((bits >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        result.push(if part.len() > 2 {
+            ALPHABET[(bits & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    result
+}
+
+struct Large {
+    map: ChunkMap,
+    leaf: ChunkLeaf,
+}
+impl Large {
+    fn new() -> Self {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut chunk_sha256 = Vec::new();
+        for index in 0..3 {
+            let bytes = vec![index as u8; if index == 2 { 7 } else { CHUNK_SIZE as usize }];
+            digest.update(&bytes);
+            chunk_sha256.push(hash(&bytes));
+        }
+        let leaf = ChunkLeaf {
+            page_index: 0,
+            chunk_sha256,
+        };
+        let map = ChunkMap::new(
+            digest.finish().as_ref().try_into().unwrap(),
+            2 * CHUNK_SIZE as u64 + 7,
+            leaf.leaf_hash().unwrap(),
+        )
+        .unwrap();
+        Self { map, leaf }
+    }
+    fn bytes(&self, index: u64) -> Vec<u8> {
+        vec![index as u8; self.map.chunk_len(index).unwrap() as usize]
+    }
+}
 
 struct Fixture {
     descriptor: ServingDescriptor,
@@ -43,12 +96,16 @@ struct Fixture {
     bodies: BTreeMap<String, Vec<u8>>,
     metadata: Mutex<Vec<String>>,
     requests: AtomicUsize,
+    map_requests: AtomicUsize,
+    leaf_requests: AtomicUsize,
+    chunk_requests: AtomicUsize,
     emitted: Arc<AtomicUsize>,
     renewals: AtomicUsize,
     mode: AtomicUsize,
     release: tokio::sync::Semaphore,
     objects: bool,
     expiry: String,
+    large: Option<Large>,
 }
 impl Fixture {
     fn new(unavailable: bool, objects: bool) -> Self {
@@ -90,13 +147,49 @@ impl Fixture {
             bodies,
             metadata: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
+            map_requests: AtomicUsize::new(0),
+            leaf_requests: AtomicUsize::new(0),
+            chunk_requests: AtomicUsize::new(0),
             emitted: Arc::new(AtomicUsize::new(0)),
             renewals: AtomicUsize::new(0),
             mode: AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(0),
             objects,
             expiry: "2099-01-01T00:00:00Z".into(),
+            large: None,
         }
+    }
+    fn with_large(mut self) -> Self {
+        let large = Large::new();
+        let mut entries: Vec<_> = self
+            .bodies
+            .iter()
+            .map(|(name, body)| {
+                Entry::file(
+                    match name.as_str() {
+                        "exec" => EntryKind::Executable,
+                        "link" => EntryKind::Symlink,
+                        _ => EntryKind::Regular,
+                    },
+                    name.as_bytes(),
+                    body.len() as u64,
+                    hash(body),
+                )
+            })
+            .collect();
+        entries.extend((0..17).map(|index| {
+            Entry::file(
+                EntryKind::Regular,
+                format!("range{index:03}").as_bytes(),
+                large.map.file_size,
+                large.map.file_content_id,
+            )
+        }));
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self.page = Page::build(&entries).unwrap();
+        self.descriptor.metadata_root = page_id(&self.page);
+        self.large = Some(large);
+        self
     }
     fn response(&self, request: &[u8], wire: Vec<u8>, pending: bool) -> Response {
         use futures::StreamExt;
@@ -211,6 +304,75 @@ async fn raw(
     assert_eq!(query["expected_digest"], id(&hash(bytes)));
     Response::builder().body(Body::from(bytes.clone())).unwrap()
 }
+async fn map_response(
+    HttpState(f): HttpState<Arc<Fixture>>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    f.map_requests.fetch_add(1, Ordering::SeqCst);
+    let map = &f.large.as_ref().unwrap().map;
+    assert!(query["path"].trim_start_matches('/').starts_with("range"));
+    assert_eq!(query["expected_digest"], id(&map.file_content_id));
+    let mut value = json!({"snapshot_id":id(&f.descriptor.snapshot_id().unwrap()),"path":query["path"],"schema_version":2,"file_content_id":id(&map.file_content_id),"file_size":map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":map.chunk_count.to_string(),"page_count":map.page_count.to_string(),"pages_root":id(&map.pages_root),"map_id":id(&map.map_id())});
+    if f.mode.load(Ordering::SeqCst) == 5 {
+        value["file_size"] = json!((map.file_size + 1).to_string());
+    }
+    Json(value)
+}
+async fn leaf_response(
+    HttpState(f): HttpState<Arc<Fixture>>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    f.leaf_requests.fetch_add(1, Ordering::SeqCst);
+    let large = f.large.as_ref().unwrap();
+    assert_eq!(query["page"], "0");
+    Json(
+        json!({"snapshot_id":id(&f.descriptor.snapshot_id().unwrap()),"path":query["path"],"map_id":id(&large.map.map_id()),"page_count":"1","leaf":{"page_index":"0","count":large.map.chunk_count.to_string(),"data_base64":base64(&large.leaf.encode().unwrap())},"proof":[]}),
+    )
+}
+async fn chunks(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Response {
+    f.chunk_requests.fetch_add(1, Ordering::SeqCst);
+    let mode = f.mode.load(Ordering::SeqCst);
+    if mode == 4 {
+        f.release.acquire().await.unwrap().forget();
+    }
+    let large = f.large.as_ref().unwrap();
+    let value: Value = serde_json::from_slice(&request).unwrap();
+    let items = value["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(items[0]["path"].as_str().unwrap().starts_with("/range"));
+    assert_eq!(items[0]["expected_digest"], id(&large.map.file_content_id));
+    assert_eq!(items[0]["map_id"], id(&large.map.map_id()));
+    let index = items[0]["chunk_index"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let bytes = large.bytes(index);
+    let mut payload = ChunkPayload {
+        map_id: large.map.map_id(),
+        file_content_id: large.map.file_content_id,
+        chunk_index: index,
+        chunk_bytes: bytes.clone(),
+    };
+    if mode == 1 {
+        payload.chunk_bytes[0] ^= 1;
+    }
+    if mode == 6 {
+        payload.map_id[0] ^= 1;
+    }
+    let mut wire = payload.encode(53, 0).unwrap();
+    let mut end = EndPayload {
+        request_item_count: 1,
+        unique_unit_count: 1,
+        logical_bytes: bytes.len() as u64,
+        request_body_sha256: hash(&request),
+    };
+    if mode == 2 || mode == 7 && index > 0 {
+        end.request_body_sha256[0] ^= 1;
+    }
+    wire.extend(end.encode(53, 1));
+    f.response(&request, wire, mode == 3)
+}
 struct Server {
     reader: SnapshotReader,
     fixture: Arc<Fixture>,
@@ -231,6 +393,12 @@ impl Server {
             .route("/api/v2/snapshots/{sid}/metadata/pages", post(metadata))
             .route("/api/v2/snapshots/{sid}/objects", post(objects))
             .route("/api/v2/snapshots/{sid}/blob", get(raw))
+            .route("/api/v2/snapshots/{sid}/chunk-map", get(map_response))
+            .route(
+                "/api/v2/snapshots/{sid}/chunk-map/pages",
+                get(leaf_response),
+            )
+            .route("/api/v2/snapshots/{sid}/chunks", post(chunks))
             .with_state(fixture.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client =
