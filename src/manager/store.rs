@@ -2,11 +2,10 @@ use std::{
     collections::HashMap,
     io::{Error, ErrorKind, Result},
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use git_internal::{
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::object::{blob::Blob, commit::Commit, tree::Tree, ObjectTrait},
 };
 use tokio::sync::mpsc::Receiver;
@@ -200,12 +199,12 @@ impl BlobFsStore for PathBuf {
                     "Hash must be 40 characters long",
                 ))?;
                 let hash_path = object_path.join(hash_flag);
-                let sha_hash = ObjectHash::from_str(hash)
+                let sha_hash = ObjectHash::from_hex_for_kind(HashKind::Sha1, hash)
                     .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
 
                 let data_path = hash_path.join(&hash[2..]);
                 let data = std::fs::read(&data_path)?;
-                let blob = Blob::from_bytes(&data, sha_hash);
+                let blob = Blob::from_bytes(&unformat_data(&data), sha_hash);
                 blob.map_err(|e| Error::new(ErrorKind::InvalidData, e))
             })
             .collect::<Result<Vec<Blob>>>()
@@ -592,7 +591,7 @@ mod test {
     use std::vec;
 
     use git_internal::{
-        hash::ObjectHash,
+        hash::{HashKind, ObjectHash},
         internal::object::tree::{Tree, TreeItem, TreeItemMode},
     };
 
@@ -605,7 +604,7 @@ mod test {
         let db = sled::open(db_path).unwrap();
         let t = Tree::from_tree_items(vec![TreeItem::new(
             TreeItemMode::Blob,
-            ObjectHash::new(&[4u8, 4u8, 4u8, 64u8, 84u8, 84u8]),
+            ObjectHash::new_for_kind(HashKind::Sha1, &[4u8, 4u8, 4u8, 64u8, 84u8, 84u8]),
             String::from("test"),
         )])
         .unwrap();

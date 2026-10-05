@@ -12,6 +12,7 @@
 //! definitive and returned as-is.
 
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
@@ -19,8 +20,10 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const TREEFRAME_REQUEST_MAX_BYTES: usize = 131_072;
+
 use reqwest::StatusCode;
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 
 #[allow(unused_imports)]
 use crate::snapshot::types::Descriptor;
@@ -34,6 +37,7 @@ use crate::snapshot::types::{
 #[derive(Clone)]
 pub struct Mst2Client {
     http: Arc<reqwest::Client>,
+    request_timeout: Duration,
     base: String,
     /// Bearer token for the snapshot surface (spec 04 §1). Sent as
     /// `Authorization` on every request; unset for lab-only deployments.
@@ -64,6 +68,13 @@ struct BoundCredentials {
 /// backoff with jitter so a fleet of clients does not resynchronise.
 const MAX_ATTEMPTS: u32 = 4;
 const BASE_BACKOFF_MS: u64 = 40;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_JSON_REQUEST_BYTES: usize = TREEFRAME_REQUEST_MAX_BYTES;
+const MAX_JSON_RESPONSE_BYTES: usize = 1_048_576;
+
+/// Local limit for APIs returning a whole file in memory. Larger files use
+/// bounded range reads; this is independent of the protocol's file-size cap.
+pub const MAX_BUFFERED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl Mst2Client {
     pub fn new(base_url: impl Into<String>) -> Self {
@@ -77,10 +88,12 @@ impl Mst2Client {
             // Spec 14 §3: refuse automatic redirects — a redirect must never
             // carry (or silently drop) credentials to another origin.
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client with sane defaults");
         Self {
             http: Arc::new(http),
+            request_timeout: REQUEST_TIMEOUT,
             base: base_url.into().trim_end_matches('/').to_string(),
             token: Arc::new(StdMutex::new(token)),
             lease: Arc::new(StdMutex::new(None)),
@@ -89,6 +102,13 @@ impl Mst2Client {
             recv_bytes: Arc::new(AtomicU64::new(0)),
             units_fetched: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Configure the logical request deadline (retries, backoff and body included).
+    /// The transport hard ceiling is 60 seconds; zero selects one millisecond.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout.clamp(Duration::from_millis(1), REQUEST_TIMEOUT);
+        self
     }
 
     /// Set or clear the bearer credential for future requests/resolves.
@@ -195,6 +215,14 @@ impl Mst2Client {
         let req = builder.build().map_err(|e| {
             SnapshotError::new(SnapshotErrorCode::Internal, format!("request build: {e}"))
         })?;
+        if req
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .is_some_and(|body| body.len() > MAX_JSON_REQUEST_BYTES)
+        {
+            return Err(json_limit("request"));
+        }
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
         let mut req = Some(req);
         let mut attempt = 0u32;
         loop {
@@ -204,22 +232,34 @@ impl Mst2Client {
             } else {
                 req.take()
             };
-            let Some(this) = this else {
+            let Some(mut this) = this else {
                 // Body was a one-shot stream; nothing safe to retry with.
                 return Err(SnapshotError::new(
                     SnapshotErrorCode::Internal,
                     "request body is not replayable",
                 ));
             };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(request_deadline());
+            }
+            // Reqwest retains this timer through response body consumption.
+            // A retry receives only the original deadline's remaining budget.
+            *this.timeout_mut() = Some(remaining);
+            if attempt > 1 {
+                self.retries.fetch_add(1, Ordering::Relaxed);
+            }
             match self.http.execute(this).await {
                 Ok(resp) if attempt < MAX_ATTEMPTS && retryable_status(resp.status()) => {
-                    self.retries.fetch_add(1, Ordering::Relaxed);
-                    sleep_backoff(attempt).await;
+                    tokio::time::timeout_at(deadline, sleep_backoff(attempt))
+                        .await
+                        .map_err(|_| request_deadline())?;
                 }
                 Ok(resp) => return Ok(resp),
                 Err(e) if attempt < MAX_ATTEMPTS && retryable_transport(&e) => {
-                    self.retries.fetch_add(1, Ordering::Relaxed);
-                    sleep_backoff(attempt).await;
+                    tokio::time::timeout_at(deadline, sleep_backoff(attempt))
+                        .await
+                        .map_err(|_| request_deadline())?;
                 }
                 Err(e) => return Err(net_err(e)),
             }
@@ -235,7 +275,7 @@ impl Mst2Client {
         let resp = self
             .send_retrying(self.http.get(self.snapshots_url("/capabilities")))
             .await?;
-        ok_or_error(resp).await?.json().await.map_err(de_err)
+        read_json(ok_or_error(resp).await?).await
     }
 
     /// Fix a view on `target` for `scope`; returns the descriptor + lease.
@@ -254,7 +294,7 @@ impl Mst2Client {
         let resp = self
             .send_retrying(self.http.post(self.snapshots_url("/resolve")).json(&body))
             .await?;
-        ok_or_error(resp).await?.json().await.map_err(de_err)
+        read_json(ok_or_error(resp).await?).await
     }
 
     /// One directory page; `cursor` continues pagination (spec 04 §5).
@@ -274,7 +314,7 @@ impl Mst2Client {
             url.push_str(&urlencode(c));
         }
         let resp = self.send_retrying(self.http.get(url)).await?;
-        ok_or_error(resp).await?.json().await.map_err(de_err)
+        read_json(ok_or_error(resp).await?).await
     }
 
     /// Batch path resolution (spec 04 §7).
@@ -291,7 +331,22 @@ impl Mst2Client {
                     .json(&body),
             )
             .await?;
-        ok_or_error(resp).await?.json().await.map_err(de_err)
+        let response: LookupResponse = read_json(ok_or_error(resp).await?).await?;
+        if response.snapshot_id != snapshot_id || response.results.len() != paths.len() {
+            return Err(lookup_binding_error());
+        }
+        for (result, path) in response.results.iter().zip(paths) {
+            if result.path != *path
+                || match result.status.as_str() {
+                    "found" => result.node.is_none(),
+                    "absent" | "not_directory" | "symlink_traversal" => result.node.is_some(),
+                    _ => true,
+                }
+            {
+                return Err(lookup_binding_error());
+            }
+        }
+        Ok(response)
     }
 
     /// Fetch a whole file, verifying SHA-256 against `expected_digest`.
@@ -310,10 +365,30 @@ impl Mst2Client {
             urlencode(expected_digest)
         ));
         let resp = self.send_retrying(self.http.get(url)).await?;
-        let resp = ok_or_error(resp).await?;
-        let bytes = resp.bytes().await.map_err(net_err)?;
-        self.recv_bytes
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let mut resp = ok_or_error(resp).await?;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_BUFFERED_FILE_BYTES)
+        {
+            return Err(buffered_limit());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(net_err)? {
+            self.recv_bytes
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            if chunk.len() as u64 > MAX_BUFFERED_FILE_BYTES - bytes.len() as u64 {
+                return Err(buffered_limit());
+            }
+            if chunk.len() > bytes.capacity() - bytes.len() {
+                let target = (bytes.len() + chunk.len())
+                    .max(bytes.capacity().saturating_mul(2))
+                    .min(MAX_BUFFERED_FILE_BYTES as usize);
+                bytes
+                    .try_reserve_exact(target - bytes.len())
+                    .map_err(|_| buffered_limit())?;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         // Defense in depth: verify locally even though the server enforces
         // expected_digest too. ring is already a dependency.
         use ring::digest::{Context, SHA256};
@@ -326,8 +401,22 @@ impl Mst2Client {
                 format!("blob {path}: expected {expected_digest}, got {got}"),
             ));
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
+}
+
+fn buffered_limit() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::LimitExceeded,
+        "whole-file buffered read exceeds the local 64 MiB budget; use range reads",
+    )
+}
+
+fn lookup_binding_error() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::IntegrityError,
+        "lookup response does not bind every ordered result to its requested snapshot and path",
+    )
 }
 
 #[derive(Deserialize)]
@@ -346,19 +435,137 @@ async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, Snaps
     if status.is_success() {
         return Ok(resp);
     }
-    // Map the typed server envelope; fall back to HTTP status otherwise.
-    if let Ok(env) = resp.json::<ErrorEnvelope>().await {
-        return Err(SnapshotError {
-            code: SnapshotErrorCode::from_server(&env.error.code),
-            message: env.error.message,
+    let bytes = read_json_bytes(resp).await.map_err(|mut error| {
+        error.http_status = status.as_u16();
+        error
+    })?;
+    Err(server_error(&bytes, status))
+}
+
+fn server_error(bytes: &[u8], status: StatusCode) -> SnapshotError {
+    let Ok(env) = parse_json::<ErrorEnvelope>(bytes) else {
+        return SnapshotError {
+            code: SnapshotErrorCode::Internal,
+            message: format!("HTTP {status} without valid error envelope"),
             http_status: status.as_u16(),
-        });
-    }
-    Err(SnapshotError {
-        code: SnapshotErrorCode::Internal,
-        message: format!("HTTP {status} without error envelope"),
+        };
+    };
+    SnapshotError {
+        code: SnapshotErrorCode::from_server(&env.error.code),
+        message: env.error.message,
         http_status: status.as_u16(),
-    })
+    }
+}
+
+fn json_limit(direction: &str) -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::LimitExceeded,
+        format!("JSON {direction} exceeds the protocol byte budget"),
+    )
+}
+
+fn request_deadline() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::TemporaryUnavailable,
+        "snapshot request deadline exceeded",
+    )
+}
+
+async fn read_json<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, SnapshotError> {
+    parse_json(&read_json_bytes(resp).await?)
+}
+
+async fn read_json_bytes(mut resp: reqwest::Response) -> Result<Vec<u8>, SnapshotError> {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_JSON_RESPONSE_BYTES as u64)
+    {
+        return Err(json_limit("response"));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(net_err)? {
+        if chunk.len() > MAX_JSON_RESPONSE_BYTES - bytes.len() {
+            return Err(json_limit("response"));
+        }
+        if chunk.len() > bytes.capacity() - bytes.len() {
+            let target = (bytes.len() + chunk.len())
+                .max(bytes.capacity().saturating_mul(2))
+                .min(MAX_JSON_RESPONSE_BYTES);
+            bytes
+                .try_reserve_exact(target - bytes.len())
+                .map_err(|_| json_limit("response"))?;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SnapshotError> {
+    let invalid = |error| {
+        SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            format!("JSON decode: {error}"),
+        )
+    };
+    // Validate keys before DTO/Value deserialization can discard duplicates,
+    // including duplicates nested in fields the current DTO does not consume.
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    UniqueJson::deserialize(&mut decoder).map_err(invalid)?;
+    decoder.end().map_err(invalid)?;
+    serde_json::from_slice(bytes).map_err(invalid)
+}
+
+struct UniqueJson;
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON without duplicate object keys")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<UniqueJson, E> {
+                Ok(UniqueJson)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson)
+            }
+            fn visit_str<E>(self, _: &str) -> Result<UniqueJson, E> {
+                Ok(UniqueJson)
+            }
+            fn visit_unit<E>(self) -> Result<UniqueJson, E> {
+                Ok(UniqueJson)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<UniqueJson, A::Error> {
+                while sequence.next_element::<UniqueJson>()?.is_some() {}
+                Ok(UniqueJson)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<UniqueJson, A::Error> {
+                let mut keys = HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !keys.insert(key) {
+                        return Err(serde::de::Error::custom("duplicate JSON key"));
+                    }
+                    map.next_value::<UniqueJson>()?;
+                }
+                Ok(UniqueJson)
+            }
+        }
+        decoder.deserialize_any(Visitor)
+    }
 }
 
 /// Statuses worth another attempt: throttling and transient server faults.
@@ -443,11 +650,7 @@ impl Mst2Client {
         url: impl AsRef<str>,
     ) -> Result<serde_json::Value, SnapshotError> {
         let url = url.as_ref();
-        ok_or_error(self.send_retrying(self.http.get(url)).await?)
-            .await?
-            .json()
-            .await
-            .map_err(de_err)
+        read_json(ok_or_error(self.send_retrying(self.http.get(url)).await?).await?).await
     }
 
     pub(crate) async fn post_json(
@@ -456,11 +659,8 @@ impl Mst2Client {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, SnapshotError> {
         let url = url.as_ref();
-        ok_or_error(self.send_retrying(self.http.post(url).json(&body)).await?)
-            .await?
-            .json()
+        read_json(ok_or_error(self.send_retrying(self.http.post(url).json(&body)).await?).await?)
             .await
-            .map_err(de_err)
     }
 
     pub(crate) async fn delete_json(
@@ -468,11 +668,7 @@ impl Mst2Client {
         url: impl AsRef<str>,
     ) -> Result<serde_json::Value, SnapshotError> {
         let url = url.as_ref();
-        ok_or_error(self.send_retrying(self.http.delete(url)).await?)
-            .await?
-            .json()
-            .await
-            .map_err(de_err)
+        read_json(ok_or_error(self.send_retrying(self.http.delete(url)).await?).await?).await
     }
 
     /// POST a TreeFrame request and validate the protocol identity headers
@@ -485,7 +681,7 @@ impl Mst2Client {
         snapshot_id: &str,
         max_response_bytes: usize,
     ) -> Result<Vec<u8>, SnapshotError> {
-        if body.len() > 131_072 {
+        if body.len() > TREEFRAME_REQUEST_MAX_BYTES {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
                 "TreeFrame request exceeds the JSON request byte limit",
@@ -502,7 +698,6 @@ impl Mst2Client {
             .send_retrying(
                 self.http
                     .post(url)
-                    .timeout(Duration::from_secs(60))
                     .header("content-type", "application/json")
                     .body(body),
             )
@@ -514,7 +709,7 @@ impl Mst2Client {
         } else {
             // Typed HTTP errors are JSON, not TreeFrames, but their bodies
             // need the same bounded read before attempting envelope parsing.
-            max_response_bytes.min(1_048_576)
+            max_response_bytes.min(MAX_JSON_RESPONSE_BYTES)
         };
         if resp
             .content_length()
@@ -538,18 +733,7 @@ impl Mst2Client {
             bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&bytes) {
-                return Err(SnapshotError {
-                    code: SnapshotErrorCode::from_server(&env.error.code),
-                    message: env.error.message,
-                    http_status: status.as_u16(),
-                });
-            }
-            return Err(SnapshotError {
-                code: SnapshotErrorCode::Internal,
-                message: format!("HTTP {status} without error envelope"),
-                http_status: status.as_u16(),
-            });
+            return Err(server_error(&bytes, status));
         }
         Ok(bytes)
     }

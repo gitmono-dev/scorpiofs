@@ -870,11 +870,25 @@ fn output_symlinks_cannot_append_to_checkout_files() {
     assert_eq!(fs::read(&tracked).unwrap(), original);
     fs::remove_file(&output).unwrap();
 
-    let hardlink = temp.path().join("hardlink.jsonl");
-    fs::hard_link(&tracked, &hardlink).unwrap();
-    assert!(std::panic::catch_unwind(|| open_output(&hardlink)).is_err());
-    assert_eq!(fs::read(&tracked).unwrap(), original);
-    fs::remove_file(&hardlink).unwrap();
+    // TMPDIR may be tmpfs while the checkout is on disk. Prefer an external
+    // sibling of the checkout so the hard-link fixture uses the same filesystem.
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hardlink_dir = tempfile::tempdir_in(checkout.parent().unwrap()).unwrap();
+    let hardlink = hardlink_dir.path().join("hardlink.jsonl");
+    match fs::hard_link(&tracked, &hardlink) {
+        Ok(()) => {
+            assert!(std::panic::catch_unwind(|| open_output(&hardlink)).is_err());
+            assert_eq!(fs::read(&tracked).unwrap(), original);
+            fs::remove_file(&hardlink).unwrap();
+        }
+        // A separately mounted checkout can still have a different device from
+        // its parent. Only this unavailable fixture is skipped; the symlink and
+        // normal-output assertions still run.
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            eprintln!("hard-link fixture unavailable across checkout mount: {error}");
+        }
+        Err(error) => panic!("cannot create hard-link fixture: {error}"),
+    }
 
     writeln!(open_output(&output), "private result").unwrap();
     assert_eq!(fs::read_to_string(&output).unwrap(), "private result\n");

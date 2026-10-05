@@ -1,0 +1,326 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitmono
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      imagePullSecrets:
+      - name: acr-pull
+      containers:
+      - name: postgres
+        image: mega2:local
+        env:
+        - name: POSTGRES_USER
+          value: mega2
+        - name: POSTGRES_PASSWORD
+          value: mega2_local_password
+        - name: POSTGRES_DB
+          value: mega2
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: d
+          mountPath: /var/lib/postgresql
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - mega2
+            - -d
+            - mega2
+          initialDelaySeconds: 5
+          periodSeconds: 3
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+      volumes:
+      - name: d
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: gitmono
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      imagePullSecrets:
+      - name: acr-pull
+      containers:
+      - name: redis
+        image: mega2:local
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: gitmono
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+  namespace: gitmono
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: rustfs
+  template:
+    metadata:
+      labels:
+        app: rustfs
+    spec:
+      imagePullSecrets:
+      - name: acr-pull
+      securityContext:
+        fsGroup: 10001
+        runAsUser: 10001
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: mega2
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: rustfs
+        image: mega2:local
+        args:
+        - /data
+        env:
+        - name: RUSTFS_ACCESS_KEY
+          value: rustfs
+        - name: RUSTFS_SECRET_KEY
+          value: rustfs_secret
+        ports:
+        - containerPort: 9000
+        volumeMounts:
+        - name: d
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 2000m
+            memory: 4Gi
+          limits:
+            cpu: 4000m
+            memory: 8Gi
+      volumes:
+      - name: d
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs
+  namespace: gitmono
+spec:
+  selector:
+    app: rustfs
+  ports:
+  - port: 9000
+    targetPort: 9000
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rustfs-init
+  namespace: gitmono
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      imagePullSecrets:
+      - name: acr-pull
+      restartPolicy: OnFailure
+      containers:
+      - name: init
+        image: mega2:local
+        command:
+        - /bin/sh
+        - -c
+        args:
+        - "set -e\n# positional args: rc alias set <name> <endpoint> <ak> <sk>\nfor\
+          \ i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25\
+          \ 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do\n  if rc alias set local\
+          \ http://rustfs:9000 rustfs rustfs_secret 2>/dev/null; then break; fi\n\
+          \  echo \"waiting for rustfs... $i\"; sleep 10;\ndone\nrc alias set local\
+          \ http://rustfs:9000 rustfs rustfs_secret\nrc bucket create local/mega2\
+          \ || true\nrc bucket list local\n"
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mega2
+  namespace: gitmono
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mega2
+  template:
+    metadata:
+      labels:
+        app: mega2
+    spec:
+      imagePullSecrets:
+      - name: acr-pull
+      shareProcessNamespace: true
+      containers:
+      - name: mega2
+        image: mega2:local
+        env:
+        - name: MEGA_BASE_DIR
+          value: /var/lib/mega2
+        - name: MEGA_DATABASE__DB_TYPE
+          value: postgres
+        - name: MEGA_DATABASE__DB_URL
+          value: postgres://mega2:mega2_local_password@postgres:5432/mega2
+        - name: MEGA_DATABASE__MIN_CONNECTION
+          value: '1'
+        - name: MEGA_REDIS__URL
+          value: redis://redis:6379
+        - name: MEGA_MONOREPO__PUSH_POLICY
+          value: trunk
+        - name: MEGA_CEDAR__ENFORCEMENT
+          value: 'off'
+        - name: MEGA_GIT__ANONYMOUS_ACCESS
+          value: 'true'
+        - name: MEGA_GIT__PUSH_AUTH
+          value: none
+        - name: MEGA_GIT__SSH_RECEIVE_PACK
+          value: 'false'
+        - name: MEGA_OBJECT_STORAGE__STORAGE_TYPE
+          value: s3compatible
+        - name: MEGA_OBJECT_STORAGE__S3__REGION
+          value: us-east-1
+        - name: MEGA_OBJECT_STORAGE__S3__BUCKET
+          value: mega2
+        - name: MEGA_OBJECT_STORAGE__S3__ACCESS_KEY_ID
+          value: rustfs
+        - name: MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY
+          value: rustfs_secret
+        - name: MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL
+          value: http://rustfs:9000
+        ports:
+        - containerPort: 8000
+        volumeMounts:
+        - name: state
+          mountPath: /var/lib/mega2
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+          limits:
+            cpu: 4000m
+            memory: 8Gi
+      - name: sampler
+        image: mega2:local
+        command:
+        - /bin/bash
+        - -c
+        args:
+        - "set -uo pipefail\necho \"M2S waiting for the mega2 process...\"\nPID=\"\
+          \"\nfor i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\
+          \ 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\
+          \ 48 49 50 51 52 53 54 55 56 57 58 59 60; do\n  for p in /proc/[0-9]*; do\n\
+          \    [ \"$(cat \"$p/comm\" 2>/dev/null)\" = \"mega2\" ] && { PID=${p#/proc/};\
+          \ break 2; }\n  done\n  sleep 2\ndone\nif [ -z \"${PID:-}\" ]; then echo\
+          \ \"M2S mega2 pid not found\"; sleep infinity; fi\necho \"M2S sampling pid=$PID\
+          \ at 1 Hz\"\nbash /bench/sampler.sh /tmp/m2.tsv 1000 \"mega2:$PID\" >/dev/null\
+          \ 2>&1 &\nsleep 2\nexec tail -f /tmp/m2.tsv\n"
+        volumeMounts:
+        - name: script
+          mountPath: /bench
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+      volumes:
+      - name: state
+        hostPath:
+          path: /var/lib/mega2-state
+          type: DirectoryOrCreate
+      - name: script
+        configMap:
+          name: bench-script
+          defaultMode: 493
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mega2
+  namespace: gitmono
+spec:
+  selector:
+    app: mega2
+  ports:
+  - port: 8000
+    targetPort: 8000
+    nodePort: 30080
+  type: NodePort

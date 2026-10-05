@@ -372,7 +372,8 @@ async fn perform_mount_task(state: ScoState, req: MountRequest) -> Result<MountI
     // Handle temporary mount case (typically for buck2)
     if temp_mount {
         let temp_hash = {
-            let hasher = ObjectHash::new(mono_path.as_bytes());
+            let hasher =
+                ObjectHash::new_for_kind(git_internal::hash::HashKind::Sha1, mono_path.as_bytes());
             hasher.to_string()
         };
 
