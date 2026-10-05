@@ -10,6 +10,15 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  workspace-evidence:
+    name: Workspace v3 evidence checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check actual POSIX evidence and streamed content oracle
+        run: python3 -B -m unittest discover -s tests/mst2-e2e -p 'test_workspace_update_*.py' -v
+
   fmt:
     name: Format Check
     runs-on: ubuntu-latest
