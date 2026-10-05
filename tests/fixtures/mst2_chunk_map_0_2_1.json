@@ -1,0 +1,14 @@
+{
+  "snapshot_id": "sha256:f94af7bddec0603b40dbf5c2b17952bbfef30093af9f5653734ac05983cbbfee",
+  "path": "/large.bin",
+  "map": {
+    "schema_version": 2,
+    "file_content_id": "sha256:4efd7288591f89e732847ac74ca216f53606e15ba2084c09bf63a434a1bab9c9",
+    "file_size": "300000",
+    "chunk_size": 1048576,
+    "chunk_count": "1",
+    "page_count": "1",
+    "pages_root": "sha256:55e79e562d3cbc2afa0cd317e1ed0f9e81d01c07a96605bf370eea3d1d9ebc25",
+    "map_id": "sha256:380018a4d799e78dcfe7e1faa75a5b0b306ef170cc799711233546538f56af79"
+  }
+}
