@@ -486,7 +486,9 @@ for kind in nonempty empty; do
     if [ "$kind" = nonempty ]; then printf 'keep\n' >"$relative_root/data/sentinel"; fi
     reset_evidence
     if invoke "$relative_root" --no-service >"$test_root/relative-$kind.log" 2>&1; then exit 1; fi
-    grep -Fq "cannot safely use a $kind data-root with an all-relative retained config" "$test_root/relative-$kind.log"
+    article=a
+    [ "$kind" != empty ] || article=an
+    grep -Fq "cannot safely use $article $kind data-root with an all-relative retained config" "$test_root/relative-$kind.log"
     assert_zero_mutations
 done
 
