@@ -2480,8 +2480,7 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 [[package]]
 name = "libfuse-fs"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e1f51352e2b0bcf582127a8145a1956b393c8a3219cf687a369e7a852b10e7f"
+source = "git+https://github.com/rk8s-dev/rk8s?rev=01dee0288279ee9cd885c2a0714fed421e735cff#01dee0288279ee9cd885c2a0714fed421e735cff"
 dependencies = [
  "async-trait",
  "asyncfuse",
@@ -4936,7 +4935,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
