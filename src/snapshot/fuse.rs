@@ -33,7 +33,7 @@ use crate::{
         closure::ValidatedSnapshotClosure,
         durable::DurableStore,
         fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission},
-        OwnedChunkedFile, ProvenSnapshotFile, SnapshotFile, SnapshotReader,
+        FileMembershipError, OwnedChunkedFile, ProvenSnapshotFile, SnapshotFile, SnapshotReader,
     },
     util::file_attr::make_file_attr,
 };
@@ -684,7 +684,10 @@ impl Mst2Fuse {
     ) -> Result<Arc<ProvenSnapshotFile>> {
         let proven = match cached {
             Some(proven) => proven,
-            None => reader.prove_file(&node.path).await.map_err(io_err)?,
+            None => reader
+                .prove_file(&node.path)
+                .await
+                .map_err(membership_io_err)?,
         };
         proven.validate(reader).await.map_err(io_err)?;
         let file = proven.file();
@@ -1503,6 +1506,17 @@ fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
     };
     Errno::from(code)
 }
+
+fn membership_io_err(error: FileMembershipError) -> Errno {
+    match error {
+        FileMembershipError::NotFile { .. } => Errno::from(libc::EIO),
+        FileMembershipError::Snapshot(error) => io_err(error),
+    }
+}
+
+#[cfg(test)]
+#[path = "fuse_owned_tests.rs"]
+mod owned_tests;
 
 #[cfg(test)]
 mod tests {
