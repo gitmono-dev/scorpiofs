@@ -740,7 +740,15 @@ async fn full_snapshot_http_raw_concurrent_fallback_preserves_metadata_and_resum
         report.completion_kind,
         scorpiofs::snapshot::CompletionKind::FullSnapshot
     );
-    assert_eq!(http.fixture.requested_ids(), before_metadata);
+    let after_metadata = http.fixture.requested_ids();
+    assert_eq!(&after_metadata[..before_metadata.len()], &before_metadata);
+    // The coordinator proves each waiter's membership against the fixed
+    // root. Its OnceCell shares one proof walk across all three callers.
+    let mut membership_pages = after_metadata[before_metadata.len()..].to_vec();
+    membership_pages.sort();
+    let mut expected_pages = closure.pages().keys().cloned().collect::<Vec<_>>();
+    expected_pages.sort();
+    assert_eq!(membership_pages, expected_pages);
     assert!(http.fixture.object_requests.lock().unwrap().is_empty());
     assert_eq!(store.snapshot_manifest().unwrap().pages(), closure.pages());
     let resumed = store
@@ -751,6 +759,7 @@ async fn full_snapshot_http_raw_concurrent_fallback_preserves_metadata_and_resum
         .unwrap();
     assert_eq!(resumed.fetched, 0);
     assert_eq!(resumed.resumed, 3);
+    assert_eq!(http.fixture.requested_ids(), after_metadata);
 }
 
 #[tokio::test]
