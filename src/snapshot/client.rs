@@ -338,6 +338,13 @@ impl Mst2Client {
         scope: &str,
         lease_seconds: u64,
     ) -> Result<ResolveResponse, SnapshotError> {
+        super::auth::validate_scope(scope)?;
+        if !(60..=3600).contains(&lease_seconds) {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                "resolve lease suggestion must be between 60 and 3600 seconds",
+            ));
+        }
         let body = serde_json::json!({
             "target": {"kind": "latest"},
             "scope": scope,
@@ -348,7 +355,8 @@ impl Mst2Client {
         let resp = self
             .send_retrying(self.http.post(self.snapshots_url("/resolve")).json(&body))
             .await?;
-        read_json(ok_or_error(resp).await?).await
+        let value = read_json(ok_or_error(resp).await?).await?;
+        super::resolve_wire::parse(value, scope)
     }
 
     /// One directory page; `cursor` continues pagination (spec 04 §5).

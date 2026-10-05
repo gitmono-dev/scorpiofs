@@ -286,7 +286,7 @@ fn decimal(value: &str, field: &str) -> Result<u64, SnapshotError> {
     Ok(parsed)
 }
 
-fn validate_scope(scope: &str) -> Result<(), SnapshotError> {
+pub(crate) fn validate_scope(scope: &str) -> Result<(), SnapshotError> {
     if scope.len() > 4096 {
         return Err(SnapshotError::new(
             SnapshotErrorCode::LimitExceeded,
