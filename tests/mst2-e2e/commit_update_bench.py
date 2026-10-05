@@ -705,10 +705,11 @@ def execute(options):
     if len(records) != options.rounds * 3:
         raise AssertionError("all requested complete V1/V2/V3 rounds are required")
     deadline = budget.report_deadline()
+    projection_writer_status = None
     if projection:
         with phase("projection_trace_finalization"):
             options.finalize_projection(deadline)
-            collector.finish(options.rounds * 3, deadline)
+            projection_writer_status = collector.finish(options.rounds * 3, deadline)
     for version in ("v1", "v2", "v3"):
         if time.monotonic() >= deadline:
             raise TimeoutError("summary exceeded its fixed report budget")
@@ -732,6 +733,7 @@ def execute(options):
                 summary[metric] = {"p50": percentile(values, 50), "p95": percentile(values, 95)}
         emit(summary)
     emit({"record": "complete", "round_scenarios": len(records),
+          "projection_writer_status": projection_writer_status,
           "elapsed_seconds": time.monotonic() - started, "correctness": "PASS"})
 
 
