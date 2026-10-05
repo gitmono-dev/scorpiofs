@@ -310,6 +310,9 @@ pub struct FixedLayerFuse {
     pub frozen_dirs: Vec<PathBuf>,
     /// Live FUSE session. Drop / [`MountHandle::unmount`] tears the mount down.
     mount_handle: Option<MountHandle>,
+    /// A failed helper fallback still needs an explicit unmount retry even
+    /// after the native session handle has been consumed.
+    unmount_failed: bool,
 }
 impl FixedLayerFuse {
     /// Build directories for upper / optional CL layers.
@@ -337,6 +340,7 @@ impl FixedLayerFuse {
             cl_dir,
             frozen_dirs: Vec::new(),
             mount_handle: None,
+            unmount_failed: false,
         })
     }
 
@@ -379,6 +383,9 @@ impl FixedLayerFuse {
         if self.mount_handle.is_some() {
             return Ok(());
         }
+        if self.unmount_failed {
+            self.unmount().await?;
+        }
 
         // Ensure mountpoint exists *before* mounting. This is a plain filesystem check.
         // Do not probe it *after* mounting, because that may trigger FUSE getattr and can fail
@@ -397,6 +404,7 @@ impl FixedLayerFuse {
         // uses nix::mount::unmount; Linux uses fusermount3). Spawning a task
         // that owns the handle would force a fusermount fallback.
         self.mount_handle = Some(handle);
+        self.unmount_failed = false;
 
         // Readiness probe: wait until the FUSE mount is actually servicing requests.
         // Without this, callers (e.g., Buck2) that immediately stat() the mountpoint
@@ -439,28 +447,40 @@ impl FixedLayerFuse {
     /// the platform helper (`fusermount3` on Linux, `umount` on macOS).
     pub async fn unmount(&mut self) -> std::io::Result<()> {
         let Some(handle) = self.mount_handle.take() else {
+            if self.unmount_failed {
+                let result = fuse_platform::unmount_path(&self.mountpoint, true).await;
+                self.unmount_failed = result.is_err();
+                return result;
+            }
             return Ok(());
         };
         let mount_path = self.mountpoint.clone();
-        match tokio::time::timeout(tokio::time::Duration::from_millis(1200), handle.unmount()).await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    path = %mount_path.display(),
-                    error = %e,
-                    "MountHandle::unmount failed; falling back to platform unmount"
-                );
-                fuse_platform::unmount_path(&mount_path, true).await
-            }
-            Err(_) => {
-                tracing::warn!(
-                    path = %mount_path.display(),
-                    "MountHandle::unmount timed out; falling back to platform unmount"
-                );
-                fuse_platform::unmount_path(&mount_path, true).await
-            }
-        }
+        // Cancellation after consuming the native handle must also require
+        // an explicit retry, rather than treating None as successful cleanup.
+        self.unmount_failed = true;
+        let result =
+            match tokio::time::timeout(tokio::time::Duration::from_millis(1200), handle.unmount())
+                .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        path = %mount_path.display(),
+                        error = %e,
+                        "MountHandle::unmount failed; falling back to platform unmount"
+                    );
+                    fuse_platform::unmount_path(&mount_path, true).await
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        path = %mount_path.display(),
+                        "MountHandle::unmount timed out; falling back to platform unmount"
+                    );
+                    fuse_platform::unmount_path(&mount_path, true).await
+                }
+            };
+        self.unmount_failed = result.is_err();
+        result
     }
 }
 
