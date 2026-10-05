@@ -40,6 +40,7 @@ impl SnapshotReader {
             self.client().validate_path(&file.rel_path)?;
             self.client().validate_file_size(file.size)?;
         }
+        self.path_membership.seed_directories(closure);
         let files: HashMap<_, _> = closure
             .files()
             .iter()
@@ -65,6 +66,7 @@ impl SnapshotReader {
             .content_membership
             .get_or_try_init(|| async {
                 let closure = self.snapshot_closure().await?;
+                self.path_membership.seed_directories(&closure);
                 Ok::<_, SnapshotError>(
                     closure
                         .files()
