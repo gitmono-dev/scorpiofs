@@ -565,7 +565,10 @@ impl Launcher {
             let attempt = format!("{logical}:a1");
             assert_eq!(binding.logical_request_id, logical);
             assert_eq!(binding.resolve_trace_receipt.logical_request_id, logical);
-            assert_eq!(binding.resolve_trace_receipt.attempt_ids, [attempt.clone()]);
+            assert_eq!(
+                binding.resolve_trace_receipt.attempt_ids.as_slice(),
+                std::slice::from_ref(&attempt)
+            );
             assert_eq!(binding.resolve_trace_receipt.final_attempt_id, attempt);
             assert_eq!(binding.resolve_trace_receipt.retry_count, 0);
             final_attempts.push(Some(attempt));
