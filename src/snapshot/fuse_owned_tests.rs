@@ -43,6 +43,7 @@ struct Fixture {
     bodies: BTreeMap<String, Vec<u8>>,
     metadata: Mutex<Vec<String>>,
     requests: AtomicUsize,
+    emitted: Arc<AtomicUsize>,
     renewals: AtomicUsize,
     mode: AtomicUsize,
     release: tokio::sync::Semaphore,
@@ -89,6 +90,7 @@ impl Fixture {
             bodies,
             metadata: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
+            emitted: Arc::new(AtomicUsize::new(0)),
             renewals: AtomicUsize::new(0),
             mode: AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(0),
@@ -99,9 +101,13 @@ impl Fixture {
     fn response(&self, request: &[u8], wire: Vec<u8>, pending: bool) -> Response {
         use futures::StreamExt;
         let body = if pending {
+            let emitted = self.emitted.clone();
             Body::from_stream(
-                futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(wire))])
-                    .chain(futures::stream::pending()),
+                futures::stream::once(async move {
+                    emitted.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, std::io::Error>(Bytes::from(wire))
+                })
+                .chain(futures::stream::pending()),
             )
         } else {
             Body::from(wire)
@@ -281,7 +287,7 @@ async fn actual_reply_clones_survive_small_cache_eviction_mount_drop_and_keep_qu
     let paid = server.reader.content_usage().output_bytes - slots;
     let cloned_reply = reply.clone();
     let last = cloned_reply.data.slice(1..8);
-    assert_eq!(last.as_ptr(), unsafe { reply.data.as_ptr().add(1) });
+    assert_eq!(last.as_ptr(), reply.data.as_ptr().wrapping_add(1));
     assert_eq!(last.as_ref(), [0; 7]);
     for index in 1..17 {
         drop(read(&fs, &format!("file{index:03}"), 0, 1).await);
@@ -386,4 +392,208 @@ async fn reply_metadata_admission_rejects_before_body_but_valid_empty_replies_ha
     assert!(read(&fs, "empty", 0, 1).await.data.is_empty());
     assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
     assert_eq!(server.reader.content_usage().output_bytes, 1024);
+}
+
+#[tokio::test]
+async fn failed_body_and_end_do_not_cache_or_retry_through_a_legacy_api() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let file = inode(&fs, "file000").await;
+    let slots = server.reader.content_usage().output_bytes;
+    for mode in [1, 2] {
+        server.fixture.mode.store(mode, Ordering::SeqCst);
+        let before = server.fixture.requests.load(Ordering::SeqCst);
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), file, file, 0, 1)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EIO
+        );
+        idle(&server.reader).await;
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), before + 1);
+        assert_eq!(server.reader.content_usage().output_bytes, slots);
+        assert_eq!(
+            fs.state
+                .lock()
+                .unwrap()
+                .owned
+                .as_ref()
+                .unwrap()
+                .contents
+                .len(),
+            0
+        );
+        assert!(fs.state.lock().unwrap().contents.is_empty());
+    }
+    server.fixture.mode.store(0, Ordering::SeqCst);
+    assert_eq!(read(&fs, "file000", 0, 1).await.data.as_ref(), [0]);
+}
+
+#[tokio::test]
+async fn actual_fuse_future_cancellation_before_and_after_body_restores_only_its_owners() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let fs = Arc::new(server.view(false).await);
+    let retained = read(&fs, "file000", 0, 4).await;
+    let baseline = server.reader.content_usage().output_bytes;
+    for (mode, name) in [(4, "file001"), (3, "file002")] {
+        server.fixture.mode.store(mode, Ordering::SeqCst);
+        let file = inode(&fs, name).await;
+        let before = server.fixture.requests.load(Ordering::SeqCst);
+        let emitted = server.fixture.emitted.load(Ordering::SeqCst);
+        let task = tokio::spawn({
+            let fs = fs.clone();
+            async move { fs.read(Request::default(), file, file, 0, 4).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.fixture.requests.load(Ordering::SeqCst) == before
+                || mode == 3 && server.fixture.emitted.load(Ordering::SeqCst) == emitted
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !task.is_finished(),
+            "actual pending HTTP unexpectedly published"
+        );
+        assert!(server.reader.content_usage().output_bytes > baseline);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        if mode == 4 {
+            server.fixture.release.add_permits(1);
+        }
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage().output_bytes, baseline);
+        assert_eq!(retained.data.as_ref(), [0; 4]);
+        assert_eq!(
+            fs.state
+                .lock()
+                .unwrap()
+                .owned
+                .as_ref()
+                .unwrap()
+                .contents
+                .len(),
+            1
+        );
+    }
+    server.fixture.mode.store(0, Ordering::SeqCst);
+    assert_eq!(read(&fs, "file001", 0, 1).await.data.as_ref(), [1]);
+    assert_eq!(read(&fs, "file002", 0, 1).await.data.as_ref(), [2]);
+    drop(retained);
+    drop(fs);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn inode_tuple_and_unproven_public_manifest_cannot_authorize_a_body_or_empty_reply() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    for case in 0..4 {
+        let fs = server.view(false).await;
+        let file = inode(&fs, "file000").await;
+        drop(fs.read(Request::default(), file, file, 0, 1).await.unwrap());
+        {
+            let mut state = fs.state.lock().unwrap();
+            let Node::File(node) = state.nodes.get_mut(&file).unwrap() else {
+                panic!("file fixture");
+            };
+            match case {
+                0 => node.path = "file001".into(),
+                1 => node.fs_kind = "symlink".into(),
+                2 => node.size = 0,
+                _ => node.digest = id(&[0x99; 32]),
+            }
+        }
+        let before = server.fixture.requests.load(Ordering::SeqCst);
+        for (offset, size) in [(0, 1), (u64::MAX, 0)] {
+            assert_eq!(
+                i32::from(
+                    fs.read(Request::default(), file, file, offset, size)
+                        .await
+                        .unwrap_err()
+                ),
+                -libc::EIO
+            );
+        }
+        if case == 1 {
+            assert_eq!(
+                i32::from(fs.readlink(Request::default(), file).await.unwrap_err()),
+                -libc::EIO
+            );
+        }
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), before);
+    }
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let fs = Mst2Fuse::build(
+        Some(server.reader.clone()),
+        None,
+        vec![SnapshotFile {
+            rel_path: "file000".into(),
+            fs_kind: "regular".into(),
+            size: 8192,
+            content_digest: id(&[0x99; 32]),
+        }],
+    )
+    .unwrap();
+    let file = inode(&fs, "file000").await;
+    assert!(fs.read(Request::default(), file, file, 0, 1).await.is_err());
+    assert!(server.reader.content_membership.get().is_none());
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cached_content_readlink_and_true_eof_require_the_current_lease() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, true);
+    let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(4);
+    fixture.expiry = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        expiry.year(),
+        u8::from(expiry.month()),
+        expiry.day(),
+        expiry.hour(),
+        expiry.minute(),
+        expiry.second()
+    );
+    let server = Server::start(fixture, 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let file = inode(&fs, "file000").await;
+    let link = inode(&fs, "link").await;
+    let prior = fs.read(Request::default(), file, file, 0, 4).await.unwrap();
+    drop(fs.readlink(Request::default(), link).await.unwrap());
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while server.fixture.renewals.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        server.reader.ensure_lease().await.unwrap_err().code,
+        crate::snapshot::SnapshotErrorCode::ScopeForbidden
+    );
+    let before = server.fixture.requests.load(Ordering::SeqCst);
+    for (offset, size) in [(0, 1), (0, 0), (8192, 1), (u64::MAX, u32::MAX)] {
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), file, file, offset, size)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EACCES
+        );
+    }
+    assert_eq!(
+        i32::from(fs.readlink(Request::default(), link).await.unwrap_err()),
+        -libc::EACCES
+    );
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), before);
+    assert_eq!(prior.data.as_ref(), [0; 4]);
 }
