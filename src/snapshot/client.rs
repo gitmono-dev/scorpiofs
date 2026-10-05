@@ -416,6 +416,22 @@ mod tests {
                 .is_err()
         );
 
+        let mut encoded = headers();
+        encoded.insert(
+            reqwest::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        assert!(validate_treeframe_headers(&encoded, expected_snapshot, expected_digest).is_err());
+
+        let mut duplicate = headers();
+        duplicate.append(
+            "x-mega-snapshot-id",
+            HeaderValue::from_static(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            ),
+        );
+        assert!(validate_treeframe_headers(&duplicate, expected_snapshot, expected_digest).is_err());
+
         let mut wrong = headers();
         wrong.insert(
             "x-mega-snapshot-id",
@@ -543,45 +559,35 @@ fn validate_treeframe_headers(
     snapshot_id: &str,
     expected_request_digest: &str,
 ) -> Result<(), SnapshotError> {
-    let content_type = headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            SnapshotError::new(
-                SnapshotErrorCode::DigestMismatch,
-                "TreeFrame response is missing Content-Type",
-            )
-        })?;
+    let content_type = one_treeframe_header(headers, "content-type", "Content-Type")?;
     if !content_type.eq_ignore_ascii_case("application/vnd.mega.treeframe;version=2") {
         return Err(SnapshotError::new(
             SnapshotErrorCode::DigestMismatch,
             format!("unexpected TreeFrame Content-Type: {content_type}"),
         ));
     }
-    let returned_snapshot = headers
-        .get("x-mega-snapshot-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            SnapshotError::new(
-                SnapshotErrorCode::DigestMismatch,
-                "TreeFrame response is missing X-Mega-Snapshot-Id",
-            )
-        })?;
+    if headers.contains_key(reqwest::header::CONTENT_ENCODING) {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            "TreeFrame response must not use Content-Encoding",
+        ));
+    }
+    let returned_snapshot = one_treeframe_header(
+        headers,
+        "x-mega-snapshot-id",
+        "X-Mega-Snapshot-Id",
+    )?;
     if returned_snapshot != snapshot_id {
         return Err(SnapshotError::new(
             SnapshotErrorCode::DigestMismatch,
             format!("TreeFrame response snapshot {returned_snapshot} does not match {snapshot_id}"),
         ));
     }
-    let returned_request_digest = headers
-        .get("x-mega-request-digest")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            SnapshotError::new(
-                SnapshotErrorCode::DigestMismatch,
-                "TreeFrame response is missing X-Mega-Request-Digest",
-            )
-        })?;
+    let returned_request_digest = one_treeframe_header(
+        headers,
+        "x-mega-request-digest",
+        "X-Mega-Request-Digest",
+    )?;
     if returned_request_digest != expected_request_digest {
         return Err(SnapshotError::new(
             SnapshotErrorCode::DigestMismatch,
@@ -591,4 +597,30 @@ fn validate_treeframe_headers(
         ));
     }
     Ok(())
+}
+
+fn one_treeframe_header<'a>(
+    headers: &'a reqwest::header::HeaderMap,
+    name: &str,
+    display_name: &str,
+) -> Result<&'a str, SnapshotError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next().ok_or_else(|| {
+        SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("TreeFrame response is missing {display_name}"),
+        )
+    })?;
+    if values.next().is_some() {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("TreeFrame response has duplicate {display_name}"),
+        ));
+    }
+    value.to_str().map_err(|_| {
+        SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("TreeFrame response has invalid {display_name}"),
+        )
+    })
 }
