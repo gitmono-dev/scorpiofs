@@ -144,3 +144,188 @@ async fn modern_copy_up_append_truncate_and_upper_fsync_preserve_the_open_fixed_
     drop(retained);
     assert_eq!(server.reader.content_usage().output_bytes, 0);
 }
+
+#[tokio::test]
+async fn copied_up_modern_file_keeps_its_live_upper_handle_after_unlink_and_whiteout() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let (lower, overlay, _temp, upper) = overlay(&server).await;
+    let req = Request::default();
+    let name = OsStr::new("file002");
+    let file = overlay
+        .lookup(req, ROOT_INODE, name)
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let flags = libc::O_RDWR as u32;
+    let opened = overlay.open(req, file, flags).await.unwrap();
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        overlay
+            .write(req, file, opened.fh, 0, b"upper", 0, flags)
+            .await
+            .unwrap()
+            .written,
+        5
+    );
+    overlay.unlink(req, ROOT_INODE, name).await.unwrap();
+    assert_eq!(
+        i32::from(overlay.lookup(req, ROOT_INODE, name).await.unwrap_err()),
+        -libc::ENOENT
+    );
+    assert!(!upper.join("file002").exists());
+    assert!(upper.join(".wh.file002").exists());
+    assert_eq!(
+        overlay
+            .read(req, file, opened.fh, 0, 5)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        b"upper"
+    );
+    assert_eq!(
+        overlay
+            .write(req, file, opened.fh, 5, b"tail", 0, flags)
+            .await
+            .unwrap()
+            .written,
+        4
+    );
+    overlay.fsync(req, file, opened.fh, false).await.unwrap();
+    assert_eq!(
+        overlay
+            .read(req, file, opened.fh, 0, 9)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        b"uppertail"
+    );
+    overlay
+        .release(req, file, opened.fh, flags, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        i32::from(overlay.lookup(req, ROOT_INODE, name).await.unwrap_err()),
+        -libc::ENOENT
+    );
+    assert_eq!(read(&lower, "file002", 0, 9).await.data.as_ref(), [2; 9]);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
+    drop(overlay);
+    drop(lower);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn editor_temp_fsync_rename_and_directory_fsync_replace_upper_without_mutating_lower() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let (lower, overlay, _temp, upper) = overlay(&server).await;
+    let req = Request::default();
+    let original_name = OsStr::new("file003");
+    let original = overlay
+        .lookup(req, ROOT_INODE, original_name)
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let old = overlay
+        .open(req, original, libc::O_RDONLY as u32)
+        .await
+        .unwrap();
+    let prior = overlay.read(req, original, old.fh, 0, 4).await.unwrap();
+    let temporary_name = OsStr::new(".file003.editor-tmp");
+    let flags = libc::O_RDWR as u32;
+    let created = overlay
+        .create(req, ROOT_INODE, temporary_name, 0o644, flags)
+        .await
+        .unwrap();
+    let inode = created.attr.ino;
+    assert_eq!(
+        overlay
+            .write(req, inode, created.fh, 0, b"replacement\n", 0, flags)
+            .await
+            .unwrap()
+            .written,
+        12
+    );
+    overlay.fsync(req, inode, created.fh, false).await.unwrap();
+    overlay
+        .release(req, inode, created.fh, flags, 0, false)
+        .await
+        .unwrap();
+    overlay
+        .rename(req, ROOT_INODE, temporary_name, ROOT_INODE, original_name)
+        .await
+        .unwrap();
+    let directory = overlay.opendir(req, ROOT_INODE, 0).await.unwrap();
+    overlay
+        .fsyncdir(req, ROOT_INODE, directory.fh, false)
+        .await
+        .unwrap();
+    overlay
+        .releasedir(req, ROOT_INODE, directory.fh, 0)
+        .await
+        .unwrap();
+    assert!(!upper.join(temporary_name).exists());
+    assert_eq!(
+        std::fs::read(upper.join(original_name)).unwrap(),
+        b"replacement\n"
+    );
+    assert_eq!(
+        i32::from(
+            overlay
+                .lookup(req, ROOT_INODE, temporary_name)
+                .await
+                .unwrap_err()
+        ),
+        -libc::ENOENT
+    );
+    let replaced = overlay
+        .lookup(req, ROOT_INODE, original_name)
+        .await
+        .unwrap()
+        .attr;
+    assert_eq!(replaced.size, 12);
+    let opened = overlay
+        .open(req, replaced.ino, libc::O_RDONLY as u32)
+        .await
+        .unwrap();
+    assert_eq!(
+        overlay
+            .read(req, replaced.ino, opened.fh, 0, 64)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        b"replacement\n"
+    );
+    overlay
+        .release(req, replaced.ino, opened.fh, 0, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        overlay
+            .read(req, original, old.fh, 0, 4)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        [3; 4]
+    );
+    overlay
+        .release(req, original, old.fh, 0, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(read(&lower, "file003", 0, 4).await.data.as_ref(), [3; 4]);
+    assert_eq!(prior.data.as_ref(), [3; 4]);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
+    drop(prior);
+    drop(overlay);
+    drop(lower);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
