@@ -12,6 +12,7 @@ pub mod client;
 pub mod closure;
 mod content;
 pub mod coordinator;
+mod descriptor_wire;
 mod directory;
 pub mod durable;
 pub mod frames;
