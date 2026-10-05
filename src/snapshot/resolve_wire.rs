@@ -63,19 +63,28 @@ pub(crate) fn opaque(value: &str) -> bool {
 }
 
 pub(crate) fn timestamp(value: &str) -> Result<OffsetDateTime, SnapshotError> {
+    // The time parser also accepts application-selected date/time separators.
+    // Our wire contract uses the RFC3339 T separator (case-insensitive).
     // RFC3339 -00:00 explicitly means an unknown local offset; it cannot
     // identify an actual lease expiry instant.
-    if value.ends_with("-00:00") {
+    if !matches!(value.as_bytes().get(10), Some(b'T' | b't')) || value.ends_with("-00:00") {
         return Err(invalid());
     }
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| invalid())
 }
 
-pub(crate) fn parse(value: Value, requested_scope: &str) -> Result<ResolveResponse, SnapshotError> {
+pub(crate) fn parse_request(
+    value: Value,
+    request: &super::ResolveRequest,
+    require_canonical: bool,
+) -> Result<ResolveResponse, SnapshotError> {
     let canonical = ["writer_epoch", "resolved_at", "delivery", "offline_grant"]
         .iter()
         .any(|key| value.get(key).is_some());
     if !canonical {
+        if require_canonical {
+            return Err(invalid());
+        }
         // Explicit existing envelope. A malformed canonical envelope never
         // gets here, including one with a null canonical field.
         return serde_json::from_value(value).map_err(|_| invalid());
@@ -83,7 +92,16 @@ pub(crate) fn parse(value: Value, requested_scope: &str) -> Result<ResolveRespon
     let wire: CanonicalResolve = serde_json::from_value(value).map_err(|_| invalid())?;
     let descriptor = wire.descriptor.into();
     super::auth::validate_descriptor(&descriptor).map_err(|_| invalid())?;
-    if descriptor.scope != requested_scope || wire.delivery != "full" || !opaque(&wire.lease_id) {
+    let delivery = match request.delivery {
+        super::ResolveDelivery::Full => "full",
+        super::ResolveDelivery::Lazy => "lazy",
+    };
+    if descriptor.scope != request.scope
+        || wire.delivery != delivery
+        || matches!(&request.target, super::ResolveTarget::View { view_id }
+            if descriptor.namespace_view_id != *view_id)
+        || !opaque(&wire.lease_id)
+    {
         return Err(invalid());
     }
     for value in [

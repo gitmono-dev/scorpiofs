@@ -112,10 +112,14 @@ pub(super) fn record_file_sync(path: &Path) {
     });
 }
 
-pub(super) struct FaultGuard;
+pub(in crate::snapshot) struct FaultGuard;
 
 impl FaultGuard {
-    pub(super) fn install(path: &Path, phase: &'static str, after_complete_rename: bool) -> Self {
+    pub(in crate::snapshot) fn install(
+        path: &Path,
+        phase: &'static str,
+        after_complete_rename: bool,
+    ) -> Self {
         FAULT.with(|slot| {
             assert!(slot.borrow().is_none());
             *slot.borrow_mut() = Some(Fault {

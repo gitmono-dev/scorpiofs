@@ -7,9 +7,7 @@ use mst2_codec::treeframe::{self, Frame};
 use serde::Serialize;
 
 use super::{
-    client::{
-        net_err, server_error, Mst2Client, MAX_JSON_RESPONSE_BYTES, TREEFRAME_REQUEST_MAX_BYTES,
-    },
+    client::{net_err, Mst2Client, MAX_JSON_RESPONSE_BYTES, TREEFRAME_REQUEST_MAX_BYTES},
     content::{AccountedBuffer, BudgetClass, ContentBudget},
     SnapshotError, SnapshotErrorCode,
 };
@@ -64,13 +62,14 @@ impl io::Write for AccountedBuffer {
 
 /// The actual HTTP/retry Bytes owner retains the serialization reservation.
 pub(crate) fn request_body<T: Serialize>(
+    client: &Mst2Client,
     budget: &ContentBudget,
     value: &T,
 ) -> Result<Bytes, SnapshotError> {
     let mut buffer = AccountedBuffer::new(
         budget,
         BudgetClass::Construction,
-        TREEFRAME_REQUEST_MAX_BYTES,
+        client.request_byte_limit().min(TREEFRAME_REQUEST_MAX_BYTES),
         size_of::<OwnedRequest>() + size_of::<Bytes>(),
     )?;
     serde_json::to_writer(&mut buffer, value)
@@ -86,14 +85,14 @@ async fn typed_error(
     let status = response.status();
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_JSON_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > client.response_byte_limit() as u64)
     {
         return limit("JSON error response exceeds the protocol byte budget");
     }
     let mut buffer = match AccountedBuffer::new(
         budget,
         BudgetClass::Construction,
-        MAX_JSON_RESPONSE_BYTES,
+        client.response_byte_limit().min(MAX_JSON_RESPONSE_BYTES),
         0,
     ) {
         Ok(buffer) => buffer,
@@ -110,7 +109,7 @@ async fn typed_error(
                     return error;
                 }
             }
-            Ok(None) => return server_error(buffer.as_bytes(), status),
+            Ok(None) => return client.response_error(buffer.as_bytes(), status),
             Err(error) => return net_err(error),
         }
     }
@@ -257,6 +256,16 @@ pub(crate) async fn consume_frames(
         logical_max,
         allow_zstd,
     } = request;
+    if item_count as usize > client.request_item_limit()
+        || logical_max
+            > match data_kind {
+                treeframe::KIND_OBJECT => client.object_byte_limit(),
+                treeframe::KIND_CHUNK => client.chunk_byte_limit(),
+                _ => return Err(invalid("unsupported owned endpoint")),
+            }
+    {
+        return Err(limit("owned request exceeds the discovered batch limit"));
+    }
     let request_sha: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &body)
         .as_ref()
         .try_into()
@@ -329,7 +338,7 @@ pub(crate) async fn consume_frames(
             treeframe::KIND_ERROR => treeframe::ERROR_MAX_BYTES,
             _ => unreachable!("endpoint kind checked"),
         };
-        if raw_len > frame_raw_max || wire_len > 2 * 1024 * 1024 {
+        if raw_len > frame_raw_max || wire_len > client.frame_wire_limit() {
             return Err(limit("frame exceeds its payload byte limit"));
         }
         frames += 1;
@@ -434,7 +443,8 @@ mod tests {
     #[test]
     fn serialized_request_bytes_retain_credits_through_last_actual_clone() {
         let budget = budget();
-        let body = request_body(&budget, &serde_json::json!({"items": ["a"]})).unwrap();
+        let client = Mst2Client::new("http://127.0.0.1:9");
+        let body = request_body(&client, &budget, &serde_json::json!({"items": ["a"]})).unwrap();
         let charged = budget.usage().construction_bytes;
         assert!(charged >= TREEFRAME_REQUEST_MAX_BYTES);
         let clone = body.clone();
@@ -445,7 +455,10 @@ mod tests {
         assert_eq!(budget.usage().construction_bytes, 0);
         let too_large = "x".repeat(TREEFRAME_REQUEST_MAX_BYTES);
         assert_eq!(
-            request_body(&budget, &too_large).err().unwrap().code,
+            request_body(&client, &budget, &too_large)
+                .err()
+                .unwrap()
+                .code,
             SnapshotErrorCode::LimitExceeded
         );
         assert_eq!(budget.usage().construction_bytes, 0);
@@ -594,6 +607,7 @@ mod tests {
         allow_zstd: bool,
     ) -> Result<Arc<VerifiedContent>, SnapshotError> {
         let body = request_body(
+            &server.client,
             budget,
             &serde_json::json!({"items":[{"path":"/a", "expected_digest":format!("sha256:{}",hex::encode(hash(CONTENT)))}]}),
         )?;
