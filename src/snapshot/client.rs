@@ -20,6 +20,8 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const TREEFRAME_REQUEST_MAX_BYTES: usize = 131_072;
+
 use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize};
 
@@ -67,7 +69,7 @@ struct BoundCredentials {
 const MAX_ATTEMPTS: u32 = 4;
 const BASE_BACKOFF_MS: u64 = 40;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_JSON_REQUEST_BYTES: usize = 131_072;
+const MAX_JSON_REQUEST_BYTES: usize = TREEFRAME_REQUEST_MAX_BYTES;
 const MAX_JSON_RESPONSE_BYTES: usize = 1_048_576;
 
 /// Local limit for APIs returning a whole file in memory. Larger files use
@@ -657,7 +659,7 @@ impl Mst2Client {
         snapshot_id: &str,
         max_response_bytes: usize,
     ) -> Result<Vec<u8>, SnapshotError> {
-        if body.len() > MAX_JSON_REQUEST_BYTES {
+        if body.len() > TREEFRAME_REQUEST_MAX_BYTES {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
                 "TreeFrame request exceeds the JSON request byte limit",
@@ -762,6 +764,11 @@ fn validate_treeframe_headers(
             format!("unexpected TreeFrame Content-Type: {content_type}"),
         ));
     }
+    // TreeFrame bytes are already framed and authenticated by the codec.
+    // Letting reqwest transparently decode an HTTP content encoding before
+    // parsing would make the response representation ambiguous and could
+    // turn a proxy transformation into an integrity failure much later.
+    // Spec 06 therefore requires this header to be absent.
     if headers.contains_key(reqwest::header::CONTENT_ENCODING) {
         return Err(SnapshotError::new(
             SnapshotErrorCode::DigestMismatch,

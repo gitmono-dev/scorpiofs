@@ -69,13 +69,15 @@ pub struct CommittedPath {
 /// Compute the git blob OID of `content`, matching what Mega's `content-hash`
 /// entries contain for the same bytes.
 ///
-/// Uses the process-wide hash kind (SHA-1 unless someone reconfigured it), which is
-/// the format the monorepo server serves for the repositories this integration
-/// targets. A length check against the lower's OID at comparison time catches a
-/// mismatched configuration instead of silently reporting phantom changes.
+/// Hashes Git blob bodies explicitly as SHA-1, the repository format served by
+/// the monorepo backend. This is independent of the worker thread's hash default.
 pub fn git_blob_oid(content: &[u8]) -> String {
-    git_internal::internal::object::blob::Blob::from_content_bytes(content.to_vec())
-        .id
+    use git_internal::{
+        hash::{HashKind, ObjectHash},
+        internal::object::types::ObjectType,
+    };
+    ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Blob, content)
+        .expect("blob is a canonical Git object type")
         .to_string()
 }
 
