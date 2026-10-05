@@ -48,7 +48,7 @@ impl Drop for Server {
 
 fn valid() -> Value {
     json!({"snapshot_id": SID, "results": [
-        {"path": "/a", "status": "found", "node": {"fs_kind": "regular", "name": "a", "size": "1"}},
+        {"path": "/a", "status": "found", "node": {"fs_kind": "regular", "name": "a", "size": "1", "content_digest": SID}},
         {"path": "/b", "status": "absent"},
     ]})
 }

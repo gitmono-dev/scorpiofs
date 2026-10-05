@@ -209,19 +209,29 @@ pub struct LookupResponse {
 pub struct LookupResult {
     pub path: String,
     pub status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_nonnull_lookup_node")]
     pub node: Option<LookupNode>,
+}
+
+fn optional_nonnull_lookup_node<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<LookupNode>, D::Error> {
+    LookupNode::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LookupNode {
     pub fs_kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub size: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub content_digest: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub directory_root: Option<String>,
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
+    pub node_class: Option<String>,
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
+    pub lifecycle: Option<String>,
 }

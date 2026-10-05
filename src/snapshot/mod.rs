@@ -17,6 +17,7 @@ pub mod frames;
 pub mod fuse;
 pub mod incremental;
 pub mod layer;
+mod lookup;
 pub mod range;
 pub mod reader;
 pub mod types;
