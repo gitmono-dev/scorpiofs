@@ -22,8 +22,8 @@ use scorpiofs::snapshot::{
     capabilities::CapabilityAdvertisement,
     durable::digest_of,
     frames::{parse_digest, MetadataPageItem},
-    ChunkedFile, Mst2Client, ResolveDelivery, ResolveRequest, ResolveTarget, SnapshotErrorCode,
-    SnapshotReader,
+    ChunkedFile, CompletionKind, DurableStore, LocalPinState, Mst2Client, ResolveDelivery,
+    ResolveRequest, ResolveTarget, ScopeCache, SnapshotErrorCode, SnapshotReader,
 };
 use serde_json::{json, Value};
 
@@ -257,7 +257,11 @@ async fn frames(
                 );
             }
             "objects" => {
-                let data = &f.bodies[item["path"].as_str().unwrap()];
+                let path = format!(
+                    "/{}",
+                    item["path"].as_str().unwrap().trim_start_matches('/')
+                );
+                let data = &f.bodies[&path];
                 assert_eq!(item["expected_digest"], digest_of(data));
                 logical += data.len();
                 wire.extend(
@@ -269,7 +273,10 @@ async fn frames(
                 );
             }
             "chunks" => {
-                assert_eq!(item["path"], "/large");
+                assert_eq!(
+                    item["path"].as_str().unwrap().trim_start_matches('/'),
+                    "large"
+                );
                 assert_eq!(item["expected_digest"], id(&f.map.file_content_id));
                 assert_eq!(item["map_id"], id(&f.map.map_id()));
                 let index: usize = item["chunk_index"].as_str().unwrap().parse().unwrap();
@@ -306,10 +313,10 @@ async fn map(
     State(f): State<Arc<Fixture>>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
-    assert_eq!(query["path"], "/large");
+    assert_eq!(query["path"].trim_start_matches('/'), "large");
     f.record("chunk-map", json!(query));
     Json(
-        json!({"snapshot_id":f.sid(),"path":"/large","schema_version":2,"file_content_id":id(&f.map.file_content_id),"file_size":f.map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":f.map.chunk_count.to_string(),"page_count":"1","pages_root":id(&f.map.pages_root),"map_id":id(&f.map.map_id())}),
+        json!({"snapshot_id":f.sid(),"path":query["path"],"schema_version":2,"file_content_id":id(&f.map.file_content_id),"file_size":f.map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":f.map.chunk_count.to_string(),"page_count":"1","pages_root":id(&f.map.pages_root),"map_id":id(&f.map.map_id())}),
     )
 }
 async fn leaf(
@@ -317,7 +324,7 @@ async fn leaf(
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
     assert_eq!(query.len(), 3);
-    assert_eq!(query["path"], "/large");
+    assert_eq!(query["path"].trim_start_matches('/'), "large");
     assert_eq!(query["map_id"], id(&f.map.map_id()));
     assert_eq!(query["page_index"], "0");
     f.record("chunk-map/pages", json!(query));
@@ -351,7 +358,7 @@ async fn blob(
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Vec<u8> {
     f.record("blob", json!(query));
-    f.bodies[&query["path"]].clone()
+    f.bodies[&format!("/{}", query["path"].trim_start_matches('/'))].clone()
 }
 
 struct Server {
@@ -398,6 +405,56 @@ impl Server {
             .map(|(_, v)| v.clone())
             .collect()
     }
+}
+
+#[tokio::test]
+async fn canonical_readers_share_verified_cas_with_independently_releasable_workspace_pins() {
+    let s = Server::start(Fixture::new()).await;
+    let first_reader = s.reader().await;
+    let second_reader = s.reader().await;
+    assert_eq!(first_reader.snapshot_id(), second_reader.snapshot_id());
+    let temp = tempfile::tempdir().unwrap();
+    let first = DurableStore::open_for_workspace(
+        temp.path(),
+        &uuid::Uuid::new_v4().to_string(),
+        &first_reader,
+    )
+    .unwrap();
+    let second = DurableStore::open_for_workspace(
+        temp.path(),
+        &uuid::Uuid::new_v4().to_string(),
+        &second_reader,
+    )
+    .unwrap();
+    assert_ne!(first.root(), second.root());
+    assert_eq!(first.content_dir(), second.content_dir());
+    first.hydrate_snapshot(&first_reader).await.unwrap();
+    let resumed = second.hydrate_snapshot(&second_reader).await.unwrap();
+    assert_eq!(resumed.fetched, 0);
+    assert_eq!(first.manifest().unwrap(), second.manifest().unwrap());
+    assert_eq!(
+        first.local_pin_state().unwrap(),
+        LocalPinState::Complete(CompletionKind::FullSnapshot)
+    );
+    let cache = ScopeCache::open(
+        first_reader
+            .authorized_context()
+            .scope_cache_dir(temp.path()),
+    )
+    .unwrap();
+    let first_release = first.release_local_pin().unwrap();
+    assert!(!first.is_complete().unwrap());
+    assert_eq!(first.release_local_pin().unwrap(), first_release);
+    assert_eq!(
+        cache.try_live_pins().unwrap(),
+        vec![second_reader.snapshot_id()]
+    );
+    assert!(second.is_snapshot_complete().unwrap());
+    let file = second.manifest().unwrap().remove(0);
+    let bytes = second.read_blob(&file.content_digest, file.size).unwrap();
+    assert_eq!(digest_of(&bytes), file.content_digest);
+    second.release_local_pin().unwrap();
+    assert!(cache.try_live_pins().unwrap().is_empty());
 }
 
 #[tokio::test]

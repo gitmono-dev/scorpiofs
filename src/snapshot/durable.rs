@@ -307,12 +307,12 @@ pub struct HydrateReport {
 /// and it is what makes a new version reuse content instead of downloading
 /// it again (spec 11 §3/§10.2: key is auth_domain + digest + size).
 pub struct DurableStore {
-    root: PathBuf,
-    content: PathBuf,
+    pub(super) root: PathBuf,
+    pub(super) content: PathBuf,
 }
 
 /// Transaction lifetime owns the lock, even if fork/dup retains a descriptor.
-struct TransactionGuard(File);
+pub(super) struct TransactionGuard(File);
 
 impl Drop for TransactionGuard {
     fn drop(&mut self) {
@@ -513,24 +513,32 @@ impl DurableStore {
 
     /// A pin file written during prepare is not a committed retention claim.
     /// Cache discovery uses the same dependency audit and view lock as reopen.
+    #[cfg(test)]
     pub(crate) fn committed_snapshot_at(
         root: &Path,
         content: &Path,
     ) -> Result<Option<String>, SnapshotError> {
-        if !root.join(COMPLETE_MARKER).exists() {
-            return Ok(None);
-        }
         let store = Self {
             root: root.to_path_buf(),
             content: content.to_path_buf(),
         };
-        let Some(_transaction) = store.try_transaction()? else {
-            return Ok(None);
+        Ok(match store.audit_pin()? {
+            super::workspace_pins::PinAudit::Active(id) => Some(id),
+            _ => None,
+        })
+    }
+
+    pub(super) fn audit_pin(&self) -> Result<super::workspace_pins::PinAudit, SnapshotError> {
+        let Some(_transaction) = self.try_transaction()? else {
+            return Ok(super::workspace_pins::PinAudit::Unknown);
         };
-        if store.completed_manifest_locked()?.is_none() {
-            return Ok(None);
+        if self.completed_manifest_locked()?.is_none() {
+            return Ok(super::workspace_pins::PinAudit::Inactive);
         }
-        Ok(store.stored_view()?.map(|view| view.snapshot_id))
+        match self.stored_view()? {
+            Some(view) => Ok(super::workspace_pins::PinAudit::Active(view.snapshot_id)),
+            None => Err(integrity_err("committed local pin is missing its view")),
+        }
     }
 
     /// Hydrate (or resume hydrating) a fixed view from a live reader.
@@ -1465,7 +1473,7 @@ impl DurableStore {
     // network awaits. It is nonblocking: unrelated async tasks never wait on
     // a short critical-section lock held by a downloading task. Dropping the
     // handle (including after process exit) releases the OS lock.
-    fn try_transaction(&self) -> Result<Option<TransactionGuard>, SnapshotError> {
+    pub(super) fn try_transaction(&self) -> Result<Option<TransactionGuard>, SnapshotError> {
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1480,7 +1488,7 @@ impl DurableStore {
         }
     }
 
-    fn transaction(&self) -> Result<TransactionGuard, SnapshotError> {
+    pub(super) fn transaction(&self) -> Result<TransactionGuard, SnapshotError> {
         self.try_transaction()?.ok_or_else(|| {
             SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
@@ -1496,6 +1504,7 @@ impl DurableStore {
         full_snapshot: bool,
     ) -> Result<TransactionGuard, SnapshotError> {
         let transaction = self.transaction()?;
+        super::workspace_pins::validate_hydration(self, view)?;
         validate_view_policy(view, full_snapshot)?;
         // Check identity before revoking anything: a conflicting caller must
         // leave the existing view's complete commitment untouched. A renewed
@@ -1545,6 +1554,7 @@ impl DurableStore {
         // COMPLETE is a current claim, not a historical flag. Revoke it
         // durably before a repair can fail or be cancelled partway through.
         self.invalidate_complete()?;
+        super::workspace_pins::begin_hydration(self)?;
         // Persist the fixed-view binding even for an interrupted first pass.
         // A later caller cannot graft a different scope/view onto its journal.
         let view_bytes = serde_json::to_vec_pretty(view)
@@ -1583,7 +1593,7 @@ impl DurableStore {
         Ok(Some(decode_commit(&bytes, MANIFEST_FILE)?))
     }
 
-    fn invalidate_complete(&self) -> Result<(), SnapshotError> {
+    pub(super) fn invalidate_complete(&self) -> Result<(), SnapshotError> {
         match fs::remove_file(self.root.join(COMPLETE_MARKER)) {
             Ok(()) => sync_dir(&self.root),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1593,7 +1603,12 @@ impl DurableStore {
 
     // The lock must be held by the caller. Recovery does not rely on the
     // append-only journal: that is only a hint, not a committed dependency.
-    fn completed_manifest_locked(&self) -> Result<Option<Vec<SnapshotFile>>, SnapshotError> {
+    pub(super) fn completed_manifest_locked(
+        &self,
+    ) -> Result<Option<Vec<SnapshotFile>>, SnapshotError> {
+        if !super::workspace_pins::complete_allowed(self)? {
+            return Ok(None);
+        }
         let Some(marker_bytes) = read_optional(&self.root.join(COMPLETE_MARKER))? else {
             return Ok(None);
         };
@@ -1908,6 +1923,7 @@ impl DurableStore {
         };
         write_atomic(&self.root, PIN_FILE, &pin_bytes)?;
         durability_checkpoint(&self.root, "pin-durable")?;
+        super::workspace_pins::publish_pin(self, view)?;
         match fs::remove_file(self.root.join(REPAIR_FILE)) {
             Ok(()) => sync_dir(&self.root)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1992,6 +2008,12 @@ impl DurableStore {
     /// Integrity/retention evidence does not constitute an offline permission.
     pub fn snapshot_manifest(&self) -> Result<ValidatedSnapshotClosure, SnapshotError> {
         let _transaction = self.transaction()?;
+        if !super::workspace_pins::complete_allowed(self)? {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "workspace local retention guarantee has been revoked",
+            ));
+        }
         let Some(bytes) = read_optional(&self.root.join(COMPLETE_MARKER))? else {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
@@ -2385,7 +2407,7 @@ pub fn digest_of(bytes: &[u8]) -> String {
 
 /// Write `data` to `dir/name`: unique temp, data fsync, rename, directory
 /// fsync. No successful return is possible when either sync fails.
-fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
+pub(super) fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
     create_dirs_durable(dir)?;
     // Random per writer: concurrent hydrations of identical content may race
     // on the same final name but must not share a tmp path.
@@ -2507,14 +2529,14 @@ fn sync_file(path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn sync_dir(path: &Path) -> Result<(), SnapshotError> {
+pub(super) fn sync_dir(path: &Path) -> Result<(), SnapshotError> {
     durability_checkpoint(path, "directory-sync")?;
     File::open(path).map_err(io_err)?.sync_all().map_err(io_err)
 }
 
 // New directory names also need their parents persisted. Existing directory
 // chains need no new entry sync until a file is published in them.
-fn create_dirs_durable(path: &Path) -> Result<(), SnapshotError> {
+pub(super) fn create_dirs_durable(path: &Path) -> Result<(), SnapshotError> {
     let mut missing = Vec::new();
     let mut cursor = path.to_path_buf();
     loop {
@@ -2555,7 +2577,7 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SnapshotError> {
     }
 }
 
-fn required_dependency(path: &Path) -> Result<Vec<u8>, SnapshotError> {
+pub(super) fn required_dependency(path: &Path) -> Result<Vec<u8>, SnapshotError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if !meta.is_file() => {
             return Err(integrity_err("completion metadata is not a regular file"));
@@ -2585,7 +2607,7 @@ fn encode_record<T: Serialize>(record: &T) -> Result<Vec<u8>, SnapshotError> {
         .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))
 }
 
-fn completion_revision(bytes: &[u8]) -> Result<u32, SnapshotError> {
+pub(super) fn completion_revision(bytes: &[u8]) -> Result<u32, SnapshotError> {
     #[derive(Deserialize)]
     struct Header {
         verification_revision: u32,
@@ -2715,7 +2737,7 @@ fn validate_manifest_policy(
     ))
 }
 
-fn durability_checkpoint(_path: &Path, _phase: &str) -> Result<(), SnapshotError> {
+pub(super) fn durability_checkpoint(_path: &Path, _phase: &str) -> Result<(), SnapshotError> {
     #[cfg(test)]
     durability_tests::checkpoint(_path, _phase)?;
     Ok(())
@@ -2734,7 +2756,7 @@ fn io_err(e: io::Error) -> SnapshotError {
 
 #[cfg(test)]
 #[path = "durable_tests.rs"]
-mod durability_tests;
+pub(super) mod durability_tests;
 
 #[cfg(test)]
 #[path = "durable_snapshot_tests.rs"]
