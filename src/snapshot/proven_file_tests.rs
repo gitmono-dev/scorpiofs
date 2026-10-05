@@ -144,8 +144,7 @@ impl Fixture {
         )])
         .unwrap();
         let mut chain = vec![leaf];
-        let mut count = 1;
-        for level in (0..depth).rev() {
+        for (count, level) in (1u64..).zip((0..depth).rev()) {
             let root = Page::Branch {
                 prefix: vec![b'a'; level],
                 terminal: None,
@@ -164,7 +163,6 @@ impl Fixture {
             }
             .encode()
             .unwrap();
-            count += 1;
             chain.push(root);
         }
         chain.reverse();
