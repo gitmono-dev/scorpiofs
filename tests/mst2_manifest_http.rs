@@ -1440,12 +1440,12 @@ async fn cancelling_first_fetch_preserves_another_waiter_and_single_source_reque
     tokio::time::timeout(Duration::from_secs(3), http.fixture.blob_started.notified())
         .await
         .unwrap();
-    leader.abort();
-    let _ = leader.await;
-    // Poll until registered as a waiter before releasing the source. This
-    // makes the cancellation regression independent of task scheduling.
+    // Register the other waiter before cancelling the first caller. If the
+    // last live caller cancels, its flight must end rather than be reused.
     let mut waiter = Box::pin(coordinator.fetch(file, false));
     assert!(futures::poll!(waiter.as_mut()).is_pending());
+    leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
     http.fixture.blob_release.notify_one();
     let result = tokio::time::timeout(Duration::from_secs(3), waiter)
         .await
