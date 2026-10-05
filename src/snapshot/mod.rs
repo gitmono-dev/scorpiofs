@@ -27,6 +27,7 @@ mod lookup;
 mod owned_range;
 mod owned_reader;
 mod owned_transport;
+mod proven_file;
 pub mod range;
 pub mod reader;
 mod resolve_receipt;
@@ -42,6 +43,7 @@ pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMete
 pub use frames::LeaseReleaseOutcome;
 pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
 pub use owned_range::{OwnedChunkedFile, VerifiedRange};
+pub use proven_file::{FileMembershipError, ProvenSnapshotFile};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use resolve_receipt::ResolveTraceReceipt;
