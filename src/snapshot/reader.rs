@@ -1601,6 +1601,7 @@ mod tests {
             "2026-02-29T00:00:00Z",      // non-leap year
             "2026-04-31T00:00:00Z",      // April has 30 days
             "2026-09-16T02:28:61Z",      // invalid second
+            "2026-09-16T02:28:60Z",      // not a valid leap-second position
             "+026-09-16T02:28:42Z",      // numeric fields are ASCII digits
             "2026-+9-16T02:28:42Z",
         ] {
