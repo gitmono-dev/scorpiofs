@@ -2,8 +2,9 @@
 //!
 //! Minimal, self-contained mount over [`SnapshotReader`]: every name maps
 //! through the fixed view (no live-ref following); file content comes from
-//! digest-verified blob reads cached in memory. It does not touch the
-//! existing Antares overlay layer (read-only slice; write/upper stay there).
+//! digest-verified blob reads cached in memory. The Antares overlay also uses
+//! this view as its read-only lower layer; writes
+//! stay in the upper layer.
 //!
 //! Symlinks are served with real symlink semantics (spec 07 §1): the view
 //! exposes them as `fs_kind = "symlink"` whose content is the target bytes,
@@ -871,6 +872,22 @@ impl Filesystem for Mst2Fuse {
             }),
             Node::Dir(_) => Err(Errno::from(libc::EISDIR)),
         }
+    }
+
+    async fn release(
+        &self,
+        _req: Request,
+        _inode: Inode,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+    ) -> Result<()> {
+        // Handles are inode numbers, with no per-open resources to close.
+        // Copy-up releases its lower read handle before opening the upper.
+        // Returning the trait default ENOSYS here would escape through OPEN,
+        // making the kernel skip later opens, including atomic O_TRUNC.
+        Ok(())
     }
 
     /// Serve `[offset, offset+size)` of a file, fetching only what covers it

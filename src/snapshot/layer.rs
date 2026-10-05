@@ -161,6 +161,157 @@ mod tests {
         assert_eq!(Layer::whiteout_format(&fs), WhiteoutFormat::OciWhiteout);
     }
 
+    /// A lower RELEASE error must not escape from copy-up through OPEN: Linux
+    /// treats ENOSYS there as permission to skip all subsequent OPEN requests.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn copy_up_then_truncate_closes_lower_handle_successfully() {
+        use std::sync::Arc;
+
+        use libfuse_fs::{
+            passthrough::{config::Config as UpperConfig, PassthroughFs},
+            unionfs::{config::Config as OverlayConfig, OverlayFs},
+        };
+
+        use crate::snapshot::{
+            durable::{digest_of, DurableStore, ViewMeta},
+            SnapshotFile,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let original = b"lower bytes\n";
+        let manifest = vec![SnapshotFile {
+            rel_path: "file.txt".into(),
+            fs_kind: "file".into(),
+            size: original.len() as u64,
+            content_digest: digest_of(original),
+        }];
+        let store = Arc::new(DurableStore::open(temp.path().join("cas")).unwrap());
+        store
+            .hydrate_with(
+                &ViewMeta {
+                    snapshot_id: "sha256:test-snapshot".into(),
+                    namespace_view_id: "sha256:test-view".into(),
+                    scope: "/project".into(),
+                    lease_id: "test-lease".into(),
+                },
+                &manifest,
+                |_| async { Ok(original.to_vec()) },
+            )
+            .await
+            .unwrap();
+        let lower = Arc::new(Mst2Fuse::from_store(store).unwrap());
+        let upper_path = temp.path().join("upper");
+        std::fs::create_dir(&upper_path).unwrap();
+        let upper = PassthroughFs::<()>::new(UpperConfig {
+            root_dir: upper_path.clone(),
+            do_import: true,
+            writeback: false,
+            whiteout_format: WhiteoutFormat::OciWhiteout,
+            ..Default::default()
+        })
+        .unwrap();
+        upper.import().await.unwrap();
+        let overlay = OverlayFs::new(
+            Some(Arc::new(upper)),
+            vec![lower.clone()],
+            OverlayConfig {
+                do_import: true,
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        let req = Request::default();
+        overlay.init(req).await.unwrap();
+        let inode = overlay
+            .lookup(req, 1, OsStr::new("file.txt"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+
+        // This first writable OPEN performs copy-up and releases the lower.
+        let opened = overlay
+            .open(req, inode, (libc::O_WRONLY | libc::O_APPEND) as u32)
+            .await
+            .expect("copy-up OPEN must succeed, never return ENOSYS");
+        overlay
+            .write(
+                req,
+                inode,
+                opened.fh,
+                original.len() as u64,
+                b"old tail",
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        overlay
+            .release(req, inode, opened.fh, 0, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(upper_path.join("file.txt")).unwrap(),
+            [original.as_slice(), b"old tail"].concat()
+        );
+
+        let truncated = overlay
+            .open(req, inode, (libc::O_WRONLY | libc::O_TRUNC) as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(upper_path.join("file.txt"))
+                .unwrap()
+                .len(),
+            0
+        );
+        overlay
+            .write(req, inode, truncated.fh, 0, b"new", 0, 0)
+            .await
+            .unwrap();
+        overlay
+            .release(req, inode, truncated.fh, 0, 0, false)
+            .await
+            .unwrap();
+        let reopened = overlay
+            .open(req, inode, libc::O_RDONLY as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            overlay
+                .read(req, inode, reopened.fh, 0, 64)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            b"new"
+        );
+        overlay
+            .release(req, inode, reopened.fh, 0, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(upper_path.join("file.txt")).unwrap(), b"new");
+
+        // Copy-up must leave the fixed snapshot content intact.
+        let lower_inode = lower
+            .lookup(req, 1, OsStr::new("file.txt"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        assert_eq!(
+            lower
+                .read(req, lower_inode, lower_inode, 0, 64)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            original
+        );
+    }
+
     /// Every mutation must answer EROFS — not the trait default ENOSYS — so the
     /// overlay treats the layer as read-only exactly like Dicfuse (spec 12 §7).
     #[tokio::test]
