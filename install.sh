@@ -813,7 +813,7 @@ pkg_install() {
     elif command -v dnf >/dev/null 2>&1; then
         run_root dnf install -y fuse3 openssl ca-certificates util-linux python3
     elif command -v pacman >/dev/null 2>&1; then
-        run_root pacman -Sy --noconfirm fuse3 openssl ca-certificates util-linux python3
+        run_root pacman -Sy --noconfirm fuse3 openssl ca-certificates util-linux python
     else
         warn "no supported package manager found; install fuse3, openssl, ca-certificates, util-linux, and python3 manually"
     fi
