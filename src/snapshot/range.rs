@@ -29,7 +29,7 @@ use crate::snapshot::{
 
 /// Files at or below this size use the OBJECT path (spec 07 §2).
 pub const OBJECT_CAP: u64 = 256 * 1024;
-const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024 * 1024;
+pub(crate) const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 const CACHED_CHUNKS: usize = 16;
 const CACHED_LEAVES: usize = 16;
 
