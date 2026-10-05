@@ -1,9 +1,11 @@
 //! Single-flight, bounded-concurrency content fetching (spec 11 §5/§7).
 //!
 //! Waiters merge on content identity (`content_id + size`), never on path:
-//! each caller has already passed its own snapshot path-membership and
-//! authorization checks before reaching here, so sharing downloaded bytes
-//! never shares permission. The leader's typed error is broadcast to every
+//! every caller proves membership against the fixed reader's committed
+//! metadata root and checks its current lease before joining a download.
+//! Deployments without metadata pages keep a separate online request for
+//! every caller, preserving the server's per-path authorization check.
+//! The leader's typed error is broadcast to every
 //! waiter. The concurrency semaphore is the scheduling knob (spec 13): it
 //! bounds simultaneous HTTP work without changing protocol semantics.
 
@@ -12,9 +14,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, OnceCell, Semaphore};
 
-use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotReader};
+use crate::snapshot::{SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader};
 
 type FetchResult = Result<Arc<Vec<u8>>, Arc<SnapshotError>>;
 
@@ -66,6 +68,7 @@ impl Drop for FlightGuard {
 /// Coordinates verified file fetches over one [`SnapshotReader`].
 pub struct FetchCoordinator {
     reader: SnapshotReader,
+    membership: OnceCell<HashMap<String, SnapshotFile>>,
     inflight: Mutex<HashMap<String, Vec<oneshot::Sender<FetchResult>>>>,
     semaphore: Arc<Semaphore>,
 }
@@ -76,6 +79,7 @@ impl FetchCoordinator {
     pub fn new(reader: SnapshotReader, max_concurrent: usize) -> Arc<Self> {
         Arc::new(FetchCoordinator {
             reader,
+            membership: OnceCell::new(),
             inflight: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
         })
@@ -89,12 +93,20 @@ impl FetchCoordinator {
         file: SnapshotFile,
         use_frames: bool,
     ) -> Result<Arc<Vec<u8>>, SnapshotError> {
-        // Every waiter owns its path contract. Content identity may merge
-        // network work only after this caller's canonical path and composed
-        // scope budget have been checked, including when a leader exists.
+        // A canonical path is not a membership proof. A caller cannot bypass
+        // its own fixed-view check by naming another leader's content id.
         self.reader
             .authorized_context()
             .validate_relative_path(&file.rel_path)?;
+        if !self.reader.capabilities().features.metadata_pages {
+            // Without a root-verified proof, retain each caller's online
+            // fixed-SID/path request. No other caller may supply its bytes
+            // or its authorization result; concurrency is still bounded.
+            self.reader.ensure_lease().await?;
+            return self.lead(&file, use_frames).await;
+        }
+        self.validate_membership(&file).await?;
+        self.reader.ensure_lease().await?;
         let key = format!("{}:{}", file.content_digest, file.size);
         let (tx, rx) = oneshot::channel();
         let leader = {
@@ -131,6 +143,44 @@ impl FetchCoordinator {
                 )
             })?
             .map_err(|e| (*e).clone())
+    }
+
+    async fn validate_membership(&self, file: &SnapshotFile) -> Result<(), SnapshotError> {
+        let files = self
+            .membership
+            .get_or_try_init(|| async {
+                let closure = self.reader.snapshot_closure().await?;
+                // Keep the fixed-root-derived path index, not duplicate page
+                // bytes. A failed/cancelled initialization can be retried.
+                Ok::<_, SnapshotError>(
+                    closure
+                        .files()
+                        .iter()
+                        .cloned()
+                        .map(|file| (file.rel_path.clone(), file))
+                        .collect::<HashMap<_, _>>(),
+                )
+            })
+            .await?;
+        let path = file.rel_path.strip_prefix('/').unwrap_or(&file.rel_path);
+        let expected = files.get(path).ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::PathNotFound,
+                format!("{} is not a file in the fixed snapshot", file.rel_path),
+            )
+        })?;
+        let same_kind = file.fs_kind == expected.fs_kind
+            || (file.fs_kind == "file" && expected.fs_kind == "regular");
+        if file.content_digest != expected.content_digest
+            || file.size != expected.size
+            || !same_kind
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!("{} differs from its committed file metadata", file.rel_path),
+            ));
+        }
+        Ok(())
     }
 
     async fn lead(
