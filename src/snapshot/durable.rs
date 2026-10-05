@@ -532,9 +532,26 @@ impl DurableStore {
         let Some(_transaction) = self.try_transaction()? else {
             return Ok(super::workspace_pins::PinAudit::Unknown);
         };
-        if self.completed_manifest_locked()?.is_none() {
+        if !super::workspace_pins::complete_allowed(self)? {
             return Ok(super::workspace_pins::PinAudit::Inactive);
         }
+        // Inventory must not turn a damaged commitment into proof of absence.
+        // Reopen can revoke a bad marker and leave REPAIR; that owner remains
+        // Unknown until explicit hydration repairs or release revokes it.
+        match fs::symlink_metadata(self.root.join(REPAIR_FILE)) {
+            Ok(_) => return Ok(super::workspace_pins::PinAudit::Unknown),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(error)),
+        }
+        let marker = self.root.join(COMPLETE_MARKER);
+        match fs::symlink_metadata(&marker) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(super::workspace_pins::PinAudit::Inactive);
+            }
+            Err(error) => return Err(io_err(error)),
+        }
+        self.verify_commit(&required_dependency(&marker)?)?;
         match self.stored_view()? {
             Some(view) => Ok(super::workspace_pins::PinAudit::Active(view.snapshot_id)),
             None => Err(integrity_err("committed local pin is missing its view")),

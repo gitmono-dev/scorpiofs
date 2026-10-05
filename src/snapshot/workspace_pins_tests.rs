@@ -387,6 +387,32 @@ async fn cleanup_preserves_busy_or_corrupt_other_owner_pins() {
 }
 
 #[tokio::test]
+async fn damaged_complete_and_repair_state_remain_conservative_retention_evidence() {
+    let f = Fixture::new();
+    let first = f.owner(2);
+    let second = f.owner(3);
+    f.hydrate(&first).await;
+    f.hydrate(&second).await;
+    f.add_record();
+    fs::write(second.root().join("manifest.json"), b"broken manifest").unwrap();
+    assert!(f
+        .cache()
+        .drop_records_for_pin(f.closure.snapshot_id())
+        .is_err());
+    assert!(f.cache().record_for("workspace-test-root").is_some());
+    assert!(!second.is_complete().unwrap());
+    assert!(!second.root().join("DURABLE_COMPLETE").exists());
+    first.release_local_pin().unwrap();
+    assert!(f.cache().try_live_pins().unwrap().is_empty());
+    assert!(
+        f.cache().record_for("workspace-test-root").is_some(),
+        "a repaired-away marker is Unknown, not evidence for pruning"
+    );
+    second.release_local_pin().unwrap();
+    assert!(f.cache().record_for("workspace-test-root").is_none());
+}
+
+#[tokio::test]
 async fn missing_registry_or_owner_records_cannot_reconstruct_old_retention_claims() {
     for released in [false, true] {
         for missing_owner in [false, true] {
