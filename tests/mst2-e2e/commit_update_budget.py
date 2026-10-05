@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 
 
@@ -81,6 +83,56 @@ def from_options(options):
                          getattr(options, "work_cleanup_deadline_monotonic", None))
 
 
+def group_members(pgid, started):
+    """Only this new-session group; zombies hold no executing work."""
+    members = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdecimal():
+            continue
+        try:
+            fields = (proc / "stat").read_text().rsplit(") ", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if int(fields[2]) != pgid:
+            continue
+        if int(fields[3]) != pgid or int(fields[19]) < int(started):
+            raise AssertionError("owned process group identity changed")
+        if int(proc.name) == pgid and fields[19] != str(started):
+            raise AssertionError("owned group leader identity was replaced")
+        if fields[0] not in ("Z", "X"):
+            members.append(int(proc.name))
+    return members
+
+
+def stop_group(pgid, started, deadline, process=None):
+    """Reaped leaders do not prove that their owned descendants exited."""
+    if group_members(pgid, started):
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        term_until = min(deadline, time.monotonic() + 5)
+        while group_members(pgid, started) and time.monotonic() < term_until:
+            time.sleep(min(.05, max(0, term_until - time.monotonic())))
+        if group_members(pgid, started):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            while group_members(pgid, started) and time.monotonic() < deadline:
+                time.sleep(min(.01, max(0, deadline - time.monotonic())))
+        if group_members(pgid, started):
+            raise TimeoutError("owned group remained active at its original deadline")
+    if process is not None:
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+
+
+def process_start(pid):
+    if sys.platform == "linux":
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    return None
+
+
 def run_process(args, deadline, env=None, data=None, capture=True):
     """Terminate and reap the owned child group within this same deadline."""
     now = time.monotonic()
@@ -93,6 +145,7 @@ def run_process(args, deadline, env=None, data=None, capture=True):
                                stdout=subprocess.PIPE if capture else None,
                                stderr=subprocess.PIPE if capture else None,
                                env=env, start_new_session=True)
+    started = process_start(process.pid)
 
     def signal_group(signum):
         try:
@@ -120,6 +173,8 @@ def run_process(args, deadline, env=None, data=None, capture=True):
         # Descendants may ignore TERM after their leader already exited.
         if not killed:
             signal_group(signal.SIGKILL)
+        if started is not None:
+            stop_group(process.pid, started, deadline, process)
 
     try:
         output, error = process.communicate(data, timeout=max(0, run_until - time.monotonic()))
@@ -129,6 +184,10 @@ def run_process(args, deadline, env=None, data=None, capture=True):
     except BaseException:
         terminate()
         raise
+    # A short-lived command owns its new-session group even when descendants
+    # close inherited pipes and its leader returns a successful exit status.
+    if started is not None:
+        stop_group(process.pid, started, deadline, process)
     return process.returncode, output, error
 
 

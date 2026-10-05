@@ -183,39 +183,20 @@ def stop_owned(root, project, deadline, process=None):
     if hashlib.sha256(compose.read_bytes()).hexdigest() != state["compose_sha256"]:
         raise AssertionError("cleanup Compose configuration differs from owned startup")
     service = state.get("service")
-    reaped = process is not None and process.poll() is not None
-    if service and not reaped and Path(f"/proc/{service['pid']}").exists():
+    if service:
         pid = service["pid"]
+        if service.get("pgid") != pid or service.get("sid") != pid:
+            raise AssertionError("owned new-session group binding is missing")
         proc = Path(f"/proc/{pid}")
-        started = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[19]
-        argv = [x.decode() for x in proc.joinpath("cmdline").read_bytes().split(b"\0") if x]
-        if (started != service["starttime"] or argv[:3] != [state["binary"], "--config", str(root / "service.toml")]
-                or os.getpgid(pid) != pid):
-            raise AssertionError("refusing cleanup of a replaced or unrelated service")
-        os.killpg(pid, signal.SIGTERM)
-        term_until = min(deadline, time.monotonic() + 5)
-        if process:
-            try:
-                process.wait(timeout=max(0, term_until - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                os.killpg(pid, signal.SIGKILL)
-                process.wait(timeout=max(0, deadline - time.monotonic()))
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        else:
-            while proc.exists() and time.monotonic() < term_until:
-                time.sleep(min(0.1, max(0, term_until - time.monotonic())))
-            if proc.exists():
-                # Recheck its start identity before escalation after waiting.
-                if proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[19] != service["starttime"]:
-                    raise AssertionError("service PID was replaced during cleanup")
-                os.killpg(pid, signal.SIGKILL)
-                while proc.exists() and time.monotonic() < deadline:
-                    time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-                if proc.exists():
-                    raise TimeoutError("owned service cleanup exceeded original deadline")
+        reaped = process is not None and process.poll() is not None
+        if not reaped and proc.exists():
+            started = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[19]
+            argv = [x.decode() for x in proc.joinpath("cmdline").read_bytes().split(b"\0") if x]
+            if (started != service["starttime"]
+                    or argv[:3] != [state["binary"], "--config", str(root / "service.toml")]
+                    or os.getpgid(pid) != pid or os.getsid(pid) != pid):
+                raise AssertionError("refusing cleanup of a replaced or unrelated service")
+        budget_module.stop_group(pid, service["starttime"], deadline, process)
     bench.command(["docker", "compose", "-p", project, "-f", str(compose), "down", "--volumes"], deadline)
     containers = bench.command(["docker", "ps", "-aq", "--filter",
                                 "label=com.docker.compose.project=" + project], deadline)
@@ -306,7 +287,8 @@ def execute(options):
         process = subprocess.Popen(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                    env=service_env, start_new_session=True)
-        state["service"] = {"pid": process.pid, "starttime": Path(f"/proc/{process.pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]}
+        state["service"] = {"pid": process.pid, "pgid": process.pid, "sid": process.pid,
+                            "starttime": budget_module.process_start(process.pid)}
         state_path.write_text(json.dumps(state))
         base = f"http://127.0.0.1:{ports['http']}"
         ready_until = min(deadline, time.monotonic() + 180)
@@ -314,12 +296,13 @@ def execute(options):
             if process.poll() is not None or time.monotonic() >= ready_until:
                 raise RuntimeError("owned service failed readiness")
             try:
-                with urlopen(base + "/api/v2/snapshots/capabilities", timeout=2) as response:
+                with urlopen(base + "/api/v2/snapshots/capabilities",
+                             timeout=min(2, max(.001, ready_until - time.monotonic()))) as response:
                     if response.status == 200:
                         break
             except OSError:
                 pass
-            time.sleep(0.2)
+            time.sleep(min(.2, max(0, ready_until - time.monotonic())))
         initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"], deadline).decode().split()
         if len(initial) != 2 or initial[1] != "refs/heads/main":
             raise AssertionError("owned service did not initialize exactly one project main")

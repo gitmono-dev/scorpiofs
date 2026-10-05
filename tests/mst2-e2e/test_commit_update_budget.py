@@ -121,14 +121,56 @@ class SessionBudgetTests(unittest.TestCase):
     def test_actual_round_child_timeout_runs_owned_finally_without_renewing_cleanup(self):
         self.actual_owned_failure("round")
 
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux exited leader cleanup")
+    def test_owned_reaped_leader_cannot_hide_live_descendant_that_ignores_term(self):
+        self.actual_owned_failure("leader")
+
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux successful leader cleanup")
+    def test_successful_short_command_still_cleans_child_that_closed_inherited_pipes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / "child"
+            script = textwrap.dedent("""\
+                import os, signal, sys, time
+                child = os.fork()
+                if child == 0:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    for fd in (0, 1, 2): os.close(fd)
+                    with open(sys.argv[1], 'w') as stream: stream.write(str(os.getpid()))
+                    while True: time.sleep(.05)
+                while not os.path.exists(sys.argv[1]): time.sleep(.01)
+                """)
+            deadline = time.monotonic() + 8
+            self.assertEqual(bench.command([sys.executable, "-c", script, str(pid_file)], deadline), b"")
+            child = Path(f"/proc/{int(pid_file.read_text())}/stat")
+            self.assertTrue(not child.exists() or child.read_text().rsplit(") ", 1)[1].split()[0] == "Z")
+            self.assertLess(time.monotonic(), deadline)
+
     def actual_owned_failure(self, failure):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source"
             (source / "target").mkdir(parents=True)
             (source / "config").mkdir()
             binary = source / "target" / "owned-service"
-            subprocess.run(["cc", "-x", "c", "-o", str(binary), "-"],
-                           input=b"#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+            program = b"#include <unistd.h>\nint main(void) { for (;;) pause(); }\n"
+            if failure == "leader":
+                program = textwrap.dedent("""\
+                    #include <unistd.h>
+                    #include <signal.h>
+                    #include <stdio.h>
+                    #include <stdlib.h>
+                    int main(int argc, char **argv) {
+                        int sync[2]; char byte; pipe(sync);
+                        if (fork() == 0) {
+                            signal(SIGTERM, SIG_IGN);
+                            close(0); close(1); close(2);
+                            char path[8192]; snprintf(path, sizeof(path), "%s.child", argv[2]);
+                            FILE *file = fopen(path, "w"); fprintf(file, "%d", getpid()); fclose(file);
+                            write(sync[1], "x", 1); for (;;) pause();
+                        }
+                        read(sync[0], &byte, 1); return 0;
+                    }
+                    """).encode()
+            subprocess.run(["cc", "-x", "c", "-o", str(binary), "-"], input=program,
                            check=True, capture_output=True)
             template = {"base_dir": "unused", "log": {}, "database": {}, "redis": {},
                         "monorepo": {}, "pack": {}, "object_storage": {"s3": {}}, "git": {}}
@@ -166,7 +208,7 @@ class SessionBudgetTests(unittest.TestCase):
                 self.assertIs(args.budget, shared)
                 deadline = min(time.monotonic() + 2, args.budget.cleanup_deadline - 1)
                 original_command([sys.executable, "-c", "import time; time.sleep(30)"], deadline)
-            ready = {"side_effect": OSError} if failure == "setup" else {"return_value": Ready()}
+            ready = {"return_value": Ready()} if failure == "round" else {"side_effect": OSError}
             # Docker/DB are fixture stubs; the service Popen, /proc identity,
             # owned finally, TERM/group cleanup and reap are actual Linux code.
             with patch.dict(os.environ), \
@@ -181,12 +223,15 @@ class SessionBudgetTests(unittest.TestCase):
                     patch.object(ci.bench, "execute", side_effect=round_timeout), \
                     patch.object(ci, "stop_owned", side_effect=stop), \
                     patch("sys.stdout", new_callable=io.StringIO):
-                with self.assertRaises(RuntimeError if failure == "setup" else bench.PhaseFailure):
+                with self.assertRaises(bench.PhaseFailure if failure == "round" else RuntimeError):
                     ci.execute(opts)
             self.assertEqual(cleanup_deadlines, [shared.cleanup_deadline])
             state = json.loads((root / "owned.json").read_text())
             self.assertNotIn("service", state)
             self.assertFalse(Path(f"/proc/{service_pids[0]}").exists())
+            if failure == "leader":
+                child = Path(f"/proc/{int((root / 'service.toml.child').read_text())}/stat")
+                self.assertTrue(not child.exists() or child.read_text().rsplit(") ", 1)[1].split()[0] == "Z")
             self.assertLess(time.monotonic(), shared.cleanup_deadline)
 
     def test_cleanup_inventory_failure_keeps_owned_state_and_never_renews_deadline(self):

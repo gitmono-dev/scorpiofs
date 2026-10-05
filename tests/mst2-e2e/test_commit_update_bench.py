@@ -321,6 +321,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 return b"", b""
         child = Hung()
         with patch.object(BENCH.budget_module.subprocess, "Popen", return_value=child), \
+                patch.object(BENCH.budget_module, "process_start", return_value=None), \
                 patch.object(BENCH.os, "killpg", create=True) as killpg, \
                 patch.object(BENCH.budget_module.signal, "SIGKILL", 9, create=True):
             with self.assertRaises(TimeoutError):
