@@ -66,7 +66,7 @@ struct BoundCredentials {
 
 /// Retry policy for idempotent reads: bounded attempts, exponential
 /// backoff with jitter so a fleet of clients does not resynchronise.
-const MAX_ATTEMPTS: u32 = 4;
+const MAX_ATTEMPTS: u32 = super::resolve_receipt::ATTEMPT_LIMIT as u32;
 const BASE_BACKOFF_MS: u64 = 40;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_JSON_REQUEST_BYTES: usize = TREEFRAME_REQUEST_MAX_BYTES;
@@ -241,6 +241,14 @@ impl Mst2Client {
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, SnapshotError> {
+        self.send_retrying_with_receipt(builder, None).await
+    }
+
+    async fn send_retrying_with_receipt(
+        &self,
+        builder: reqwest::RequestBuilder,
+        mut receipt: Option<&mut super::ResolveTraceReceipt>,
+    ) -> Result<reqwest::Response, SnapshotError> {
         // Spec 04 §1: identity travels in headers — bearer credential plus
         // the resolved lease — never in the URL.
         let builder = {
@@ -288,10 +296,29 @@ impl Mst2Client {
             // Reqwest retains this timer through response body consumption.
             // A retry receives only the original deadline's remaining budget.
             *this.timeout_mut() = Some(remaining);
+            let request_id = receipt
+                .as_deref_mut()
+                .map(|receipt| receipt.attempt(attempt))
+                .transpose()?;
+            if let Some(id) = &request_id {
+                this.headers_mut().insert(
+                    "x-request-id",
+                    reqwest::header::HeaderValue::from_str(id).map_err(|_| {
+                        SnapshotError::new(
+                            SnapshotErrorCode::InvalidRequest,
+                            "invalid resolve attempt id",
+                        )
+                    })?,
+                );
+            }
             if attempt > 1 {
                 self.retries.fetch_add(1, Ordering::Relaxed);
             }
-            match self.http.execute(this).await {
+            let response = self.http.execute(this).await;
+            if let (Ok(response), Some(id)) = (&response, &request_id) {
+                super::resolve_receipt::validate_echo(response.headers(), id)?;
+            }
+            match response {
                 Ok(resp) if attempt < MAX_ATTEMPTS && retryable_status(resp.status()) => {
                     tokio::time::timeout_at(deadline, sleep_backoff(attempt))
                         .await
@@ -338,6 +365,30 @@ impl Mst2Client {
         scope: &str,
         lease_seconds: u64,
     ) -> Result<ResolveResponse, SnapshotError> {
+        self.resolve_with_receipt(scope, lease_seconds, None).await
+    }
+
+    /// Opt in to exact response-id checks and a receipt from this resolve's
+    /// actual attempts. Other requests keep their existing headers and policy.
+    pub async fn resolve_observed(
+        &self,
+        scope: &str,
+        lease_seconds: u64,
+        logical_request_id: &str,
+    ) -> Result<(ResolveResponse, super::ResolveTraceReceipt), SnapshotError> {
+        let mut receipt = super::ResolveTraceReceipt::new(logical_request_id)?;
+        let response = self
+            .resolve_with_receipt(scope, lease_seconds, Some(&mut receipt))
+            .await?;
+        Ok((response, receipt.finish()?))
+    }
+
+    async fn resolve_with_receipt(
+        &self,
+        scope: &str,
+        lease_seconds: u64,
+        receipt: Option<&mut super::ResolveTraceReceipt>,
+    ) -> Result<ResolveResponse, SnapshotError> {
         let body = serde_json::json!({
             "target": {"kind": "latest"},
             "scope": scope,
@@ -346,7 +397,10 @@ impl Mst2Client {
             "supported_metadata_codecs": [1],
         });
         let resp = self
-            .send_retrying(self.http.post(self.snapshots_url("/resolve")).json(&body))
+            .send_retrying_with_receipt(
+                self.http.post(self.snapshots_url("/resolve")).json(&body),
+                receipt,
+            )
             .await?;
         read_json(ok_or_error(resp).await?).await
     }
