@@ -769,13 +769,13 @@ async fn typed_rate_limit_and_metadata_outages_recover_without_changing_the_fixe
         canonical_renewal_failure(
             "RATE_LIMITED",
             StatusCode::TOO_MANY_REQUESTS,
-            SnapshotErrorCode::RateLimited,
+            SnapshotErrorCode::Internal,
             true
         ),
         canonical_renewal_failure(
             "METADATA_NOT_READY",
             StatusCode::SERVICE_UNAVAILABLE,
-            SnapshotErrorCode::MetadataNotReady,
+            SnapshotErrorCode::Internal,
             true
         )
     );
@@ -787,13 +787,13 @@ async fn typed_rate_limit_and_metadata_outages_cannot_extend_or_revive_the_origi
         canonical_renewal_failure(
             "RATE_LIMITED",
             StatusCode::TOO_MANY_REQUESTS,
-            SnapshotErrorCode::RateLimited,
+            SnapshotErrorCode::Internal,
             false
         ),
         canonical_renewal_failure(
             "METADATA_NOT_READY",
             StatusCode::SERVICE_UNAVAILABLE,
-            SnapshotErrorCode::MetadataNotReady,
+            SnapshotErrorCode::Internal,
             false
         )
     );

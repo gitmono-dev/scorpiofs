@@ -17,7 +17,7 @@ pub mod coordinator;
 mod descriptor_wire;
 mod directory;
 pub mod durable;
-mod error_wire;
+pub mod error_wire;
 pub mod frames;
 pub mod fuse;
 pub mod incremental;
@@ -29,6 +29,7 @@ mod owned_transport;
 mod proven_file;
 pub mod range;
 pub mod reader;
+mod resolve_wire;
 pub mod types;
 
 pub use auth::{AuthorizedSnapshotContext, CacheDomain};

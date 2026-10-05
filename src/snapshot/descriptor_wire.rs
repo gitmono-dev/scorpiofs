@@ -8,7 +8,7 @@ use super::{Descriptor, SnapshotError, SnapshotErrorCode};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DescriptorWire {
+pub(crate) struct DescriptorWire {
     schema_version: u16,
     metadata_codec: u16,
     instance_id: String,
