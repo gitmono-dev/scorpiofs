@@ -551,7 +551,23 @@ impl DurableStore {
             }
             Err(error) => return Err(io_err(error)),
         }
-        self.verify_commit(&required_dependency(&marker)?)?;
+        match self.verify_commit(&required_dependency(&marker)?) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.code,
+                    SnapshotErrorCode::IntegrityError | SnapshotErrorCode::DigestMismatch
+                ) =>
+            {
+                // Preserve the existing recovery contract (including ordinary
+                // incremental client callers), but never use that revocation
+                // as evidence that this owner's retention hints may be pruned.
+                self.invalidate_complete()?;
+                write_atomic(&self.root, REPAIR_FILE, error.message.as_bytes())?;
+                return Ok(super::workspace_pins::PinAudit::Unknown);
+            }
+            Err(error) => return Err(error),
+        }
         match self.stored_view()? {
             Some(view) => Ok(super::workspace_pins::PinAudit::Active(view.snapshot_id)),
             None => Err(integrity_err("committed local pin is missing its view")),

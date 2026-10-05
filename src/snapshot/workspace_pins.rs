@@ -367,6 +367,22 @@ pub(super) fn complete_allowed(store: &DurableStore) -> Result<bool, SnapshotErr
         return Ok(true);
     };
     let registration = require_registration(store, &binding)?;
+    match read_record::<ViewMeta>(&store.root().join("view.json"))? {
+        Some(view) => binding.validate_view(&view)?,
+        None => {
+            for name in ["DURABLE_COMPLETE", "pin.json"] {
+                match fs::symlink_metadata(store.root().join(name)) {
+                    Ok(_) => {
+                        return Err(integrity(
+                            "workspace retention state has lost its fixed view",
+                        ))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io_error(error)),
+                }
+            }
+        }
+    }
     if release_record(store, &binding)?.is_some() {
         return Ok(false);
     }
@@ -526,6 +542,11 @@ pub(super) fn owner_inventory(
         } else {
             store.audit_pin()?
         };
+        if matches!(&audit, PinAudit::Active(id) if id != &binding.snapshot_id) {
+            return Err(integrity(
+                "audited snapshot differs from its fixed workspace owner",
+            ));
+        }
         registered.insert((sid, id.to_owned()));
         out.push((binding.snapshot_id, audit));
     }

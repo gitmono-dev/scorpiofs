@@ -20,6 +20,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_namespace(3)
+    }
+
+    fn with_namespace(namespace: u8) -> Self {
         let bytes = b"independently retained workspace bytes".to_vec();
         let empty = Page::build(&[]).unwrap();
         let root = Page::build(&[
@@ -34,7 +38,7 @@ impl Fixture {
         .unwrap();
         let descriptor = ServingDescriptor {
             instance_uuid: *uuid::Uuid::from_u128(1).as_bytes(),
-            namespace_view_id: [3; 32],
+            namespace_view_id: [namespace; 32],
             scope: "/project".into(),
             metadata_root: page_id(&root),
         }
@@ -395,10 +399,13 @@ async fn damaged_complete_and_repair_state_remain_conservative_retention_evidenc
     f.hydrate(&second).await;
     f.add_record();
     fs::write(second.root().join("manifest.json"), b"broken manifest").unwrap();
-    assert!(f
-        .cache()
-        .drop_records_for_pin(f.closure.snapshot_id())
-        .is_err());
+    assert_eq!(
+        f.cache()
+            .drop_records_for_pin(f.closure.snapshot_id())
+            .unwrap(),
+        0
+    );
+    assert!(matches!(second.audit_pin().unwrap(), PinAudit::Unknown));
     assert!(f.cache().record_for("workspace-test-root").is_some());
     assert!(!second.is_complete().unwrap());
     assert!(!second.root().join("DURABLE_COMPLETE").exists());
@@ -410,6 +417,98 @@ async fn damaged_complete_and_repair_state_remain_conservative_retention_evidenc
     );
     second.release_local_pin().unwrap();
     assert!(f.cache().record_for("workspace-test-root").is_none());
+}
+
+#[tokio::test]
+async fn a_legitimate_completion_bundle_cannot_be_grafted_into_another_fixed_owner() {
+    let f = Fixture::new();
+    let other = Fixture::with_namespace(4);
+    assert_ne!(f.closure.snapshot_id(), other.closure.snapshot_id());
+    assert_eq!(f.context.cache_domain(), other.context.cache_domain());
+    let first = f.owner(2);
+    let second = DurableStore::open_workspace_context(
+        f.temp.path(),
+        &uuid::Uuid::from_u128(3).to_string(),
+        &other.context,
+    )
+    .unwrap();
+    f.hydrate(&first).await;
+    other.hydrate(&second).await;
+    assert_eq!(first.content_dir(), second.content_dir());
+    assert_full(&first, &f);
+    assert_full(&second, &other);
+    f.add_record();
+    for name in [
+        "view.json",
+        "manifest.json",
+        "pin.json",
+        "descriptor.bin",
+        "metadata.json",
+        "journal.log",
+        "DURABLE_COMPLETE",
+    ] {
+        fs::copy(second.root().join(name), first.root().join(name)).unwrap();
+    }
+    for entry in fs::read_dir(second.root().join("metadata")).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(
+            entry.path(),
+            first.root().join("metadata").join(entry.file_name()),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        first.workspace_binding().unwrap().unwrap().snapshot_id(),
+        f.closure.snapshot_id()
+    );
+    assert_eq!(
+        first.local_pin_state().unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert!(first.is_complete().is_err());
+    assert!(first.is_pinned().is_err());
+    assert!(first.completion_kind().is_err());
+    assert!(first.is_snapshot_complete().is_err());
+    assert!(first.manifest().is_err());
+    assert!(first.snapshot_manifest().is_err());
+    assert!(first.audit_pin().is_err());
+    assert!(DurableStore::open_workspace_context(
+        f.temp.path(),
+        &uuid::Uuid::from_u128(2).to_string(),
+        &f.context
+    )
+    .is_err());
+    assert!(f.cache().try_live_pins().is_err());
+    for sid in [f.closure.snapshot_id(), other.closure.snapshot_id()] {
+        assert!(f.cache().drop_records_for_pin(sid).is_err());
+    }
+    assert!(f.cache().record_for("workspace-test-root").is_some());
+    assert_full(&second, &other);
+}
+
+#[tokio::test]
+async fn a_missing_or_corrupt_fixed_view_is_never_proven_absence_for_an_owned_commit() {
+    for corrupt in [false, true] {
+        let f = Fixture::new();
+        let store = f.owner(2);
+        f.hydrate(&store).await;
+        f.add_record();
+        let view = store.root().join("view.json");
+        if corrupt {
+            fs::write(view, b"broken view").unwrap();
+        } else {
+            fs::remove_file(view).unwrap();
+        }
+        assert!(store.local_pin_state().is_err());
+        assert!(store.is_complete().is_err());
+        assert!(store.snapshot_manifest().is_err());
+        assert!(f.cache().try_live_pins().is_err());
+        assert!(f
+            .cache()
+            .drop_records_for_pin(f.closure.snapshot_id())
+            .is_err());
+        assert!(f.cache().record_for("workspace-test-root").is_some());
+    }
 }
 
 #[tokio::test]
