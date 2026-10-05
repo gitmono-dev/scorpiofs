@@ -7,6 +7,7 @@
 //!   resume, a completeness marker and a pin.
 
 pub mod auth;
+pub mod capabilities;
 mod cas_index;
 mod chunk_wire;
 pub mod client;
@@ -22,6 +23,7 @@ pub mod fuse;
 pub mod incremental;
 pub mod layer;
 mod lookup;
+mod owned_range;
 mod owned_reader;
 mod owned_transport;
 pub mod range;
@@ -36,6 +38,7 @@ pub use coordinator::{FetchCoordinator, FetchCoordinatorCounts, FetchCoordinator
 pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMeters, ViewMeta};
 pub use frames::LeaseReleaseOutcome;
 pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
+pub use owned_range::{OwnedChunkedFile, VerifiedRange};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use types::{

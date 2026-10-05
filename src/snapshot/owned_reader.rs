@@ -53,9 +53,8 @@ impl SnapshotReader {
         Ok(())
     }
 
-    async fn validate_content_member(&self, file: &SnapshotFile) -> Result<(), SnapshotError> {
-        self.authorized_context()
-            .validate_relative_path(&file.rel_path)?;
+    pub(crate) async fn content_member(&self, path: &str) -> Result<&SnapshotFile, SnapshotError> {
+        self.authorized_context().validate_relative_path(path)?;
         self.ensure_lease().await?;
         let files = self
             .content_membership
@@ -70,13 +69,20 @@ impl SnapshotReader {
                 )
             })
             .await?;
-        let path = file.rel_path.strip_prefix('/').unwrap_or(&file.rel_path);
-        let expected = files.get(path).ok_or_else(|| {
+        let path = path.strip_prefix('/').unwrap_or(path);
+        files.get(path).ok_or_else(|| {
             SnapshotError::new(
                 SnapshotErrorCode::PathNotFound,
                 "requested content is not a file in the fixed root",
             )
-        })?;
+        })
+    }
+
+    pub(crate) async fn validate_content_member(
+        &self,
+        file: &SnapshotFile,
+    ) -> Result<(), SnapshotError> {
+        let expected = self.content_member(&file.rel_path).await?;
         if file.content_digest != expected.content_digest
             || file.size != expected.size
             || !(file.fs_kind == expected.fs_kind
