@@ -1003,13 +1003,13 @@ impl Filesystem for Mst2Fuse {
         Ok(())
     }
 
-    /// Serve `[offset, offset+size)` of a file, fetching only what covers it
-    /// (spec 07 §6, spec 11 §6: `open` prepares a handle, `read` starts I/O).
+    /// Serve `[offset, offset+size)` of a file (spec 07 §6, spec 11 §6:
+    /// `open` prepares a handle, `read` starts I/O).
     ///
-    /// Order of sources: an already-materialized whole file (small files and
-    /// hydrated CAS objects) is sliced; otherwise small files come through
-    /// the OBJECT path and large files through the verified chunk reader,
-    /// which transfers only the covering chunks.
+    /// Verified bytes in memory are sliced. Small files come from verified
+    /// local CAS or OBJECT requests. Large local CAS files are fully scanned
+    /// and hashed with bounded memory, returning the requested range from
+    /// those same buffers; large online reads transfer only covering chunks.
     async fn read(
         &self,
         _req: Request,
@@ -1054,12 +1054,13 @@ impl Filesystem for Mst2Fuse {
         }
 
         // 3. Large file: serve the requested range only (spec 07 §6, BODY-12).
-        //    A hydrated store is the offline-safe source — a bounded `pread`
-        //    that never loads the file whole. The verified chunk reader is the
-        //    live-transport path when the CAS does not hold the file.
+        //    Local CAS scans and hashes the whole file with bounded memory,
+        //    collecting only the range from those same verified buffers.
+        //    The verified chunk reader is the live-transport path when the
+        //    CAS does not hold the file.
         if let Some(store) = &self.store {
             if let Some(bytes) = store
-                .pread_blob(&f.digest, offset, (end - offset) as usize)
+                .read_verified_blob_range(&f.digest, f.size, offset, (end - offset) as usize)
                 .map_err(io_err)?
             {
                 if bytes.len() as u64 != end - offset {
@@ -1693,6 +1694,62 @@ mod tests {
                 .data
                 .as_ref(),
             b"a"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_large_ranges_reject_same_size_corruption() {
+        // Invoke filesystem operations directly, without a mount or an
+        // offline authorization claim.
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(DurableStore::open(temp.path()).unwrap());
+        let body = vec![0x51; 5 * 64 * 1024 + 7];
+        let digest = crate::snapshot::durable::digest_of(&body);
+        let path = store
+            .content_dir()
+            .join(digest.strip_prefix("sha256:").unwrap());
+        std::fs::write(&path, &body).unwrap();
+        let fs = Mst2Fuse::build(
+            None,
+            Some(store),
+            vec![SnapshotFile {
+                rel_path: "large".into(),
+                fs_kind: "regular".into(),
+                size: body.len() as u64,
+                content_digest: digest,
+            }],
+        )
+        .unwrap();
+        let req = Request::default();
+        let inode = fs
+            .lookup(req, ROOT_INODE, OsStr::new("large"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        assert_eq!(
+            fs.read(req, inode, inode, 0, 13)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            &body[..13]
+        );
+        for corrupt_at in [4, body.len() - 1] {
+            let mut corrupt = body.clone();
+            corrupt[corrupt_at] ^= 1;
+            std::fs::write(&path, corrupt).unwrap();
+            let error = fs.read(req, inode, inode, 0, 13).await.unwrap_err();
+            assert_eq!(i32::from(error), -libc::EIO);
+        }
+        std::fs::write(&path, &body).unwrap();
+        assert_eq!(
+            fs.read(req, inode, inode, body.len() as u64 - 5, 13)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            &body[body.len() - 5..]
         );
     }
 
