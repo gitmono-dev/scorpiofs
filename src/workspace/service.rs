@@ -280,9 +280,11 @@ impl WorkspaceService {
         runtime.mountpoint_identity = Some(directory_identity(&workspace.mountpoint)?);
         initialize_workspace_directory(&workspace.mountpoint, 0o755)?;
         check_private_paths(workspace, runtime)?;
+        check_retired_mountpoint(workspace, runtime)?;
         runtime.mount =
             Some(WorkspaceMount::new(lower, &workspace.upper, workspace.mountpoint.clone()).await?);
         check_private_paths(workspace, runtime)?;
+        check_retired_mountpoint(workspace, runtime)?;
         runtime.mount.as_mut().unwrap().mount().await?;
         check_private_paths(workspace, runtime)?;
         runtime.mount_state = MountState::Mounted;
