@@ -268,7 +268,7 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
     let expires = parse_rfc3339_timestamp(expiry).ok_or_else(|| {
         SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
-            "lease expiry is not a valid UTC RFC3339 timestamp",
+            "lease expiry is not a valid RFC3339 timestamp",
         )
     })?;
     // Sample the monotonic clock first: scheduling delay between clock reads
@@ -280,15 +280,26 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
             "system clock precedes the Unix epoch",
         )
     })?;
-    let remaining = expires
-        .checked_sub(now)
-        .filter(|d| !d.is_zero())
+    // A std Duration's nanoseconds fit in i128. Signed comparison also treats
+    // valid timestamps before 1970 as expired, rather than malformed data.
+    let remaining_nanos = expires
+        .checked_sub(now.as_nanos() as i128)
+        .filter(|nanos| *nanos > 0)
         .ok_or_else(|| {
             SnapshotError::new(
                 SnapshotErrorCode::LeaseExpired,
                 "server returned an expired snapshot lease",
             )
-        })?;
+        })? as u128;
+    let remaining = Duration::new(
+        u64::try_from(remaining_nanos / 1_000_000_000).map_err(|_| {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "lease expiry exceeds the clock range",
+            )
+        })?,
+        (remaining_nanos % 1_000_000_000) as u32,
+    );
     let deadline = instant.checked_add(remaining).ok_or_else(|| {
         SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
@@ -324,72 +335,19 @@ impl Drop for LeaseKeeper {
     }
 }
 
-/// Minimal RFC3339 (`YYYY-MM-DDTHH:MM:SSZ`) → unix seconds. Only the exact
-/// shape this deployment emits is accepted. Calendar validation rejects
-/// impossible dates instead of granting a fictitious extra lease window.
-fn parse_rfc3339_unix(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if b.len() != 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'Z'
-    {
-        return None;
-    }
-    let num = |from: usize, to: usize| -> Option<u64> {
-        if !b[from..to].iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        std::str::from_utf8(&b[from..to]).ok()?.parse::<u64>().ok()
-    };
-    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
-    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = match mo {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return None,
-    };
-    if !(1..=month_days).contains(&d) || h > 23 || mi > 59 || sec > 59 {
-        return None;
-    }
-    // days_from_civil (Howard Hinnant), matching runtime.rs' inverse.
-    let y_adj = if mo <= 2 { y as i64 - 1 } else { y as i64 };
-    let era = y_adj.div_euclid(400);
-    let yoe = y_adj - era * 400;
-    let mp = (mo as i64 + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    if days < 0 {
-        return None;
-    }
-    Some(days as u64 * 86_400 + h * 3600 + mi * 60 + sec)
+/// Share the wire contract's actual RFC3339 instant, including known offsets.
+/// Subnanosecond precision is floored by the parser, never rounded upward.
+fn parse_rfc3339_timestamp(value: &str) -> Option<i128> {
+    super::resolve_wire::timestamp(value)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp_nanos())
 }
 
-fn parse_rfc3339_timestamp(value: &str) -> Option<Duration> {
-    if value.len() == 20 {
-        return parse_rfc3339_unix(value).map(Duration::from_secs);
-    }
-    let bytes = value.as_bytes();
-    if !(22..=30).contains(&bytes.len()) || bytes[19] != b'.' || bytes.last() != Some(&b'Z') {
-        return None;
-    }
-    let fraction = &bytes[20..bytes.len() - 1];
-    if !fraction.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let mut canonical = bytes[..19].to_vec();
-    canonical.push(b'Z');
-    let seconds = parse_rfc3339_unix(std::str::from_utf8(&canonical).ok()?)?;
-    let nanos = std::str::from_utf8(fraction).ok()?.parse::<u32>().ok()?
-        * 10u32.pow(9 - fraction.len() as u32);
-    Some(Duration::new(seconds, nanos))
+#[cfg(test)]
+fn parse_rfc3339_unix(value: &str) -> Option<i64> {
+    super::resolve_wire::timestamp(value)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp())
 }
 
 /// A fixed view plus everything needed to read its content.
@@ -1785,20 +1743,30 @@ mod tests {
             parse_rfc3339_unix("2024-02-29T23:59:59Z"),
             Some(1_709_251_199)
         );
+        assert_eq!(
+            parse_rfc3339_unix("2026-09-16T10:28:42+08:00"),
+            Some(1_789_525_722)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2026-09-15T23:58:42-02:30"),
+            Some(1_789_525_722)
+        );
+        assert_eq!(parse_rfc3339_unix("1969-12-31T23:59:59Z"), Some(-1));
     }
 
     #[test]
-    fn rfc3339_parser_rejects_non_canonical_shapes() {
+    fn rfc3339_parser_rejects_invalid_or_unknown_instants() {
         for bad in [
             "",
             "2026-09-16T02:28:42",       // missing Z
             "2026-09-16 02:28:42Z",      // space separator
             "2026-13-01T00:00:00Z",      // month 13
             "2026-09-16T24:00:00Z",      // hour 24
-            "2026-09-16T02:28:42+08:00", // offset form not emitted here
+            "2026-09-16T02:28:42-00:00", // unknown local offset
             "2026-02-29T00:00:00Z",      // non-leap year
             "2026-04-31T00:00:00Z",      // April has 30 days
-            "2026-09-16T02:28:60Z",      // invalid second
+            "2026-09-16T02:28:61Z",      // invalid second
+            "2026-09-16T02:28:60Z",      // not a valid leap-second position
             "+026-09-16T02:28:42Z",      // numeric fields are ASCII digits
             "2026-+9-16T02:28:42Z",
         ] {
@@ -1810,17 +1778,32 @@ mod tests {
     fn rfc3339_fraction_is_exact_and_strict() {
         assert_eq!(
             parse_rfc3339_timestamp("1970-01-01T00:00:01.123456789Z"),
-            Some(Duration::new(1, 123_456_789))
+            Some(1_123_456_789)
         );
         assert_eq!(
             parse_rfc3339_timestamp("1970-01-01T00:00:01.1Z"),
-            Some(Duration::new(1, 100_000_000))
+            Some(1_100_000_000)
+        );
+        // Supported wire precision is floored to nanoseconds, never rounded
+        // upward into a longer retention grant.
+        assert_eq!(
+            parse_rfc3339_timestamp("1970-01-01T00:00:01.1234567899Z"),
+            Some(1_123_456_789)
+        );
+        assert_eq!(
+            parse_rfc3339_timestamp("1970-01-01T08:00:01.1+08:00"),
+            Some(1_100_000_000)
+        );
+        // RFC3339 permits a leap second. The shared parser conservatively
+        // clamps it to the last nanosecond of the preceding POSIX second.
+        assert_eq!(
+            parse_rfc3339_timestamp("2016-12-31T23:59:60Z"),
+            Some(1_483_228_799_999_999_999)
         );
         for bad in [
             "1970-01-01T00:00:01.Z",
-            "1970-01-01T00:00:01.1234567890Z",
             "1970-01-01T00:00:01.+1Z",
-            "1970-01-01T00:00:01.1+00:00",
+            "1970-01-01T00:00:01.1-00:00",
             "1970-01-01T00:00:01.１Z",
             "2026-02-29T00:00:01.1Z",
         ] {
@@ -1845,6 +1828,7 @@ mod tests {
             ("", SnapshotErrorCode::IntegrityError),
             ("2026-02-29T00:00:00Z", SnapshotErrorCode::IntegrityError),
             ("1970-01-01T00:00:00Z", SnapshotErrorCode::LeaseExpired),
+            ("1969-12-31T23:59:59Z", SnapshotErrorCode::LeaseExpired),
         ] {
             let error = match LeaseKeeper::new(60, "lease", "snapshot", expiry, 1) {
                 Ok(_) => panic!("invalid initial expiry was accepted: {expiry}"),

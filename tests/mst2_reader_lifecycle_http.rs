@@ -29,6 +29,7 @@ const METADATA_ROOT: [u8; 32] = [0x01; 32];
 #[derive(Clone, Copy)]
 enum Expiry {
     After(Duration),
+    OffsetAfter(Duration, i32),
     Text(&'static str),
     Missing,
 }
@@ -146,7 +147,16 @@ fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 // Independent calendar formatter: subtract whole calendar years/months from
 // Unix days rather than reusing the production parser's civil-date algorithm.
 fn timestamp_after(after: Duration) -> String {
+    timestamp_after_offset(after, 0)
+}
+
+fn timestamp_after_offset(after: Duration, offset_seconds: i32) -> String {
     let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + after;
+    let at = if offset_seconds >= 0 {
+        at + Duration::from_secs(offset_seconds as u64)
+    } else {
+        at - Duration::from_secs(offset_seconds.unsigned_abs() as u64)
+    };
     let mut days = at.as_secs() / 86_400;
     let mut year = 1970;
     let leap = |year: u64| {
@@ -180,20 +190,35 @@ fn timestamp_after(after: Duration) -> String {
         month += 1;
     }
     let time = at.as_secs() % 86_400;
-    format!(
-        "{year:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+    let mut timestamp = format!(
+        "{year:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}",
         month + 1,
         days + 1,
         time / 3600,
         time / 60 % 60,
         time % 60,
         at.subsec_nanos()
-    )
+    );
+    if offset_seconds == 0 {
+        timestamp.push('Z');
+    } else {
+        let offset = offset_seconds.unsigned_abs();
+        timestamp.push_str(&format!(
+            "{}{:02}:{:02}",
+            if offset_seconds > 0 { '+' } else { '-' },
+            offset / 3600,
+            offset / 60 % 60,
+        ));
+    }
+    timestamp
 }
 
 fn add_expiry(response: &mut Value, expiry: Expiry) {
     match expiry {
         Expiry::After(after) => response["lease_expires_at"] = timestamp_after(after).into(),
+        Expiry::OffsetAfter(after, offset) => {
+            response["lease_expires_at"] = timestamp_after_offset(after, offset).into()
+        }
         Expiry::Text(value) => response["lease_expires_at"] = value.into(),
         Expiry::Missing => {}
     }
@@ -474,10 +499,76 @@ async fn server_grants_control_both_initial_and_renewed_windows() {
 }
 
 #[tokio::test]
+async fn offset_initial_and_renewed_grants_preserve_the_same_fixed_authority() {
+    for offset in [8 * 3600, -2 * 3600 - 30 * 60] {
+        let fixture = Arc::new(Fixture {
+            initial_expiry: Expiry::OffsetAfter(Duration::from_millis(1500), offset),
+            renewal_expiry: Expiry::OffsetAfter(Duration::from_millis(1500), -offset),
+            renewal_epoch: Mutex::new(Some(json!("1"))),
+            ..Fixture::default()
+        });
+        let server = serve(fixture.clone()).await;
+        let client = Mst2Client::with_token(&server.url, Some("offset-actor".into()));
+        let reader = SnapshotReader::resolve(client.clone(), "/alpha", 600)
+            .await
+            .unwrap();
+        let snapshot = reader.snapshot_id().to_string();
+        let lease = reader.lease_id().to_string();
+        client.set_token(Some("next-actor".into()));
+        fixture.wait_for_renewals(2).await;
+        probe(&reader).await;
+        assert_eq!(reader.snapshot_id(), snapshot);
+        assert_eq!(reader.lease_id(), lease);
+        assert_eq!(reader.authorized_context().authorization_epoch(), 1);
+        assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+        let requests = fixture.requests.lock().unwrap();
+        for request in requests.iter().filter(|request| request.kind == "renew") {
+            assert_eq!(request.actor.as_deref(), Some("Bearer offset-actor"));
+            assert_eq!(request.lease.as_deref(), Some(lease.as_str()));
+            assert_eq!(request.requested_seconds, Some(600));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_positive_offset_does_not_extend_a_failed_renewals_actual_grant() {
+    let fixture = Arc::new(Fixture {
+        initial_expiry: Expiry::OffsetAfter(Duration::from_millis(1500), 8 * 3600),
+        fail_renewal: AtomicBool::new(true),
+        ..Fixture::default()
+    });
+    let server = serve(fixture.clone()).await;
+    let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), "/alpha", 600)
+        .await
+        .unwrap();
+    fixture.wait_for_renewals(1).await;
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    let clone = reader.clone();
+    assert_eq!(
+        reader.lookup(&["/probe".into()]).await.unwrap_err().code,
+        SnapshotErrorCode::LeaseExpired
+    );
+    assert_eq!(
+        clone.lookup(&["/probe".into()]).await.unwrap_err().code,
+        SnapshotErrorCode::LeaseExpired
+    );
+    assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.count("lookup"), 0);
+}
+
+#[tokio::test]
 async fn invalid_initial_expiry_fails_before_any_snapshot_request() {
     for (expiry, expected) in [
         (Expiry::Missing, SnapshotErrorCode::IntegrityError),
         (Expiry::Text("garbage"), SnapshotErrorCode::IntegrityError),
+        (
+            Expiry::Text("2099-01-01T00:00:00-00:00"),
+            SnapshotErrorCode::IntegrityError,
+        ),
+        (
+            Expiry::Text("1969-12-31T23:59:59Z"),
+            SnapshotErrorCode::LeaseExpired,
+        ),
         (
             Expiry::Text("2026-04-31T00:00:00Z"),
             SnapshotErrorCode::IntegrityError,
