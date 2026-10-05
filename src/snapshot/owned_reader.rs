@@ -36,6 +36,7 @@ impl SnapshotReader {
         closure: &ValidatedSnapshotClosure,
     ) -> Result<(), SnapshotError> {
         closure.matches_descriptor(self.descriptor())?;
+        self.path_membership.seed_directories(closure);
         let files: HashMap<_, _> = closure
             .files()
             .iter()
@@ -60,6 +61,7 @@ impl SnapshotReader {
             .content_membership
             .get_or_try_init(|| async {
                 let closure = self.snapshot_closure().await?;
+                self.path_membership.seed_directories(&closure);
                 Ok::<_, SnapshotError>(
                     closure
                         .files()
