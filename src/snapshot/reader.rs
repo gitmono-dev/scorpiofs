@@ -357,6 +357,8 @@ pub struct SnapshotReader {
     lease_id: String,
     context: AuthorizedSnapshotContext,
     caps: Capabilities,
+    advertisement: super::capabilities::CapabilityAdvertisement,
+    delivery: super::ResolveDelivery,
     lease: Arc<LeaseKeeper>,
     pub(crate) content_scope: Arc<super::content::ContentBudget>,
     pub(crate) content_membership: Arc<tokio::sync::OnceCell<HashMap<String, SnapshotFile>>>,
@@ -370,9 +372,14 @@ impl SnapshotReader {
         scope: &str,
         lease_seconds: u64,
     ) -> Result<Self, SnapshotError> {
-        Ok(Self::resolve_internal(client, scope, lease_seconds, None)
-            .await?
-            .0)
+        Ok(Self::resolve_internal(
+            client,
+            &super::ResolveRequest::latest(scope, lease_seconds),
+            None,
+            false,
+        )
+        .await?
+        .0)
     }
 
     /// Resolve once with opt-in trace correlation. The returned receipt belongs
@@ -384,8 +391,13 @@ impl SnapshotReader {
         logical_request_id: &str,
     ) -> Result<(Self, super::ResolveTraceReceipt), SnapshotError> {
         super::resolve_receipt::validate_logical_id(logical_request_id)?;
-        let (reader, receipt) =
-            Self::resolve_internal(client, scope, lease_seconds, Some(logical_request_id)).await?;
+        let (reader, receipt) = Self::resolve_internal(
+            client,
+            &super::ResolveRequest::latest(scope, lease_seconds),
+            Some(logical_request_id),
+            false,
+        )
+        .await?;
         let receipt = receipt.ok_or_else(|| {
             SnapshotError::new(
                 SnapshotErrorCode::IntegrityError,
@@ -395,14 +407,55 @@ impl SnapshotReader {
         Ok((reader, receipt))
     }
 
+    /// Resolve an explicit canonical target and delivery. Lazy does not imply
+    /// that metadata, content or durable hydration has completed.
+    pub async fn resolve_request(
+        client: Mst2Client,
+        request: &super::ResolveRequest,
+    ) -> Result<Self, SnapshotError> {
+        Ok(Self::resolve_internal(client, request, None, true).await?.0)
+    }
+
+    pub async fn resolve_request_observed(
+        client: Mst2Client,
+        request: &super::ResolveRequest,
+        logical_request_id: &str,
+    ) -> Result<(Self, super::ResolveTraceReceipt), SnapshotError> {
+        super::resolve_receipt::validate_logical_id(logical_request_id)?;
+        let (reader, receipt) =
+            Self::resolve_internal(client, request, Some(logical_request_id), true).await?;
+        Ok((
+            reader,
+            receipt.ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "typed resolve is missing its receipt",
+                )
+            })?,
+        ))
+    }
+
     async fn resolve_internal(
         client: Mst2Client,
-        scope: &str,
-        lease_seconds: u64,
+        request: &super::ResolveRequest,
         logical_request_id: Option<&str>,
+        require_canonical: bool,
     ) -> Result<(Self, Option<super::ResolveTraceReceipt>), SnapshotError> {
         let client = client.for_resolve();
-        let caps = client.capabilities().await?;
+        let advertisement = client.capability_advertisement().await?;
+        if require_canonical
+            && matches!(
+                advertisement,
+                super::capabilities::CapabilityAdvertisement::Legacy(_)
+            )
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "typed resolve requires canonical discovery",
+            ));
+        }
+        let caps = advertisement.reader_capabilities();
+        let client = client.with_advertisement(&advertisement);
         if !caps.features.resolve || !caps.features.directory {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
@@ -415,17 +468,41 @@ impl SnapshotReader {
                 "server does not support metadata codec 1",
             ));
         }
+        if client.is_canonical()
+            && request.delivery == super::ResolveDelivery::Full
+            && !caps.features.full_hydration
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "full delivery is disabled by discovery",
+            ));
+        }
         let (res, receipt) = match logical_request_id {
             Some(id) => {
-                let (response, receipt) = client.resolve_observed(scope, lease_seconds, id).await?;
+                let (response, receipt) = if client.is_canonical() {
+                    client.resolve_request_observed(request, id).await?
+                } else {
+                    client
+                        .resolve_observed(&request.scope, request.lease_seconds, id)
+                        .await?
+                };
                 (response, Some(receipt))
             }
-            None => (client.resolve(scope, lease_seconds).await?, None),
+            None => (
+                if client.is_canonical() {
+                    client.resolve_request(request).await?
+                } else {
+                    client
+                        .resolve(&request.scope, request.lease_seconds)
+                        .await?
+                },
+                None,
+            ),
         };
         let context = AuthorizedSnapshotContext::new(
             client.base(),
             &client.credential_partition(),
-            scope,
+            &request.scope,
             res.descriptor.clone(),
             &res.authorization_epoch,
             &res.publication_sequence,
@@ -434,7 +511,7 @@ impl SnapshotReader {
         // Cloned clients resolving another view cannot overwrite this pair.
         let client = client.with_snapshot_lease(&res.lease_id);
         let lease = Arc::new(LeaseKeeper::new(
-            lease_seconds,
+            request.lease_seconds,
             &res.lease_id,
             &res.descriptor.snapshot_id,
             &res.lease_expires_at,
@@ -453,6 +530,8 @@ impl SnapshotReader {
                 context,
                 lease_id: res.lease_id,
                 caps,
+                advertisement,
+                delivery: request.delivery,
                 lease,
                 content_scope: super::content::ContentBudget::new(
                     super::ContentBudgetLimits::default(),
@@ -491,6 +570,15 @@ impl SnapshotReader {
     /// transports on these rather than assuming the server profile.
     pub fn capabilities(&self) -> &Capabilities {
         &self.caps
+    }
+
+    /// Exact discovery; legacy advertisements have no canonical limits.
+    pub fn capability_advertisement(&self) -> &super::capabilities::CapabilityAdvertisement {
+        &self.advertisement
+    }
+
+    pub fn delivery(&self) -> super::ResolveDelivery {
+        self.delivery
     }
 
     /// Negotiated content encoding for frame responses, exposed for the
@@ -608,7 +696,12 @@ impl SnapshotReader {
     /// A deployment without the page surface cannot provide a full closure.
     pub async fn snapshot_closure(&self) -> Result<ValidatedSnapshotClosure, SnapshotError> {
         let (pages, _, _) = self.snapshot_pages_with(&mut NetworkPages).await?;
-        ValidatedSnapshotClosure::from_pages(self.descriptor(), pages)
+        let closure = ValidatedSnapshotClosure::from_pages(self.descriptor(), pages)?;
+        for file in closure.files() {
+            self.client.validate_path(&file.rel_path)?;
+            self.client.validate_file_size(file.size)?;
+        }
+        Ok(closure)
     }
 
     /// Collect only dependencies reached from this reader's fixed root.
@@ -639,12 +732,16 @@ impl SnapshotReader {
         let mut route_visits = 0;
         let mut page_decodes = 0;
         while !frontier.is_empty() {
-            let take = frontier.len().min(PAGES_BATCH);
+            let take = frontier
+                .len()
+                .min(PAGES_BATCH)
+                .min(self.client.metadata_item_limit());
             let batch: Vec<PageFrontier> = frontier.drain(..take).collect();
             let mut items = Vec::with_capacity(batch.len());
             let mut requested = HashSet::new();
             for f in &batch {
                 self.context.validate_relative_path(&f.dir)?;
+                self.client.validate_path(&f.dir)?;
                 if f.route.len() > mst2_codec::metapage::MAX_DEPTH {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::LimitExceeded,
@@ -837,6 +934,7 @@ impl SnapshotReader {
         digest: &str,
         size: u64,
     ) -> Result<Vec<u8>, SnapshotError> {
+        self.client.validate_file_size(size)?;
         if size > crate::snapshot::client::MAX_BUFFERED_FILE_BYTES || usize::try_from(size).is_err()
         {
             return Err(SnapshotError::new(
@@ -1008,6 +1106,8 @@ impl SnapshotReader {
                 "whole-file accounted read exceeds the local 64 MiB budget; use range reads",
             ));
         }
+        self.client.validate_file_size(file.size)?;
+        self.client.validate_path(&file.rel_path)?;
         let size = usize::try_from(file.size).map_err(|_| {
             SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
@@ -1060,6 +1160,7 @@ impl SnapshotReader {
                 expected_digest: &file.content_digest,
             };
             let body = owned_transport::request_body(
+                &self.client,
                 budget,
                 &Request {
                     items: &[item],
@@ -1159,9 +1260,12 @@ impl SnapshotReader {
         let mut last_receipt = None;
         while start < map.chunk_count as usize {
             self.ensure_lease().await?;
-            let mut end = map.chunk_count as usize;
+            let mut end = (map.chunk_count as usize)
+                .min(start + self.client.request_item_limit())
+                .min(start + (self.client.chunk_byte_limit() / CHUNK_SIZE as usize).max(1));
             let body = loop {
                 match owned_transport::request_body(
+                    &self.client,
                     budget,
                     &Request {
                         items: &items[start..end],
