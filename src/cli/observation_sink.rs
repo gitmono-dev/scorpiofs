@@ -293,7 +293,7 @@ async fn write_observations(
         first_error: first_error.map(SinkError::code),
     };
     let mut encoded = match serde_json::to_vec(&footer) {
-        Ok(encoded) if encoded.len() as u64 + 1 <= FOOTER_RESERVE => encoded,
+        Ok(encoded) if (encoded.len() as u64) < FOOTER_RESERVE => encoded,
         _ => return false,
     };
     encoded.push(b'\n');
