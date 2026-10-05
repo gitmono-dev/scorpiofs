@@ -67,12 +67,50 @@ SELECT COALESCE((SELECT row_to_json(x) FROM (
 COMMIT;"""
 
 
+SNAPSHOT_ERROR_CODES = frozenset({
+    "ScopeInvalid", "InvalidRequest", "LimitExceeded", "Unauthenticated", "ScopeForbidden",
+    "ViewNotFound", "SnapshotNotReady", "SnapshotGone", "PathNotFound", "NotDirectory",
+    "UnsupportedEntry", "LeaseUnknown", "LeaseExpired", "CursorInvalid", "CursorStale",
+    "ProofBudgetExceeded", "DigestMismatch", "IntegrityError", "ObjectUnavailable",
+    "RangeNotSupported", "SymlinkTraversal", "DurableViewConflict", "TemporaryUnavailable", "Internal",
+})
+MEASUREMENT_STAGES = frozenset({
+    "arguments", "resolve", "cache_setup", "metadata", "metadata_oracle", "hydrate",
+    "completion_audit", "old_complete_view_audit",
+})
+
+
+class CommandFailure(RuntimeError):
+    """Closed diagnostic fields; never command arguments or child messages."""
+
+    def __init__(self, program, status, stderr):
+        self.details = {"command": program, "exit_status": status}
+        if program == "mst2_update_measure" and len(stderr) <= 4096:
+            try:
+                failure = json.loads(stderr)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                failure = None
+            if (isinstance(failure, dict)
+                    and set(failure) in ({"record", "stage"}, {"record", "stage", "snapshot_error_code"})
+                    and failure["record"] == "measurement_failure"
+                    and isinstance(failure["stage"], str)
+                    and failure["stage"] in MEASUREMENT_STAGES
+                    and ("snapshot_error_code" not in failure
+                         or (isinstance(failure["snapshot_error_code"], str)
+                             and failure["snapshot_error_code"] in SNAPSHOT_ERROR_CODES))):
+                self.details["measurement_stage"] = failure["stage"]
+                if "snapshot_error_code" in failure:
+                    self.details["snapshot_error_code"] = failure["snapshot_error_code"]
+        super().__init__(program + " failed")
+
+
 class PhaseFailure(AssertionError):
     """A fixed harness phase, without child output or exception text."""
 
     def __init__(self, phase, error):
         self.phase = phase
         self.failure_type = type(error).__name__
+        self.details = error.details if isinstance(error, CommandFailure) else {}
         super().__init__(phase + " failed")
 
 
@@ -90,6 +128,9 @@ def failure_record(error):
     record = {"execution_failed": True, "error_type": type(error).__name__}
     if isinstance(error, PhaseFailure):
         record.update(error_type=error.failure_type, phase=error.phase)
+        record.update(error.details)
+    elif isinstance(error, CommandFailure):
+        record.update(error.details)
     return record
 
 
@@ -127,7 +168,7 @@ def command(args, deadline, env=None, data=None):
                 pass
             process.communicate(timeout=5)
     try:
-        out, _ = process.communicate(data, timeout=remaining)
+        out, error_output = process.communicate(data, timeout=remaining)
     except subprocess.TimeoutExpired:
         terminate()
         raise TimeoutError(f"{Path(str(args[0])).name} exceeded its operation budget") from None
@@ -135,7 +176,9 @@ def command(args, deadline, env=None, data=None):
         terminate()
         raise
     if process.returncode:
-        raise RuntimeError(f"{Path(str(args[0])).name} failed with exit {process.returncode}")
+        name = Path(str(args[0])).name.removesuffix(".exe")
+        program = name if name in {"git", "psql", "docker", "mst2_update_measure"} else "external_command"
+        raise CommandFailure(program, process.returncode, error_output)
     return out
 
 
@@ -526,13 +569,15 @@ def execute(options):
             driver_binding(options)
             if service_binding(options) != owner or tip() != current:
                 raise AssertionError("service/target identity changed before the next publication")
-            commit, tree = create_version(fixture, round_number, version, options.profile == "smoke", deadline)
-            expected = expected_manifest(fixture, commit, deadline)
+            with phase("fixture_and_git_oracle"):
+                commit, tree = create_version(fixture, round_number, version, options.profile == "smoke", deadline)
+                expected = expected_manifest(fixture, commit, deadline)
             expected_path = group / f"{version}-expected.json"
             expected_path.write_text(json.dumps(expected))
             publish_start = time.monotonic()
-            git(fixture, deadline, "push", "--no-thin", options.git_url,
-                f"{commit}:refs/heads/main", env=git_env)
+            with phase("git_publication_push"):
+                git(fixture, deadline, "push", "--no-thin", options.git_url,
+                    f"{commit}:refs/heads/main", env=git_env)
             push_ms = (time.monotonic() - publish_start) * 1000
             with phase("updated_publication_identity"):
                 previous_identity = identity
@@ -551,8 +596,9 @@ def execute(options):
             if native:
                 driver_env["M2_EXPECTED_SEQUENCE"] = str(native["sequence"])
             def scorpio():
-                got = json.loads(command([str(options.driver), "sync", str(expected_path)],
-                                         deadline, env=driver_env))
+                with phase("scorpio_sync"):
+                    got = json.loads(command([str(options.driver), "sync", str(expected_path)],
+                                             deadline, env=driver_env))
                 source_digest = "sha256:" + hashlib.sha256((checkout / "examples/mst2_update_measure.rs").read_bytes()).hexdigest()
                 if got.get("driver_source_digest") != source_digest:
                     raise AssertionError("measurement binary was compiled from different driver source")
@@ -567,18 +613,21 @@ def execute(options):
                 # Mega2 rejects deepen+have; cold V1 alone needs depth=1.
                 # Ordinary V2/V3 stop at the preceding fetched commit.
                 depth = ["--depth=1"] if version == "v1" else []
-                command(durable_git + ["fetch", *depth, "--no-tags", options.git_url, "refs/heads/main"], deadline, env=git_env)
+                with phase("git_baseline_fetch"):
+                    command(durable_git + ["fetch", *depth, "--no-tags", options.git_url, "refs/heads/main"], deadline, env=git_env)
                 fetched = command(["git", "--git-dir", str(git_store), "rev-parse", "FETCH_HEAD"], deadline).decode().strip()
                 if fetched != commit:
                     raise AssertionError("Git comparison fetched a different commit")
                 fetch_ms = (time.monotonic() - start) * 1000
-                if version == "v1":
-                    command(durable_git + ["worktree", "add", "--detach", str(git_worktree), commit], deadline)
-                else:
-                    git(git_worktree, deadline, "-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "reset", "--hard", commit)
+                with phase("git_baseline_worktree"):
+                    if version == "v1":
+                        command(durable_git + ["worktree", "add", "--detach", str(git_worktree), commit], deadline)
+                    else:
+                        git(git_worktree, deadline, "-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "reset", "--hard", commit)
                 ready_ms = (time.monotonic() - start) * 1000
-                flushed_store = fsync_tree(git_store, deadline)
-                flushed_worktree = fsync_tree(git_worktree, deadline)
+                with phase("git_baseline_flush"):
+                    flushed_store = fsync_tree(git_store, deadline)
+                    flushed_worktree = fsync_tree(git_worktree, deadline)
                 # Directory entries for both trees must survive publication.
                 fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY)
                 try:
@@ -597,8 +646,9 @@ def execute(options):
                 git_measured, measured = baseline(), scorpio()
             # Full local bytes against independent Git after both timers end.
             verify_worktree(git_worktree, expected)
-            for old_path, old_store in old:
-                command([str(options.driver), "audit", str(old_path), old_store], deadline)
+            with phase("old_complete_view_audit"):
+                for old_path, old_store in old:
+                    command([str(options.driver), "audit", str(old_path), old_store], deadline)
             if version == "v2" and measured["fetched_content_units"] != 1:
                 raise AssertionError("single-file update must fetch exactly one new content unit")
             if version == "v3" and measured["fetched_content_units"] != 0:

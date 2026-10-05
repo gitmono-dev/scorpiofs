@@ -87,6 +87,31 @@ class CommitUpdateBenchTests(unittest.TestCase):
                     raise KeyError("private-connection-string")
         self.assertEqual(BENCH.failure_record(nested.exception)["phase"], "updated_publication_identity")
 
+    def test_command_failure_keeps_only_closed_typed_snapshot_diagnostics(self):
+        private = b'{"record":"measurement_failure","stage":"metadata","snapshot_error_code":"IntegrityError"}\n'
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("scorpio_sync"):
+                raise BENCH.CommandFailure("mst2_update_measure", 1, private)
+        self.assertEqual(BENCH.failure_record(failed.exception), {
+            "execution_failed": True, "error_type": "CommandFailure", "phase": "scorpio_sync",
+            "command": "mst2_update_measure", "exit_status": 1, "measurement_stage": "metadata",
+            "snapshot_error_code": "IntegrityError",
+        })
+        self.assertNotIn("private-token", json.dumps(BENCH.failure_record(failed.exception)))
+        for stderr in [b"private-token", b"Error: SnapshotError { code: IntegrityError, message: x }",
+                       b'{"record":"measurement_failure","stage":"metadata","snapshot_error_code":"Unknown"}',
+                       b'{"record":"measurement_failure","stage":"secret-stage"}',
+                       b'{"record":"measurement_failure","stage":"metadata","message":"private-token"}',
+                       private + b"private-token", b"[]", b"null", b"\xff", b" " * 4097]:
+            error = BENCH.CommandFailure("mst2_update_measure", 1, stderr)
+            self.assertNotIn("snapshot_error_code", BENCH.failure_record(error))
+            self.assertNotIn("measurement_stage", BENCH.failure_record(error))
+        # Git/SQL messages cannot impersonate a driver's typed error.
+        error = BENCH.CommandFailure("git", 128, private)
+        self.assertEqual(BENCH.failure_record(error), {
+            "execution_failed": True, "error_type": "CommandFailure", "command": "git", "exit_status": 128,
+        })
+
     def test_query_reports_safe_phase_without_echoing_invalid_output(self):
         for sql, phase in [(BENCH.IDENTITY_SQL, "Git identity"), (BENCH.NATIVE_SQL, "native publication")]:
             with patch.object(BENCH, "command", return_value=b"private-token-do-not-log"):
