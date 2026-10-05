@@ -287,7 +287,31 @@ impl ScopeCache {
     /// transferred to another live pin survives). Returns `SnapshotNotReady`
     /// while another index transaction is active; the caller may retry.
     pub fn drop_records_for_pin(&self, pin_ref: &str) -> Result<u64, SnapshotError> {
+        self.drop_records_for_pin_impl(pin_ref, None)
+    }
+
+    // The caller holds the exact owner's transaction and has durably released
+    // its registry row. Other owners are still independently lock/audit checked.
+    pub(super) fn drop_records_for_released_owner(
+        &self,
+        owner: &super::workspace_pins::WorkspaceBinding,
+    ) -> Result<u64, SnapshotError> {
+        self.drop_records_for_pin_impl(owner.snapshot_id(), Some(owner))
+    }
+
+    fn drop_records_for_pin_impl(
+        &self,
+        pin_ref: &str,
+        releasing: Option<&super::workspace_pins::WorkspaceBinding>,
+    ) -> Result<u64, SnapshotError> {
         let _lock = self.index_lock()?;
+        // A snapshot may have several independent workspace owners. Unknown
+        // ownership is insufficient evidence to remove its retention hints.
+        if self.pin_inventory(releasing)?.iter().any(|(id, audit)| {
+            id == pin_ref && !matches!(audit, super::workspace_pins::PinAudit::Inactive)
+        }) {
+            return Ok(0);
+        }
         let mut records = self.load_records()?;
         let before = records.len() as u64;
         records.retain(|_, r| r.pin_ref != pin_ref);
@@ -297,27 +321,71 @@ impl ScopeCache {
 
     /// Snapshot ids holding a local pin in this scope.
     pub fn live_pins(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Ok(entries) = fs::read_dir(&self.dir) {
-            for e in entries.flatten() {
-                let pin = e.path().join("pin.json");
-                if !pin.exists() {
-                    continue;
+        self.try_live_pins().unwrap_or_default()
+    }
+
+    pub fn try_live_pins(&self) -> Result<Vec<String>, SnapshotError> {
+        let mut out: Vec<_> = self
+            .pin_inventory(None)?
+            .into_iter()
+            .filter_map(|(_, audit)| {
+                if let super::workspace_pins::PinAudit::Active(id) = audit {
+                    Some(id)
+                } else {
+                    None
                 }
-                if let Ok(Some(id)) = crate::snapshot::durable::DurableStore::committed_snapshot_at(
-                    &e.path(),
-                    &self.dir.join("blobs"),
-                ) {
-                    if id
-                        .strip_prefix("sha256:")
-                        .is_some_and(|hex| e.file_name() == hex)
-                    {
-                        out.push(id);
-                    }
-                }
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    fn pin_inventory(
+        &self,
+        releasing: Option<&super::workspace_pins::WorkspaceBinding>,
+    ) -> Result<Vec<(String, super::workspace_pins::PinAudit)>, SnapshotError> {
+        let mut out = super::workspace_pins::owner_inventory(&self.dir, releasing)?;
+        for entry in fs::read_dir(&self.dir).map_err(io_err)? {
+            let entry = entry.map_err(io_err)?;
+            let name = entry.file_name();
+            let Some(hex) = name.to_str().filter(|name| {
+                name.len() == 64
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) else {
+                continue;
+            };
+            let metadata = fs::symlink_metadata(entry.path()).map_err(io_err)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "pin directory is not a real scope child",
+                ));
             }
+            // Owner roots are found exclusively through the fixed registry;
+            // the containing SID directory itself may still hold an older pin.
+            if !entry.path().join("pin.json").exists()
+                && !entry.path().join("DURABLE_COMPLETE").exists()
+            {
+                continue;
+            }
+            let sid = format!("sha256:{hex}");
+            let store = super::DurableStore {
+                root: entry.path(),
+                content: self.dir.join("blobs"),
+            };
+            let audit = store.audit_pin()?;
+            if matches!(&audit, super::workspace_pins::PinAudit::Active(id) if id != &sid) {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "pin snapshot differs from its scope child",
+                ));
+            }
+            out.push((sid, audit));
         }
-        out
+        Ok(out)
     }
 
     /// Store a verified page (digest/bytes checked by the caller). The id's

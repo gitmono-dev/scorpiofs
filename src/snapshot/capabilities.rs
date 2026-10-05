@@ -6,9 +6,8 @@ use serde_json::Value;
 use super::{types::Capabilities, SnapshotError, SnapshotErrorCode};
 
 /// Canonical discovery or the deployment's existing legacy advertisement.
-/// Legacy limits are not promoted into canonical limits. Existing readers
-/// continue to use the legacy API until their request planners enforce the
-/// advertised limits and their response parsers support the canonical wire.
+/// Legacy limits are not promoted into canonical limits. Snapshot readers
+/// retain this advertisement and configure their private transport from it.
 #[derive(Debug, Clone)]
 pub enum CapabilityAdvertisement {
     Canonical(CanonicalCapabilities),
@@ -40,10 +39,34 @@ impl CanonicalCapabilities {
         &self.features
     }
 
-    /// These values describe the server. Reading them does not configure an
-    /// existing reader, enable a feature, or relax the client's hard limits.
+    /// Server maxima. Readers enforce these in addition to local hard limits.
     pub fn limits(&self) -> &CapabilityLimits {
         &self.limits
+    }
+}
+
+impl CapabilityAdvertisement {
+    /// Local feature selection, never a lease, authorization or readiness fact.
+    pub(crate) fn reader_capabilities(&self) -> Capabilities {
+        match self {
+            Self::Legacy(caps) => caps.clone(),
+            Self::Canonical(caps) => Capabilities {
+                protocol_versions: vec![2],
+                metadata_codecs: vec![1],
+                frame_encodings: vec!["identity".into()],
+                features: super::types::CapabilityFeatures {
+                    resolve: caps.features.strict_publication,
+                    directory: caps.features.directory,
+                    leases: true,
+                    lookup: caps.features.lookup,
+                    metadata_pages: caps.features.metadata_pages,
+                    raw_blob: caps.features.raw_blob,
+                    objects: caps.features.small_objects,
+                    chunk_reads: caps.features.chunk_reads,
+                    full_hydration: caps.features.full_hydration,
+                },
+            },
+        }
     }
 }
 

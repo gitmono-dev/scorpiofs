@@ -1,6 +1,41 @@
 //! MST/2 snapshot client DTOs and errors (spec 03/04).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// Resolve selects one namespace publication; later requests use its snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResolveTarget {
+    Latest,
+    View { view_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolveDelivery {
+    Full,
+    Lazy,
+}
+
+/// Explicit resolve semantics, including the requested completion scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolveRequest {
+    pub target: ResolveTarget,
+    pub scope: String,
+    pub delivery: ResolveDelivery,
+    pub lease_seconds: u64,
+}
+
+impl ResolveRequest {
+    pub fn latest(scope: impl Into<String>, lease_seconds: u64) -> Self {
+        Self {
+            target: ResolveTarget::Latest,
+            scope: scope.into(),
+            delivery: ResolveDelivery::Full,
+            lease_seconds,
+        }
+    }
+}
 
 /// Client-side snapshot error. Mirrors the server code set so callers can
 /// distinguish absence/auth/not-found from transport failures.
