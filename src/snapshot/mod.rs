@@ -17,7 +17,7 @@ pub mod coordinator;
 mod descriptor_wire;
 mod directory;
 pub mod durable;
-mod error_wire;
+pub mod error_wire;
 pub mod frames;
 pub mod fuse;
 mod fuse_owned;
@@ -30,6 +30,7 @@ mod owned_transport;
 mod proven_file;
 pub mod range;
 pub mod reader;
+mod resolve_wire;
 pub mod types;
 
 pub use auth::{AuthorizedSnapshotContext, CacheDomain};
@@ -41,7 +42,7 @@ pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMete
 pub use frames::LeaseReleaseOutcome;
 pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
 pub use owned_range::{OwnedChunkedFile, VerifiedRange};
-pub use proven_file::ProvenSnapshotFile;
+pub use proven_file::{FileMembershipError, ProvenSnapshotFile};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use types::{

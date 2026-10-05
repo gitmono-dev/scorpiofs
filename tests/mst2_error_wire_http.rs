@@ -45,35 +45,35 @@ async fn response(status: u16, body: Value) -> SnapshotError {
 }
 
 #[tokio::test]
-async fn every_spec_error_retains_its_type_and_actual_http_status() {
+async fn every_spec_error_preserves_legacy_fallback_and_actual_http_status() {
     use SnapshotErrorCode::*;
     for (code, status, expected) in [
         ("PATH_NOT_FOUND", 404, PathNotFound),
         ("NOT_DIRECTORY", 409, NotDirectory),
-        ("NOT_FILE", 409, NotFile),
+        ("NOT_FILE", 409, Internal),
         ("SYMLINK_TRAVERSAL", 409, SymlinkTraversal),
         ("UNAUTHENTICATED", 401, Unauthenticated),
         ("SCOPE_FORBIDDEN", 403, ScopeForbidden),
         ("LEASE_EXPIRED", 410, LeaseExpired),
         ("SNAPSHOT_GONE", 410, SnapshotGone),
         ("SNAPSHOT_NOT_READY", 503, SnapshotNotReady),
-        ("METADATA_NOT_READY", 503, MetadataNotReady),
+        ("METADATA_NOT_READY", 503, Internal),
         ("OBJECT_UNAVAILABLE", 503, ObjectUnavailable),
         ("INTEGRITY_ERROR", 502, IntegrityError),
         ("CURSOR_STALE", 409, CursorStale),
         ("EXPECTED_DIGEST_MISMATCH", 409, DigestMismatch),
-        ("MIXED_SOURCE_BATCH", 422, MixedSourceBatch),
+        ("MIXED_SOURCE_BATCH", 422, Internal),
         ("UNSUPPORTED_ENTRY", 422, UnsupportedEntry),
-        ("UNSUPPORTED_CODEC", 422, UnsupportedCodec),
-        ("OBJECT_TOO_LARGE", 413, ObjectTooLarge),
+        ("UNSUPPORTED_CODEC", 422, Internal),
+        ("OBJECT_TOO_LARGE", 413, Internal),
         ("LIMIT_EXCEEDED", 413, LimitExceeded),
         ("PROOF_BUDGET_EXCEEDED", 413, ProofBudgetExceeded),
         ("INVALID_REQUEST", 400, InvalidRequest),
         ("RANGE_NOT_SUPPORTED", 400, RangeNotSupported),
-        ("NAMESPACE_CONFLICT", 409, NamespaceConflict),
-        ("PUBLICATION_CONFLICT", 409, PublicationConflict),
-        ("RELEASE_IMMUTABLE", 409, ReleaseImmutable),
-        ("RATE_LIMITED", 429, RateLimited),
+        ("NAMESPACE_CONFLICT", 409, Internal),
+        ("PUBLICATION_CONFLICT", 409, Internal),
+        ("RELEASE_IMMUTABLE", 409, Internal),
+        ("RATE_LIMITED", 429, Internal),
         ("TEMPORARY_UNAVAILABLE", 503, TemporaryUnavailable),
     ] {
         let error = response(status, envelope(code)).await;
@@ -177,6 +177,7 @@ async fn deployed_legacy_envelopes_keep_explicit_codes_without_status_spoofing()
         ("LEASE_UNKNOWN", 404, LeaseUnknown),
         ("OBJECT_DIGEST_MISMATCH", 409, DigestMismatch),
         ("INTERNAL", 500, Internal),
+        ("CONFLICT", 409, Internal),
     ] {
         // Current deployed legacy codes also carry request/retry hints.
         assert_eq!(
@@ -187,6 +188,12 @@ async fn deployed_legacy_envelopes_keep_explicit_codes_without_status_spoofing()
         let value =
             json!({"error": {"code": code, "message": "legacy", "extension": true}, "extra": true});
         assert_eq!(response(status, value).await.code, expected, "{code}");
+    }
+    for value in [
+        envelope("CONFLICT"),
+        json!({"error": {"code": "CONFLICT", "message": "legacy"}}),
+    ] {
+        assert_eq!(response(403, value).await.code, IntegrityError);
     }
     let value = json!({"error": {"code": "FUTURE_UNKNOWN", "message": "legacy"}});
     assert_eq!(response(403, value).await.code, Internal);
@@ -230,4 +237,85 @@ async fn error_wire_reuses_recursive_duplicate_and_body_byte_bounds() {
     let error = server.client.capabilities().await.unwrap_err();
     assert_eq!(error.code, SnapshotErrorCode::LimitExceeded);
     assert_eq!(error.http_status, 404);
+}
+
+#[test]
+fn explicit_canonical_parser_retains_all_spec_error_types() {
+    use scorpiofs::snapshot::error_wire::{CanonicalSnapshotError, CanonicalSnapshotErrorCode::*};
+    for (code, status, expected) in [
+        ("PATH_NOT_FOUND", 404, PathNotFound),
+        ("NOT_DIRECTORY", 409, NotDirectory),
+        ("NOT_FILE", 409, NotFile),
+        ("SYMLINK_TRAVERSAL", 409, SymlinkTraversal),
+        ("UNAUTHENTICATED", 401, Unauthenticated),
+        ("SCOPE_FORBIDDEN", 403, ScopeForbidden),
+        ("LEASE_EXPIRED", 410, LeaseExpired),
+        ("SNAPSHOT_GONE", 410, SnapshotGone),
+        ("SNAPSHOT_NOT_READY", 503, SnapshotNotReady),
+        ("METADATA_NOT_READY", 503, MetadataNotReady),
+        ("OBJECT_UNAVAILABLE", 503, ObjectUnavailable),
+        ("INTEGRITY_ERROR", 502, IntegrityError),
+        ("CURSOR_STALE", 409, CursorStale),
+        ("EXPECTED_DIGEST_MISMATCH", 409, ExpectedDigestMismatch),
+        ("MIXED_SOURCE_BATCH", 422, MixedSourceBatch),
+        ("UNSUPPORTED_ENTRY", 422, UnsupportedEntry),
+        ("UNSUPPORTED_CODEC", 422, UnsupportedCodec),
+        ("OBJECT_TOO_LARGE", 413, ObjectTooLarge),
+        ("LIMIT_EXCEEDED", 413, LimitExceeded),
+        ("PROOF_BUDGET_EXCEEDED", 413, ProofBudgetExceeded),
+        ("INVALID_REQUEST", 400, InvalidRequest),
+        ("RANGE_NOT_SUPPORTED", 400, RangeNotSupported),
+        ("NAMESPACE_CONFLICT", 409, NamespaceConflict),
+        ("PUBLICATION_CONFLICT", 409, PublicationConflict),
+        ("RELEASE_IMMUTABLE", 409, ReleaseImmutable),
+        ("RATE_LIMITED", 429, RateLimited),
+        ("TEMPORARY_UNAVAILABLE", 503, TemporaryUnavailable),
+    ] {
+        let bytes = serde_json::to_vec(&envelope(code)).unwrap();
+        let error = CanonicalSnapshotError::parse_response(&bytes, status).unwrap();
+        assert_eq!(error.code, expected);
+        assert_eq!(error.http_status, status);
+        assert_eq!(error.message, "public error");
+        assert_eq!(error.request_id, "request-fixture");
+        assert!(!error.retryable);
+        assert!(CanonicalSnapshotError::parse_response(
+            &bytes,
+            if status == 404 { 403 } else { 404 }
+        )
+        .is_err());
+    }
+    // Deployed aliases stay available through old APIs, but are not SPEC codes.
+    assert!(CanonicalSnapshotError::parse_response(
+        &serde_json::to_vec(&envelope("CONFLICT")).unwrap(),
+        409
+    )
+    .is_err());
+    assert!(CanonicalSnapshotError::parse_response(
+        br#"{"error":{"code":"PATH_NOT_FOUND","message":"legacy"}}"#,
+        404
+    )
+    .is_err());
+    assert!(CanonicalSnapshotError::parse_response(br#"{"error":{"code":"PATH_NOT_FOUND","message":"legacy","request_id":"a","retryable":false,"retryable":true}}"#, 404).is_err());
+    assert_eq!(
+        CanonicalSnapshotError::parse_response(&vec![b' '; 1_048_577], 404)
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::LimitExceeded
+    );
+}
+
+#[test]
+fn original_public_error_enum_still_supports_exhaustive_external_matches() {
+    fn classify(code: SnapshotErrorCode) -> bool {
+        use SnapshotErrorCode::*;
+        match code {
+            ScopeInvalid | InvalidRequest | LimitExceeded | Unauthenticated | ScopeForbidden
+            | ViewNotFound | SnapshotNotReady | SnapshotGone | PathNotFound | NotDirectory
+            | UnsupportedEntry | LeaseUnknown | LeaseExpired | CursorInvalid | CursorStale
+            | ProofBudgetExceeded | DigestMismatch | IntegrityError | ObjectUnavailable
+            | RangeNotSupported | SymlinkTraversal | DurableViewConflict | TemporaryUnavailable
+            | Internal => true,
+        }
+    }
+    assert!(classify(SnapshotErrorCode::Internal));
 }

@@ -35,6 +35,53 @@ fn limit() -> SnapshotError {
     )
 }
 
+/// Errors from the new selective membership API. This separate type preserves
+/// exhaustive matches over the established `SnapshotErrorCode` enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FileMembershipError {
+    /// The scope root or final committed path is a directory, not a file.
+    NotFile { message: String },
+    /// Original path, authority, lease, transport, integrity or work error.
+    Snapshot(SnapshotError),
+}
+impl FileMembershipError {
+    pub fn snapshot_error(&self) -> Option<&SnapshotError> {
+        match self {
+            Self::NotFile { .. } => None,
+            Self::Snapshot(error) => Some(error),
+        }
+    }
+    /// Local directory classification has no fabricated HTTP error status.
+    pub fn http_status(&self) -> u16 {
+        self.snapshot_error().map_or(0, |error| error.http_status)
+    }
+}
+impl From<SnapshotError> for FileMembershipError {
+    fn from(error: SnapshotError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+impl std::fmt::Display for FileMembershipError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFile { message } => write!(formatter, "NotFile: {message}"),
+            Self::Snapshot(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+impl std::error::Error for FileMembershipError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.snapshot_error()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
+fn not_file(message: &str) -> FileMembershipError {
+    FileMembershipError::NotFile {
+        message: message.into(),
+    }
+}
+
 /// Immutable facts derived from a specific descriptor-root MTP2 path. This is
 /// membership evidence, not a lease, offline permission or complete closure.
 /// No public constructor, deserializer or unchecked conversion is provided.
@@ -220,7 +267,10 @@ impl SnapshotReader {
     /// Prove only a target's ancestors and selected radix pages. A matching
     /// complete-closure seed yields the same opaque token without metadata I/O.
     /// Reader clones share bounded path cells and actual initializer flights.
-    pub async fn prove_file(&self, path: &str) -> Result<Arc<ProvenSnapshotFile>, SnapshotError> {
+    pub async fn prove_file(
+        &self,
+        path: &str,
+    ) -> Result<Arc<ProvenSnapshotFile>, FileMembershipError> {
         self.prove_file_deadline(path, self.path_membership.deadline)
             .await
     }
@@ -229,7 +279,7 @@ impl SnapshotReader {
         &self,
         path: &str,
         deadline: Duration,
-    ) -> Result<Arc<ProvenSnapshotFile>, SnapshotError> {
+    ) -> Result<Arc<ProvenSnapshotFile>, FileMembershipError> {
         self.authorized_context().validate_relative_path(path)?;
         let _caller = Admission::acquire(&self.path_membership.callers, &process().callers)?;
         // This caller's one deadline includes renewal, waiting on another
@@ -242,14 +292,11 @@ impl SnapshotReader {
     async fn prove_file_admitted(
         &self,
         path: &str,
-    ) -> Result<Arc<ProvenSnapshotFile>, SnapshotError> {
+    ) -> Result<Arc<ProvenSnapshotFile>, FileMembershipError> {
         self.ensure_lease().await?;
         let path = path.strip_prefix('/').unwrap_or(path);
         if path.is_empty() {
-            return Err(SnapshotError::new(
-                SnapshotErrorCode::NotFile,
-                "scope root is not a file",
-            ));
+            return Err(not_file("scope root is not a file"));
         }
         if let Some(files) = self.content_membership.get() {
             for (separator, _) in path.match_indices('/') {
@@ -261,7 +308,8 @@ impl SnapshotReader {
                             SnapshotErrorCode::NotDirectory
                         },
                         "seeded fixed-root ancestor is not a directory",
-                    ));
+                    )
+                    .into());
                 }
             }
             let file = files.get(path).ok_or_else(|| {
@@ -275,15 +323,13 @@ impl SnapshotReader {
                             .is_ok()
                     })
                 {
-                    return SnapshotError::new(
-                        SnapshotErrorCode::NotFile,
-                        "seeded fixed-root path is a directory",
-                    );
+                    return not_file("seeded fixed-root path is a directory");
                 }
                 SnapshotError::new(
                     SnapshotErrorCode::PathNotFound,
                     "file absent from seeded fixed root",
                 )
+                .into()
             })?;
             return Ok(ProvenSnapshotFile::mint(self, file.clone()));
         }
@@ -291,7 +337,8 @@ impl SnapshotReader {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
                 "selective membership requires metadata/pages",
-            ));
+            )
+            .into());
         }
         let cell = self.path_membership.table.lock().unwrap().get(path)?;
         let token = cell
@@ -322,7 +369,7 @@ impl SnapshotReader {
             .await
     }
 
-    async fn prove_path(&self, path: &str) -> Result<Arc<ProvenSnapshotFile>, SnapshotError> {
+    async fn prove_path(&self, path: &str) -> Result<Arc<ProvenSnapshotFile>, FileMembershipError> {
         let mut root = parse_digest(&self.descriptor().metadata_root)?;
         let mut directory = String::from("/");
         let mut active = std::collections::HashSet::new();
@@ -330,7 +377,7 @@ impl SnapshotReader {
         let mut components = path.split('/').peekable();
         while let Some(component) = components.next() {
             if !active.insert(root) {
-                return Err(integrity("cycle in selected directory roots"));
+                return Err(integrity("cycle in selected directory roots").into());
             }
             let entry = self
                 .prove_component(&directory, root, component.as_bytes(), &mut work)
@@ -340,13 +387,15 @@ impl SnapshotReader {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::SymlinkTraversal,
                         "selected ancestor is a symlink; membership does not follow it",
-                    ));
+                    )
+                    .into());
                 }
                 if entry.kind != EntryKind::Directory {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::NotDirectory,
                         "selected ancestor is not a directory",
-                    ));
+                    )
+                    .into());
                 }
                 root = entry.child_root;
                 if directory != "/" {
@@ -355,15 +404,12 @@ impl SnapshotReader {
                 directory.push_str(component);
             } else {
                 if entry.kind == EntryKind::Directory {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::NotFile,
-                        "selected path is a directory",
-                    ));
+                    return Err(not_file("selected path is a directory"));
                 }
                 if entry.size > super::range::MAX_FILE_SIZE
                     || entry.kind == EntryKind::Symlink && !(1..=4095).contains(&entry.size)
                 {
-                    return Err(limit());
+                    return Err(limit().into());
                 }
                 self.ensure_lease().await?;
                 return Ok(ProvenSnapshotFile::mint(
@@ -383,7 +429,7 @@ impl SnapshotReader {
                 ));
             }
         }
-        Err(integrity("selected file path has no final component"))
+        Err(integrity("selected file path has no final component").into())
     }
 
     async fn prove_component(
