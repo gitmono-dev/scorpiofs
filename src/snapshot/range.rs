@@ -29,6 +29,7 @@ use crate::snapshot::{
 
 /// Files at or below this size use the OBJECT path (spec 07 §2).
 pub const OBJECT_CAP: u64 = 256 * 1024;
+const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 const CACHED_CHUNKS: usize = 16;
 const CACHED_LEAVES: usize = 16;
 
@@ -86,6 +87,12 @@ impl ChunkedFile {
         size: u64,
     ) -> Result<Self, SnapshotError> {
         reader.authorized_context().validate_relative_path(path)?;
+        if size > MAX_FILE_SIZE {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "file size exceeds the 8 TiB serving profile",
+            ));
+        }
         if size <= OBJECT_CAP {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::Internal,
