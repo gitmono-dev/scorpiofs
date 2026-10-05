@@ -681,7 +681,7 @@ impl Mst2Client {
             urlencode(expected_digest)
         ));
         let response: serde_json::Value = self.get_json(&url).await?;
-        if self.is_canonical() && response.get("map").is_some() {
+        if self.is_canonical() && response.get("map").is_none() {
             return Err(chunk_binding_error());
         }
         let v = super::chunk_wire::map_descriptor(&response, sid, path)?;

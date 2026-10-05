@@ -61,6 +61,7 @@ fn base64(bytes: &[u8]) -> String {
 struct Fixture {
     caps: Mutex<Value>,
     resolve_override: Mutex<Option<Value>>,
+    legacy_flat_map: Mutex<bool>,
     calls: Mutex<Vec<(String, Value)>>,
     descriptor: ServingDescriptor,
     pages: BTreeMap<String, Vec<u8>>,
@@ -135,6 +136,7 @@ impl Fixture {
         Self {
             caps: Mutex::new(caps),
             resolve_override: Mutex::new(None),
+            legacy_flat_map: Mutex::new(false),
             calls: Mutex::new(vec![]),
             descriptor,
             pages,
@@ -308,9 +310,15 @@ async fn map(
 ) -> Json<Value> {
     assert_eq!(query["path"], "/large");
     f.record("chunk-map", json!(query));
-    Json(
-        json!({"snapshot_id":f.sid(),"path":"/large","schema_version":2,"file_content_id":id(&f.map.file_content_id),"file_size":f.map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":f.map.chunk_count.to_string(),"page_count":"1","pages_root":id(&f.map.pages_root),"map_id":id(&f.map.map_id())}),
-    )
+    let descriptor = json!({"schema_version":2,"file_content_id":id(&f.map.file_content_id),"file_size":f.map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":f.map.chunk_count.to_string(),"page_count":"1","pages_root":id(&f.map.pages_root),"map_id":id(&f.map.map_id())});
+    let mut body = json!({"snapshot_id":f.sid(),"path":"/large","map":descriptor});
+    if *f.legacy_flat_map.lock().unwrap() {
+        let descriptor = body.as_object_mut().unwrap().remove("map").unwrap();
+        body.as_object_mut()
+            .unwrap()
+            .extend(descriptor.as_object().unwrap().clone());
+    }
+    Json(body)
 }
 async fn leaf(
     State(f): State<Arc<Fixture>>,
@@ -709,4 +717,25 @@ async fn discovered_request_byte_limit_rejects_resolve_before_the_actual_post() 
         SnapshotErrorCode::LimitExceeded
     );
     assert!(s.calls("resolve").is_empty());
+}
+
+#[tokio::test]
+async fn canonical_reader_rejects_legacy_flat_maps_before_page_or_chunk_requests() {
+    let fixture = Fixture::new();
+    *fixture.legacy_flat_map.lock().unwrap() = true;
+    let s = Server::start(fixture).await;
+    let reader = s.reader().await;
+    let closure = reader.snapshot_closure().await.unwrap();
+    reader.seed_content_membership(&closure).unwrap();
+    let file = closure
+        .files()
+        .iter()
+        .find(|f| f.rel_path == "large")
+        .unwrap();
+    assert_eq!(
+        reader.read_content(file, true).await.unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert!(s.calls("chunk-map/pages").is_empty());
+    assert!(s.calls("chunks").is_empty());
 }
