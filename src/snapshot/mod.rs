@@ -17,6 +17,7 @@ pub mod coordinator;
 mod descriptor_wire;
 mod directory;
 pub mod durable;
+pub mod error_wire;
 pub mod frames;
 pub mod fuse;
 pub mod incremental;
