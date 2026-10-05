@@ -177,15 +177,19 @@ async fn objects(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Respo
     let name = items[0]["path"].as_str().unwrap().trim_start_matches('/');
     let body = &f.bodies[name];
     assert_eq!(items[0]["expected_digest"], id(&hash(body)));
-    let mut bytes = body.clone();
-    if mode == 1 {
-        bytes[0] ^= 1;
-    }
     let mut wire = ObjectPayload {
-        objects: vec![(hash(body), bytes)],
+        objects: vec![(hash(body), body.clone())],
     }
     .encode(52, 0)
     .unwrap();
+    if mode == 1 {
+        // Encode the valid OBJECT first, then corrupt its content while keeping
+        // the outer frame digest valid. The actual client must reject the
+        // inner object digest; the validating fixture encoder cannot forge it.
+        *wire.last_mut().unwrap() ^= 1;
+        let frame_digest = hash(&wire[mst2_codec::treeframe::HEADER_LEN..]);
+        wire[32..64].copy_from_slice(&frame_digest);
+    }
     let mut end = EndPayload {
         request_item_count: 1,
         unique_unit_count: 1,
