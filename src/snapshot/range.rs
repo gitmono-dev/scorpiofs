@@ -17,7 +17,7 @@
 //! Small files (≤ 256 KiB) are served whole through the OBJECT path: the
 //! spec's small/large split, not a size threshold invented here.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 
 use mst2_codec::chunkmap::{CHUNKS_PER_PAGE, CHUNK_SIZE};
 
@@ -29,6 +29,40 @@ use crate::snapshot::{
 
 /// Files at or below this size use the OBJECT path (spec 07 §2).
 pub const OBJECT_CAP: u64 = 256 * 1024;
+const CACHED_CHUNKS: usize = 16;
+const CACHED_LEAVES: usize = 16;
+
+struct BoundedCache<T> {
+    entries: VecDeque<(u64, Arc<Vec<T>>)>,
+    capacity: usize,
+}
+
+impl<T> BoundedCache<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, index: u64) -> Option<Arc<Vec<T>>> {
+        let slot = self.entries.iter().position(|(key, _)| *key == index)?;
+        let entry = self.entries.remove(slot)?;
+        let value = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(value)
+    }
+
+    fn insert(&mut self, index: u64, value: Arc<Vec<T>>) {
+        if let Some(slot) = self.entries.iter().position(|(key, _)| *key == index) {
+            self.entries.remove(slot);
+        }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((index, value));
+    }
+}
 
 /// A large file read through its chunk map, with verified per-chunk caching.
 pub struct ChunkedFile {
@@ -38,9 +72,9 @@ pub struct ChunkedFile {
     pub size: u64,
     map: VerifiedChunkMap,
     /// Leaf digests per chunk-map page, verified against `pages_root`.
-    leaves: tokio::sync::Mutex<HashMap<u64, Arc<Vec<[u8; 32]>>>>,
+    leaves: tokio::sync::Mutex<BoundedCache<[u8; 32]>>,
     /// Verified chunk bytes by index.
-    chunks: tokio::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>,
+    chunks: tokio::sync::Mutex<BoundedCache<u8>>,
 }
 
 impl ChunkedFile {
@@ -75,8 +109,8 @@ impl ChunkedFile {
             digest: digest.to_string(),
             size,
             map,
-            leaves: tokio::sync::Mutex::new(HashMap::new()),
-            chunks: tokio::sync::Mutex::new(HashMap::new()),
+            leaves: tokio::sync::Mutex::new(BoundedCache::new(CACHED_LEAVES)),
+            chunks: tokio::sync::Mutex::new(BoundedCache::new(CACHED_CHUNKS)),
         })
     }
 
@@ -91,23 +125,29 @@ impl ChunkedFile {
             return Ok(Vec::new());
         }
         let end = offset.saturating_add(length).min(self.size);
+        let returned = end - offset;
+        if returned > crate::snapshot::client::MAX_BUFFERED_FILE_BYTES {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "range output exceeds the local 64 MiB budget; request a smaller range",
+            ));
+        }
+        let returned = usize::try_from(returned).map_err(|_| range_allocation_error())?;
+        self.reader
+            .authorized_context()
+            .validate_relative_path(&self.path)?;
+        self.reader.ensure_lease().await?;
         let (start_chunk, end_chunk) =
             mst2_codec::chunkmap::range_chunks(offset, end - offset, self.size)
                 .map_err(codec_err)?;
 
+        let mut out = Vec::new();
+        out.try_reserve_exact(returned)
+            .map_err(|_| range_allocation_error())?;
         for index in start_chunk..=end_chunk {
-            self.ensure_chunk(index).await?;
-        }
-
-        let cache = self.chunks.lock().await;
-        let mut out = Vec::with_capacity((end - offset) as usize);
-        for index in start_chunk..=end_chunk {
-            let bytes = cache.get(&index).ok_or_else(|| {
-                SnapshotError::new(
-                    SnapshotErrorCode::Internal,
-                    format!("chunk {index} missing after fetch"),
-                )
-            })?;
+            // Keep this verified chunk alive while copying, even if another
+            // read evicts it. Output need not fit inside the retained cache.
+            let bytes = self.ensure_chunk(index).await?;
             let chunk_start = index * CHUNK_SIZE as u64;
             let from = if index == start_chunk {
                 (offset - chunk_start) as usize
@@ -135,26 +175,17 @@ impl ChunkedFile {
 
     /// True when every chunk of the file is already cached and verified.
     pub async fn fully_cached(&self) -> bool {
-        self.chunks.lock().await.len() as u64 == self.map.chunk_count
+        self.chunks.lock().await.entries.len() as u64 == self.map.chunk_count
     }
 
     /// Make chunk `index` available and verified, fetching the leaf page
     /// that authenticates it first when needed.
-    async fn ensure_chunk(&self, index: u64) -> Result<(), SnapshotError> {
-        if self.chunks.lock().await.contains_key(&index) {
-            return Ok(());
+    async fn ensure_chunk(&self, index: u64) -> Result<Arc<Vec<u8>>, SnapshotError> {
+        if let Some(bytes) = self.chunks.lock().await.get(index) {
+            return Ok(bytes);
         }
         let page = index / CHUNKS_PER_PAGE as u64;
-        self.ensure_leaf_page(page).await?;
-        let digests = self
-            .leaves
-            .lock()
-            .await
-            .get(&page)
-            .cloned()
-            .ok_or_else(|| {
-                SnapshotError::new(SnapshotErrorCode::Internal, "leaf page missing after fetch")
-            })?;
+        let digests = self.ensure_leaf_page(page).await?;
         let slot = (index % CHUNKS_PER_PAGE as u64) as usize;
         let want = digests.get(slot).copied().ok_or_else(|| {
             SnapshotError::new(
@@ -209,14 +240,15 @@ impl ChunkedFile {
                 ),
             ));
         }
-        self.chunks.lock().await.insert(index, Arc::new(unit.bytes));
-        Ok(())
+        let bytes = Arc::new(unit.bytes);
+        self.chunks.lock().await.insert(index, Arc::clone(&bytes));
+        Ok(bytes)
     }
 
     /// Fetch and proof-check one leaf page (cached per page).
-    async fn ensure_leaf_page(&self, page: u64) -> Result<(), SnapshotError> {
-        if self.leaves.lock().await.contains_key(&page) {
-            return Ok(());
+    async fn ensure_leaf_page(&self, page: u64) -> Result<Arc<Vec<[u8; 32]>>, SnapshotError> {
+        if let Some(digests) = self.leaves.lock().await.get(page) {
+            return Ok(digests);
         }
         self.reader
             .authorized_context()
@@ -233,11 +265,9 @@ impl ChunkedFile {
                 page,
             )
             .await?;
-        self.leaves
-            .lock()
-            .await
-            .insert(page, Arc::new(leaf.chunk_sha256));
-        Ok(())
+        let digests = Arc::new(leaf.chunk_sha256);
+        self.leaves.lock().await.insert(page, Arc::clone(&digests));
+        Ok(digests)
     }
 }
 
@@ -256,6 +286,13 @@ impl VerifiedChunkMap {
 
 fn codec_err(e: mst2_codec::CodecError) -> SnapshotError {
     SnapshotError::new(SnapshotErrorCode::Internal, format!("chunk codec: {e}"))
+}
+
+fn range_allocation_error() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::LimitExceeded,
+        "range output cannot fit in memory",
+    )
 }
 
 #[cfg(test)]
