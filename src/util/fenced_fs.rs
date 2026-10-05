@@ -1,6 +1,12 @@
 //! Retain native mutation futures through request cancellation.
 
-use std::{ffi::OsStr, future::Future, sync::Arc};
+use std::{
+    ffi::OsStr,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use asyncfuse::{
     notify::Notify,
@@ -9,7 +15,6 @@ use asyncfuse::{
 };
 use bytes::Bytes;
 use futures::Stream;
-use tokio::sync::oneshot;
 
 use super::mutation_fence::{AdmittedMutation, MutationFence};
 
@@ -46,27 +51,49 @@ impl<FS> FencedFilesystem<FS> {
     }
 }
 
-// The reply may be canceled after send succeeds but before receive is polled.
-// Keep the admission and orphan-handle cleanup in the delivered value itself.
-type FinishDelivery<T> = Box<dyn FnOnce(Option<Result<T>>) + Send>;
+type FinishOperation<T> = Box<dyn FnOnce(Option<Result<T>>) + Send>;
 
-struct Delivered<T> {
-    result: Option<Result<T>>,
-    finish: Option<FinishDelivery<T>>,
+// Normal operations run inline. Only cancellation transfers the remaining
+// owned future to the runtime; it never cancels the actual native operation.
+struct NativeOperation<T: Send + 'static> {
+    future: Option<Pin<Box<dyn Future<Output = Result<T>> + Send>>>,
+    finish: Option<FinishOperation<T>>,
+    polling: bool,
 }
 
-impl<T> Delivered<T> {
-    fn take(mut self) -> Result<T> {
-        let result = self.result.take().expect("native result already taken");
-        self.finish.take().expect("native completion already taken")(None);
+impl<T: Send + 'static> Future for NativeOperation<T> {
+    type Output = Result<T>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.polling = true;
+        let result = this
+            .future
+            .as_mut()
+            .expect("completed native operation polled")
+            .as_mut()
+            .poll(context);
+        this.polling = false;
+        if result.is_ready() {
+            drop(this.future.take());
+            this.finish.take().expect("native completion already taken")(None);
+        }
         result
     }
 }
 
-impl<T> Drop for Delivered<T> {
+impl<T: Send + 'static> Drop for NativeOperation<T> {
     fn drop(&mut self) {
-        if let Some(finish) = self.finish.take() {
-            finish(self.result.take());
+        if let (Some(future), Some(finish)) = (self.future.take(), self.finish.take()) {
+            if self.polling {
+                // Unwinding a panicked poll must not poll that future again.
+                // Dropping finish leaves the captured admission Unknown.
+                drop(finish);
+            } else {
+                tokio::spawn(async move {
+                    finish(Some(future.await));
+                });
+            }
         }
     }
 }
@@ -96,34 +123,26 @@ impl<FS: Filesystem + Send + Sync + 'static> FencedFilesystem<FS> {
         CFut: Future<Output = Result<()>> + Send + 'static,
     {
         let inner = self.inner.clone();
-        let (send, receive) = oneshot::channel();
-        // Dropping the caller does not abort this task or release its fence.
-        tokio::spawn(async move {
-            let result = operation(inner.clone()).await;
-            let delivered = Delivered {
-                result: Some(result),
-                finish: Some(Box::new(move |orphan| {
-                    if let Some(result) = orphan {
-                        tokio::spawn(async move {
-                            match cleanup(inner, result).await {
-                                Ok(()) => admission.complete(),
-                                Err(error) => tracing::error!(
-                                    ?error,
-                                    "orphan FUSE handle cleanup failed; mutation state is unknown"
-                                ),
-                            }
-                        });
-                    } else {
-                        admission.complete();
-                    }
-                })),
-            };
-            let _ = send.send(delivered);
-        });
-        let delivered = receive
-            .await
-            .map_err(|_| asyncfuse::Errno::from(libc::EIO))?;
-        delivered.take()
+        NativeOperation {
+            future: Some(Box::pin(operation(inner.clone()))),
+            finish: Some(Box::new(move |orphan| {
+                if let Some(result) = orphan {
+                    tokio::spawn(async move {
+                        match cleanup(inner, result).await {
+                            Ok(()) => admission.complete(),
+                            Err(error) => tracing::error!(
+                                ?error,
+                                "orphan FUSE handle cleanup failed; mutation state is unknown"
+                            ),
+                        }
+                    });
+                } else {
+                    admission.complete();
+                }
+            })),
+            polling: false,
+        }
+        .await
     }
 }
 
@@ -349,10 +368,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
         flush: bool,
     ) -> Result<()> {
         let admission = self.fence.admit(true).await.map_err(native_error)?;
+        let fence = self.fence.clone();
         self.run(admission, move |inner| async move {
-            inner
+            let result = inner
                 .release(req, inode, fh, flags, lock_owner, flush)
-                .await
+                .await;
+            if result.is_err() {
+                fence.mark_uncertain();
+            }
+            result
         })
         .await
     }
@@ -443,8 +467,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
 
     async fn releasedir(&self, req: Request, inode: Inode, fh: u64, flags: u32) -> Result<()> {
         let admission = self.fence.admit(true).await.map_err(native_error)?;
+        let fence = self.fence.clone();
         self.run(admission, move |inner| async move {
-            inner.releasedir(req, inode, fh, flags).await
+            let result = inner.releasedir(req, inode, fh, flags).await;
+            if result.is_err() {
+                fence.mark_uncertain();
+            }
+            result
         })
         .await
     }
@@ -1048,13 +1077,52 @@ mod tests {
         let fs = FencedFilesystem::new(ControlledFs::new());
         fs.inner.panic_write.store(true, Ordering::Release);
         fs.inner.proceed.add_permits(1);
-        assert_eq!(
-            fs.write(Request::default(), 2, 99, 0, b"panic", 0, 0)
+        let other = fs.clone();
+        let caller = tokio::spawn(async move {
+            other
+                .write(Request::default(), 2, 99, 0, b"panic", 0, 0)
                 .await
-                .unwrap_err(),
-            libc::EIO.into()
-        );
+        });
+        assert!(caller.await.unwrap_err().is_panic());
         assert!(fs.fence.pause().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_release_is_unknown_even_when_the_reply_is_observed() {
+        for directory in [false, true] {
+            for cancelled in [false, true] {
+                let fs = FencedFilesystem::new(ControlledFs::new());
+                fs.inner.release_fails.store(true, Ordering::Release);
+                let other = fs.clone();
+                let caller = tokio::spawn(async move {
+                    if directory {
+                        other.releasedir(Request::default(), 2, 99, 0).await
+                    } else {
+                        other.release(Request::default(), 2, 99, 0, 0, false).await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), fs.inner.release_started.acquire())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .forget();
+                if cancelled {
+                    caller.abort();
+                    assert!(caller.await.unwrap_err().is_cancelled());
+                    fs.inner.release_proceed.add_permits(1);
+                } else {
+                    fs.inner.release_proceed.add_permits(1);
+                    assert_eq!(caller.await.unwrap().unwrap_err(), libc::EIO.into());
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(5), fs.fence.pause())
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+                assert_eq!(fs.inner.release_count.load(Ordering::Acquire), 1);
+            }
+        }
     }
 
     #[tokio::test]

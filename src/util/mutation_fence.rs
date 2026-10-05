@@ -81,6 +81,10 @@ impl MutationFence {
     pub fn is_uncertain(&self) -> bool {
         self.uncertain.load(Ordering::Acquire)
     }
+
+    pub(crate) fn mark_uncertain(&self) {
+        self.uncertain.store(true, Ordering::Release);
+    }
 }
 
 pub struct MutationPause {
