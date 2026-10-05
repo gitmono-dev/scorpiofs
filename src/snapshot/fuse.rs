@@ -1031,33 +1031,6 @@ impl Mst2Fuse {
         }
         Ok(Some(inode))
     }
-
-    /// Content digest of `rel_path` in the fixed view, in the view's wire form
-    /// (`sha256:<hex>`). Directory pages are loaded on demand, so a lazy mount
-    /// resolves the path with the same metadata requests a lookup would make.
-    /// `None` = the path is absent from the view, or is a directory (which has
-    /// no content identity).
-    pub(crate) async fn digest_for_path(&self, rel_path: &str) -> Option<String> {
-        let parts: Vec<&str> = rel_path.split('/').filter(|p| !p.is_empty()).collect();
-        let mut inode = ROOT_INODE;
-        for part in parts {
-            if self.ensure_loaded(inode).await.is_err() {
-                return None;
-            }
-            let next = {
-                let state = self.state.lock().unwrap();
-                match state.nodes.get(&inode) {
-                    Some(Node::Dir(d)) => d.children.get(part).copied(),
-                    _ => None,
-                }
-            };
-            inode = next?;
-        }
-        match self.node(inode).ok()? {
-            Node::File(f) => Some(f.digest.clone()),
-            Node::Dir(_) => None,
-        }
-    }
 }
 
 fn node_identity(node: &Node) -> std::result::Result<SnapshotNodeIdentity, SnapshotError> {
@@ -2001,12 +1974,18 @@ mod tests {
             .ino;
         assert_ne!(left_plain, right_plain);
         assert_eq!(
-            fs.digest_for_path("left/plain").await,
-            Some(crate::snapshot::durable::digest_of(b"data"))
+            fs.path_state("left/plain").await.unwrap(),
+            SnapshotPathState::Present(SnapshotNodeIdentity::Regular {
+                size: 4,
+                content_digest: crate::snapshot::durable::digest_of(b"data"),
+            })
         );
         assert_eq!(
-            fs.digest_for_path("right/plain").await,
-            Some(crate::snapshot::durable::digest_of(b"data"))
+            fs.path_state("right/plain").await.unwrap(),
+            SnapshotPathState::Present(SnapshotNodeIdentity::Regular {
+                size: 4,
+                content_digest: crate::snapshot::durable::digest_of(b"data"),
+            })
         );
     }
 
@@ -2037,8 +2016,11 @@ mod tests {
             .attr
             .ino;
         assert_eq!(
-            fs.digest_for_path("left/link").await,
-            Some(crate::snapshot::durable::digest_of(b"plain"))
+            fs.path_state("left/link").await.unwrap(),
+            SnapshotPathState::Present(SnapshotNodeIdentity::Symlink {
+                size: 5,
+                content_digest: crate::snapshot::durable::digest_of(b"plain"),
+            })
         );
         let error = fs.open(req, link, libc::O_RDONLY as u32).await.unwrap_err();
         assert_eq!(i32::from(error), -libc::ELOOP);
