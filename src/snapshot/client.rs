@@ -680,12 +680,47 @@ impl Mst2Client {
             .await
     }
 
-    pub(crate) async fn delete_json(
+    /// Status selects the release wire contract before decoding: canonical
+    /// 204 has no JSON, while legacy 200 carries an identity-bound receipt.
+    pub(crate) async fn delete_release_json(
         &self,
         url: impl AsRef<str>,
-    ) -> Result<serde_json::Value, SnapshotError> {
+    ) -> Result<Option<serde_json::Value>, SnapshotError> {
         let url = url.as_ref();
-        read_json(ok_or_error(self.send_retrying(self.http.delete(url)).await?).await?).await
+        let mut response = ok_or_error(self.send_retrying(self.http.delete(url)).await?).await?;
+        let status = response.status();
+        let invalid = || SnapshotError {
+            code: SnapshotErrorCode::IntegrityError,
+            message: "lease release success has invalid HTTP status or body framing".into(),
+            http_status: status.as_u16(),
+        };
+        match status {
+            StatusCode::NO_CONTENT => {
+                if response
+                    .headers()
+                    .contains_key(reqwest::header::TRANSFER_ENCODING)
+                    || response
+                        .headers()
+                        .get_all(reqwest::header::CONTENT_LENGTH)
+                        .iter()
+                        .any(|value| {
+                            value
+                                .to_str()
+                                .ok()
+                                .and_then(|text| text.parse::<u64>().ok())
+                                != Some(0)
+                        })
+                {
+                    return Err(invalid());
+                }
+                if response.chunk().await.map_err(net_err)?.is_some() {
+                    return Err(invalid());
+                }
+                Ok(None)
+            }
+            StatusCode::OK => read_json(response).await.map(Some),
+            _ => Err(invalid()),
+        }
     }
 
     /// POST a TreeFrame request and validate the protocol identity headers
