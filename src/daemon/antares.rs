@@ -33,13 +33,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt,
-    sync::RwLock,
+    sync::{OnceCell, RwLock},
     time::{sleep, timeout},
 };
 use uuid::Uuid;
 
 use crate::{
-    antares::fuse::AntaresFuse,
+    antares::fuse::FixedLayerFuse,
     daemon::{
         lower_view::DicfuseLower,
         upper_fork::{fork_upper, ForkCopyError, ForkCopyStats},
@@ -96,9 +96,9 @@ async fn mst2_lower_layer() -> Result<Option<Arc<Mst2Fuse>>, ServiceError> {
 /// projection (P3; see `mst2-impl/P3-HASH-DOMAIN-DESIGN.md`).
 fn lower_view_for(entry: &MountEntry) -> Arc<dyn crate::daemon::lower_view::LowerView> {
     use crate::daemon::lower_view::{DicfuseLower, Mst2Lower};
-    match &entry.mst2_lower {
-        Some(view) => Arc::new(Mst2Lower(view.clone())),
-        None => Arc::new(DicfuseLower(entry.fuse.dic.store.clone())),
+    match &entry.lower {
+        MountLower::Snapshot(view) => Arc::new(Mst2Lower(view.clone())),
+        MountLower::Dictionary(dic) => Arc::new(DicfuseLower(dic.store.clone())),
     }
 }
 
@@ -1022,6 +1022,29 @@ impl IntoResponse for ApiError {
 // Service Implementation
 // ============================================================================
 
+/// The selected base is shared by serving and content comparison. Snapshot
+/// mounts never carry an unused dictionary projection.
+enum MountLower {
+    Snapshot(Arc<Mst2Fuse>),
+    Dictionary(Arc<Dicfuse>),
+}
+
+impl MountLower {
+    fn layer(&self) -> Arc<dyn libfuse_fs::unionfs::layer::Layer> {
+        match self {
+            Self::Snapshot(view) => view.clone(),
+            Self::Dictionary(dic) => dic.clone(),
+        }
+    }
+
+    fn snapshot(&self) -> Option<&Arc<Mst2Fuse>> {
+        match self {
+            Self::Snapshot(view) => Some(view),
+            Self::Dictionary(_) => None,
+        }
+    }
+}
+
 /// Internal entry tracking a single mount.
 struct MountEntry {
     mount_id: Uuid,
@@ -1050,13 +1073,8 @@ struct MountEntry {
     upper_dir: String,
     /// Auto-generated CL directory (if cl is provided)
     cl_dir: Option<String>,
-    fuse: AntaresFuse,
-    /// The MST/2 snapshot view backing this mount's lower projection, when the
-    /// mount was created with `mst2_lower_enabled` (spec 12 §1). Not persisted:
-    /// a restarted daemon refuses to restore such a mount rather than silently
-    /// serving the Dicfuse projection instead (spec 15 §3 — explicit modes, no
-    /// silent fallback).
-    mst2_lower: Option<Arc<Mst2Fuse>>,
+    fuse: FixedLayerFuse,
+    lower: MountLower,
     state: MountLifecycle,
     created_at_epoch_ms: u64,
     last_seen_epoch_ms: u64,
@@ -1365,8 +1383,8 @@ pub enum StateOwnership {
 
 /// Concrete implementation of AntaresService.
 pub struct AntaresServiceImpl {
-    /// Shared Dicfuse instance for root path (read-only base layer).
-    dicfuse: Arc<Dicfuse>,
+    /// Initialized only when a dictionary mount needs it.
+    dicfuse: OnceCell<Arc<Dicfuse>>,
     /// Cache of Dicfuse instances keyed by base_path for subdirectory mounts.
     /// This avoids creating duplicate instances for the same path.
     dicfuse_cache: Arc<RwLock<HashMap<String, Arc<Dicfuse>>>>,
@@ -1406,16 +1424,19 @@ impl AntaresServiceImpl {
         dicfuse: Option<Arc<Dicfuse>>,
         state_ownership: StateOwnership,
     ) -> Self {
-        let dic = match dicfuse {
-            Some(d) => d,
-            None => DicfuseManager::global().await,
+        let dic = if config::mst2_lower_enabled() {
+            dicfuse
+        } else {
+            let dic = match dicfuse {
+                Some(dic) => dic,
+                None => DicfuseManager::global().await,
+            };
+            dic.start_import();
+            Some(dic)
         };
-        // Trigger import as early as possible so directory tree loading begins
-        // before any mount requests arrive. Idempotent: no-op if already started.
-        dic.start_import();
         let state_file = PathBuf::from(crate::util::config::antares_state_file());
         Self {
-            dicfuse: dic,
+            dicfuse: OnceCell::new_with(dic),
             dicfuse_cache: Arc::new(RwLock::new(HashMap::new())),
             mounts: Arc::new(RwLock::new(HashMap::new())),
             path_index: Arc::new(RwLock::new(HashMap::new())),
@@ -1424,6 +1445,22 @@ impl AntaresServiceImpl {
             state_file,
             state_ownership,
         }
+    }
+
+    async fn shared_dicfuse(&self) -> Arc<Dicfuse> {
+        let dic = self
+            .dicfuse
+            .get_or_init(|| async {
+                let dic = DicfuseManager::global().await;
+                dic.start_import();
+                dic
+            })
+            .await
+            .clone();
+        // An explicitly provided dictionary is also lazy in snapshot mode.
+        // Start its import only if an operation actually selects that base.
+        dic.start_import();
+        dic
     }
 
     /// Create a new service instance and recover previous mounts if available.
@@ -1895,13 +1932,14 @@ impl AntaresServiceImpl {
 
         // For root path, use the shared global instance (but ensure it's initialized first).
         if path.is_empty() || path == "/" {
+            let dicfuse = self.shared_dicfuse().await;
             tracing::info!(
                 "Waiting for shared Dicfuse instance to initialize for path: / (timeout: {}s)",
                 INIT_TIMEOUT_SECS
             );
             match tokio::time::timeout(
                 Duration::from_secs(INIT_TIMEOUT_SECS),
-                self.dicfuse.store.wait_for_ready(),
+                dicfuse.store.wait_for_ready(),
             )
             .await
             {
@@ -1920,7 +1958,7 @@ impl AntaresServiceImpl {
                     )));
                 }
             }
-            return Ok(self.dicfuse.clone());
+            return Ok(dicfuse);
         }
 
         // Normalize the path for consistent cache keys
@@ -2075,9 +2113,9 @@ impl AntaresServiceImpl {
         upper_dir: &Path,
         cl_dir: Option<&Path>,
         sealed_chain: &[String],
-    ) -> Result<AntaresFuse, ServiceError> {
+    ) -> Result<FixedLayerFuse, ServiceError> {
         let frozen = sealed_chain.iter().map(PathBuf::from).collect::<Vec<_>>();
-        let mut fuse = AntaresFuse::new(
+        let mut fuse = FixedLayerFuse::new(
             mountpoint.to_path_buf(),
             dicfuse,
             upper_dir.to_path_buf(),
@@ -2092,27 +2130,21 @@ impl AntaresServiceImpl {
         Ok(fuse)
     }
 
-    /// Rebuild the mount over an MST/2 snapshot view instead of the Dicfuse
-    /// projection (spec 12 §1). The Dicfuse instance is still constructed — it
-    /// backs the effective-diff/verify paths for Dicfuse-lowered mounts and is
-    /// required by `AntaresFuse::new` — but the overlay's base layer is the
-    /// snapshot view.
+    /// Rebuild directly over the selected fixed snapshot.
     async fn remount_with_mst2_lower(
         mountpoint: &Path,
         view: Arc<Mst2Fuse>,
-        dicfuse: Arc<Dicfuse>,
         upper_dir: &Path,
         cl_dir: Option<&Path>,
-    ) -> Result<AntaresFuse, ServiceError> {
-        let mut fuse = AntaresFuse::new(
+    ) -> Result<FixedLayerFuse, ServiceError> {
+        let mut fuse = FixedLayerFuse::new(
             mountpoint.to_path_buf(),
-            dicfuse,
+            view,
             upper_dir.to_path_buf(),
             cl_dir.map(PathBuf::from),
         )
         .await
-        .map_err(|e| ServiceError::FuseFailure(format!("failed to rebuild overlay: {e}")))?
-        .with_lower_override(view as Arc<dyn libfuse_fs::unionfs::layer::Layer>);
+        .map_err(|e| ServiceError::FuseFailure(format!("failed to rebuild overlay: {e}")))?;
         fuse.mount()
             .await
             .map_err(|e| ServiceError::FuseFailure(format!("failed to remount: {e}")))?;
@@ -2127,15 +2159,13 @@ impl AntaresServiceImpl {
         &self,
         mount_id: Uuid,
         old_view: Arc<Mst2Fuse>,
-        path: &str,
+        _path: &str,
         upper_dir: &Path,
         cl_dir: Option<&Path>,
         mountpoint: &Path,
         base_revision: &Option<String>,
         start: Instant,
     ) -> Result<RefreshResponse, ServiceError> {
-        let dicfuse = self.lower_dicfuse_for(path, None).await?;
-
         // Dirty check against the *current* view: a refresh must not discard
         // uncommitted upper content (same contract as the Dicfuse path).
         let view_before = Arc::new(crate::daemon::lower_view::Mst2Lower(old_view.clone()));
@@ -2177,15 +2207,7 @@ impl AntaresServiceImpl {
             }
         }
 
-        match Self::remount_with_mst2_lower(
-            mountpoint,
-            new_view.clone(),
-            dicfuse.clone(),
-            upper_dir,
-            cl_dir,
-        )
-        .await
-        {
+        match Self::remount_with_mst2_lower(mountpoint, new_view.clone(), upper_dir, cl_dir).await {
             Ok(new_fuse) => {
                 {
                     let mut mounts = self.mounts.write().await;
@@ -2193,7 +2215,7 @@ impl AntaresServiceImpl {
                         .get_mut(&mount_id)
                         .ok_or(ServiceError::NotFound(mount_id))?;
                     entry.fuse = new_fuse;
-                    entry.mst2_lower = Some(new_view.clone());
+                    entry.lower = MountLower::Snapshot(new_view.clone());
                     entry.pinned_refs = new_id.clone();
                     entry.state = MountLifecycle::Ready;
                     entry.last_seen_epoch_ms = current_epoch_ms();
@@ -2216,14 +2238,8 @@ impl AntaresServiceImpl {
             }
             Err(e) => {
                 // Roll back to the old view so the mount keeps serving bytes.
-                let _ = Self::remount_with_mst2_lower(
-                    mountpoint,
-                    old_view,
-                    self.lower_dicfuse_for(path, None).await?,
-                    upper_dir,
-                    cl_dir,
-                )
-                .await;
+                let _ =
+                    Self::remount_with_mst2_lower(mountpoint, old_view, upper_dir, cl_dir).await;
                 Err(e)
             }
         }
@@ -2238,15 +2254,13 @@ impl AntaresServiceImpl {
         mount_id: Uuid,
         request: CommitFinalizeRequest,
         old_view: Arc<Mst2Fuse>,
-        path: &str,
+        _path: &str,
         upper_dir: &Path,
         cl_dir: Option<&Path>,
         mountpoint: &Path,
         base_revision: &Option<String>,
         start: Instant,
     ) -> Result<CommitFinalizeResponse, ServiceError> {
-        let dicfuse = self.lower_dicfuse_for(path, None).await?;
-
         // Optimistic lock against the effective diff over the current view.
         let view_before = Arc::new(crate::daemon::lower_view::Mst2Lower(old_view.clone()));
         let changes = effective_changes(view_before.as_ref(), upper_dir, &[])
@@ -2364,7 +2378,6 @@ impl AntaresServiceImpl {
                     let _ = Self::remount_with_mst2_lower(
                         mountpoint,
                         old_view.clone(),
-                        dicfuse.clone(),
                         upper_dir,
                         cl_dir,
                     )
@@ -2381,15 +2394,7 @@ impl AntaresServiceImpl {
                 }
             };
 
-        match Self::remount_with_mst2_lower(
-            mountpoint,
-            new_view.clone(),
-            dicfuse.clone(),
-            upper_dir,
-            cl_dir,
-        )
-        .await
-        {
+        match Self::remount_with_mst2_lower(mountpoint, new_view.clone(), upper_dir, cl_dir).await {
             Ok(new_fuse) => {
                 {
                     let mut mounts = self.mounts.write().await;
@@ -2397,7 +2402,7 @@ impl AntaresServiceImpl {
                         .get_mut(&mount_id)
                         .ok_or(ServiceError::NotFound(mount_id))?;
                     entry.fuse = new_fuse;
-                    entry.mst2_lower = Some(new_view.clone());
+                    entry.lower = MountLower::Snapshot(new_view.clone());
                     entry.pinned_refs = new_view.snapshot_id().map(str::to_string);
                     entry.state = MountLifecycle::Ready;
                     entry.last_seen_epoch_ms = current_epoch_ms();
@@ -2421,14 +2426,8 @@ impl AntaresServiceImpl {
                 })
             }
             Err(e) => {
-                let _ = Self::remount_with_mst2_lower(
-                    mountpoint,
-                    old_view,
-                    dicfuse.clone(),
-                    upper_dir,
-                    cl_dir,
-                )
-                .await;
+                let _ =
+                    Self::remount_with_mst2_lower(mountpoint, old_view, upper_dir, cl_dir).await;
                 Ok(CommitFinalizeResponse {
                     state: "failed".into(),
                     code: Some("SWITCH_FAILED".into()),
@@ -2567,7 +2566,7 @@ impl AntaresServiceImpl {
             }
         };
 
-        let source_fuse = match AntaresFuse::new(
+        let source_fuse = match FixedLayerFuse::new(
             PathBuf::from(&source_mountpoint),
             source_dicfuse.clone(),
             source_new_upper.clone(),
@@ -2716,7 +2715,7 @@ impl AntaresServiceImpl {
                     upper_dir: e.upper_dir.clone(),
                     cl_dir: e.cl_dir.clone(),
                     created_at_epoch_ms: e.created_at_epoch_ms,
-                    mst2_lower: e.mst2_lower.is_some(),
+                    mst2_lower: e.lower.snapshot().is_some(),
                 })
                 .collect(),
         };
@@ -2838,15 +2837,20 @@ impl AntaresServiceImpl {
             let upper_dir = PathBuf::from(&persisted.upper_dir);
             let cl_dir = persisted.cl_dir.as_ref().map(PathBuf::from);
 
-            // Try to create and mount AntaresFuse
+            // Try to create and mount FixedLayerFuse
             let frozen = persisted
                 .sealed_chain
                 .iter()
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            match AntaresFuse::new(mountpoint.clone(), dicfuse, upper_dir, cl_dir.clone())
-                .await
-                .and_then(|fuse| fuse.with_frozen_layers(frozen))
+            match FixedLayerFuse::new(
+                mountpoint.clone(),
+                dicfuse.clone(),
+                upper_dir,
+                cl_dir.clone(),
+            )
+            .await
+            .and_then(|fuse| fuse.with_frozen_layers(frozen))
             {
                 Ok(mut fuse) => {
                     if let Err(e) = fuse.mount().await {
@@ -2878,8 +2882,8 @@ impl AntaresServiceImpl {
                         fuse,
                         // Recovery only restores Dicfuse-lowered mounts; the
                         // MST/2 ones are skipped above and must be re-attached.
-                        mst2_lower: None,
-                        // Dicfuse is ready after AntaresFuse::new() completes import_arc.
+                        lower: MountLower::Dictionary(dicfuse),
+                        // Dicfuse is ready after FixedLayerFuse::new() completes import_arc.
                         state: MountLifecycle::Ready,
                         created_at_epoch_ms: persisted.created_at_epoch_ms,
                         last_seen_epoch_ms: current_epoch_ms(),
@@ -2903,7 +2907,7 @@ impl AntaresServiceImpl {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to create AntaresFuse for recovery of {}: {}",
+                        "Failed to create FixedLayerFuse for recovery of {}: {}",
                         persisted.mount_id,
                         e
                     );
@@ -3164,34 +3168,26 @@ impl AntaresService for AntaresServiceImpl {
             }
         }
 
-        // 5. Get or create Dicfuse instance for this mount (uses cache for subdirectory paths)
-        // If a specific base path is requested (not root), get from cache or create a dedicated
-        // Dicfuse with path remapping. Otherwise, use the shared global instance.
-        // This may take time for new subdirectory paths as it waits for import_arc to complete.
-        let dicfuse = self
-            .get_or_create_dicfuse(&request.path, request.pinned_refs.as_deref())
-            .await?;
+        // Select one base before constructing the overlay. Resolving a snapshot
+        // never starts an unused dictionary import or a second lower cache.
+        let lower = match mst2_lower_layer().await? {
+            Some(view) => MountLower::Snapshot(view),
+            None => MountLower::Dictionary(
+                self.get_or_create_dicfuse(&request.path, request.pinned_refs.as_deref())
+                    .await?,
+            ),
+        };
 
-        // 6. Create AntaresFuse instance (may take time, not holding lock)
+        // 6. Create FixedLayerFuse instance (may take time, not holding lock)
         let sealed = request
             .sealed_chain
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        let mut fuse = AntaresFuse::new(mountpoint, dicfuse, upper_dir, cl_dir)
+        let mut fuse = FixedLayerFuse::new(mountpoint, lower.layer(), upper_dir, cl_dir)
             .await
             .and_then(|fuse| fuse.with_frozen_layers(sealed))
             .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
-
-        // MST/2 lower projection (spec 12 §1): when the operator enabled it,
-        // the snapshot view takes the Dicfuse slot as the overlay's base layer.
-        // The view is kept on the mount entry so the effective diff compares
-        // against the projection that is actually being served.
-        let mst2_lower = mst2_lower_layer().await?;
-        if let Some(view) = &mst2_lower {
-            fuse = fuse
-                .with_lower_override(view.clone() as Arc<dyn libfuse_fs::unionfs::layer::Layer>);
-        }
 
         // 7. Mount the filesystem
         fuse.mount()
@@ -3279,7 +3275,7 @@ impl AntaresService for AntaresServiceImpl {
             upper_dir: upper_dir_str.clone(),
             cl_dir: cl_dir_str.clone(),
             fuse,
-            mst2_lower,
+            lower,
             state: MountLifecycle::Mounted,
             created_at_epoch_ms: now,
             last_seen_epoch_ms: now,
@@ -3897,17 +3893,19 @@ impl AntaresService for AntaresServiceImpl {
                 entry.pinned_refs.clone(),
                 entry.sealed_chain.clone(),
                 entry.state.clone(),
-                entry.mst2_lower.clone(),
+                entry.lower.snapshot().cloned(),
             )
         };
 
-        let dicfuse = self
-            .lower_dicfuse_for(&path, pinned_refs.as_deref())
-            .await?;
         let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
         let view: Arc<dyn crate::daemon::lower_view::LowerView> = match &mst2_lower {
             Some(view) => Arc::new(crate::daemon::lower_view::Mst2Lower(view.clone())),
-            None => Arc::new(DicfuseLower(dicfuse.store.clone())),
+            None => {
+                let dicfuse = self
+                    .lower_dicfuse_for(&path, pinned_refs.as_deref())
+                    .await?;
+                Arc::new(DicfuseLower(dicfuse.store.clone()))
+            }
         };
         let changes = effective_changes(view.as_ref(), &upper_dir, &chain_dirs)
             .await
@@ -3958,7 +3956,7 @@ impl AntaresService for AntaresServiceImpl {
                 entry.pinned_refs.clone(),
                 entry.sealed_chain.clone(),
                 entry.state.clone(),
-                entry.mst2_lower.clone(),
+                entry.lower.snapshot().cloned(),
             )
         };
         if !matches!(mount_state, MountLifecycle::Mounted | MountLifecycle::Ready) {
@@ -4195,6 +4193,7 @@ impl AntaresService for AntaresServiceImpl {
                 .ok_or(ServiceError::NotFound(mount_id))?;
             entry.fuse = new_fuse;
             entry.pinned_refs = Some(new_refs.clone());
+            entry.lower = MountLower::Dictionary(new_dicfuse.clone());
             // Flattened above: the chain no longer applies to the new revision.
             entry.sealed_chain = Vec::new();
             entry.state = MountLifecycle::Ready;
@@ -4271,7 +4270,7 @@ impl AntaresService for AntaresServiceImpl {
                 entry.pinned_refs.clone(),
                 entry.sealed_chain.clone(),
                 entry.state.clone(),
-                entry.mst2_lower.clone(),
+                entry.lower.snapshot().cloned(),
             )
         };
         if !matches!(mount_state, MountLifecycle::Mounted | MountLifecycle::Ready) {
@@ -4423,6 +4422,7 @@ impl AntaresService for AntaresServiceImpl {
                 .ok_or(ServiceError::NotFound(mount_id))?;
             entry.fuse = new_fuse;
             entry.pinned_refs = Some(target.clone());
+            entry.lower = MountLower::Dictionary(new_dicfuse.clone());
             // Flattened above: the chain no longer applies to the new revision.
             entry.sealed_chain = Vec::new();
             entry.state = MountLifecycle::Ready;
@@ -4497,12 +4497,13 @@ impl AntaresService for AntaresServiceImpl {
         let mountpoint = PathBuf::from(&entry.mountpoint);
         let upper_dir = PathBuf::from(&entry.upper_dir);
         let cl_dir = entry.cl_dir.as_ref().map(PathBuf::from);
+        let base_layer = entry.fuse.base_layer();
         let mut fuse = std::mem::replace(&mut entry.fuse, {
-            // Create a placeholder AntaresFuse to replace (will be removed anyway if unmount succeeds)
+            // Create a placeholder FixedLayerFuse to replace (will be removed anyway if unmount succeeds)
             // This is safe because we're about to remove the entry on success, or restore fuse on failure
-            AntaresFuse::new(
+            FixedLayerFuse::new(
                 mountpoint.clone(),
-                self.dicfuse.clone(),
+                base_layer,
                 upper_dir.clone(),
                 cl_dir.clone(),
             )
@@ -4644,7 +4645,7 @@ impl AntaresService for AntaresServiceImpl {
         let mountpoint = PathBuf::from(&entry.mountpoint);
         let upper_dir = PathBuf::from(&entry.upper_dir);
         let existing_cl_dir = entry.cl_dir.as_ref().map(PathBuf::from);
-        let dicfuse = entry.fuse.dic.clone();
+        let base_layer = entry.fuse.base_layer();
         // Cancel any in-flight deep-preload walk before unmounting.
         entry.preload_cancel.store(true, Ordering::Relaxed);
         // Enter a short quiescing window so control-plane operations reject this mount
@@ -4652,9 +4653,9 @@ impl AntaresService for AntaresServiceImpl {
         entry.state = MountLifecycle::Quiescing;
         entry.update_last_seen();
         let mut old_fuse = std::mem::replace(&mut entry.fuse, {
-            AntaresFuse::new(
+            FixedLayerFuse::new(
                 mountpoint.clone(),
-                self.dicfuse.clone(),
+                base_layer.clone(),
                 upper_dir.clone(),
                 existing_cl_dir.clone(),
             )
@@ -4724,9 +4725,9 @@ impl AntaresService for AntaresServiceImpl {
             return Err(e);
         }
 
-        let mut new_fuse = AntaresFuse::new(
+        let mut new_fuse = FixedLayerFuse::new(
             mountpoint.clone(),
-            dicfuse,
+            base_layer,
             upper_dir.clone(),
             Some(cl_dir_path.clone()),
         )
@@ -4833,7 +4834,7 @@ impl AntaresService for AntaresServiceImpl {
         let mountpoint = PathBuf::from(&entry.mountpoint);
         let upper_dir = PathBuf::from(&entry.upper_dir);
         let existing_cl_dir = entry.cl_dir.as_ref().map(PathBuf::from);
-        let dicfuse = entry.fuse.dic.clone();
+        let base_layer = entry.fuse.base_layer();
         // Cancel any in-flight deep-preload walk before unmounting.
         entry.preload_cancel.store(true, Ordering::Relaxed);
         // Enter a short quiescing window so control-plane operations reject this mount
@@ -4841,9 +4842,9 @@ impl AntaresService for AntaresServiceImpl {
         entry.state = MountLifecycle::Quiescing;
         entry.update_last_seen();
         let mut old_fuse = std::mem::replace(&mut entry.fuse, {
-            AntaresFuse::new(
+            FixedLayerFuse::new(
                 mountpoint.clone(),
-                self.dicfuse.clone(),
+                base_layer.clone(),
                 upper_dir.clone(),
                 existing_cl_dir.clone(),
             )
@@ -4890,9 +4891,10 @@ impl AntaresService for AntaresServiceImpl {
             }
         }
 
-        let mut new_fuse = AntaresFuse::new(mountpoint.clone(), dicfuse, upper_dir.clone(), None)
-            .await
-            .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
+        let mut new_fuse =
+            FixedLayerFuse::new(mountpoint.clone(), base_layer, upper_dir.clone(), None)
+                .await
+                .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
         if let Err(e) = new_fuse.mount().await {
             tracing::error!("Failed to remount {} without CL: {}", mount_id, e);
             let remount_result = old_fuse.mount().await;
