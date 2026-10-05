@@ -66,7 +66,9 @@ jobs:
         run: cargo test --test mst2_workspace_v3_http --test mst2_workspace_launcher_http -- --nocapture
 
       - name: Native namespace and upper-diff HTTP cases
-        run: cargo test --test mst2_namespace_http -- --nocapture
+        run: |
+          cargo test --lib snapshot::upper_diff::unix::tests:: -- --nocapture
+          cargo test --test mst2_namespace_http -- --nocapture
 
       - name: cargo build --release
         run: cargo build --release --locked --bin scorpio --bin antares

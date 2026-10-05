@@ -562,15 +562,21 @@ mod unix {
         #[cfg(target_os = "macos")]
         {
             let name = c_name(OsStr::new(name))?;
+            // Darwin O_SYMLINK opens the final link itself. O_NOFOLLOW must
+            // not also be set: vnode authorization rejects a link with ELOOP
+            // when that flag is present, even together with O_SYMLINK.
             let fd = unsafe {
                 libc::openat(
                     parent.as_raw_fd(),
                     name.as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_SYMLINK,
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_SYMLINK,
                 )
             };
             if fd < 0 {
-                return Err(io(std::io::Error::last_os_error()));
+                return Err(unknown(format!(
+                    "upper symlink descriptor open failed: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
             let file = unsafe { File::from_raw_fd(fd) };
             if stat_fd(&file)? != before {
@@ -849,6 +855,52 @@ mod unix {
             );
             assert_eq!(scanned.meters.xattr_checks, 2);
             verify(&scanned).unwrap();
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn symlink_attributes_are_independent_of_an_existing_targets_attributes() {
+            use std::os::unix::ffi::OsStrExt;
+
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("target");
+            std::fs::write(&target, b"outside upper").unwrap();
+            let set_attribute = |path: &Path, options| {
+                let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(
+                    unsafe {
+                        libc::setxattr(
+                            path.as_ptr(),
+                            c"user.scorpiofs-link-test".as_ptr(),
+                            b"state".as_ptr().cast(),
+                            5,
+                            0,
+                            options,
+                        )
+                    },
+                    0,
+                    "fixture could not set the requested node's own attribute"
+                );
+            };
+            set_attribute(&target, 0);
+            let upper = tempfile::tempdir().unwrap();
+            let root = upper.path().canonicalize().unwrap();
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let scanned = collect(&root, DiffLimits::default()).unwrap();
+            assert!(matches!(
+                scanned.facts["link"].identity,
+                UpperNodeIdentity::Symlink { .. }
+            ));
+            assert_eq!(scanned.meters.xattr_checks, 2);
+            verify(&scanned).unwrap();
+
+            set_attribute(&link, libc::XATTR_NOFOLLOW);
+            assert_eq!(
+                collect(&root, DiffLimits::default()).err().unwrap().code,
+                SnapshotErrorCode::UnsupportedEntry
+            );
+            eprintln!("MAC_SYMLINK_XATTR_RUN: target attribute excluded; link attribute rejected");
         }
     }
 }
