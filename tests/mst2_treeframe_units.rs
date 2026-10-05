@@ -43,6 +43,7 @@ enum Case {
     WrongRequest,
     Error,
     HttpError,
+    HttpStatusMismatch,
     DeclaredTooLarge,
     StreamTooLarge,
     DeclaredHttpErrorTooLarge,
@@ -181,9 +182,11 @@ async fn response(
         )
         .header("x-mega-snapshot-id", "fixed-snapshot")
         .header("x-mega-request-digest", id(&body));
-    if matches!(
+    if matches!(fixture.case, Case::HttpError) {
+        response = response.status(axum::http::StatusCode::FORBIDDEN);
+    } else if matches!(
         fixture.case,
-        Case::HttpError | Case::DeclaredHttpErrorTooLarge | Case::StreamHttpErrorTooLarge
+        Case::HttpStatusMismatch | Case::DeclaredHttpErrorTooLarge | Case::StreamHttpErrorTooLarge
     ) {
         response = response.status(axum::http::StatusCode::BAD_REQUEST);
     }
@@ -204,7 +207,7 @@ async fn response(
         Body::from_stream(futures::stream::iter(
             (0..8192).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![0; 65_536]))),
         ))
-    } else if matches!(fixture.case, Case::HttpError) {
+    } else if matches!(fixture.case, Case::HttpError | Case::HttpStatusMismatch) {
         Body::from(r#"{"error":{"code":"SCOPE_FORBIDDEN","message":"fixture scope denied"}}"#)
     } else {
         Body::from(wire)
@@ -344,6 +347,11 @@ async fn endpoint_requires_end_binding_to_actual_units_and_exact_request() {
         assert_eq!(
             fetch(endpoint, Case::HttpError).await.unwrap_err(),
             SnapshotErrorCode::ScopeForbidden
+        );
+        assert_eq!(
+            fetch(endpoint, Case::HttpStatusMismatch).await.unwrap_err(),
+            SnapshotErrorCode::IntegrityError,
+            "a known permission code cannot bind HTTP 400"
         );
     }
 }
