@@ -16,12 +16,30 @@ const COMMIT_OID: &str = "7cad6d07b034fb881bde587c5a1b98242ac3f076";
 
 #[test]
 fn legacy_git_cache_survives_dependency_upgrade() {
+    const SEED_PATH: &str = "SCORPIO_GIT_COMPAT_SEED_DB";
+    if let Some(path) = std::env::var_os(SEED_PATH) {
+        // A real process exit closes sled's background-worker file handles.
+        // Dropping just Db can race those workers and leave its lock alive.
+        let db = sled::open(path).unwrap();
+        db.insert("tree:v2:/", LEGACY_TREE.as_bytes()).unwrap();
+        db.insert("commit:v2", LEGACY_COMMIT.as_bytes()).unwrap();
+        db.flush().unwrap();
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
-    let db = sled::open(dir.path().join("cache")).unwrap();
-    db.insert("tree:v2:/", LEGACY_TREE.as_bytes()).unwrap();
-    db.insert("commit:v2", LEGACY_COMMIT.as_bytes()).unwrap();
-    db.flush().unwrap();
-    drop(db);
+    let seed = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "legacy_git_cache_survives_dependency_upgrade",
+            "--test-threads=1",
+        ])
+        .env(SEED_PATH, dir.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        seed.status.success(),
+        "legacy cache seed process failed: {seed:?}"
+    );
     // Reading existing on-disk records must remain valid even on a non-SHA1 worker.
     let _guard = set_hash_kind_for_test(HashKind::Blake3);
     let db = sled::open(dir.path().join("cache")).unwrap();
