@@ -274,7 +274,12 @@ async fn metadata(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
         }
         .encode(7, sequence),
     );
-    ([("content-type", "application/octet-stream")], wire).into_response()
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", f.snapshot_id())
+        .header("x-mega-request-digest", digest_of(&body))
+        .body(axum::body::Body::from(wire))
+        .unwrap()
 }
 
 async fn blob(

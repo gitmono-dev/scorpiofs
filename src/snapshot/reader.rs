@@ -1061,7 +1061,10 @@ mod tests {
                 "publication_sequence": "1", "authorization_epoch": "1",
             }))
         }
-        async fn metadata(State(fixture): State<Arc<ClosureHttpFixture>>, body: Bytes) -> Vec<u8> {
+        async fn metadata(
+            State(fixture): State<Arc<ClosureHttpFixture>>,
+            body: Bytes,
+        ) -> axum::response::Response {
             let request: Value = serde_json::from_slice(&body).unwrap();
             let items: Vec<MetadataPageItem> = request["items"]
                 .as_array()
@@ -1116,7 +1119,21 @@ mod tests {
                 }
                 .encode(7, 1),
             );
-            wire
+            axum::response::Response::builder()
+                .header("content-type", "application/vnd.mega.treeframe;version=2")
+                .header(
+                    "x-mega-snapshot-id",
+                    format!(
+                        "sha256:{}",
+                        hex::encode(fixture.descriptor.snapshot_id().unwrap())
+                    ),
+                )
+                .header(
+                    "x-mega-request-digest",
+                    crate::snapshot::durable::digest_of(&body),
+                )
+                .body(axum::body::Body::from(wire))
+                .unwrap()
         }
         let fixture = Arc::new(fixture);
         let app = Router::new()

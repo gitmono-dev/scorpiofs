@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use axum::{body::Bytes, extract::State, routing::post, Router};
+use axum::{body::Bytes, extract::State, response::Response, routing::post, Router};
 use mst2_codec::{
     metapage::{page_id, Entry, EntryKind, Page},
     treeframe::{ChunkPayload, EndPayload, ErrorPayload, MetaPayload, ObjectPayload},
@@ -30,6 +30,9 @@ enum ResponseCase {
     WrongUnits,
     WrongBytes,
     DuplicatePage,
+    MissingPage,
+    MissingWitness,
+    ExtraPage,
     ObjectFrame,
     ChunkFrame,
     ErrorBeforePages,
@@ -50,16 +53,36 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
         .unwrap()
 }
 
-async fn metadata_response(State(fixture): State<Arc<ResponseFixture>>, body: Bytes) -> Vec<u8> {
+async fn metadata_response(State(fixture): State<Arc<ResponseFixture>>, body: Bytes) -> Response {
     fixture.requests.fetch_add(1, Ordering::SeqCst);
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(request, fixture.expected_request);
     let stream_id = 19;
     let mut sequence = 0;
     let mut wire = Vec::new();
+    let mut response_pages = fixture.pages.clone();
+    match fixture.case {
+        ResponseCase::MissingPage => {
+            response_pages.pop();
+        }
+        ResponseCase::MissingWitness => {
+            response_pages.remove(0);
+        }
+        ResponseCase::ExtraPage => {
+            let page = Page::build(&[Entry::file(
+                EntryKind::Regular,
+                b"unrequested",
+                1,
+                [0x55; 32],
+            )])
+            .unwrap();
+            response_pages.push((page_id(&page), page));
+        }
+        _ => {}
+    }
     if !matches!(fixture.case, ResponseCase::ErrorBeforePages) {
         // One page per frame exercises stream-wide rather than per-frame checks.
-        for page in &fixture.pages {
+        for page in &response_pages {
             wire.extend(
                 MetaPayload {
                     pages: vec![page.clone()],
@@ -130,9 +153,8 @@ async fn metadata_response(State(fixture): State<Arc<ResponseFixture>>, body: By
                 .len()
                 .try_into()
                 .unwrap(),
-            unique_unit_count: fixture.pages.len().try_into().unwrap(),
-            logical_bytes: fixture
-                .pages
+            unique_unit_count: response_pages.len().try_into().unwrap(),
+            logical_bytes: response_pages
                 .iter()
                 .map(|(_, page)| page.len() as u64)
                 .sum(),
@@ -152,7 +174,15 @@ async fn metadata_response(State(fixture): State<Arc<ResponseFixture>>, body: By
     // All frames, including the deliberately wrong request-level responses,
     // retain valid codec hashes, sequences and termination.
     mst2_codec::treeframe::parse_stream(&wire).expect("fixture must be codec-valid");
-    wire
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", "fixed-snapshot")
+        .header(
+            "x-mega-request-digest",
+            format!("sha256:{}", hex32(&sha256(&body))),
+        )
+        .body(axum::body::Body::from(wire))
+        .unwrap()
 }
 
 struct FixtureServer {
@@ -240,10 +270,17 @@ fn witness_case() -> (Vec<MetadataPageItem>, Pages) {
 
 async fn assert_rejected(case: ResponseCase, message: &str) {
     let (items, pages) = witness_case();
-    assert_eq!(fetch(ResponseCase::Valid, &items, &pages).await.unwrap(), pages);
+    assert_eq!(
+        fetch(ResponseCase::Valid, &items, &pages).await.unwrap(),
+        pages
+    );
     let error = fetch(case, &items, &pages).await.unwrap_err();
     assert_eq!(error.code, SnapshotErrorCode::DigestMismatch, "{case:?}");
-    assert!(error.message.contains(message), "{case:?}: {}", error.message);
+    assert!(
+        error.message.contains(message),
+        "{case:?}: {}",
+        error.message
+    );
 }
 
 #[tokio::test]
@@ -251,7 +288,10 @@ async fn metadata_end_accepts_multiple_frames_ancestor_witnesses_and_empty_page(
     let (items, pages) = witness_case();
     assert_eq!(items.len(), 2);
     assert_eq!(pages.len(), 3);
-    assert_eq!(fetch(ResponseCase::Valid, &items, &pages).await.unwrap(), pages);
+    assert_eq!(
+        fetch(ResponseCase::Valid, &items, &pages).await.unwrap(),
+        pages
+    );
 }
 
 #[tokio::test]
@@ -267,7 +307,10 @@ async fn metadata_end_accepts_alias_items_with_one_unique_empty_page() {
         })
         .collect();
     let pages = vec![(id, empty)];
-    assert_eq!(fetch(ResponseCase::Valid, &items, &pages).await.unwrap(), pages);
+    assert_eq!(
+        fetch(ResponseCase::Valid, &items, &pages).await.unwrap(),
+        pages
+    );
 }
 
 #[tokio::test]
@@ -296,6 +339,21 @@ async fn metadata_end_rejects_duplicate_page_in_separate_frames() {
 }
 
 #[tokio::test]
+async fn metadata_end_rejects_missing_terminal_witness_and_extra_pages() {
+    assert_rejected(
+        ResponseCase::MissingPage,
+        "missing a requested terminal page",
+    )
+    .await;
+    assert_rejected(
+        ResponseCase::MissingWitness,
+        "missing a requested route witness",
+    )
+    .await;
+    assert_rejected(ResponseCase::ExtraPage, "contains an unrequested page").await;
+}
+
+#[tokio::test]
 async fn metadata_end_rejects_object_data_frame() {
     assert_rejected(ResponseCase::ObjectFrame, "non-META data frame").await;
 }
@@ -308,8 +366,14 @@ async fn metadata_end_rejects_chunk_data_frame() {
 #[tokio::test]
 async fn metadata_end_preserves_error_failure_before_and_after_valid_pages() {
     let (items, pages) = witness_case();
-    assert_eq!(fetch(ResponseCase::Valid, &items, &pages).await.unwrap(), pages);
-    for case in [ResponseCase::ErrorBeforePages, ResponseCase::ErrorAfterPages] {
+    assert_eq!(
+        fetch(ResponseCase::Valid, &items, &pages).await.unwrap(),
+        pages
+    );
+    for case in [
+        ResponseCase::ErrorBeforePages,
+        ResponseCase::ErrorAfterPages,
+    ] {
         let error = fetch(case, &items, &pages).await.unwrap_err();
         assert_eq!(error.code, SnapshotErrorCode::Internal);
         assert!(error.message.contains("TEMPORARY_UNAVAILABLE"));
