@@ -15,6 +15,10 @@ use crate::{
     workspace::{WorkspaceConfig, WorkspaceService},
 };
 
+mod observation_sink;
+pub use observation_sink::ObservationFileOptions;
+use observation_sink::ObservationSink;
+
 /// Stable process exit codes shared by the CLIs (scripts depend on these).
 pub mod exit {
     pub const SUCCESS: i32 = 0;
@@ -46,6 +50,15 @@ pub fn init(
 /// mounted by explicit requests, after selecting their fixed lower view.
 /// Assumes [`init`] has already loaded configuration.
 pub async fn serve(http_addr: SocketAddr) -> i32 {
+    serve_with_observation(http_addr, None).await
+}
+
+/// Explicit diagnostic output. Ordinary serving creates no observation task,
+/// file, additional resolve request, or diagnostic request header.
+pub async fn serve_with_observation(
+    http_addr: SocketAddr,
+    observation: Option<ObservationFileOptions>,
+) -> i32 {
     // Bind the HTTP listener up-front so a bind failure is a clean exit (code 4)
     // rather than a panic inside the daemon task.
     let listener = match tokio::net::TcpListener::bind(http_addr).await {
@@ -57,18 +70,39 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
     };
     tracing::info!("server running on {http_addr}");
 
+    let (observer, mut sink) = match observation {
+        None => (None, None),
+        Some(options) => match ObservationSink::start(options) {
+            Ok((observer, sink)) => (Some(observer), Some(sink)),
+            Err(error) => {
+                tracing::error!("workspace observation initialization failed: {error}");
+                return exit::CONFIG;
+            }
+        },
+    };
+
     let token = config::mst2_auth_token();
     let paths = config::runtime_paths();
-    let service = match WorkspaceService::new(
-        Mst2Client::with_token(
-            config::mst2_base_url(),
-            (!token.is_empty()).then(|| token.to_owned()),
-        ),
-        WorkspaceConfig::new(paths.workspace_root.into(), paths.cache_root.into()),
-    ) {
+    let client = Mst2Client::with_token(
+        config::mst2_base_url(),
+        (!token.is_empty()).then(|| token.to_owned()),
+    );
+    let workspace_config =
+        WorkspaceConfig::new(paths.workspace_root.into(), paths.cache_root.into());
+    let initialized = match &observer {
+        Some(observer) => {
+            WorkspaceService::new_with_observer(client, workspace_config, observer.clone())
+        }
+        None => WorkspaceService::new(client, workspace_config),
+    };
+    let service = match initialized {
         Ok(service) => service,
         Err(error) => {
             tracing::error!("workspace initialization failed: {error}");
+            drop(observer);
+            if let Some(sink) = sink {
+                let _ = sink.finish(exit::CONFIG).await;
+            }
             return exit::CONFIG;
         }
     };
@@ -100,6 +134,10 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
             }
         }
         _ = shutdown_signal() => {}
+        _ = observation_failed(&mut sink) => {
+            tracing::error!("workspace observation failure requires daemon shutdown");
+            exit_code = exit::INTERNAL;
+        }
     }
 
     // Drain HTTP requests before cleaning up their mounts: an admitted create
@@ -127,7 +165,23 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
         }
     }
 
+    // HTTP and owned cleanup have joined. Any detached lifecycle owner still
+    // holding the service keeps the producer alive, which rejects sink finish.
+    drop(service);
+    drop(observer);
+    if let Some(sink) = sink {
+        if !sink.finish(exit_code).await && exit_code == exit::SUCCESS {
+            exit_code = exit::INTERNAL;
+        }
+    }
     exit_code
+}
+
+async fn observation_failed(sink: &mut Option<ObservationSink>) {
+    match sink {
+        Some(sink) => sink.failed().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Every workspace command goes through the daemon that owns its mount, reader,
