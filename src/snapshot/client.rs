@@ -70,7 +70,7 @@ const MAX_ATTEMPTS: u32 = 4;
 const BASE_BACKOFF_MS: u64 = 40;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_JSON_REQUEST_BYTES: usize = TREEFRAME_REQUEST_MAX_BYTES;
-const MAX_JSON_RESPONSE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_JSON_RESPONSE_BYTES: usize = 1_048_576;
 
 /// Local limit for APIs returning a whole file in memory. Larger files use
 /// bounded range reads; this is independent of the protocol's file-size cap.
@@ -186,6 +186,48 @@ impl Mst2Client {
     /// Payload bytes this client has received so far.
     pub fn received_bytes(&self) -> u64 {
         self.recv_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn count_received_bytes(&self, bytes: usize) {
+        self.recv_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) async fn owned_blob_response(
+        &self,
+        snapshot_id: &str,
+        path: &str,
+        expected_digest: &str,
+    ) -> Result<reqwest::Response, SnapshotError> {
+        let url = self.snapshots_url(&format!(
+            "/{snapshot_id}/blob?path={}&expected_digest={}",
+            urlencode(path),
+            urlencode(expected_digest),
+        ));
+        self.send_retrying(self.http.get(url)).await
+    }
+
+    pub(crate) async fn owned_frame_response(
+        &self,
+        snapshot_id: &str,
+        endpoint: &str,
+        body: bytes::Bytes,
+    ) -> Result<reqwest::Response, SnapshotError> {
+        let request_digest = format!(
+            "sha256:{}",
+            hex::encode(ring::digest::digest(&ring::digest::SHA256, &body))
+        );
+        let response = self
+            .send_retrying(
+                self.http
+                    .post(self.snapshots_url(&format!("/{snapshot_id}/{endpoint}")))
+                    .header("content-type", "application/json")
+                    .body(body),
+            )
+            .await?;
+        if response.status().is_success() {
+            validate_treeframe_headers(response.headers(), snapshot_id, &request_digest)?;
+        }
+        Ok(response)
     }
 
     /// How many transport retries this client has performed.
@@ -459,7 +501,7 @@ async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, Snaps
     Err(server_error(&bytes, status))
 }
 
-fn server_error(bytes: &[u8], status: StatusCode) -> SnapshotError {
+pub(crate) fn server_error(bytes: &[u8], status: StatusCode) -> SnapshotError {
     let Ok(env) = parse_json::<ErrorEnvelope>(bytes) else {
         return SnapshotError {
             code: SnapshotErrorCode::Internal,
@@ -608,7 +650,7 @@ async fn sleep_backoff(attempt: u32) {
     tokio::time::sleep(Duration::from_millis(base + jitter)).await;
 }
 
-fn net_err(e: reqwest::Error) -> SnapshotError {
+pub(crate) fn net_err(e: reqwest::Error) -> SnapshotError {
     let code = if retryable_transport(&e) || e.is_body() {
         SnapshotErrorCode::TemporaryUnavailable
     } else {
