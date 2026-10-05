@@ -71,3 +71,111 @@ pub async fn daemon_main<S: AntaresService + 'static>(
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::{antares::*, *};
+
+    struct FailingCleanup {
+        admitted: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        drained: AtomicBool,
+        cleanup_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AntaresService for FailingCleanup {
+        async fn create_mount(&self, _: CreateMountRequest) -> Result<MountCreated, ServiceError> {
+            unreachable!()
+        }
+        async fn list_mounts(&self) -> Result<Vec<MountStatus>, ServiceError> {
+            self.admitted.notify_one();
+            self.release.notified().await;
+            self.drained.store(true, Ordering::SeqCst);
+            Ok(vec![])
+        }
+        async fn describe_mount(&self, _: uuid::Uuid) -> Result<MountStatus, ServiceError> {
+            unreachable!()
+        }
+        async fn delete_mount(&self, _: uuid::Uuid) -> Result<MountStatus, ServiceError> {
+            unreachable!()
+        }
+        async fn build_cl(&self, _: uuid::Uuid, _: String) -> Result<MountStatus, ServiceError> {
+            unreachable!()
+        }
+        async fn clear_cl(&self, _: uuid::Uuid) -> Result<MountStatus, ServiceError> {
+            unreachable!()
+        }
+        async fn check_mount_ready(
+            &self,
+            _: uuid::Uuid,
+        ) -> Result<MountReadyResponse, ServiceError> {
+            unreachable!()
+        }
+        async fn changed_paths(&self, _: uuid::Uuid) -> Result<MountChangesResponse, ServiceError> {
+            unreachable!()
+        }
+        async fn health_info(&self) -> HealthResponse {
+            unreachable!("process health must not call the mount service")
+        }
+        async fn shutdown_cleanup(&self) -> Result<(), ServiceError> {
+            assert!(self.drained.load(Ordering::SeqCst));
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            Err(ServiceError::FuseFailure("fixture unmount denial".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_an_admitted_request_and_reports_cleanup_failure() {
+        let service = Arc::new(FailingCleanup {
+            admitted: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            drained: AtomicBool::new(false),
+            cleanup_calls: AtomicUsize::new(0),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut server = tokio::spawn(daemon_main(service.clone(), shutdown_rx, listener));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let health = client.get(format!("{base}/health")).send().await.unwrap();
+        assert!(health.status().is_success());
+        let request = tokio::spawn(async move {
+            client
+                .get(format!("{base}/antares/mounts"))
+                .send()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.admitted.notified(),
+        )
+        .await
+        .unwrap();
+        shutdown_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut server)
+                .await
+                .is_err()
+        );
+        assert_eq!(service.cleanup_calls.load(Ordering::SeqCst), 0);
+        service.release.notify_one();
+        let response = request.await.unwrap();
+        assert!(response.status().is_success());
+        // Consume the response so the connection can finish graceful draining.
+        let _: serde_json::Value = response.json().await.unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("fixture unmount denial"));
+        assert_eq!(service.cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+}

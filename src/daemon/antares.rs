@@ -2983,20 +2983,29 @@ impl AntaresServiceImpl {
         let mut index = self.path_index.write().await;
         let mut job_index = self.job_index.write().await;
 
+        let mut failed_mounts = Vec::new();
+        let mut failure = None;
         for (mount_id, mut entry) in mounts.drain() {
             tracing::info!("Unmounting {} during shutdown", mount_id);
             entry.preload_cancel.store(true, Ordering::Relaxed);
             if let Err(e) = entry.fuse.unmount().await {
                 tracing::warn!("Failed to unmount {} during shutdown: {}", mount_id, e);
-                // Continue with other mounts even if one fails
+                let reason = format!("failed to unmount {mount_id} during shutdown: {e}");
+                failure.get_or_insert_with(|| reason.clone());
+                entry.state = MountLifecycle::Failed { reason };
+                entry.update_last_seen();
+                failed_mounts.push((mount_id, entry));
             }
         }
-        // All mounts drained; clear indices.
-        // TODO(antares): If we ever decide to keep failed-unmount mounts in memory/state for
-        // later retry, revisit index cleanup to avoid inconsistencies.
-        index.clear();
-        job_index.clear();
-        Ok(())
+        // Keep failed mounts and their indices available for a cleanup retry;
+        // a consumed native handle does not prove the helper fallback worked.
+        mounts.extend(failed_mounts);
+        index.retain(|_, mount_id| mounts.contains_key(mount_id));
+        job_index.retain(|_, mount_id| mounts.contains_key(mount_id));
+        match failure {
+            Some(reason) => Err(ServiceError::FuseFailure(reason)),
+            None => Ok(()),
+        }
     }
 }
 
