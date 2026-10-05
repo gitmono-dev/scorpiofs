@@ -654,6 +654,14 @@ impl Mst2Client {
         let pages_root = parse_digest(v["pages_root"].as_str().unwrap_or(""))?;
         let map_id_want = parse_digest(v["map_id"].as_str().unwrap_or(""))?;
         let file_size = parse_count(v["file_size"].as_str().unwrap_or(""), "file_size")?;
+        // SPEC 07 limits content to 8 TiB independently of the wider JSON
+        // counter domain and the codec's structural descriptor checks.
+        const MAX_CHUNK_MAP_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
+        if file_size > MAX_CHUNK_MAP_FILE_BYTES {
+            return Err(limit_err(
+                "chunk-map file size exceeds the 8 TiB protocol limit",
+            ));
+        }
         let chunk_count = parse_count(v["chunk_count"].as_str().unwrap_or(""), "chunk_count")?;
         let page_count = parse_count(v["page_count"].as_str().unwrap_or(""), "page_count")?;
         let chunk_size = v["chunk_size"].as_u64().unwrap_or(0);

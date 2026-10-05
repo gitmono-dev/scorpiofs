@@ -698,7 +698,7 @@ async fn protocol_counts_are_canonical_and_the_counter_ceiling_precedes_map_limi
     for (count, code) in [
         ("01", SnapshotErrorCode::ScopeInvalid),
         ("+1", SnapshotErrorCode::ScopeInvalid),
-        ("9223372036854775807", SnapshotErrorCode::DigestMismatch),
+        ("9223372036854775807", SnapshotErrorCode::LimitExceeded),
         ("9223372036854775808", SnapshotErrorCode::LimitExceeded),
         ("18446744073709551616", SnapshotErrorCode::LimitExceeded),
     ] {
@@ -738,4 +738,37 @@ async fn protocol_counts_are_canonical_and_the_counter_ceiling_precedes_map_limi
         8 * 1024 * 1024 * 1024 * 1024
     );
     assert_eq!(server.leaves.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn canonical_and_legacy_maps_enforce_the_eight_tib_file_boundary() {
+    const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
+    let fixture = Fixture::new();
+    for canonical in [false, true] {
+        for size in [MAX_FILE_BYTES, MAX_FILE_BYTES + 1] {
+            // A fully self-consistent map identity isolates the file-size
+            // policy from digest/count/profile failures.
+            let map = ChunkMap::new(fixture.map.file_content_id, size, [0xdd; 32]).unwrap();
+            let mut body = fixture.map_body();
+            body["file_size"] = json!(map.file_size.to_string());
+            body["chunk_count"] = json!(map.chunk_count.to_string());
+            body["page_count"] = json!(map.page_count.to_string());
+            body["pages_root"] = json!(id(&map.pages_root));
+            body["map_id"] = json!(id(&map.map_id()));
+            if canonical {
+                body.as_object_mut().unwrap().remove("snapshot_id");
+                body.as_object_mut().unwrap().remove("path");
+                body = json!({"snapshot_id": SID, "path": PATH, "map": body});
+            }
+            let server = Server::start(body, fixture.leaf_body()).await;
+            let result = server.client.chunk_map(SID, PATH, &fixture.content).await;
+            if size == MAX_FILE_BYTES {
+                assert_eq!(result.unwrap().file_size, size);
+            } else {
+                assert_eq!(result.unwrap_err().code, SnapshotErrorCode::LimitExceeded);
+            }
+            assert_eq!(server.leaves.load(Ordering::SeqCst), 0);
+            assert_eq!(server.client.retry_count(), 0);
+        }
+    }
 }
