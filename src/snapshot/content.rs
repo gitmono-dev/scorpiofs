@@ -248,6 +248,97 @@ pub struct VerifiedContent {
     buffer: AccountedBuffer,
 }
 
+/// A bounded OBJECT batch. Its table/key capacity has its own output credits;
+/// each content Arc independently retains its admitted whole-file allocation.
+pub struct VerifiedContentBatch {
+    entries: Vec<(String, Arc<VerifiedContent>)>,
+    _reservation: Reservation,
+}
+
+impl VerifiedContentBatch {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn get(&self, digest: &str) -> Option<&Arc<VerifiedContent>> {
+        self.entries
+            .iter()
+            .find(|(key, _)| key == digest)
+            .map(|(_, body)| body)
+    }
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Arc<VerifiedContent>)> {
+        self.entries.iter().map(|(key, body)| (key.as_str(), body))
+    }
+}
+
+impl fmt::Debug for VerifiedContentBatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerifiedContentBatch")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct BatchBuilder {
+    entries: Vec<(String, Arc<VerifiedContent>)>,
+    reservation: Reservation,
+}
+
+impl BatchBuilder {
+    pub(crate) fn new(budget: &ContentBudget, count: usize) -> Result<Self, SnapshotError> {
+        let bytes = count
+            .checked_mul(size_of::<(String, Arc<VerifiedContent>)>() + 71)
+            .and_then(|n| n.checked_add(size_of::<VerifiedContentBatch>() + 2 * size_of::<usize>()))
+            .ok_or_else(capacity_limit)?;
+        let reservation = budget.reserve(BudgetClass::Output, bytes)?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(count)
+            .map_err(|_| capacity_limit())?;
+        if entries.capacity() != count {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "unexpected fixed batch table capacity",
+            ));
+        }
+        Ok(Self {
+            entries,
+            reservation,
+        })
+    }
+    pub(crate) fn push(
+        &mut self,
+        digest: &str,
+        content: Arc<VerifiedContent>,
+    ) -> Result<(), SnapshotError> {
+        if digest.len() != 71 || self.entries.len() == self.entries.capacity() {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "invalid fixed batch table entry",
+            ));
+        }
+        let mut key = String::new();
+        key.try_reserve_exact(71).map_err(|_| capacity_limit())?;
+        if key.capacity() != 71 {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "unexpected fixed batch key capacity",
+            ));
+        }
+        key.push_str(digest);
+        self.entries.push((key, content));
+        Ok(())
+    }
+    pub(crate) fn finish(self) -> VerifiedContentBatch {
+        VerifiedContentBatch {
+            entries: self.entries,
+            _reservation: self.reservation,
+        }
+    }
+}
+
 impl VerifiedContent {
     pub fn as_bytes(&self) -> &[u8] {
         self.buffer.as_bytes()

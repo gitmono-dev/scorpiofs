@@ -554,28 +554,16 @@ async fn hydrate_full_batches(
     reader: &SnapshotReader,
     closure: &scorpiofs::snapshot::ValidatedSnapshotClosure,
 ) -> Result<scorpiofs::snapshot::HydrateReport, scorpiofs::snapshot::SnapshotError> {
-    let client = reader.client().clone();
-    let sid = reader.snapshot_id().to_string();
+    let source = reader.clone();
     store
-        .hydrate_snapshot_batches::<_, _, Vec<u8>, Vec<u8>>(
+        .hydrate_snapshot_content_batches(
             reader,
             closure,
             2,
             2,
             move |batch| {
-                let client = client.clone();
-                let sid = sid.clone();
-                Box::pin(async move {
-                    let items: Vec<_> = batch
-                        .iter()
-                        .map(|f| (format!("/{}", f.rel_path), f.content_digest.clone()))
-                        .collect();
-                    let got = client.objects(&sid, &items, None).await?;
-                    Ok(got
-                        .into_iter()
-                        .map(|(id, bytes)| (id_string(&id), Arc::new(bytes)))
-                        .collect())
-                })
+                let source = source.clone();
+                Box::pin(async move { source.read_content_batch(&batch).await })
             },
             |_| Box::pin(async { panic!("all HTTP batch fixture files are small") }),
         )

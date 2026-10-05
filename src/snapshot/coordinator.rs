@@ -326,6 +326,36 @@ impl FetchCoordinator {
         content_limits: super::ContentBudgetLimits,
         membership: Option<HashMap<String, SnapshotFile>>,
     ) -> Arc<Self> {
+        Self::with_membership_scope(
+            reader,
+            max_concurrent,
+            limits,
+            super::content::ContentBudget::new(content_limits),
+            membership,
+        )
+    }
+
+    pub(crate) fn in_reader_content_scope(
+        reader: SnapshotReader,
+        max_concurrent: usize,
+    ) -> Arc<Self> {
+        let content = reader.content_scope.clone();
+        Self::with_membership_scope(
+            reader,
+            max_concurrent,
+            FetchCoordinatorLimits::default(),
+            content,
+            None,
+        )
+    }
+
+    fn with_membership_scope(
+        reader: SnapshotReader,
+        max_concurrent: usize,
+        limits: FetchCoordinatorLimits,
+        content: Arc<super::content::ContentBudget>,
+        membership: Option<HashMap<String, SnapshotFile>>,
+    ) -> Arc<Self> {
         Arc::new(FetchCoordinator {
             reader,
             membership: OnceCell::new_with(membership),
@@ -336,7 +366,7 @@ impl FetchCoordinator {
             jobs: Arc::new(Semaphore::new(limits.max_pending_jobs)),
             callers: Arc::new(Semaphore::new(limits.max_active_callers)),
             limits,
-            content: super::content::ContentBudget::new(content_limits),
+            content,
         })
     }
 

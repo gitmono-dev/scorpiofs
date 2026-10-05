@@ -44,6 +44,22 @@ use crate::snapshot::{
     SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
 };
 
+trait BorrowedBatch {
+    fn content_bytes(&self, digest: &str) -> Option<&[u8]>;
+}
+
+impl<B: AsRef<[u8]>> BorrowedBatch for HashMap<String, std::sync::Arc<B>> {
+    fn content_bytes(&self, digest: &str) -> Option<&[u8]> {
+        self.get(digest).map(|body| body.as_ref().as_ref())
+    }
+}
+
+impl BorrowedBatch for super::VerifiedContentBatch {
+    fn content_bytes(&self, digest: &str) -> Option<&[u8]> {
+        self.get(digest).map(|body| body.as_bytes())
+    }
+}
+
 const VIEW_FILE: &str = "view.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const JOURNAL_FILE: &str = "journal.log";
@@ -529,15 +545,28 @@ impl DurableStore {
             scope: reader.descriptor().scope.clone(),
             lease_id: reader.lease_id().to_string(),
         };
-        let manifest = reader.file_manifest().await?;
+        let manifest = if reader.capabilities().features.metadata_pages {
+            let closure = reader.snapshot_closure().await?;
+            reader.seed_content_membership(&closure)?;
+            closure.files().to_vec()
+        } else {
+            reader.file_manifest().await?
+        };
+        let legacy = super::FetchCoordinator::in_reader_content_scope(reader.clone(), 1);
         self.hydrate_file_closure(
             &view,
             &manifest,
             None,
             |f| {
-                let digest = f.content_digest.clone();
-                let path = f.rel_path.clone();
-                async move { reader.read_file(&path, &digest).await }
+                let file = f.clone();
+                let legacy = legacy.clone();
+                async move {
+                    if reader.capabilities().features.metadata_pages {
+                        reader.read_content(&file, false).await
+                    } else {
+                        legacy.fetch(file, false).await
+                    }
+                }
             },
             Some(reader),
         )
@@ -566,21 +595,14 @@ impl DurableStore {
         let use_frames =
             reader.capabilities().features.objects && reader.capabilities().features.chunk_reads;
         validate_snapshot_view(&view, closure)?;
+        reader.seed_content_membership(closure)?;
         self.hydrate_file_closure(
             &view,
             closure.files(),
             Some(closure),
             |file| {
-                let path = file.rel_path.clone();
-                let digest = file.content_digest.clone();
-                let size = file.size;
-                async move {
-                    if use_frames {
-                        reader.read_file_frames(&path, &digest, size).await
-                    } else {
-                        reader.read_file(&path, &digest).await
-                    }
-                }
+                let file = file.clone();
+                async move { reader.read_content(&file, use_frames).await }
             },
             Some(reader),
         )
@@ -616,8 +638,17 @@ impl DurableStore {
         Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
     {
         validate_snapshot_view(view, closure)?;
-        self.hydrate_file_closure(view, closure.files(), Some(closure), fetch, None)
-            .await
+        self.hydrate_file_closure(
+            view,
+            closure.files(),
+            Some(closure),
+            |file| {
+                let future = fetch(file);
+                async move { future.await.map(std::sync::Arc::new) }
+            },
+            None,
+        )
+        .await
     }
 
     /// Hydration core, parameterised over the byte source so the write-ahead,
@@ -632,11 +663,20 @@ impl DurableStore {
         F: Fn(&SnapshotFile) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
     {
-        self.hydrate_file_closure(view, manifest, None, fetch, None)
-            .await
+        self.hydrate_file_closure(
+            view,
+            manifest,
+            None,
+            |file| {
+                let future = fetch(file);
+                async move { future.await.map(std::sync::Arc::new) }
+            },
+            None,
+        )
+        .await
     }
 
-    async fn hydrate_file_closure<F, Fut>(
+    async fn hydrate_file_closure<F, Fut, B>(
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
@@ -646,7 +686,8 @@ impl DurableStore {
     ) -> Result<HydrateReport, SnapshotError>
     where
         F: Fn(&SnapshotFile) -> Fut,
-        Fut: std::future::Future<Output = Result<Vec<u8>, SnapshotError>>,
+        Fut: std::future::Future<Output = Result<std::sync::Arc<B>, SnapshotError>>,
+        B: AsRef<[u8]>,
     {
         let _transaction = self.prepare_hydration_for_kind(view, manifest, closure.is_some())?;
         let journal = JournalBatch::new(self);
@@ -686,10 +727,11 @@ impl DurableStore {
             }) {
                 write_reader_blob(&self.content, reader, f).await?;
             } else {
-                let bytes = fetch(f).await?;
+                let owner = fetch(f).await?;
+                let bytes = owner.as_ref().as_ref();
                 // The store owns its own correctness: verify whatever the source
                 // returned, regardless of whether the source claimed to verify.
-                let got = digest_of(&bytes);
+                let got = digest_of(bytes);
                 if got != f.content_digest {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::DigestMismatch,
@@ -707,7 +749,7 @@ impl DurableStore {
                         ),
                     ));
                 }
-                write_atomic(&self.content, &blob_name(&f.content_digest), &bytes)?;
+                write_atomic(&self.content, &blob_name(&f.content_digest), bytes)?;
             }
             journal.append(&FileRecord {
                 rel_path: f.rel_path.clone(),
@@ -1024,7 +1066,54 @@ impl DurableStore {
         .await
     }
 
-    async fn hydrate_batches_closure<FBatch, FLarge, BSmall, BLarge>(
+    /// Bounded owned OBJECT batches for a complete fixed reader. The batch
+    /// table and bodies are borrowed through independent CAS verification.
+    pub async fn hydrate_snapshot_content_batches<FBatch, FLarge>(
+        &self,
+        reader: &SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+        batch_concurrency: usize,
+        large_concurrency: usize,
+        fetch_batch: FBatch,
+        fetch_large: FLarge,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        FBatch: Fn(
+                Vec<SnapshotFile>,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<super::VerifiedContentBatch, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+        FLarge: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<super::VerifiedContent>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let view = self.snapshot_view(reader, closure).await?;
+        reader.seed_content_membership(closure)?;
+        self.hydrate_batches_closure(
+            &view,
+            closure.files(),
+            Some(SnapshotHydration {
+                closure,
+                reader: Some(reader),
+            }),
+            (batch_concurrency, large_concurrency),
+            fetch_batch,
+            fetch_large,
+        )
+        .await
+    }
+
+    async fn hydrate_batches_closure<FBatch, FLarge, Batch, BLarge>(
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
@@ -1036,10 +1125,8 @@ impl DurableStore {
     where
         FBatch: Fn(
                 Vec<SnapshotFile>,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::collections::HashMap<String, std::sync::Arc<BSmall>>, SnapshotError>,
-            > + Send
+            ) -> futures::future::BoxFuture<'static, Result<Batch, SnapshotError>>
+            + Send
             + Sync
             + Clone
             + 'static,
@@ -1051,10 +1138,10 @@ impl DurableStore {
             + Sync
             + Clone
             + 'static,
-        BSmall: AsRef<[u8]> + Send + Sync + 'static,
+        Batch: BorrowedBatch + Send + Sync + 'static,
         BLarge: AsRef<[u8]> + Send + Sync + 'static,
     {
-        use std::{collections::HashMap as BufMap, sync::atomic::Ordering::Relaxed};
+        use std::sync::atomic::Ordering::Relaxed;
 
         use futures::stream::{StreamExt, TryStreamExt};
 
@@ -1134,12 +1221,8 @@ impl DurableStore {
                 let journal = &journal;
                 async move {
                     let bytes = fetch_batch(batch.clone()).await?;
-                    let mut by_digest: BufMap<String, std::sync::Arc<BSmall>> = BufMap::new();
-                    for (digest, data) in bytes {
-                        by_digest.insert(digest, data);
-                    }
                     for f in &batch {
-                        let data = by_digest.remove(&f.content_digest).ok_or_else(|| {
+                        let data = bytes.content_bytes(&f.content_digest).ok_or_else(|| {
                             SnapshotError::new(
                                 SnapshotErrorCode::DigestMismatch,
                                 format!(
@@ -1148,7 +1231,6 @@ impl DurableStore {
                                 ),
                             )
                         })?;
-                        let data = data.as_ref().as_ref();
                         let got = digest_of(data);
                         if got != f.content_digest {
                             return Err(SnapshotError::new(

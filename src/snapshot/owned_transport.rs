@@ -23,6 +23,10 @@ impl SuccessfulEndReceipt {
     pub(crate) fn into_content(self) -> ContentEofReceipt {
         ContentEofReceipt(())
     }
+
+    pub(crate) fn content_receipt(&self) -> ContentEofReceipt {
+        ContentEofReceipt(())
+    }
 }
 
 fn invalid(message: impl Into<String>) -> SnapshotError {

@@ -76,6 +76,7 @@ struct Fixture {
     corrupt_metadata: AtomicBool,
     corrupt_blob: AtomicBool,
     body_mode: AtomicUsize,
+    batch_segment: AtomicUsize,
     block_metadata: AtomicBool,
     metadata_requests: AtomicUsize,
     requests: Mutex<Vec<String>>,
@@ -122,6 +123,7 @@ impl Fixture {
             corrupt_metadata: AtomicBool::new(false),
             corrupt_blob: AtomicBool::new(false),
             body_mode: AtomicUsize::new(0),
+            batch_segment: AtomicUsize::new(0),
             block_metadata: AtomicBool::new(false),
             metadata_requests: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
@@ -243,6 +245,96 @@ async fn blob(
     ])))
 }
 
+async fn objects(
+    State(f): State<Arc<Fixture>>,
+    Path(snapshot): Path<String>,
+    body: Bytes,
+) -> Response {
+    assert!(
+        body.len() <= 128 * 1024,
+        "owned request writer exceeded its admitted fixed capacity"
+    );
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let items = request["items"].as_array().unwrap();
+    f.requests.lock().unwrap().push("objects".into());
+    let mode = f.body_mode.load(Ordering::SeqCst);
+    let mut objects = Vec::new();
+    for item in items.iter().rev() {
+        let path = item["path"].as_str().unwrap();
+        let bytes = content(path);
+        assert_eq!(item["expected_digest"], digest_of(&bytes));
+        if !objects.iter().any(|(id, _)| *id == hash(&bytes)) {
+            objects.push((hash(&bytes), bytes));
+        }
+    }
+    let logical = objects.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+    let units = objects.len();
+    if mode == 20 {
+        objects.pop();
+    }
+    if mode == 21 {
+        objects.push((hash(b"foreign"), b"foreign".to_vec()));
+    }
+    let mut wire = if objects.is_empty() {
+        Vec::new()
+    } else {
+        mst2_codec::treeframe::ObjectPayload {
+            objects: objects.clone(),
+        }
+        .encode(29, 0)
+        .unwrap()
+    };
+    let mut end = EndPayload {
+        request_item_count: items.len() as u32,
+        unique_unit_count: units as u32,
+        logical_bytes: logical,
+        request_body_sha256: hash(&body),
+    };
+    if mode == 22 || (mode == 27 && f.batch_segment.fetch_add(1, Ordering::SeqCst) >= 1) {
+        end.request_body_sha256[0] ^= 1;
+    }
+    let mut sequence = u64::from(!wire.is_empty());
+    if mode == 25 {
+        wire.extend(
+            mst2_codec::treeframe::ObjectPayload { objects }
+                .encode(29, sequence)
+                .unwrap(),
+        );
+        sequence += 1;
+    }
+    if mode == 24 {
+        wire.extend(
+            mst2_codec::treeframe::ErrorPayload {
+                code: "INTEGRITY_ERROR".into(),
+                retryable: false,
+                request_id: "batch-late".into(),
+            }
+            .encode(29, sequence)
+            .unwrap(),
+        );
+    } else {
+        wire.extend(end.encode(29, sequence));
+    }
+    if mode == 23 {
+        wire.push(0);
+    }
+    let response_body = if mode == 26 {
+        use futures::StreamExt;
+        axum::body::Body::from_stream(
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(wire))])
+                .chain(futures::stream::pending()),
+        )
+    } else {
+        axum::body::Body::from(wire)
+    };
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", snapshot)
+        .header("x-mega-request-digest", id(&hash(&body)))
+        .body(response_body)
+        .unwrap()
+}
+
 struct Server {
     url: String,
     fixture: Arc<Fixture>,
@@ -255,7 +347,10 @@ impl Drop for Server {
 }
 impl Server {
     async fn start(metadata_pages: bool) -> Self {
-        let fixture = Arc::new(Fixture::new(metadata_pages));
+        Self::start_fixture(Fixture::new(metadata_pages)).await
+    }
+    async fn start_fixture(fixture: Fixture) -> Self {
+        let fixture = Arc::new(fixture);
         let app = Router::new()
             .route("/api/v2/snapshots/capabilities", get(capabilities))
             .route("/api/v2/snapshots/resolve", post(resolve))
@@ -264,6 +359,7 @@ impl Server {
                 post(metadata),
             )
             .route("/api/v2/snapshots/{snapshot}/blob", get(blob))
+            .route("/api/v2/snapshots/{snapshot}/objects", post(objects))
             .with_state(fixture.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         Self {
@@ -282,6 +378,73 @@ impl Server {
         let closure = reader.snapshot_closure().await.unwrap();
         coordinator(reader, &closure, running, jobs, callers)
     }
+}
+
+#[tokio::test]
+async fn owned_batch_long_authorized_paths_split_requests_and_late_segment_failure_publishes_nothing(
+) {
+    let _serial = TEST_LOCK.lock().await;
+    let components: Vec<String> = (0..8)
+        .map(|index| char::from(b'a' + index).to_string().repeat(255))
+        .collect();
+    let prefix = components.join("/");
+    let files: Vec<_> = (0..128)
+        .map(|index| file(&format!("{prefix}/f{index:03}")))
+        .collect();
+    let leaf = Page::build(
+        &files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                Entry::file(
+                    EntryKind::Regular,
+                    format!("f{index:03}").as_bytes(),
+                    file.size,
+                    hash(&content(&file.rel_path)),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mut pages = std::collections::BTreeMap::from([(id(&page_id(&leaf)), leaf.clone())]);
+    let mut root = leaf;
+    for component in components.iter().rev() {
+        root = Page::build(&[Entry::dir(component.as_bytes(), page_id(&root))]).unwrap();
+        pages.insert(id(&page_id(&root)), root.clone());
+    }
+    let mut fixture = Fixture::new(true);
+    fixture.descriptor.metadata_root = page_id(&root);
+    fixture.page = root;
+    let s = Server::start_fixture(fixture).await;
+    let reader = s.reader().await;
+    reader
+        .seed_content_membership(
+            &ValidatedSnapshotClosure::from_pages(reader.descriptor(), pages).unwrap(),
+        )
+        .unwrap();
+    let batch = reader.read_content_batch(&files).await.unwrap();
+    assert_eq!(batch.len(), 128);
+    assert!(
+        s.fixture.request_count() >= 2,
+        "long escaping-aware request writer split before sending oversized JSON"
+    );
+    for file in &files {
+        assert_eq!(
+            batch.get(&file.content_digest).unwrap().as_bytes(),
+            content(&file.rel_path)
+        );
+    }
+    drop(batch);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+    until(|| reader.content_usage().construction_bytes == 0).await;
+    // A valid first segment followed by an invalid END in a later response must
+    // discard the entire unpublished batch, including earlier segment bodies.
+    s.fixture.body_mode.store(27, Ordering::SeqCst);
+    s.fixture.batch_segment.store(0, Ordering::SeqCst);
+    assert!(reader.read_content_batch(&files).await.is_err());
+    assert_eq!(s.fixture.batch_segment.load(Ordering::SeqCst), 2);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+    until(|| reader.content_usage().construction_bytes == 0).await;
 }
 
 fn coordinator(
@@ -835,4 +998,236 @@ async fn queued_and_running_cancellation_drop_actual_fixed_output_owners() {
     assert_eq!(c.content_usage().output_bytes, 0);
     assert_eq!(c.content_usage().construction_bytes, 0);
     assert_eq!(s.fixture.request_count(), 1);
+}
+
+#[tokio::test]
+async fn direct_reader_clones_share_budget_and_reject_forged_fixed_view_facts_before_body_http() {
+    let _serial = TEST_LOCK.lock().await;
+    let s = Server::start(true).await;
+    let reader = s.reader().await.with_content_limits(
+        scorpiofs::snapshot::ContentBudgetLimits::new(1024, 2 * 1024 * 1024).unwrap(),
+    );
+    let closure = reader.snapshot_closure().await.unwrap();
+    reader.seed_content_membership(&closure).unwrap();
+    let clone = reader.clone();
+    assert_eq!(
+        clone
+            .read_content(&file("absent"), false)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::PathNotFound
+    );
+    let mut wrong_size = file("a");
+    wrong_size.size += 1;
+    assert_eq!(
+        clone
+            .read_content(&wrong_size, false)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    let mut wrong_digest = file("a");
+    wrong_digest.content_digest = digest_of(b"forged");
+    assert_eq!(
+        clone
+            .read_content(&wrong_digest, false)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    let mut wrong_kind = file("a");
+    wrong_kind.fs_kind = "symlink".into();
+    assert_eq!(
+        clone
+            .read_content(&wrong_kind, false)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    let mut wrong_path = file("a");
+    wrong_path.rel_path = "../a".into();
+    assert!(clone.read_content(&wrong_path, false).await.is_err());
+    assert_eq!(s.fixture.request_count(), 0);
+    s.fixture.blob_release.add_permits(1);
+    let owner = reader.read_content(&file("a"), false).await.unwrap();
+    assert_eq!(clone.content_usage().output_bytes, 1024);
+    assert_eq!(
+        clone
+            .read_content(&file("b"), false)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::LimitExceeded
+    );
+    assert_eq!(s.fixture.request_count(), 1);
+    drop(owner);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+    s.fixture.blob_release.add_permits(1);
+    assert_eq!(
+        clone
+            .read_content(&file("b"), false)
+            .await
+            .unwrap()
+            .as_bytes(),
+        content("b")
+    );
+}
+
+#[tokio::test]
+async fn owned_object_batch_charges_table_and_aliases_once_until_actual_owners_drop() {
+    let _serial = TEST_LOCK.lock().await;
+    let s = Server::start(true).await;
+    let reader = s.reader().await.with_content_limits(
+        scorpiofs::snapshot::ContentBudgetLimits::new(4096, 8 * 1024 * 1024).unwrap(),
+    );
+    let closure = reader.snapshot_closure().await.unwrap();
+    reader.seed_content_membership(&closure).unwrap();
+    let mut absent_alias = file("a");
+    absent_alias.rel_path = "absent".into();
+    assert_eq!(
+        reader
+            .read_content_batch(&[file("a"), absent_alias])
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::PathNotFound
+    );
+    let mut forged_alias = file("b");
+    forged_alias.fs_kind = "regular".into();
+    assert_eq!(
+        reader
+            .read_content_batch(&[file("a"), forged_alias])
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    assert_eq!(
+        s.fixture.request_count(),
+        0,
+        "each alias authorizes before deduplication"
+    );
+    assert_eq!(reader.content_usage().output_bytes, 0);
+    let alias_only = reader
+        .read_content_batch(&[file("a"), file("b")])
+        .await
+        .unwrap();
+    assert_eq!(alias_only.len(), 1);
+    assert_eq!(
+        reader.content_usage().output_bytes,
+        2048,
+        "one table plus one unique content"
+    );
+    drop(alias_only);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+    let batch = reader
+        .read_content_batch(&[file("a"), file("b"), file("f00")])
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_eq!(
+        batch.get(&file("a").content_digest).unwrap().as_bytes(),
+        content("a")
+    );
+    assert_eq!(
+        reader.content_usage().output_bytes,
+        3072,
+        "one table and two whole-content owners"
+    );
+    let retained = batch.get(&file("a").content_digest).unwrap().clone();
+    let cloned = retained.clone();
+    assert_eq!(reader.content_usage().output_bytes, 3072);
+    drop(batch);
+    assert_eq!(
+        reader.content_usage().output_bytes,
+        1024,
+        "table and unretained content dropped before credits"
+    );
+    drop(retained);
+    assert_eq!(reader.content_usage().output_bytes, 1024);
+    drop(cloned);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn owned_batch_pre_http_capacity_and_late_integrity_failures_release_all_builders() {
+    let _serial = TEST_LOCK.lock().await;
+    let s = Server::start(true).await;
+    let reader = s.reader().await.with_content_limits(
+        scorpiofs::snapshot::ContentBudgetLimits::new(2048, 8 * 1024 * 1024).unwrap(),
+    );
+    let closure = reader.snapshot_closure().await.unwrap();
+    reader.seed_content_membership(&closure).unwrap();
+    assert_eq!(
+        reader
+            .read_content_batch(&[file("a"), file("f00")])
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::LimitExceeded
+    );
+    assert_eq!(
+        s.fixture.request_count(),
+        0,
+        "all outputs admit before body HTTP"
+    );
+    assert_eq!(reader.content_usage().output_bytes, 0);
+    for mode in 20..=25 {
+        s.fixture.body_mode.store(mode, Ordering::SeqCst);
+        assert!(reader
+            .read_content_batch(&[file("a"), file("b")])
+            .await
+            .is_err());
+        assert_eq!(reader.content_usage().output_bytes, 0);
+        until(|| reader.content_usage().construction_bytes == 0).await;
+    }
+    let requests = s.fixture.request_count();
+    assert_eq!(
+        reader
+            .read_content_batch(&vec![file("a"); 129])
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::LimitExceeded
+    );
+    assert_eq!(s.fixture.request_count(), requests);
+}
+
+#[tokio::test]
+async fn owned_batch_end_without_eof_and_actual_cancellation_keep_then_release_all_owners() {
+    let _serial = TEST_LOCK.lock().await;
+    let s = Server::start(true).await;
+    let reader = s.reader().await.with_content_limits(
+        scorpiofs::snapshot::ContentBudgetLimits::new(4096, 8 * 1024 * 1024).unwrap(),
+    );
+    reader
+        .seed_content_membership(&reader.snapshot_closure().await.unwrap())
+        .unwrap();
+    s.fixture.body_mode.store(26, Ordering::SeqCst);
+    let task = tokio::spawn({
+        let reader = reader.clone();
+        async move { reader.read_content_batch(&[file("a"), file("f00")]).await }
+    });
+    until(|| s.fixture.request_count() == 1).await;
+    assert!(!task.is_finished());
+    assert_eq!(reader.content_usage().output_bytes, 3072);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    until(|| {
+        reader.content_usage().output_bytes == 0 && reader.content_usage().construction_bytes == 0
+    })
+    .await;
+    s.fixture.body_mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        reader
+            .read_content_batch(&[file("a"), file("f00")])
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
