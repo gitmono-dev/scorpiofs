@@ -492,7 +492,12 @@ impl WorkspaceService {
                 });
             }
         }
-        let local_pin_state = if let Some(store) = &runtime.store {
+        let local_pin_state = if runtime.hydrate.is_some() {
+            // The admitted task may still be acquiring its publication lock.
+            // An observation must not take that lock first and fail hydration.
+            // Audit the durable guarantee only after joining the owned task.
+            PinState::Unknown
+        } else if let Some(store) = &runtime.store {
             let store = store.clone();
             match trace_blocking("local_pin_audit", move || {
                 let result = trace_sync("local_pin_audit_work", || store.local_pin_state());

@@ -56,7 +56,22 @@ struct Version {
 
 impl Version {
     fn new(content: &[u8]) -> Self {
-        let child_bytes = Page::Leaf { entries: vec![] }.encode().unwrap();
+        let child_entries = if content == CONTENT[2] {
+            // Give the pending full closure an independently unseen META page.
+            vec![Entry::file(
+                EntryKind::Regular,
+                b"leaf.txt",
+                content.len() as u64,
+                parse_digest(&digest_of(content)).unwrap(),
+            )]
+        } else {
+            vec![]
+        };
+        let child_bytes = Page::Leaf {
+            entries: child_entries,
+        }
+        .encode()
+        .unwrap();
         let child = page_id(&child_bytes);
         let root_bytes = Page::Leaf {
             entries: vec![
@@ -111,6 +126,10 @@ struct Fixture {
     requests: Mutex<Vec<String>>,
     child_pages: AtomicUsize,
     blobs: AtomicUsize,
+    block_child_metadata: AtomicBool,
+    child_metadata_started: tokio::sync::Notify,
+    child_metadata_release: tokio::sync::Semaphore,
+    pending_child_metadata_calls: AtomicUsize,
     block_objects: AtomicBool,
     objects_started: tokio::sync::Notify,
     objects_release: tokio::sync::Semaphore,
@@ -126,6 +145,10 @@ impl Fixture {
             requests: Mutex::new(Vec::new()),
             child_pages: AtomicUsize::new(0),
             blobs: AtomicUsize::new(0),
+            block_child_metadata: AtomicBool::new(false),
+            child_metadata_started: tokio::sync::Notify::new(),
+            child_metadata_release: tokio::sync::Semaphore::new(0),
+            pending_child_metadata_calls: AtomicUsize::new(0),
             block_objects: AtomicBool::new(false),
             objects_started: tokio::sync::Notify::new(),
             objects_release: tokio::sync::Semaphore::new(0),
@@ -190,6 +213,14 @@ async fn metadata(
         "/" => (v.root, &v.root_bytes),
         "/deep" => {
             f.child_pages.fetch_add(1, Ordering::SeqCst);
+            if f.version(&sid) == 2 {
+                f.pending_child_metadata_calls
+                    .fetch_add(1, Ordering::SeqCst);
+                if f.block_child_metadata.load(Ordering::SeqCst) {
+                    f.child_metadata_started.notify_one();
+                    f.child_metadata_release.acquire().await.unwrap().forget();
+                }
+            }
             (v.child, &v.child_bytes)
         }
         _ => panic!("unexpected metadata path"),
@@ -231,7 +262,7 @@ async fn objects(
     let content = CONTENT[version];
     let request: Value = serde_json::from_slice(&body).unwrap();
     let items = request["items"].as_array().unwrap();
-    // All three committed file paths share one digest, so the durable lane
+    // All committed file paths share one digest, so the durable lane
     // requests one independently verified body for all logical aliases.
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["expected_digest"], digest_of(content));
@@ -444,6 +475,24 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 
+async fn workspace_cli(base: &str, arguments: &[&str]) -> std::process::Output {
+    let binary = std::env::var_os("SCORPIO_LAUNCHER_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_scorpio")));
+    tokio::process::Command::new(binary)
+        .args([
+            "--config-path",
+            "/nonexistent-scorpio-client-config",
+            "workspace",
+            "--endpoint",
+            base,
+        ])
+        .args(arguments)
+        .output()
+        .await
+        .unwrap()
+}
+
 #[cfg(target_os = "linux")]
 async fn wait_complete(client: &reqwest::Client, base: &str, id: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -481,6 +530,12 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
     launcher.ready(&client).await;
     assert!(f.requests.lock().unwrap().is_empty());
     launcher.assert_no_dictionary();
+    let listed = workspace_cli(&launcher.base, &["list"]).await;
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&listed.stdout).unwrap(),
+        json!([])
+    );
     let health: Value = client
         .get(format!("{}/health", launcher.base))
         .send()
@@ -589,16 +644,13 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     let mut old_fd = None;
     for index in 0..2 {
         f.latest.store(index, Ordering::SeqCst);
-        let response = client.post(format!("{}/v3/workspaces", launcher.base))
-            .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
-            .send().await.unwrap();
-        let status = response.status();
-        let body: Value = response.json().await.unwrap();
+        let response = workspace_cli(&launcher.base, &["create", "/project"]).await;
         assert!(
-            status.is_success(),
-            "mount rejected: {body}; {}",
+            response.status.success(),
+            "CLI mount rejected: {response:?}; {}",
             launcher.log()
         );
+        let body: Value = serde_json::from_slice(&response.stdout).unwrap();
         ids.push(body["workspace_id"].as_str().unwrap().to_owned());
         generations.push(body["generation"].as_str().unwrap().to_owned());
         assert_eq!(body["snapshot_id"], f.versions[index].sid);
@@ -880,6 +932,7 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     assert_ne!(digest_of(CONTENT[2]), digest_of(CONTENT[0]));
     assert_ne!(digest_of(CONTENT[2]), digest_of(CONTENT[1]));
     f.latest.store(2, Ordering::SeqCst);
+    f.block_child_metadata.store(true, Ordering::SeqCst);
     f.block_objects.store(true, Ordering::SeqCst);
     let pending: Value = client
         .post(format!("{}/v3/workspaces", launcher.base))
@@ -891,12 +944,67 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     assert_eq!(pending["snapshot_id"], f.versions[2].sid);
     assert_eq!(pending["metadata_ready"], true);
     assert_eq!(pending["hydration_state"], "running");
-    assert_ne!(pending["local_pin_state"], "complete_snapshot");
+    assert_eq!(pending["local_pin_state"], "unknown");
     assert!(mounted(&pending_mount));
+    tokio::time::timeout(Duration::from_secs(5), f.child_metadata_started.notified())
+        .await
+        .expect("full closure must actually reach the pending child META request");
+    assert_eq!(f.pending_child_metadata_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 0);
+    // The child META response precedes the durable transaction acquisition.
+    // A status audit here would obtain the free lock and report Incomplete;
+    // observing the admitted task must return Unknown without taking that lock.
+    for _ in 0..2 {
+        let status: Value = client
+            .get(format!("{}/v3/workspaces/{pending_id}", launcher.base))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["hydration_state"], "running");
+        assert_eq!(status["local_pin_state"], "unknown");
+        assert_eq!(status["snapshot_id"], f.versions[2].sid);
+        assert_eq!(status["generation"], pending["generation"]);
+        assert_eq!(status["metadata_ready"], true);
+        assert!(status["last_error"].is_null());
+        assert!(mounted(&pending_mount));
+        assert_eq!(f.pending_child_metadata_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 0);
+    }
+    eprintln!("PRE_TRANSACTION_HYDRATION_OBSERVE_RUN: actual child META holds Full closure before publication transaction; creation and repeated status report fixed running workspace without a pin audit");
+    f.block_child_metadata.store(false, Ordering::SeqCst);
+    f.child_metadata_release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), f.objects_started.notified())
         .await
         .expect("new content must actually reach the pending OBJECT request");
     assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 1);
+    // Observing an admitted hydration must not compete for its publication
+    // lock, fail the task, or advertise completion while OBJECT is pending.
+    for _ in 0..2 {
+        let status: Value = client
+            .get(format!("{}/v3/workspaces/{pending_id}", launcher.base))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["hydration_state"], "running");
+        assert_eq!(status["local_pin_state"], "unknown");
+        assert_eq!(status["snapshot_id"], f.versions[2].sid);
+        assert_eq!(status["generation"], pending["generation"]);
+        assert_eq!(status["metadata_ready"], true);
+        assert!(status["last_error"].is_null());
+        assert!(mounted(&pending_mount));
+        assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 1);
+    }
+    eprintln!("RUNNING_HYDRATION_OBSERVE_RUN: actual pending OBJECT remains running across fixed workspace creation and repeated status observations");
     let cancelled: Value = client
         .post(format!(
             "{}/v3/workspaces/{pending_id}/hydrate/cancel",
@@ -947,6 +1055,10 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     assert_eq!(retried["snapshot_id"], f.versions[2].sid);
     assert_eq!(
         std::fs::read(pending_mount.join("base.txt")).unwrap(),
+        CONTENT[2]
+    );
+    assert_eq!(
+        std::fs::read(pending_mount.join("deep/leaf.txt")).unwrap(),
         CONTENT[2]
     );
     assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 2);

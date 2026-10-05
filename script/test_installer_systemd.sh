@@ -120,6 +120,10 @@ curl() {
         [ "$arg" = "--noproxy" ] && saw_noproxy=1
         if [[ "$arg" == */health ]]; then
             [ "$saw_noproxy" -eq 1 ] || return 64
+            if [ -n "${MOCK_RETIRED_ALIAS_PATH:-}" ]; then
+                [ ! -e "$MOCK_RETIRED_ALIAS_PATH" ] || return 64
+                printf 'retired alias absent at health check\n' >>"$systemctl_log"
+            fi
             [ "${MOCK_HEALTH_FAIL:-0}" -eq 0 ] || return 7
             printf 'ok\n'
             return 0
@@ -284,6 +288,8 @@ grep -Fq "using runtime paths from retained ${test_root}/etc/scorpio.toml" \
     "${test_root}/old-binary-dry-run.log"
 mv "${test_root}/installed-scorpio" "${test_root}/prefix/bin/scorpio"
 
+printf '#!/usr/bin/env bash\nexit 64\n' >"${test_root}/prefix/bin/antares"
+chmod 0755 "${test_root}/prefix/bin/antares"
 antares_job_mount="${test_root}/data/antares/mnt/job-1"
 MOCK_STALE_MOUNT="$antares_job_mount" \
 SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
@@ -305,6 +311,7 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
         exit 1
     }
 assert_systemctl_log_line "fusermount3 -u -z ${antares_job_mount}"
+test ! -e "${test_root}/prefix/bin/antares"
 
 assert_unit_contains 'ExecStopPost=-/bin/sh -c'
 assert_unit_contains 'findmnt -rno TARGET 2>/dev/null | sort -r'
@@ -318,8 +325,12 @@ assert_systemctl_log_line "fusermount3 -u -z ${test_root}/data/mount"
 cp "${test_root}/prefix/bin/scorpio" "${test_root}/marked-scorpio"
 printf 'old-binary-marker' >>"${test_root}/marked-scorpio"
 mv "${test_root}/marked-scorpio" "${test_root}/prefix/bin/scorpio"
+printf '#!/usr/bin/env bash\nexit 65\n# previous alias bytes\n' >"${test_root}/prefix/bin/antares"
+chmod 0755 "${test_root}/prefix/bin/antares"
+alias_digest_before="$(sha256sum "${test_root}/prefix/bin/antares" | awk '{print $1}')"
 cp "${test_root}/etc/scorpio.toml" "${test_root}/config-before-health-failure.toml"
-if MOCK_HEALTH_FAIL=1 SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
+if MOCK_HEALTH_FAIL=1 MOCK_RETIRED_ALIAS_PATH="${test_root}/prefix/bin/antares" \
+    SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
     --version "$version" \
     --release-base-url "$release_base_url" \
     --non-interactive \
@@ -342,12 +353,50 @@ grep -Fq 'restoring ScorpioFS artifacts from before the failed upgrade' \
     "${test_root}/health-failure.log"
 cmp "${test_root}/config-before-health-failure.toml" "${test_root}/etc/scorpio.toml"
 tail -c 17 "${test_root}/prefix/bin/scorpio" | grep -Fxq 'old-binary-marker'
+assert_systemctl_log_line 'retired alias absent at health check'
+test -x "${test_root}/prefix/bin/antares"
+test "$(sha256sum "${test_root}/prefix/bin/antares" | awk '{print $1}')" = "$alias_digest_before"
 test "$(stat -c '%U' "${test_root}/data/store")" = "$service_user"
 test "$(stat -c '%U' "${test_root}/data/antares/upper")" = "$service_user"
 test "$(stat -c '%U' "${test_root}/data/antares/cl")" = "$service_user"
 test "$(stat -c '%U' "${test_root}/data")" = "$service_user"
 grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
 test "$(grep -Fc 'start scorpiofs.service' "$systemctl_log")" -ge 2
+: >"$systemctl_log"
+
+mock_service_active=0
+printf '#!/usr/bin/env bash\nexit 66\n# inactive alias bytes\n' >"${test_root}/prefix/bin/antares"
+chmod 0755 "${test_root}/prefix/bin/antares"
+inactive_alias_digest="$(sha256sum "${test_root}/prefix/bin/antares" | awk '{print $1}')"
+if MOCK_HEALTH_FAIL=1 MOCK_RETIRED_ALIAS_PATH="${test_root}/prefix/bin/antares" \
+    SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "${test_root}/data" \
+    --workspace "${test_root}/data/mount" \
+    --store-path "${test_root}/data/store" \
+    --http-addr 127.0.0.1:2925 >"${test_root}/inactive-health-failure.log" 2>&1; then
+    printf 'installer accepted an unhealthy replacement for an inactive service\n' >&2
+    exit 1
+fi
+grep -Fq 'did not become healthy' "${test_root}/inactive-health-failure.log"
+assert_systemctl_log_line 'retired alias absent at health check'
+test -x "${test_root}/prefix/bin/antares"
+test "$(sha256sum "${test_root}/prefix/bin/antares" | awk '{print $1}')" = "$inactive_alias_digest"
+test "$(grep -Fc 'start scorpiofs.service' "$systemctl_log")" -eq 1
+test "$(grep -Fc 'stop scorpiofs.service' "$systemctl_log")" -eq 1
+if grep -Fxq 'restart scorpiofs.service' "$systemctl_log"; then
+    printf 'installer restarted the previously inactive service after failure\n' >&2
+    exit 1
+fi
+mock_service_active=1
 : >"$systemctl_log"
 
 sed -i 's/^User=.*/User=root/' "$unit_capture"

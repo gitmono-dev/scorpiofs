@@ -119,7 +119,7 @@ impl WorkspaceMount {
             return Ok(());
         }
         self.handle = Some(
-            crate::server::mount_filesystem_with_antares_cache(
+            crate::server::mount_filesystem_with_writeback_cache(
                 LoggingFileSystem::new(self.overlay.clone()),
                 self.mountpoint.as_os_str(),
                 false,

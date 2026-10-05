@@ -1,24 +1,16 @@
-//! Shared command implementations for the `scorpio` and `antares` binaries.
-//!
-//! The two binaries are thin clap front-ends; the actual work lives here so the
-//! unified `scorpio` CLI and the (deprecated) `antares` alias behave identically
-//! and reuse the service/manager layer directly instead of self-calling over
-//! HTTP.
+//! Commands for the v3 workspace daemon and its HTTP client.
 
 use std::{
     collections::HashMap,
     io::{self, Write},
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
     time::Duration,
 };
 
 use tokio::sync::oneshot;
 
 use crate::{
-    antares::{AntaresManager, AntaresPaths},
-    daemon::antares::AntaresServiceImpl,
     snapshot::Mst2Client,
     util::{config, logging},
     workspace::{WorkspaceConfig, WorkspaceService},
@@ -31,33 +23,6 @@ pub mod exit {
     pub const CONFIG: i32 = 2;
     pub const MOUNT: i32 = 3;
     pub const BIND: i32 = 4;
-}
-
-/// Build the config CLI-override map from the optional Antares path flags.
-///
-/// Returning these as config overrides (rather than mutating `AntaresPaths`
-/// after the fact) keeps the documented precedence `CLI > env > file > default`
-/// intact and ensures runtime directories are created for the effective paths.
-pub fn antares_overrides(
-    upper_root: Option<PathBuf>,
-    cl_root: Option<PathBuf>,
-    mount_root: Option<PathBuf>,
-    state_file: Option<PathBuf>,
-) -> HashMap<String, String> {
-    let mut overrides = HashMap::new();
-    if let Some(p) = upper_root {
-        overrides.insert("antares_upper_root".to_string(), p.display().to_string());
-    }
-    if let Some(p) = cl_root {
-        overrides.insert("antares_cl_root".to_string(), p.display().to_string());
-    }
-    if let Some(p) = mount_root {
-        overrides.insert("antares_mount_root".to_string(), p.display().to_string());
-    }
-    if let Some(p) = state_file {
-        overrides.insert("antares_state_file".to_string(), p.display().to_string());
-    }
-    overrides
 }
 
 /// Load configuration (with CLI overrides) and initialize logging.
@@ -168,134 +133,162 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
     exit_code
 }
 
-/// Mount an Antares job instance directly via the manager.
-pub async fn antares_mount(job_id: &str, cl: Option<&str>) -> i32 {
-    let manager = AntaresManager::new(AntaresPaths::from_global_config()).await;
-    match manager.mount_job(job_id, cl).await {
-        Ok(instance) => {
-            println!("mounted job {job_id} at {}", instance.mountpoint.display());
+/// Every workspace command goes through the daemon that owns its mount, reader,
+/// private upper and lifecycle fence. The client never constructs a manager.
+pub enum WorkspaceCommand {
+    Create {
+        scope: String,
+        view_id: Option<String>,
+        full: bool,
+    },
+    List,
+    Status {
+        id: String,
+    },
+    Hydrate {
+        id: String,
+    },
+    CancelHydrate {
+        id: String,
+    },
+    ReleaseLocalPin {
+        id: String,
+    },
+    Destroy {
+        id: String,
+        discard_dirty: bool,
+    },
+}
+
+pub async fn workspace_request(endpoint: &str, command: WorkspaceCommand) -> i32 {
+    match send_workspace_request(endpoint, command).await {
+        Ok(Some(response)) => {
+            println!("{}", serde_json::to_string_pretty(&response).unwrap());
             exit::SUCCESS
         }
-        Err(err) => {
-            eprintln!("failed to mount job {job_id}: {err}");
-            exit::MOUNT
-        }
-    }
-}
-
-/// Unmount an Antares job instance.
-pub async fn antares_umount(job_id: &str) -> i32 {
-    let manager = AntaresManager::new(AntaresPaths::from_global_config()).await;
-    match manager.umount_job(job_id).await {
-        Ok(Some(_)) => {
-            println!("unmounted job {job_id}");
-            exit::SUCCESS
-        }
-        Ok(None) => {
-            eprintln!("job {job_id} not found");
-            exit::MOUNT
-        }
-        Err(err) => {
-            eprintln!("failed to unmount job {job_id}: {err}");
-            exit::MOUNT
-        }
-    }
-}
-
-/// List tracked Antares job instances.
-pub async fn antares_list() -> i32 {
-    let manager = AntaresManager::new(AntaresPaths::from_global_config()).await;
-    let items = manager.list().await;
-    if items.is_empty() {
-        println!("no active jobs");
-    } else {
-        for it in items {
-            let cl = it
-                .cl_dir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(none)".to_string());
-            println!(
-                "job_id={} mount={} upper={} cl={}",
-                it.job_id,
-                it.mountpoint.display(),
-                it.upper_dir.display(),
-                cl
-            );
-        }
-    }
-    exit::SUCCESS
-}
-
-/// Run the standalone Antares HTTP daemon (the `antares serve` form).
-pub async fn antares_serve(addr: SocketAddr) -> i32 {
-    use crate::daemon::antares::AntaresDaemon;
-
-    // Bind up-front so a bind failure maps to the dedicated exit code (4).
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("failed to bind Antares HTTP address {addr}: {e}");
-            return exit::BIND;
-        }
-    };
-    tracing::info!("starting Antares daemon on {addr}");
-
-    let service = Arc::new(AntaresServiceImpl::new(None).await);
-    let daemon = AntaresDaemon::new(service);
-    if let Err(e) = daemon.serve_with_listener(listener).await {
-        tracing::error!("daemon error: {e}");
-        return exit::INTERNAL;
-    }
-    exit::SUCCESS
-}
-
-/// Mount via a running HTTP daemon (recommended for build systems). `endpoint`
-/// is the base URL; the request is sent to `{endpoint}/mounts`.
-pub async fn http_mount(job_id: Option<&str>, path: &str, cl: Option<&str>, endpoint: &str) -> i32 {
-    // Use the async reqwest client: this runs inside the binaries' tokio
-    // runtime, where reqwest::blocking would panic.
-    let client = reqwest::Client::new();
-    let url = format!("{}/mounts", endpoint.trim_end_matches('/'));
-    let payload = serde_json::json!({
-        "job_id": job_id,
-        "path": path,
-        "cl": cl,
-    });
-
-    match client
-        .post(url)
-        .header("content-type", "application/json")
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-            Ok(v) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
-                );
-                exit::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("failed to parse response json: {e}");
-                exit::INTERNAL
-            }
-        },
-        Ok(r) => {
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            eprintln!("http mount failed: status={status} body={body}");
-            exit::MOUNT
-        }
-        Err(e) => {
-            eprintln!("http mount request failed: {e}");
+        Ok(None) => exit::SUCCESS,
+        Err(error) => {
+            eprintln!("workspace request failed: {error}");
             exit::INTERNAL
         }
     }
 }
 
+async fn send_workspace_request(
+    endpoint: &str,
+    command: WorkspaceCommand,
+) -> Result<Option<serde_json::Value>, String> {
+    use reqwest::{Method, StatusCode};
+    use serde_json::json;
+
+    let mut url = url::Url::parse(endpoint).map_err(|_| "invalid daemon URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("daemon URL must use HTTP(S) without credentials, query or fragment".into());
+    }
+    let (method, mut id, suffix, body) = match command {
+        WorkspaceCommand::Create {
+            scope,
+            view_id,
+            full,
+        } => {
+            crate::snapshot::auth::validate_scope(&scope).map_err(|e| e.to_string())?;
+            let target = if let Some(view_id) = view_id {
+                crate::snapshot::frames::parse_digest(&view_id).map_err(|e| e.to_string())?;
+                json!({"kind": "view", "view_id": view_id})
+            } else {
+                json!({"kind": "latest"})
+            };
+            (
+                Method::POST,
+                None,
+                None,
+                Some(json!({
+                    "target": target,
+                    "scope": scope,
+                    "delivery": if full { "full" } else { "lazy" },
+                    "upper_policy": "private",
+                })),
+            )
+        }
+        WorkspaceCommand::List => (Method::GET, None, None, None),
+        WorkspaceCommand::Status { id } => (Method::GET, Some(id), None, None),
+        WorkspaceCommand::Hydrate { id } => (Method::POST, Some(id), Some("hydrate"), None),
+        WorkspaceCommand::CancelHydrate { id } => {
+            (Method::POST, Some(id), Some("hydrate/cancel"), None)
+        }
+        WorkspaceCommand::ReleaseLocalPin { id } => {
+            (Method::POST, Some(id), Some("local-pin/release"), None)
+        }
+        WorkspaceCommand::Destroy { id, discard_dirty } => (
+            Method::POST,
+            Some(id),
+            Some("destroy"),
+            Some(json!({"discard_dirty": discard_dirty})),
+        ),
+    };
+    if let Some(id) = &mut id {
+        *id = uuid::Uuid::parse_str(id)
+            .map_err(|_| "workspace ID must be a UUID")?
+            .to_string();
+    }
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "invalid daemon URL path")?;
+        segments.pop_if_empty().push("v3").push("workspaces");
+        if let Some(id) = &id {
+            segments.push(id);
+        }
+        if let Some(suffix) = suffix {
+            segments.extend(suffix.split('/'));
+        }
+    }
+    // Never replay a mutating request after a timeout or follow a redirect to
+    // another lifecycle owner. The daemon retains admitted operations itself.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client.request(method, url);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let mut response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    const RESPONSE_CAP: usize = 4 * 1024 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|length| length > RESPONSE_CAP as u64)
+    {
+        return Err("workspace response exceeds 4 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if chunk.len() > RESPONSE_CAP - bytes.len() {
+            return Err("workspace response exceeds 4 MiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "status={status} body={}",
+            String::from_utf8_lossy(&bytes)
+        ));
+    }
+    if status == StatusCode::NO_CONTENT && bytes.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("invalid response JSON: {e}"))
+}
 /// `scorpio config init`: write a config template to `path`.
 ///
 /// Does not require an existing/valid config. Refuses to overwrite unless
