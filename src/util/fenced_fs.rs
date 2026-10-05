@@ -54,11 +54,14 @@ impl<FS> FencedFilesystem<FS> {
     /// control owner is dropped. The lifecycle caller must keep this inner Arc
     /// private and expose no Weak capability that could resurrect an owner.
     pub(crate) async fn wait_for_retired_owners(
-        &self,
+        &mut self,
         timeout: std::time::Duration,
     ) -> std::io::Result<()> {
         tokio::time::timeout(timeout, async {
-            while Arc::strong_count(&self.inner) != 1 {
+            // get_mut checks actual uniqueness with Acquire synchronization,
+            // including absence of Weak capabilities; a relaxed count alone
+            // cannot publish a waiting RELEASE cancellation's Unknown flag.
+            while Arc::get_mut(&mut self.inner).is_none() {
                 if self.fence.is_uncertain() {
                     return Err(std::io::Error::other(
                         "native handle retirement has an unknown outcome",

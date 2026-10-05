@@ -272,12 +272,12 @@ impl AntaresFuse {
         Ok(())
     }
 
-    async fn finish_overlay_retirement(&self) -> std::io::Result<()> {
-        if let Some(overlay) = &self.overlay {
+    async fn finish_overlay_retirement(&mut self) -> std::io::Result<()> {
+        if let Some(overlay) = &mut self.overlay {
             // Session completion does not join asyncfuse's worker requests.
             // Every mounted wrapper and retained native future owns this exact
-            // private Arc; no Weak capability to it is exposed. Once only the
-            // control owner remains, no old request can enter the fence later.
+            // private Arc. Acquire-synchronized uniqueness also excludes Weak
+            // capabilities, so no old request can enter the fence later.
             overlay
                 .wait_for_retired_owners(tokio::time::Duration::from_secs(5))
                 .await?;

@@ -641,7 +641,7 @@ async fn retirement_wait_tracks_a_cancelled_caller_until_modern_copy_and_orphan_
     let fixture = Fixture::new(false, true).with_large_file(Large::with_full_chunks(5));
     let server = Server::start(fixture, 32 * 1024 * 1024).await;
     let (lower, overlay, temp, upper) = overlay(&server).await;
-    let fenced = crate::util::fenced_fs::FencedFilesystem::new(overlay);
+    let mut fenced = crate::util::fenced_fs::FencedFilesystem::new(overlay);
     let req = request();
     let name = OsStr::new("range000");
     let file = fenced.lookup(req, ROOT_INODE, name).await.unwrap().attr.ino;
