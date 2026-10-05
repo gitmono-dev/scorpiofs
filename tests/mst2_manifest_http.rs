@@ -557,7 +557,7 @@ async fn hydrate_full_batches(
     let client = reader.client().clone();
     let sid = reader.snapshot_id().to_string();
     store
-        .hydrate_snapshot_batches(
+        .hydrate_snapshot_batches::<_, _, Vec<u8>, Vec<u8>>(
             reader,
             closure,
             2,
@@ -770,7 +770,7 @@ async fn assert_raw_concurrent_hydration(seeded: bool) {
     assert!(http.fixture.object_requests.lock().unwrap().is_empty());
     assert_eq!(store.snapshot_manifest().unwrap().pages(), closure.pages());
     let resumed = store
-        .hydrate_snapshot_concurrent(&reader, &closure, 3, |_| {
+        .hydrate_snapshot_concurrent::<_, Vec<u8>>(&reader, &closure, 3, |_| {
             Box::pin(async { panic!("cache hits must not fetch") })
         })
         .await
@@ -968,9 +968,9 @@ async fn full_snapshot_commit_update_and_rename_keep_old_view_and_reuse_content(
     );
     assert_eq!(
         wrong_store
-            .hydrate_snapshot_concurrent(&reader, &old_closure, 4, |_| Box::pin(async {
-                panic!("mismatched fixed closure must be rejected before fetch")
-            }))
+            .hydrate_snapshot_concurrent::<_, Vec<u8>>(&reader, &old_closure, 4, |_| Box::pin(
+                async { panic!("mismatched fixed closure must be rejected before fetch") }
+            ))
             .await
             .unwrap_err()
             .code,
