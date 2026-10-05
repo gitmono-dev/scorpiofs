@@ -41,6 +41,9 @@ pub struct Mst2Client {
     /// The lease this client resolved, sent as `X-Mega-Snapshot-Lease` on
     /// snapshot-bound requests (spec 04 §1: identity in headers, not URLs).
     lease: Arc<StdMutex<Option<String>>>,
+    /// An immutable credential snapshot used by a resolved reader. Pool and
+    /// counters remain shared; configuration changes affect future resolves.
+    bound_credentials: Option<Arc<BoundCredentials>>,
     /// Transport-level retries performed (metrics, spec 13 §6).
     retries: Arc<AtomicU64>,
     /// Payload bytes received (frame/blob bodies), for the "transfer is
@@ -50,6 +53,11 @@ pub struct Mst2Client {
     /// Wire bytes cannot prove a range read stayed narrow when a frame is
     /// compressed, but the unit count can.
     units_fetched: Arc<AtomicU64>,
+}
+
+struct BoundCredentials {
+    token: Option<String>,
+    lease: Option<String>,
 }
 
 /// Retry policy for idempotent reads: bounded attempts, exponential
@@ -76,21 +84,73 @@ impl Mst2Client {
             base: base_url.into().trim_end_matches('/').to_string(),
             token: Arc::new(StdMutex::new(token)),
             lease: Arc::new(StdMutex::new(None)),
+            bound_credentials: None,
             retries: Arc::new(AtomicU64::new(0)),
             recv_bytes: Arc::new(AtomicU64::new(0)),
             units_fetched: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Set or clear the bearer credential (e.g. after loading config).
+    /// Set or clear the bearer credential for future requests/resolves.
+    /// Resolved readers keep their immutable credential snapshot.
     pub fn set_token(&self, token: Option<String>) {
         *self.token.lock().unwrap() = token;
     }
 
     /// Bind the lease produced by [`Mst2Client::resolve`]; it rides every
-    /// subsequent request as `X-Mega-Snapshot-Lease`. Called by the reader.
+    /// subsequent unbound request as `X-Mega-Snapshot-Lease`. Readers bind a
+    /// private immutable lease instead, so this cannot change their identity.
     pub fn bind_lease(&self, lease_id: &str) {
         *self.lease.lock().unwrap() = Some(lease_id.to_string());
+    }
+
+    fn credentials(&self) -> (Option<String>, Option<String>) {
+        match &self.bound_credentials {
+            Some(bound) => (bound.token.clone(), bound.lease.clone()),
+            None => (
+                self.token.lock().unwrap().clone(),
+                self.lease.lock().unwrap().clone(),
+            ),
+        }
+    }
+
+    /// Freeze the actor before starting resolve, and remove any previous
+    /// lease. Rotation while resolve is in flight must not rebind its actor.
+    pub(crate) fn for_resolve(&self) -> Self {
+        let (token, _) = self.credentials();
+        let mut client = self.clone();
+        client.token = Arc::new(StdMutex::new(token.clone()));
+        client.lease = Arc::new(StdMutex::new(None));
+        client.bound_credentials = Some(Arc::new(BoundCredentials { token, lease: None }));
+        client
+    }
+
+    /// Conservative cache partition for the frozen actor credential. Token
+    /// rotation deliberately yields a new partition even if an issuer maps
+    /// both credentials to the same actor. Never log the token itself.
+    pub fn credential_partition(&self) -> String {
+        use ring::digest::{Context, SHA256};
+        let (token, _) = self.credentials();
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"scorpio.mst2.actor-credential\0");
+        match token {
+            Some(token) => {
+                digest.update(b"bearer\0");
+                digest.update(token.as_bytes());
+            }
+            None => digest.update(b"unauthenticated-lab\0"),
+        }
+        hex::encode(digest.finish().as_ref())
+    }
+
+    pub(crate) fn with_snapshot_lease(&self, lease_id: &str) -> Self {
+        let (token, _) = self.credentials();
+        let mut client = self.clone();
+        client.bound_credentials = Some(Arc::new(BoundCredentials {
+            token,
+            lease: Some(lease_id.to_string()),
+        }));
+        client
     }
 
     /// Content units (objects/chunks) this client has fetched so far.
@@ -122,8 +182,7 @@ impl Mst2Client {
         // Spec 04 §1: identity travels in headers — bearer credential plus
         // the resolved lease — never in the URL.
         let builder = {
-            let token = self.token.lock().unwrap().clone();
-            let lease = self.lease.lock().unwrap().clone();
+            let (token, lease) = self.credentials();
             let mut b = builder;
             if let Some(t) = token {
                 b = b.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
@@ -295,10 +354,11 @@ async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, Snaps
             http_status: status.as_u16(),
         });
     }
-    Err(SnapshotError::new(
-        SnapshotErrorCode::Internal,
-        format!("HTTP {status} without error envelope"),
-    ))
+    Err(SnapshotError {
+        code: SnapshotErrorCode::Internal,
+        message: format!("HTTP {status} without error envelope"),
+        http_status: status.as_u16(),
+    })
 }
 
 /// Statuses worth another attempt: throttling and transient server faults.
@@ -325,10 +385,19 @@ async fn sleep_backoff(attempt: u32) {
 }
 
 fn net_err(e: reqwest::Error) -> SnapshotError {
-    SnapshotError::new(SnapshotErrorCode::Internal, format!("network: {e}"))
+    let code = if retryable_transport(&e) || e.is_body() {
+        SnapshotErrorCode::TemporaryUnavailable
+    } else {
+        SnapshotErrorCode::Internal
+    };
+    SnapshotError::new(code, format!("network: {e}"))
 }
 fn de_err(e: reqwest::Error) -> SnapshotError {
-    SnapshotError::new(SnapshotErrorCode::Internal, format!("decode: {e}"))
+    if !e.is_decode() && (retryable_transport(&e) || e.is_body()) {
+        net_err(e)
+    } else {
+        SnapshotError::new(SnapshotErrorCode::IntegrityError, format!("decode: {e}"))
+    }
 }
 
 fn hex_lower(b: &[u8]) -> String {
