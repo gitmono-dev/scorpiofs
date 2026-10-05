@@ -2983,20 +2983,30 @@ impl AntaresServiceImpl {
         let mut index = self.path_index.write().await;
         let mut job_index = self.job_index.write().await;
 
-        for (mount_id, mut entry) in mounts.drain() {
+        let mut failure = None;
+        // Do not drain owned entries across an await: cancellation of the
+        // outer shutdown deadline must preserve current and remaining handles.
+        let mount_ids: Vec<_> = mounts.keys().copied().collect();
+        for mount_id in mount_ids {
             tracing::info!("Unmounting {} during shutdown", mount_id);
+            let entry = mounts.get_mut(&mount_id).expect("locked mount entry");
             entry.preload_cancel.store(true, Ordering::Relaxed);
             if let Err(e) = entry.fuse.unmount().await {
                 tracing::warn!("Failed to unmount {} during shutdown: {}", mount_id, e);
-                // Continue with other mounts even if one fails
+                let reason = format!("failed to unmount {mount_id} during shutdown: {e}");
+                failure.get_or_insert_with(|| reason.clone());
+                entry.state = MountLifecycle::Failed { reason };
+                entry.update_last_seen();
+            } else {
+                mounts.remove(&mount_id);
+                index.retain(|_, indexed_id| *indexed_id != mount_id);
+                job_index.retain(|_, indexed_id| *indexed_id != mount_id);
             }
         }
-        // All mounts drained; clear indices.
-        // TODO(antares): If we ever decide to keep failed-unmount mounts in memory/state for
-        // later retry, revisit index cleanup to avoid inconsistencies.
-        index.clear();
-        job_index.clear();
-        Ok(())
+        match failure {
+            Some(reason) => Err(ServiceError::FuseFailure(reason)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3177,6 +3187,7 @@ impl AntaresService for AntaresServiceImpl {
                     .await?,
             ),
         };
+        let snapshot_lower = matches!(&lower, MountLower::Snapshot(_));
 
         // 6. Create AntaresFuse instance (may take time, not holding lock)
         let sealed = request
@@ -3324,16 +3335,9 @@ impl AntaresService for AntaresServiceImpl {
         // Persist state to file for recovery
         self.persist_state().await;
 
-        // Transition to Ready immediately.
-        //
-        // By this point Dicfuse's `import_arc()` → `load_dir_depth()` (Phase 1) has
-        // already populated the in-memory directory cache.  Any FUSE `statx` that
-        // arrives now will hit the Dicfuse memory cache (~1 ms) instead of making a
-        // network round-trip (~100 ms).  Waiting for `deep_preload_walk` (Phase 2)
-        // to push those entries into the **kernel** FUSE cache would save ~1 ms per
-        // statx but costs ~140 s of startup latency — unacceptable for CI.
-        //
-        // Phase 2 still runs in the background as a best-effort optimisation.
+        // Mount readiness is separate from hydration. The snapshot root has
+        // verified metadata, but neither child pages nor bodies are promised
+        // to be present until their explicit read/hydration operations finish.
         {
             let mut mounts = self.mounts.write().await;
             if let Some(entry) = mounts.get_mut(&mount_id) {
@@ -3342,19 +3346,22 @@ impl AntaresService for AntaresServiceImpl {
                     entry.update_last_seen();
                     tracing::info!(
                         mount_id = %mount_id,
-                        "antares svc: mount is Ready (Dicfuse cache warm, kernel cache warming in background)"
+                        "antares svc: mount is Ready"
                     );
                 }
             }
         }
 
-        // Best-effort: warm FUSE kernel caches in the background.
-        self.spawn_deep_preload_task(
-            mount_id,
-            mountpoint_str.clone(),
-            preload_cancel.clone(),
-            "create_mount",
-        );
+        // Snapshot mounts preserve demand-driven child metadata loading. An
+        // automatic recursive stat walk defeats that property on monorepos.
+        if !snapshot_lower {
+            self.spawn_deep_preload_task(
+                mount_id,
+                mountpoint_str.clone(),
+                preload_cancel.clone(),
+                "create_mount",
+            );
+        }
 
         Ok(MountCreated {
             mount_id,

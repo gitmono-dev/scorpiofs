@@ -7,7 +7,10 @@ use libfuse_fs::{
     util::whiteout::WhiteoutFormat,
 };
 
-use crate::{server::mount_filesystem_with_antares_cache, util::fuse_platform};
+use crate::{
+    server::mount_filesystem_with_antares_cache,
+    util::{fenced_fs::FencedFilesystem, fuse_platform, mutation_fence::MutationFence},
+};
 
 /// Antares records deletions with the OCI whiteout form (`.wh.<name>`) instead of the
 /// Linux kernel-overlayfs character-device form.
@@ -95,6 +98,11 @@ pub struct AntaresFuse {
     pub frozen_dirs: Vec<PathBuf>,
     /// Live FUSE session. Drop / [`MountHandle::unmount`] tears the mount down.
     mount_handle: Option<MountHandle>,
+    /// The native session and lifecycle owner use the same operation fence.
+    overlay: Option<FencedFilesystem<OverlayFs>>,
+    /// A failed helper fallback still needs an explicit unmount retry even
+    /// after the native session handle has been consumed.
+    unmount_failed: bool,
 }
 impl AntaresFuse {
     /// Build directories for upper / optional CL layers.
@@ -122,12 +130,18 @@ impl AntaresFuse {
             cl_dir,
             frozen_dirs: Vec::new(),
             mount_handle: None,
+            overlay: None,
+            unmount_failed: false,
         })
     }
 
     /// Keep the same fixed base when rebuilding only the writable layers.
     pub fn base_layer(&self) -> Arc<dyn Layer> {
         self.base_layer.clone()
+    }
+
+    pub fn mutation_fence(&self) -> Option<&MutationFence> {
+        self.overlay.as_ref().map(FencedFilesystem::fence)
     }
 
     /// Attach sealed chain layers (chain forks). Each path must be an existing
@@ -186,13 +200,17 @@ impl AntaresFuse {
         if self.mount_handle.is_some() {
             return Ok(());
         }
+        if self.unmount_failed {
+            self.unmount().await?;
+        }
 
         // Ensure mountpoint exists *before* mounting. This is a plain filesystem check.
         // Do not probe it *after* mounting, because that may trigger FUSE getattr and can fail
         // transiently while Dicfuse is still loading.
         std::fs::metadata(&self.mountpoint)?;
 
-        let overlay = self.build_overlay().await?;
+        let overlay = FencedFilesystem::new(self.build_overlay().await?);
+        self.overlay = Some(overlay.clone());
         let logfs = LoggingFileSystem::new(overlay);
         // Keep Antares mounts on the safer non-writeback path for now.
         // With writeback cache enabled, reopening an existing file in append mode
@@ -204,6 +222,7 @@ impl AntaresFuse {
         // uses nix::mount::unmount; Linux uses fusermount3). Spawning a task
         // that owns the handle would force a fusermount fallback.
         self.mount_handle = Some(handle);
+        self.unmount_failed = false;
 
         // Readiness probe: wait until the FUSE mount is actually servicing requests.
         // Without this, callers (e.g., Buck2) that immediately stat() the mountpoint
@@ -240,34 +259,103 @@ impl AntaresFuse {
         Ok(())
     }
 
+    async fn recover_copy_up_ownership(&self) -> std::io::Result<()> {
+        if let Some(overlay) = &self.overlay {
+            overlay.fence().seal().await?;
+            // The void FUSE destroy callback can only log cleanup errors.
+            // Keep this exact overlay and its source ledger until recovery
+            // confirms real closure. Handle retirement remains admitted after
+            // seal, so recheck its actual outcome after recovery as well.
+            overlay.inner().recover_all_copyups().await?;
+            overlay.fence().seal().await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_overlay_retirement(&mut self) -> std::io::Result<()> {
+        if let Some(overlay) = &mut self.overlay {
+            // Session completion does not join asyncfuse's worker requests.
+            // Every mounted wrapper and retained native future owns this exact
+            // private Arc. Acquire-synchronized uniqueness also excludes Weak
+            // capabilities, so no old request can enter the fence later.
+            overlay
+                .wait_for_retired_owners(tokio::time::Duration::from_secs(5))
+                .await?;
+        }
+        self.recover_copy_up_ownership().await
+    }
+
     /// Unmount the FUSE session if mounted.
     ///
     /// Prefers [`MountHandle::unmount`] (asyncfuse native path). Falls back to
     /// the platform helper (`fusermount3` on Linux, `umount` on macOS).
     pub async fn unmount(&mut self) -> std::io::Result<()> {
+        // Do not consume the native handle while a write or orphan-handle
+        // cleanup is still running, or when its outcome is unknown.
+        self.recover_copy_up_ownership().await?;
         let Some(handle) = self.mount_handle.take() else {
+            if self.unmount_failed {
+                let result = fuse_platform::unmount_path(&self.mountpoint, true).await;
+                let result = if result.is_ok() {
+                    self.finish_overlay_retirement().await
+                } else {
+                    result
+                };
+                self.unmount_failed = result.is_err();
+                if result.is_ok() {
+                    self.overlay = None;
+                }
+                return result;
+            }
+            if self.overlay.is_some() {
+                self.unmount_failed = true;
+                let result = self.finish_overlay_retirement().await;
+                self.unmount_failed = result.is_err();
+                if result.is_ok() {
+                    self.overlay = None;
+                }
+                return result;
+            }
             return Ok(());
         };
         let mount_path = self.mountpoint.clone();
-        match tokio::time::timeout(tokio::time::Duration::from_millis(1200), handle.unmount()).await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    path = %mount_path.display(),
-                    error = %e,
-                    "MountHandle::unmount failed; falling back to platform unmount"
-                );
-                fuse_platform::unmount_path(&mount_path, true).await
-            }
-            Err(_) => {
-                tracing::warn!(
-                    path = %mount_path.display(),
-                    "MountHandle::unmount timed out; falling back to platform unmount"
-                );
-                fuse_platform::unmount_path(&mount_path, true).await
-            }
+        // Cancellation after consuming the native handle must also require
+        // an explicit retry, rather than treating None as successful cleanup.
+        self.unmount_failed = true;
+        let result =
+            match tokio::time::timeout(tokio::time::Duration::from_millis(1200), handle.unmount())
+                .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        path = %mount_path.display(),
+                        error = %e,
+                        "MountHandle::unmount failed; falling back to platform unmount"
+                    );
+                    fuse_platform::unmount_path(&mount_path, true).await
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        path = %mount_path.display(),
+                        "MountHandle::unmount timed out; falling back to platform unmount"
+                    );
+                    fuse_platform::unmount_path(&mount_path, true).await
+                }
+            };
+        // Native session teardown and helper fallback can overlap actual late
+        // RELEASE calls. Drain again before discarding the control owner; a
+        // failed/unknown cleanup keeps the owner and explicit retry state.
+        let result = if result.is_ok() {
+            self.finish_overlay_retirement().await
+        } else {
+            result
+        };
+        self.unmount_failed = result.is_err();
+        if result.is_ok() {
+            self.overlay = None;
         }
+        result
     }
 }
 
@@ -278,7 +366,10 @@ mod tests {
         ffi::{OsStr, OsString},
         num::NonZeroU32,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
     };
 
     use async_trait::async_trait;
@@ -333,7 +424,7 @@ mod tests {
     #[derive(Debug)]
     struct MemUpperLayer {
         next_inode: AtomicU64,
-        state: tokio::sync::RwLock<MemState>,
+        state: Arc<std::sync::RwLock<MemState>>,
     }
 
     impl MemUpperLayer {
@@ -355,7 +446,7 @@ mod tests {
             );
             Self {
                 next_inode: AtomicU64::new(1),
-                state: tokio::sync::RwLock::new(st),
+                state: Arc::new(std::sync::RwLock::new(st)),
             }
         }
 
@@ -393,7 +484,7 @@ mod tests {
             kind: FileType,
             perm: u16,
         ) -> std::io::Result<u64> {
-            let mut st = self.state.write().await;
+            let mut st = self.state.write().unwrap();
             let parent_node = st
                 .nodes
                 .get(&parent)
@@ -430,12 +521,12 @@ mod tests {
         }
 
         async fn get_child_inode(&self, parent: u64, name: &OsStr) -> Option<u64> {
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             st.children.get(&parent).and_then(|m| m.get(name).copied())
         }
 
         async fn read_file_by_name(&self, name: &str) -> Option<Vec<u8>> {
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let ino = st
                 .children
                 .get(&1)
@@ -464,7 +555,7 @@ mod tests {
                 .get_child_inode(parent, name)
                 .await
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
@@ -483,7 +574,7 @@ mod tests {
             _fh: Option<u64>,
             _flags: u32,
         ) -> FuseResult<ReplyAttr> {
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
@@ -522,7 +613,7 @@ mod tests {
             offset: u64,
             size: u32,
         ) -> FuseResult<ReplyData> {
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
@@ -550,7 +641,7 @@ mod tests {
             _write_flags: u32,
             _flags: u32,
         ) -> FuseResult<ReplyWrite> {
-            let mut st = self.state.write().await;
+            let mut st = self.state.write().unwrap();
             let node = st
                 .nodes
                 .get_mut(&inode)
@@ -620,7 +711,7 @@ mod tests {
         > {
             use futures::stream::iter;
 
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let parent_node = st
                 .nodes
                 .get(&parent)
@@ -719,10 +810,143 @@ mod tests {
         }
     }
 
+    /// A test destination remains outside MemState's visible namespace until
+    /// complete bytes are promoted; synchronous ownership permits real Drop
+    /// rollback without spawning or waiting for a cleanup task.
+    struct MemCopyUp {
+        state: Arc<std::sync::RwLock<MemState>>,
+        node: Option<MemNode>,
+        inode: u64,
+        parent: u64,
+        final_name: Option<OsString>,
+        committed: bool,
+    }
+
+    #[async_trait]
+    impl libfuse_fs::unionfs::copy_up::CopyUpFile for MemCopyUp {
+        async fn write(&mut self, offset: u64, data: &[u8]) -> std::io::Result<u32> {
+            let offset: usize = offset
+                .try_into()
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            let end = offset
+                .checked_add(data.len())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            let written: u32 = data
+                .len()
+                .try_into()
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            let node = self
+                .node
+                .as_mut()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            node.data.resize(end.max(node.data.len()), 0);
+            node.data[offset..end].copy_from_slice(data);
+            Ok(written)
+        }
+
+        fn promote(&mut self, name: &OsStr) -> std::io::Result<()> {
+            let mut state = self.state.write().unwrap();
+            let parent = state
+                .nodes
+                .get(&self.parent)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            if parent.kind != FileType::Directory {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+            if state
+                .children
+                .get(&self.parent)
+                .is_some_and(|children| children.contains_key(name))
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+            }
+            let node = self
+                .node
+                .take()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            state.nodes.insert(self.inode, node);
+            state
+                .children
+                .entry(self.parent)
+                .or_default()
+                .insert(name.to_os_string(), self.inode);
+            self.final_name = Some(name.to_os_string());
+            Ok(())
+        }
+
+        fn verify_promotion(&self) -> std::io::Result<()> {
+            let state = self.state.read().unwrap();
+            let name = self
+                .final_name
+                .as_ref()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            if state
+                .children
+                .get(&self.parent)
+                .and_then(|children| children.get(name))
+                == Some(&self.inode)
+                && state.nodes.contains_key(&self.inode)
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::ESTALE))
+            }
+        }
+
+        fn commit(&mut self) {
+            self.committed = true;
+        }
+    }
+
+    impl Drop for MemCopyUp {
+        fn drop(&mut self) {
+            if self.committed {
+                return;
+            }
+            let Some(name) = &self.final_name else {
+                return;
+            };
+            let mut state = self.state.write().unwrap();
+            let owned = state
+                .children
+                .get(&self.parent)
+                .is_some_and(|children| children.get(name) == Some(&self.inode));
+            if owned {
+                state.children.get_mut(&self.parent).unwrap().remove(name);
+                state.nodes.remove(&self.inode);
+            }
+        }
+    }
+
     #[async_trait]
     impl Layer for MemUpperLayer {
         fn root_inode(&self) -> Inode {
             1
+        }
+
+        async fn begin_copy_up(
+            &self,
+            ctx: OperationContext,
+            parent: Inode,
+            mode: u32,
+        ) -> FuseResult<Box<dyn libfuse_fs::unionfs::copy_up::CopyUpFile>> {
+            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(Box::new(MemCopyUp {
+                state: self.state.clone(),
+                node: Some(MemNode {
+                    inode,
+                    parent,
+                    kind: FileType::RegularFile,
+                    perm: (mode & 0o7777) as u16,
+                    uid: ctx.uid.unwrap_or(ctx.req.uid),
+                    gid: ctx.gid.unwrap_or(ctx.req.gid),
+                    data: Vec::new(),
+                }),
+                inode,
+                parent,
+                final_name: None,
+                committed: false,
+            }))
         }
 
         async fn create_with_context(
@@ -737,7 +961,7 @@ mod tests {
                 .create_child(parent, name, FileType::RegularFile, 0o644)
                 .await
                 .map_err(asyncfuse::Errno::from)?;
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
@@ -763,7 +987,7 @@ mod tests {
                 .create_child(parent, name, FileType::Directory, 0o755)
                 .await
                 .map_err(asyncfuse::Errno::from)?;
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)

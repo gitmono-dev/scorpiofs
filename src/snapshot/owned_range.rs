@@ -180,6 +180,7 @@ impl LeafCache {
 pub struct OwnedChunkedFile {
     reader: SnapshotReader,
     file: SnapshotFile,
+    proven: Option<Arc<super::ProvenSnapshotFile>>,
     map: VerifiedChunkMap,
     leaves: tokio::sync::Mutex<LeafCache>,
     chunks: tokio::sync::Mutex<ChunkCache>,
@@ -205,21 +206,51 @@ impl OwnedChunkedFile {
             return Err(invalid("range tuple differs from the fixed-root file"));
         }
         file.rel_path = path.into();
+        Self::open_file(reader, file, None).await
+    }
+
+    /// Open using selective fixed-root membership without a full closure walk.
+    pub async fn open_proven(
+        reader: &SnapshotReader,
+        proven: Arc<super::ProvenSnapshotFile>,
+    ) -> Result<Self, SnapshotError> {
+        proven.validate(reader).await?;
+        Self::open_file(reader, proven.file().clone(), Some(proven)).await
+    }
+
+    async fn open_file(
+        reader: &SnapshotReader,
+        file: SnapshotFile,
+        proven: Option<Arc<super::ProvenSnapshotFile>>,
+    ) -> Result<Self, SnapshotError> {
+        if !(OBJECT_CAP + 1..=super::range::MAX_FILE_SIZE).contains(&file.size) {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "owned chunk range requires a large file within 8 TiB",
+            ));
+        }
         let chunks = ChunkCache::new(reader)?;
         let map = reader
             .client()
-            .chunk_map(reader.snapshot_id(), path, digest)
+            .chunk_map(reader.snapshot_id(), &file.rel_path, &file.content_digest)
             .await?;
-        if map.file_size != size {
+        if map.file_size != file.size {
             return Err(invalid("chunk map differs from fixed-root size"));
         }
         Ok(Self {
             reader: reader.clone(),
             file,
+            proven,
             map,
             leaves: tokio::sync::Mutex::new(LeafCache::new()),
             chunks: tokio::sync::Mutex::new(chunks),
         })
+    }
+    async fn validate_file(&self) -> Result<(), SnapshotError> {
+        match &self.proven {
+            Some(proven) => proven.validate(&self.reader).await,
+            None => self.reader.validate_content_member(&self.file).await,
+        }
     }
     pub fn size(&self) -> u64 {
         self.file.size
@@ -251,7 +282,7 @@ impl OwnedChunkedFile {
         offset: u64,
         length: u64,
     ) -> Result<Arc<VerifiedRange>, SnapshotError> {
-        self.reader.validate_content_member(&self.file).await?;
+        self.validate_file().await?;
         let returned = if offset >= self.file.size {
             0
         } else {
@@ -310,7 +341,7 @@ impl OwnedChunkedFile {
     }
 
     async fn ensure_chunk(&self, index: u64) -> Result<Arc<VerifiedChunk>, SnapshotError> {
-        self.reader.validate_content_member(&self.file).await?;
+        self.validate_file().await?;
         if let Some(owner) = self.chunks.lock().await.get(index) {
             return Ok(owner);
         }
@@ -413,7 +444,7 @@ impl OwnedChunkedFile {
     }
 
     async fn ensure_leaf(&self, page: u64) -> Result<Arc<Vec<[u8; 32]>>, SnapshotError> {
-        self.reader.validate_content_member(&self.file).await?;
+        self.validate_file().await?;
         if let Some(digests) = self.leaves.lock().await.get(page) {
             return Ok(digests);
         }

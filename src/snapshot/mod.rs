@@ -20,6 +20,7 @@ pub mod durable;
 pub mod error_wire;
 pub mod frames;
 pub mod fuse;
+mod fuse_owned;
 pub mod incremental;
 pub mod layer;
 mod lease_wire;
@@ -28,6 +29,7 @@ mod owned_range;
 mod owned_reader;
 mod owned_transport;
 mod path_state;
+mod proven_file;
 pub mod range;
 pub mod reader;
 mod resolve_receipt;
@@ -48,6 +50,7 @@ pub use path_state::{
     MetadataProofLimits, SnapshotDirectoryEntry, SnapshotNodeIdentity, SnapshotNodeKind,
     SnapshotPathState,
 };
+pub use proven_file::{FileMembershipError, ProvenSnapshotFile};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use resolve_receipt::ResolveTraceReceipt;

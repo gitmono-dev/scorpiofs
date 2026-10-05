@@ -7,7 +7,6 @@
 
 use std::{
     collections::HashMap,
-    ffi::OsStr,
     io::{self, Write},
     net::SocketAddr,
     path::PathBuf,
@@ -15,15 +14,11 @@ use std::{
     time::Duration,
 };
 
-use asyncfuse::raw::logfs::LoggingFileSystem;
 use tokio::sync::oneshot;
 
 use crate::{
     antares::{AntaresManager, AntaresPaths},
     daemon::{antares::AntaresServiceImpl, daemon_main},
-    fuse::MegaFuse,
-    manager::{fetch::CheckHash, ScorpioManager},
-    server::mount_filesystem,
     util::{config, logging},
 };
 
@@ -81,64 +76,31 @@ pub fn init(
     Ok(())
 }
 
-/// Run the workspace daemon: mount the FUSE workspace and serve the HTTP API
-/// (including the nested Antares routes) until a shutdown signal. Assumes
-/// [`init`] has already loaded configuration.
+/// Run the workspace control daemon until a shutdown signal. Filesystems are
+/// mounted by explicit requests, after selecting their fixed lower view.
+/// Assumes [`init`] has already loaded configuration.
 pub async fn serve(http_addr: SocketAddr) -> i32 {
-    let mut manager = match ScorpioManager::from_toml(config::config_file()) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("failed to load state file '{}': {e}", config::config_file());
-            return exit::CONFIG;
-        }
-    };
-    manager.check().await;
-
-    let fuse_interface = MegaFuse::new_from_manager(&manager).await;
-    let mountpoint = OsStr::new(config::workspace());
-    let lgfs = LoggingFileSystem::new(fuse_interface.clone());
-    let mut mount_handle = match mount_filesystem(lgfs, mountpoint).await {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!("failed to mount workspace at {:?}: {e}", mountpoint);
-            return exit::MOUNT;
-        }
-    };
-
     // Bind the HTTP listener up-front so a bind failure is a clean exit (code 4)
     // rather than a panic inside the daemon task.
     let listener = match tokio::net::TcpListener::bind(http_addr).await {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("failed to bind HTTP address {http_addr}: {e}");
-            let _ = mount_handle.unmount().await;
             return exit::BIND;
         }
     };
     tracing::info!("server running on {http_addr}");
 
+    let service = Arc::new(AntaresServiceImpl::new(None).await);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let mut daemon_task = tokio::spawn(daemon_main(
-        Arc::new(fuse_interface),
-        manager,
-        shutdown_rx,
-        listener,
-    ));
+    let mut daemon_task = tokio::spawn(daemon_main(service.clone(), shutdown_rx, listener));
 
     let mut exit_code = exit::SUCCESS;
-    let mut mount_finished = false;
     let mut daemon_finished = false;
 
-    // Wait for whichever happens first: the FUSE session ends, the HTTP daemon
-    // exits (e.g. a runtime server error), or a shutdown signal arrives.
+    // The daemon owns its explicitly created mounts. There is no separate
+    // dictionary workspace session to initialize or supervise at startup.
     tokio::select! {
-        res = &mut mount_handle => {
-            mount_finished = true;
-            if let Err(e) = res {
-                tracing::error!("FUSE session ended with error: {e:?}");
-                exit_code = exit::INTERNAL;
-            }
-        }
         res = &mut daemon_task => {
             daemon_finished = true;
             match res {
@@ -156,11 +118,11 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
         _ = shutdown_signal() => {}
     }
 
-    // Stop the HTTP server first (this triggers Antares shutdown cleanup), then
-    // unmount the main workspace filesystem.
+    // Drain HTTP requests before cleaning up their mounts: an admitted create
+    // must finish recording its handle before shutdown drains the service.
     let _ = shutdown_tx.send(());
     if !daemon_finished {
-        match tokio::time::timeout(Duration::from_secs(20), &mut daemon_task).await {
+        match tokio::time::timeout(Duration::from_secs(35), &mut daemon_task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => {
                 tracing::error!("HTTP daemon server error: {e}");
@@ -173,15 +135,15 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
             Err(_) => {
                 tracing::warn!("HTTP daemon shutdown timed out; aborting task");
                 daemon_task.abort();
+                let _ = daemon_task.await;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(15), service.shutdown_cleanup_impl())
+                        .await;
                 exit_code = exit::INTERNAL;
             }
         }
     }
 
-    if !mount_finished {
-        tracing::info!("unmounting workspace filesystem");
-        let _ = mount_handle.unmount().await;
-    }
     exit_code
 }
 
