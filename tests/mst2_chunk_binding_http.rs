@@ -161,6 +161,78 @@ fn canonical_leaf(fixture: &Fixture) -> Value {
 }
 
 #[tokio::test]
+async fn chunk_leaf_base64_rejects_illegal_padding_and_nonzero_unused_bits() {
+    for count in 1..=3 {
+        let leaf = ChunkLeaf {
+            page_index: 0,
+            chunk_sha256: vec![[0x51; 32]; count],
+        };
+        let map = ChunkMap::new(
+            [42; 32],
+            (count as u64 - 1) * CHUNK_SIZE as u64 + 7,
+            leaf.leaf_hash().unwrap(),
+        )
+        .unwrap();
+        let fixture = Fixture {
+            content: id(&map.file_content_id),
+            map,
+            leaf,
+        };
+        let valid = canonical_leaf(&fixture);
+        let encoded = valid["leaf_base64"].as_str().unwrap();
+        let server = Server::start(Value::Null, valid.clone()).await;
+        assert_eq!(
+            server
+                .client
+                .chunk_map_page_canonical(SID, PATH, &fixture.content, &fixture.verified(), 0)
+                .await
+                .unwrap()
+                .chunk_sha256,
+            fixture.leaf.chunk_sha256
+        );
+        let mut bad = Vec::new();
+        for position in [8, 9] {
+            let mut illegal = encoded.as_bytes().to_vec();
+            assert_eq!(illegal[position], b'A');
+            illegal[position] = b'=';
+            bad.push(String::from_utf8(illegal).unwrap());
+        }
+        if encoded.ends_with('=') {
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let padding = if encoded.ends_with("==") { 2 } else { 1 };
+            let mut unused_bits = encoded.as_bytes().to_vec();
+            let index = unused_bits.len() - padding - 1;
+            let symbol = ALPHABET
+                .iter()
+                .position(|byte| *byte == unused_bits[index])
+                .unwrap();
+            unused_bits[index] = ALPHABET[symbol + 1];
+            bad.push(String::from_utf8(unused_bits).unwrap());
+        }
+        for encoded in bad {
+            let mut canonical = valid.clone();
+            canonical["leaf_base64"] = json!(encoded);
+            let mut legacy = fixture.leaf_body();
+            legacy["leaf"]["count"] = json!(count.to_string());
+            legacy["leaf"]["data_base64"] = canonical["leaf_base64"].clone();
+            let server = Server::start(Value::Null, canonical).await;
+            assert!(server
+                .client
+                .chunk_map_page_canonical(SID, PATH, &fixture.content, &fixture.verified(), 0)
+                .await
+                .is_err());
+            let server = Server::start(Value::Null, legacy).await;
+            assert!(server
+                .client
+                .chunk_map_page(SID, PATH, &fixture.content, &fixture.verified(), 0)
+                .await
+                .is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn canonical_page_proof_is_bound_to_nonzero_index_and_tree_shape() {
     let left = ChunkLeaf {
         page_index: 0,

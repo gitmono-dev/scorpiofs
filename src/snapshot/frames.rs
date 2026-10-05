@@ -178,34 +178,43 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, SnapshotError> {
             _ => return None,
         })
     };
+    let invalid = || {
+        SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "invalid canonical padded base64",
+        )
+    };
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(4) {
-        return Err(SnapshotError::new(
-            SnapshotErrorCode::Internal,
-            "base64 bad length",
-        ));
+        return Err(invalid());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.as_chunks::<4>().0 {
-        let v = |c: u8| -> Result<u8, SnapshotError> {
-            if c == b'=' {
-                Ok(0)
-            } else {
-                dec(c).ok_or_else(|| {
-                    SnapshotError::new(SnapshotErrorCode::Internal, "base64 bad char")
-                })
+    let groups = bytes.as_chunks::<4>().0;
+    for (index, chunk) in groups.iter().enumerate() {
+        let a = dec(chunk[0]).ok_or_else(invalid)?;
+        let b = dec(chunk[1]).ok_or_else(invalid)?;
+        let final_group = index + 1 == groups.len();
+        if chunk[2] == b'=' {
+            if !final_group || chunk[3] != b'=' || b & 0x0f != 0 {
+                return Err(invalid());
             }
-        };
-        let (a, b, c, d) = (v(chunk[0])?, v(chunk[1])?, v(chunk[2])?, v(chunk[3])?);
+            out.push((a << 2) | (b >> 4));
+            continue;
+        }
+        let c = dec(chunk[2]).ok_or_else(invalid)?;
+        if chunk[3] == b'=' {
+            if !final_group || c & 0x03 != 0 {
+                return Err(invalid());
+            }
+            out.push((a << 2) | (b >> 4));
+            out.push((b & 0x0f) << 4 | (c >> 2));
+            continue;
+        }
+        let d = dec(chunk[3]).ok_or_else(invalid)?;
         // All shifts stay within u8: masks keep the top bits bounded.
         out.push((a << 2) | (b >> 4));
         out.push((b & 0x0f) << 4 | (c >> 2));
         out.push((c & 0x03) << 6 | d);
-        if chunk[2] == b'=' {
-            out.truncate(out.len() - 2);
-        } else if chunk[3] == b'=' {
-            out.truncate(out.len() - 1);
-        }
     }
     Ok(out)
 }
