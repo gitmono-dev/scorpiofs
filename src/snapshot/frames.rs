@@ -257,10 +257,24 @@ impl Mst2Client {
         format!("{}/api/v2/snapshots{tail}", self.base())
     }
 
-    /// GET `/{sid}/descriptor`: never re-resolves latest.
+    /// GET `/{sid}/descriptor`: validate the explicit bare or legacy wrapper
+    /// contract and canonical identity, retaining the original JSON shape.
+    /// This never re-resolves latest or establishes a new lease authority.
     pub async fn descriptor(&self, sid: &str) -> Result<serde_json::Value, SnapshotError> {
-        self.get_json(&self.snap_url(&format!("/{sid}/descriptor")))
-            .await
+        let value = self
+            .get_json(&self.snap_url(&format!("/{sid}/descriptor")))
+            .await?;
+        super::descriptor_wire::validate(&value, sid)?;
+        Ok(value)
+    }
+
+    /// Retrieve a normalized descriptor with a verified fixed snapshot identity.
+    /// Lease fields in a legacy wrapper remain hints, not reader authorization.
+    pub async fn verified_descriptor(&self, sid: &str) -> Result<super::Descriptor, SnapshotError> {
+        let value = self
+            .get_json(&self.snap_url(&format!("/{sid}/descriptor")))
+            .await?;
+        super::descriptor_wire::validate(&value, sid)
     }
 
     pub async fn renew_lease(
