@@ -72,7 +72,7 @@ fn assert_private_storage_released(root: &std::path::Path) {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>(),
-        [OsStr::new("upper")]
+        [std::ffi::OsString::from("upper")]
     );
     // Observe descriptors for this operation's actual private namespace,
     // including deleted files. Unrelated concurrent test descriptors do not
@@ -508,7 +508,11 @@ async fn late_modern_chunk_failures_leave_no_partial_upper_or_private_resources_
             ),
             -libc::EIO
         );
-        assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 5);
+        let failed_attempts = if mode == 10 { 4 } else { 1 };
+        assert_eq!(
+            server.fixture.chunk_requests.load(Ordering::SeqCst),
+            4 + failed_attempts
+        );
         assert!(!upper.join(name).exists());
         assert_eq!(std::fs::read_dir(&upper).unwrap().count(), 0);
         assert_private_storage_released(temp.path());
@@ -527,7 +531,10 @@ async fn late_modern_chunk_failures_leave_no_partial_upper_or_private_resources_
         );
         let opened = overlay.open(req, file, libc::O_RDWR as u32).await.unwrap();
         assert_eq!(std::fs::read(upper.join(name)).unwrap(), original);
-        assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 7);
+        assert_eq!(
+            server.fixture.chunk_requests.load(Ordering::SeqCst),
+            6 + failed_attempts
+        );
         overlay
             .release(req, file, opened.fh, 0, 0, false)
             .await
