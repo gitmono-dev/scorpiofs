@@ -259,6 +259,19 @@ impl AntaresFuse {
         Ok(())
     }
 
+    async fn recover_copy_up_ownership(&self) -> std::io::Result<()> {
+        if let Some(overlay) = &self.overlay {
+            overlay.fence().seal().await?;
+            // The void FUSE destroy callback can only log cleanup errors.
+            // Keep this exact overlay and its source ledger until recovery
+            // confirms real closure. Handle retirement remains admitted after
+            // seal, so recheck its actual outcome after recovery as well.
+            overlay.inner().recover_all_copyups().await?;
+            overlay.fence().seal().await?;
+        }
+        Ok(())
+    }
+
     /// Unmount the FUSE session if mounted.
     ///
     /// Prefers [`MountHandle::unmount`] (asyncfuse native path). Falls back to
@@ -266,17 +279,15 @@ impl AntaresFuse {
     pub async fn unmount(&mut self) -> std::io::Result<()> {
         // Do not consume the native handle while a write or orphan-handle
         // cleanup is still running, or when its outcome is unknown.
-        if let Some(overlay) = &self.overlay {
-            overlay.fence().seal().await?;
-            // The void FUSE destroy callback can only log cleanup errors.
-            // Keep this exact overlay and its source ledger until recovery
-            // confirms real closure; an error or caller cancellation must
-            // leave the native handle available for an explicit retry.
-            overlay.inner().recover_all_copyups().await?;
-        }
+        self.recover_copy_up_ownership().await?;
         let Some(handle) = self.mount_handle.take() else {
             if self.unmount_failed {
                 let result = fuse_platform::unmount_path(&self.mountpoint, true).await;
+                let result = if result.is_ok() {
+                    self.recover_copy_up_ownership().await
+                } else {
+                    result
+                };
                 self.unmount_failed = result.is_err();
                 if result.is_ok() {
                     self.overlay = None;
@@ -311,6 +322,14 @@ impl AntaresFuse {
                     fuse_platform::unmount_path(&mount_path, true).await
                 }
             };
+        // Native session teardown and helper fallback can overlap actual late
+        // RELEASE calls. Drain again before discarding the control owner; a
+        // failed/unknown cleanup keeps the owner and explicit retry state.
+        let result = if result.is_ok() {
+            self.recover_copy_up_ownership().await
+        } else {
+            result
+        };
         self.unmount_failed = result.is_err();
         if result.is_ok() {
             self.overlay = None;
