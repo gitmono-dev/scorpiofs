@@ -138,9 +138,11 @@ impl Layer for Mst2Fuse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use asyncfuse::{raw::prelude::*, Errno};
     use std::ffi::OsStr;
+
+    use asyncfuse::{raw::prelude::*, Errno};
+
+    use super::*;
 
     /// An empty view: no reader, no store, no entries. Enough to exercise the
     /// layer surface without a server.
@@ -192,10 +194,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(erofs(err), "setattr: {err:?}");
-        let err = fs
-            .setxattr(req, 1, name, b"v", 0, 0)
-            .await
-            .unwrap_err();
+        let err = fs.setxattr(req, 1, name, b"v", 0, 0).await.unwrap_err();
         assert!(erofs(err), "setxattr: {err:?}");
         let err = fs.removexattr(req, 1, name).await.unwrap_err();
         assert!(erofs(err), "removexattr: {err:?}");

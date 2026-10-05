@@ -22,12 +22,15 @@
 //!   copy is retried if the source moved; if it will not settle, the fork fails
 //!   rather than producing a child that never existed.
 
-use std::collections::BTreeSet;
-use std::fs;
-use std::io;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs, io,
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        io::AsRawFd,
+    },
+    path::{Path, PathBuf},
+};
 
 /// The VCS metadata directory inside a mount. It is a reconstructable pointer, not
 /// part of the writable delta, so it is never copied — the child gets its own.
