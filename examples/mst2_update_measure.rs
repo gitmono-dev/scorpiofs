@@ -323,13 +323,15 @@ async fn measure(stage: &mut &'static str) -> Result<(), Box<dyn std::error::Err
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::*;
+    use std::{path::Path, process::Command};
+
     use mst2_codec::{
         descriptor::ServingDescriptor,
         metapage::{page_id, Entry, EntryKind, Page},
     };
     use scorpiofs::snapshot::{durable::digest_of, ValidatedSnapshotClosure};
-    use std::{path::Path, process::Command};
+
+    use super::*;
 
     async fn fixture(root: &Path, content: &Path, version: u8, body: &[u8]) -> Expected {
         let digest = digest_of(body);
