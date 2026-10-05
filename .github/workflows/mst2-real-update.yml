@@ -6,7 +6,7 @@ on:
       mega_sha:
         description: Immutable reviewed Mega2 server SHA
         required: true
-        default: c6c1d5c839f73a717192fec6e403c1ed320148f1
+        default: 3400d62cdaa3948aef822f07af8230f1fb100a27
       profile:
         type: choice
         description: Fixture size
