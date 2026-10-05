@@ -353,7 +353,7 @@ mod tests {
     #[derive(Debug)]
     struct MemUpperLayer {
         next_inode: AtomicU64,
-        state: tokio::sync::RwLock<MemState>,
+        state: Arc<std::sync::RwLock<MemState>>,
     }
 
     impl MemUpperLayer {
@@ -375,7 +375,7 @@ mod tests {
             );
             Self {
                 next_inode: AtomicU64::new(1),
-                state: tokio::sync::RwLock::new(st),
+                state: Arc::new(std::sync::RwLock::new(st)),
             }
         }
 
@@ -413,7 +413,7 @@ mod tests {
             kind: FileType,
             perm: u16,
         ) -> std::io::Result<u64> {
-            let mut st = self.state.write().await;
+            let mut st = self.state.write().unwrap();
             let parent_node = st
                 .nodes
                 .get(&parent)
@@ -450,12 +450,12 @@ mod tests {
         }
 
         async fn get_child_inode(&self, parent: u64, name: &OsStr) -> Option<u64> {
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             st.children.get(&parent).and_then(|m| m.get(name).copied())
         }
 
         async fn read_file_by_name(&self, name: &str) -> Option<Vec<u8>> {
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let ino = st
                 .children
                 .get(&1)
@@ -484,7 +484,7 @@ mod tests {
                 .get_child_inode(parent, name)
                 .await
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
@@ -503,7 +503,7 @@ mod tests {
             _fh: Option<u64>,
             _flags: u32,
         ) -> FuseResult<ReplyAttr> {
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
@@ -542,7 +542,7 @@ mod tests {
             offset: u64,
             size: u32,
         ) -> FuseResult<ReplyData> {
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
@@ -570,7 +570,7 @@ mod tests {
             _write_flags: u32,
             _flags: u32,
         ) -> FuseResult<ReplyWrite> {
-            let mut st = self.state.write().await;
+            let mut st = self.state.write().unwrap();
             let node = st
                 .nodes
                 .get_mut(&inode)
@@ -640,7 +640,7 @@ mod tests {
         > {
             use futures::stream::iter;
 
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let parent_node = st
                 .nodes
                 .get(&parent)
@@ -739,10 +739,141 @@ mod tests {
         }
     }
 
+    /// A test destination remains outside MemState's visible namespace until
+    /// complete bytes are promoted; synchronous ownership permits real Drop
+    /// rollback without spawning or waiting for a cleanup task.
+    struct MemCopyUp {
+        state: Arc<std::sync::RwLock<MemState>>,
+        node: Option<MemNode>,
+        inode: u64,
+        parent: u64,
+        final_name: Option<OsString>,
+        committed: bool,
+    }
+
+    #[async_trait]
+    impl libfuse_fs::unionfs::copy_up::CopyUpFile for MemCopyUp {
+        async fn write(&mut self, offset: u64, data: &[u8]) -> std::io::Result<u32> {
+            let offset: usize = offset
+                .try_into()
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            let end = offset
+                .checked_add(data.len())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            let written: u32 = data
+                .len()
+                .try_into()
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            let node = self
+                .node
+                .as_mut()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            node.data.resize(end.max(node.data.len()), 0);
+            node.data[offset..end].copy_from_slice(data);
+            Ok(written)
+        }
+
+        fn promote(&mut self, name: &OsStr) -> std::io::Result<()> {
+            let mut state = self.state.write().unwrap();
+            let parent = state
+                .nodes
+                .get(&self.parent)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            if parent.kind != FileType::Directory {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+            if state
+                .children
+                .get(&self.parent)
+                .is_some_and(|children| children.contains_key(name))
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+            }
+            let node = self
+                .node
+                .take()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            state.nodes.insert(self.inode, node);
+            state
+                .children
+                .entry(self.parent)
+                .or_default()
+                .insert(name.to_os_string(), self.inode);
+            self.final_name = Some(name.to_os_string());
+            Ok(())
+        }
+
+        fn verify_promotion(&self) -> std::io::Result<()> {
+            let state = self.state.read().unwrap();
+            let name = self
+                .final_name
+                .as_ref()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            if state
+                .children
+                .get(&self.parent)
+                .and_then(|children| children.get(name))
+                == Some(&self.inode)
+                && state.nodes.contains_key(&self.inode)
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::ESTALE))
+            }
+        }
+
+        fn commit(&mut self) {
+            self.committed = true;
+        }
+    }
+
+    impl Drop for MemCopyUp {
+        fn drop(&mut self) {
+            if self.committed {
+                return;
+            }
+            let Some(name) = &self.final_name else {
+                return;
+            };
+            let mut state = self.state.write().unwrap();
+            if let Some(children) = state.children.get_mut(&self.parent) {
+                if children.get(name) == Some(&self.inode) {
+                    children.remove(name);
+                    state.nodes.remove(&self.inode);
+                }
+            }
+        }
+    }
+
     #[async_trait]
     impl Layer for MemUpperLayer {
         fn root_inode(&self) -> Inode {
             1
+        }
+
+        async fn begin_copy_up(
+            &self,
+            ctx: OperationContext,
+            parent: Inode,
+            mode: u32,
+        ) -> FuseResult<Box<dyn libfuse_fs::unionfs::copy_up::CopyUpFile>> {
+            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(Box::new(MemCopyUp {
+                state: self.state.clone(),
+                node: Some(MemNode {
+                    inode,
+                    parent,
+                    kind: FileType::RegularFile,
+                    perm: (mode & 0o7777) as u16,
+                    uid: ctx.uid.unwrap_or(ctx.req.uid),
+                    gid: ctx.gid.unwrap_or(ctx.req.gid),
+                    data: Vec::new(),
+                }),
+                inode,
+                parent,
+                final_name: None,
+                committed: false,
+            }))
         }
 
         async fn create_with_context(
@@ -757,7 +888,7 @@ mod tests {
                 .create_child(parent, name, FileType::RegularFile, 0o644)
                 .await
                 .map_err(asyncfuse::Errno::from)?;
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
@@ -783,7 +914,7 @@ mod tests {
                 .create_child(parent, name, FileType::Directory, 0o755)
                 .await
                 .map_err(asyncfuse::Errno::from)?;
-            let st = self.state.read().await;
+            let st = self.state.read().unwrap();
             let node = st
                 .nodes
                 .get(&inode)
