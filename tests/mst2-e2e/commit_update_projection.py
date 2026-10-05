@@ -339,6 +339,8 @@ class ProjectionCollector:
         while time.monotonic() < until:
             try:
                 snapshot = self.snapshot(closed)
+                if time.monotonic() >= until:
+                    raise TraceRejected("native projection acknowledgement exceeded its original deadline")
                 if required_id is not None and required_id not in snapshot[1]:
                     if snapshot[0]["closed"]:
                         reject()
