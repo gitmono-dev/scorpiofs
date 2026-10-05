@@ -369,6 +369,37 @@ impl SnapshotReader {
         scope: &str,
         lease_seconds: u64,
     ) -> Result<Self, SnapshotError> {
+        Ok(Self::resolve_internal(client, scope, lease_seconds, None)
+            .await?
+            .0)
+    }
+
+    /// Resolve once with opt-in trace correlation. The returned receipt belongs
+    /// to the same response that establishes this reader's fixed authority.
+    pub async fn resolve_observed(
+        client: Mst2Client,
+        scope: &str,
+        lease_seconds: u64,
+        logical_request_id: &str,
+    ) -> Result<(Self, super::ResolveTraceReceipt), SnapshotError> {
+        super::resolve_receipt::validate_logical_id(logical_request_id)?;
+        let (reader, receipt) =
+            Self::resolve_internal(client, scope, lease_seconds, Some(logical_request_id)).await?;
+        let receipt = receipt.ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "observed resolve is missing its receipt",
+            )
+        })?;
+        Ok((reader, receipt))
+    }
+
+    async fn resolve_internal(
+        client: Mst2Client,
+        scope: &str,
+        lease_seconds: u64,
+        logical_request_id: Option<&str>,
+    ) -> Result<(Self, Option<super::ResolveTraceReceipt>), SnapshotError> {
         let client = client.for_resolve();
         let caps = client.capabilities().await?;
         if !caps.features.resolve || !caps.features.directory {
@@ -383,7 +414,13 @@ impl SnapshotReader {
                 "server does not support metadata codec 1",
             ));
         }
-        let res = client.resolve(scope, lease_seconds).await?;
+        let (res, receipt) = match logical_request_id {
+            Some(id) => {
+                let (response, receipt) = client.resolve_observed(scope, lease_seconds, id).await?;
+                (response, Some(receipt))
+            }
+            None => (client.resolve(scope, lease_seconds).await?, None),
+        };
         let context = AuthorizedSnapshotContext::new(
             client.base(),
             &client.credential_partition(),
@@ -409,15 +446,20 @@ impl SnapshotReader {
         if tokio::runtime::Handle::try_current().is_ok() {
             lease.spawn(client.clone());
         }
-        Ok(Self {
-            client,
-            context,
-            lease_id: res.lease_id,
-            caps,
-            lease,
-            content_scope: super::content::ContentBudget::new(super::ContentBudgetLimits::default()),
-            content_membership: Arc::new(tokio::sync::OnceCell::new()),
-        })
+        Ok((
+            Self {
+                client,
+                context,
+                lease_id: res.lease_id,
+                caps,
+                lease,
+                content_scope: super::content::ContentBudget::new(
+                    super::ContentBudgetLimits::default(),
+                ),
+                content_membership: Arc::new(tokio::sync::OnceCell::new()),
+            },
+            receipt,
+        ))
     }
 
     /// Renew the view's retention lease if it is close to expiry. Called
