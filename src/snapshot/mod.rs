@@ -35,6 +35,7 @@ pub mod reader;
 mod resolve_receipt;
 mod resolve_wire;
 pub mod types;
+pub mod upper_diff;
 pub mod workspace_pins;
 
 pub use auth::{AuthorizedSnapshotContext, CacheDomain};

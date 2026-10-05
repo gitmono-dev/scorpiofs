@@ -472,3 +472,335 @@ async fn cached_namespace_still_checks_advertised_negative_path_limits() {
     );
     assert_eq!(server.paths(), ["/"]);
 }
+
+#[cfg(unix)]
+fn upper_file(path: &std::path::Path, bytes: &[u8], mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, bytes).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+fn upper_directory(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir(path).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_upper_diff_compares_modes_empty_directories_and_symlink_target_bytes() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits, UpperChangeKind},
+        util::mutation_fence::MutationFence,
+    };
+    let server = Server::start(Fixture::new()).await;
+    let view = Arc::new(
+        Mst2Fuse::from_reader_lazy(server.reader().await, None)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let fence = MutationFence::new(4);
+    let pause = fence.pause().await.unwrap();
+    assert!(scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default()
+    )
+    .await
+    .unwrap()
+    .is_clean());
+    upper_file(&temp.path().join("plain"), b"plain", 0o644);
+    upper_directory(&temp.path().join("empty"));
+    symlink("used", temp.path().join("sym")).unwrap();
+    let diff = scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert!(diff.is_clean());
+    assert_eq!(diff.meters.hash_bytes, 9);
+    std::fs::set_permissions(
+        temp.path().join("plain"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    upper_directory(&temp.path().join("new-empty"));
+    symlink("/missing-outside-target", temp.path().join("outside-link")).unwrap();
+    let diff = scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        diff.changes
+            .iter()
+            .map(|change| (change.rel_path.as_str(), change.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("new-empty", UpperChangeKind::Added),
+            ("outside-link", UpperChangeKind::Added),
+            ("plain", UpperChangeKind::Modified)
+        ]
+    );
+    assert!(!server.paths().iter().any(|path| path == "/unused"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upper_whiteouts_include_directories_and_opaque_ancestors_hide_nested_lower_children() {
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits, UpperChangeKind},
+        util::mutation_fence::MutationFence,
+    };
+    let server = Server::start(Fixture::new()).await;
+    let view = Arc::new(
+        Mst2Fuse::from_reader_lazy(server.reader().await, None)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let fence = MutationFence::new(4);
+    let pause = fence.pause().await.unwrap();
+    upper_file(&temp.path().join(".wh.plain"), b"", 0o644);
+    upper_file(&temp.path().join(".wh.unused"), b"", 0o644);
+    let diff = scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        diff.changes
+            .iter()
+            .map(|change| (change.rel_path.as_str(), change.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("plain", UpperChangeKind::Deleted),
+            ("unused", UpperChangeKind::Deleted)
+        ]
+    );
+    assert!(matches!(
+        diff.changes[1].base,
+        Some(SnapshotNodeIdentity::Directory { .. })
+    ));
+    assert_eq!(server.paths(), ["/"]);
+    let temp = tempfile::tempdir().unwrap();
+    upper_file(&temp.path().join(".wh..wh..opq"), b"", 0o644);
+    upper_directory(&temp.path().join("used"));
+    let diff = scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        diff.changes
+            .iter()
+            .map(|change| (change.rel_path.as_str(), change.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("empty", UpperChangeKind::Deleted),
+            ("plain", UpperChangeKind::Deleted),
+            ("sym", UpperChangeKind::Deleted),
+            ("unused", UpperChangeKind::Deleted),
+            ("used/data", UpperChangeKind::Deleted)
+        ]
+    );
+    upper_file(&temp.path().join("used/data"), b"old", 0o644);
+    let diff = scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!diff
+        .changes
+        .iter()
+        .any(|change| change.rel_path == "used/data"));
+    assert!(!server.paths().iter().any(|path| path == "/unused"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upper_directory_replacing_lower_file_derives_child_absence_and_streams_large_files() {
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits, UpperChangeKind},
+        util::mutation_fence::MutationFence,
+    };
+    let server = Server::start(Fixture::new()).await;
+    let view = Arc::new(
+        Mst2Fuse::from_reader_lazy(server.reader().await, None)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let fence = MutationFence::new(4);
+    let pause = fence.pause().await.unwrap();
+    upper_directory(&temp.path().join("plain"));
+    let bytes = vec![0x41; 2 * 1024 * 1024 + 7];
+    upper_file(&temp.path().join("plain/new"), &bytes, 0o644);
+    let diff = scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(diff.meters.hash_bytes, bytes.len() as u64);
+    assert_eq!(
+        diff.changes
+            .iter()
+            .map(|change| (change.rel_path.as_str(), change.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("plain", UpperChangeKind::Modified),
+            ("plain/new", UpperChangeKind::Added)
+        ]
+    );
+    assert_eq!(
+        diff.changes[1].upper.as_ref().unwrap(),
+        &scorpiofs::snapshot::upper_diff::UpperNodeIdentity::Regular {
+            mode: 0o644,
+            size: bytes.len() as u64,
+            content_digest: digest_of(&bytes)
+        }
+    );
+    assert_eq!(server.paths(), ["/"]);
+    assert_eq!(
+        scan_upper(
+            &view,
+            &temp.path().canonicalize().unwrap(),
+            &pause,
+            DiffLimits {
+                max_bytes: 64 * 1024,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        SnapshotErrorCode::ProofBudgetExceeded
+    );
+    assert_eq!(
+        scan_upper(
+            &view,
+            &temp.path().canonicalize().unwrap(),
+            &pause,
+            DiffLimits {
+                max_depth: 0,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        SnapshotErrorCode::ProofBudgetExceeded
+    );
+    assert_eq!(
+        scan_upper(
+            &view,
+            &temp.path().canonicalize().unwrap(),
+            &pause,
+            DiffLimits {
+                max_nodes: 1,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        SnapshotErrorCode::ProofBudgetExceeded
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upper_scan_proof_errors_conflicting_markers_and_unsupported_nodes_cannot_be_clean() {
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits},
+        util::mutation_fence::MutationFence,
+    };
+    let mut fixture = Fixture::new();
+    fixture.fault = Some(("/used", 503, "OBJECT_UNAVAILABLE"));
+    let server = Server::start(fixture).await;
+    let view = Arc::new(
+        Mst2Fuse::from_reader_lazy(server.reader().await, None)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let fence = MutationFence::new(4);
+    let pause = fence.pause().await.unwrap();
+    upper_directory(&temp.path().join("used"));
+    upper_file(&temp.path().join("used/data"), b"old", 0o644);
+    assert_eq!(
+        scan_upper(
+            &view,
+            &temp.path().canonicalize().unwrap(),
+            &pause,
+            DiffLimits::default()
+        )
+        .await
+        .unwrap_err()
+        .code,
+        SnapshotErrorCode::ObjectUnavailable
+    );
+    let temp = tempfile::tempdir().unwrap();
+    upper_file(&temp.path().join(".wh.plain"), b"", 0o644);
+    upper_file(&temp.path().join("plain"), b"plain", 0o644);
+    assert!(scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default()
+    )
+    .await
+    .is_err());
+    let temp = tempfile::tempdir().unwrap();
+    upper_file(&temp.path().join(".wh..wh..opq"), b"invalid", 0o644);
+    assert!(scan_upper(
+        &view,
+        &temp.path().canonicalize().unwrap(),
+        &pause,
+        DiffLimits::default()
+    )
+    .await
+    .is_err());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = std::ffi::CString::new(temp.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            scan_upper(
+                &view,
+                &temp.path().canonicalize().unwrap(),
+                &pause,
+                DiffLimits::default()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::UnsupportedEntry
+        );
+    }
+}
