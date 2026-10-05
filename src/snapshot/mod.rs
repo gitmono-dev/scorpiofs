@@ -41,7 +41,7 @@ pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMete
 pub use frames::LeaseReleaseOutcome;
 pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
 pub use owned_range::{OwnedChunkedFile, VerifiedRange};
-pub use proven_file::ProvenSnapshotFile;
+pub use proven_file::{FileMembershipError, ProvenSnapshotFile};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use types::{

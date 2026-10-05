@@ -571,7 +571,14 @@ async fn initializer_and_caller_admission_reject_before_http_and_restore_on_actu
     .await
     .unwrap();
     assert_eq!(
-        server.reader.prove_file("file004").await.unwrap_err().code,
+        server
+            .reader
+            .prove_file("file004")
+            .await
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(server.fixture.requests.lock().unwrap().len(), 4);
@@ -595,7 +602,14 @@ async fn initializer_and_caller_admission_reject_before_http_and_restore_on_actu
         .try_acquire_many_owned(128)
         .unwrap();
     assert_eq!(
-        server.reader.prove_file("file005").await.unwrap_err().code,
+        server
+            .reader
+            .prove_file("file005")
+            .await
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(server.fixture.requests.lock().unwrap().len(), 4);
@@ -709,7 +723,14 @@ async fn a_hash_valid_child_with_wrong_partition_or_declared_count_is_not_member
         );
         let server = Server::start(fixture).await;
         assert_eq!(
-            server.reader.prove_file("abfile").await.unwrap_err().code,
+            server
+                .reader
+                .prove_file("abfile")
+                .await
+                .unwrap_err()
+                .snapshot_error()
+                .unwrap()
+                .code,
             SnapshotErrorCode::IntegrityError
         );
         assert_eq!(server.fixture.bodies.load(Ordering::SeqCst), 0);
@@ -722,7 +743,14 @@ async fn deep_selected_path_accounts_for_all_repeated_witnesses_before_the_next_
     let (fixture, name) = Fixture::deep_radix(140);
     let server = Server::start(fixture).await;
     assert_eq!(
-        server.reader.prove_file(&name).await.unwrap_err().code,
+        server
+            .reader
+            .prove_file(&name)
+            .await
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::LimitExceeded
     );
     let requests = server.fixture.requests.lock().unwrap();
@@ -783,7 +811,12 @@ async fn incomplete_old_witness_chain_never_substitutes_for_a_new_target() {
     server.fixture.mode.store(3, Ordering::SeqCst);
     server.fixture.release.add_permits(1);
     assert!(matches!(
-        task.await.unwrap().unwrap_err().code,
+        task.await
+            .unwrap()
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::IntegrityError | SnapshotErrorCode::DigestMismatch
     ));
     assert_eq!(server.fixture.requests.lock().unwrap().len(), 2);
@@ -799,7 +832,14 @@ async fn shared_initializer_deadline_cancels_actual_http_and_restores_admission_
         .deadline = Duration::from_millis(50);
     server.fixture.paused.store(true, Ordering::SeqCst);
     assert_eq!(
-        server.reader.prove_file("file000").await.unwrap_err().code,
+        server
+            .reader
+            .prove_file("file000")
+            .await
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(server.fixture.requests.lock().unwrap().len(), 1);
@@ -888,9 +928,15 @@ async fn cached_transferred_proofs_and_owned_reads_keep_current_lease_checks() {
         server.reader.ensure_lease().await.unwrap_err().code,
         SnapshotErrorCode::ScopeForbidden
     );
+    let error = server.reader.prove_file("file000").await.unwrap_err();
+    assert_eq!(error.http_status(), 403);
+    let source = error.snapshot_error().unwrap();
+    assert_eq!(source.code, SnapshotErrorCode::ScopeForbidden);
+    assert_eq!(source.http_status, 403);
+    assert_eq!(error.to_string(), source.to_string());
     assert_eq!(
-        server.reader.prove_file("file000").await.unwrap_err().code,
-        SnapshotErrorCode::ScopeForbidden
+        std::error::Error::source(&error).unwrap().to_string(),
+        source.to_string()
     );
     assert_eq!(
         server
@@ -969,7 +1015,14 @@ async fn actual_waiters_at_local_caller_limit_reject_before_a_second_metadata_re
     .await
     .unwrap();
     assert_eq!(
-        server.reader.prove_file("file000").await.unwrap_err().code,
+        server
+            .reader
+            .prove_file("file000")
+            .await
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(server.fixture.requests.lock().unwrap().len(), 1);
@@ -1024,7 +1077,14 @@ async fn process_initializer_admission_is_shared_across_distinct_reader_instance
     .unwrap();
     let extra = Server::start(Fixture::flat(1)).await;
     assert_eq!(
-        extra.reader.prove_file("file000").await.unwrap_err().code,
+        extra
+            .reader
+            .prove_file("file000")
+            .await
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::LimitExceeded
     );
     assert!(extra.fixture.requests.lock().unwrap().is_empty());
@@ -1058,6 +1118,8 @@ async fn a_waiters_own_deadline_drops_its_credit_without_cancelling_the_live_lea
             .prove_file_deadline("file000", Duration::from_millis(50))
             .await
             .unwrap_err()
+            .snapshot_error()
+            .unwrap()
             .code,
         SnapshotErrorCode::LimitExceeded
     );
@@ -1097,7 +1159,14 @@ async fn selected_membership_rejects_wrong_kinds_missing_paths_and_serving_profi
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::flat(1)).await;
     assert_eq!(
-        server.reader.prove_file("missing").await.unwrap_err().code,
+        server
+            .reader
+            .prove_file("missing")
+            .await
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::PathNotFound
     );
     assert_eq!(
@@ -1106,6 +1175,8 @@ async fn selected_membership_rejects_wrong_kinds_missing_paths_and_serving_profi
             .prove_file("file000/child")
             .await
             .unwrap_err()
+            .snapshot_error()
+            .unwrap()
             .code,
         SnapshotErrorCode::NotDirectory
     );
@@ -1127,7 +1198,14 @@ async fn selected_membership_rejects_wrong_kinds_missing_paths_and_serving_profi
         );
         let server = Server::start(Fixture::from_parts(root, witnesses, pages)).await;
         assert_eq!(
-            server.reader.prove_file("file").await.unwrap_err().code,
+            server
+                .reader
+                .prove_file("file")
+                .await
+                .unwrap_err()
+                .snapshot_error()
+                .unwrap()
+                .code,
             SnapshotErrorCode::LimitExceeded
         );
         assert_eq!(server.fixture.bodies.load(Ordering::SeqCst), 0);
@@ -1139,16 +1217,18 @@ async fn scope_root_existing_directory_and_intermediate_symlink_have_distinct_ty
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::wide()).await;
     for path in ["", "/"] {
-        assert_eq!(
-            server.reader.prove_file(path).await.unwrap_err().code,
-            SnapshotErrorCode::NotFile
-        );
+        let error = server.reader.prove_file(path).await.unwrap_err();
+        assert_eq!(error.http_status(), 0);
+        assert!(error.snapshot_error().is_none());
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(error.to_string().starts_with("NotFile: "));
+        assert!(matches!(error, FileMembershipError::NotFile { .. }));
     }
     assert!(server.fixture.requests.lock().unwrap().is_empty());
-    assert_eq!(
-        server.reader.prove_file("wanted").await.unwrap_err().code,
-        SnapshotErrorCode::NotFile
-    );
+    assert!(matches!(
+        server.reader.prove_file("wanted").await.unwrap_err(),
+        FileMembershipError::NotFile { .. }
+    ));
     assert_eq!(
         server.fixture.requests.lock().unwrap().as_slice(),
         [("/".into(), Vec::new())]
@@ -1174,6 +1254,8 @@ async fn scope_root_existing_directory_and_intermediate_symlink_have_distinct_ty
             .prove_file("link/target")
             .await
             .unwrap_err()
+            .snapshot_error()
+            .unwrap()
             .code,
         SnapshotErrorCode::SymlinkTraversal
     );
@@ -1207,12 +1289,18 @@ async fn full_closure_seed_distinguishes_known_directories_from_absent_paths_wit
     )
     .unwrap();
     server.reader.seed_content_membership(&closure).unwrap();
+    let error = server.reader.prove_file("empty").await.unwrap_err();
+    assert_eq!(error.http_status(), 0);
+    assert!(matches!(error, FileMembershipError::NotFile { .. }));
     assert_eq!(
-        server.reader.prove_file("empty").await.unwrap_err().code,
-        SnapshotErrorCode::NotFile
-    );
-    assert_eq!(
-        server.reader.prove_file("absent").await.unwrap_err().code,
+        server
+            .reader
+            .prove_file("absent")
+            .await
+            .unwrap_err()
+            .snapshot_error()
+            .unwrap()
+            .code,
         SnapshotErrorCode::PathNotFound
     );
     assert!(server.reader.prove_file("file").await.is_ok());
@@ -1222,6 +1310,8 @@ async fn full_closure_seed_distinguishes_known_directories_from_absent_paths_wit
             .prove_file("file/child")
             .await
             .unwrap_err()
+            .snapshot_error()
+            .unwrap()
             .code,
         SnapshotErrorCode::NotDirectory
     );
@@ -1231,6 +1321,8 @@ async fn full_closure_seed_distinguishes_known_directories_from_absent_paths_wit
             .prove_file("link/target")
             .await
             .unwrap_err()
+            .snapshot_error()
+            .unwrap()
             .code,
         SnapshotErrorCode::SymlinkTraversal
     );
