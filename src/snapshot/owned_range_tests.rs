@@ -685,3 +685,55 @@ async fn a_late_cross_chunk_failure_publishes_no_range_and_reuses_the_proven_fir
     drop(owner);
     assert_eq!(server.reader.content_usage().output_bytes, 0);
 }
+
+#[tokio::test]
+async fn transferred_proof_opens_ranges_without_initializing_a_complete_closure() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(2, 8 * 1024 * 1024).await;
+    let proof = server.reader.prove_file("file").await.unwrap();
+    let consumer = SnapshotReader::resolve(
+        super::super::Mst2Client::new(server.reader.client().base()),
+        "/project",
+        600,
+    )
+    .await
+    .unwrap();
+    assert!(consumer.content_membership.get().is_none());
+    let file = OwnedChunkedFile::open_proven(&consumer, proof)
+        .await
+        .unwrap();
+    assert_eq!(
+        file.read_range_owned(CHUNK_SIZE as u64 - 2, 5)
+            .await
+            .unwrap()
+            .as_bytes(),
+        [0, 0, 1, 1, 1]
+    );
+    assert_eq!(
+        file.read_range_owned(CHUNK_SIZE as u64 - 2, 5)
+            .await
+            .unwrap()
+            .as_bytes(),
+        [0, 0, 1, 1, 1]
+    );
+    assert!(file
+        .read_range_owned(u64::MAX, u64::MAX)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 2);
+    assert!(consumer.content_membership.get().is_none());
+    let foreign = Server::start(2, 8 * 1024 * 1024).await;
+    let foreign_proof = foreign.reader.prove_file("file").await.unwrap();
+    assert_eq!(
+        OwnedChunkedFile::open_proven(&consumer, foreign_proof)
+            .await
+            .err()
+            .unwrap()
+            .code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
+    drop(file);
+    assert_eq!(consumer.content_usage().output_bytes, 0);
+}
