@@ -716,7 +716,8 @@ fn previous_unchanged(previous: &DurableStore, marker: &[u8], digest: &str) {
     assert!(previous
         .verify_blob(
             digest,
-            b"content of a different already committed snapshot".len() as u64
+            b"content of a different already committed snapshot".len() as u64,
+            CasVerificationReason::CompletionAudit,
         )
         .unwrap());
 }

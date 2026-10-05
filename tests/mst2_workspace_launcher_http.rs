@@ -329,6 +329,7 @@ struct Launcher {
     temp: tempfile::TempDir,
     base: String,
     mounts: Vec<PathBuf>,
+    performance: bool,
 }
 
 impl Drop for Launcher {
@@ -352,6 +353,15 @@ impl Drop for Launcher {
 
 impl Launcher {
     fn start(upstream: &str, addr: std::net::SocketAddr) -> Self {
+        Self::start_mode(upstream, addr, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_performance(upstream: &str, addr: std::net::SocketAddr) -> Self {
+        Self::start_mode(upstream, addr, true)
+    }
+
+    fn start_mode(upstream: &str, addr: std::net::SocketAddr, performance: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let mut config = toml::Table::new();
         for (key, value) in [
@@ -385,17 +395,25 @@ impl Launcher {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_scorpio")));
         let log = File::create(temp.path().join("launcher.log")).unwrap();
-        let child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .env_clear()
             .envs(
                 std::env::vars_os()
                     .filter(|(key, _)| !key.to_string_lossy().starts_with("SCORPIO_")),
             )
+            // Ordinary launches exercise the shipped default filter; an
+            // inherited developer/CI filter must not opt them into meters.
+            .env_remove("RUST_LOG")
             .arg("--config-path")
             .arg(path)
             .arg("serve")
             .arg("--http-addr")
-            .arg(addr.to_string())
+            .arg(addr.to_string());
+        if performance {
+            command.args(["--log-level", "scorpiofs::workspace::performance=debug"]);
+        }
+        let child = command
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -405,11 +423,125 @@ impl Launcher {
             temp,
             base: format!("http://{addr}"),
             mounts: Vec::new(),
+            performance,
         }
     }
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.temp.path().join("launcher.log")).unwrap()
+    }
+
+    fn assert_performance_disabled(&self) {
+        assert!(!self.performance);
+        let log = self.log();
+        for marker in [
+            "workspace_stage",
+            "workspace stage wall time",
+            "cas_cumulative",
+            "workspace CAS verification totals",
+        ] {
+            assert!(
+                !log.contains(marker),
+                "ordinary launcher emitted opt-in meter marker {marker}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_performance_records(&self, workspace: &Value) {
+        assert!(self.performance);
+        // The shipped formatter may decorate fields with ANSI SGR sequences.
+        // Remove decoration only; assertions still inspect its actual records.
+        let log = strip_ansi(&self.log());
+        let id = workspace["workspace_id"].as_str().unwrap();
+        let generation = workspace["generation"].as_str().unwrap();
+        let sid = workspace["snapshot_id"].as_str().unwrap();
+        let owner = format!("workspace_id={id}");
+        let generation = format!("generation={generation}");
+        let lines: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains(&owner) && line.contains(&generation))
+            .collect();
+        assert!(
+            !lines.is_empty(),
+            "performance records lack the actual workspace/generation"
+        );
+        for stage in [
+            "resolve",
+            "store_bind",
+            "root_metadata_proof",
+            "private_paths_prepare",
+            "native_mount_prepare",
+            "native_mount_ready",
+            "native_readiness_check",
+            "upper_scan",
+            "hydrate_metadata_closure",
+            "cas_resume_audit",
+            "small_object_fetch_write",
+            "large_content_fetch_write",
+            "durable_hydration_commit",
+            "local_pin_audit",
+            "local_pin_release",
+        ] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("workspace stage wall time")
+                        && line.contains(&format!("stage=\"{stage}\""))
+                        && line.contains("elapsed_us=")
+                        && line.contains("completed=true")),
+                "actual daemon lacks completed owner stage {stage}"
+            );
+        }
+        let fixed = format!("snapshot_id={sid}");
+        let metadata_stage = lines
+            .iter()
+            .find(|line| {
+                line.contains("workspace stage wall time")
+                    && line.contains("stage=\"hydrate_metadata_closure\"")
+                    && line.contains(&fixed)
+                    && line.contains("elapsed_us=")
+            })
+            .expect("actual hydration stage must retain the workspace's fixed SID");
+        let hydration = lines
+            .iter()
+            .find(|line| {
+                line.contains("workspace CAS verification totals")
+                    && line.contains("operation=\"hydration\"")
+                    && line.contains(&fixed)
+            })
+            .expect("hydration totals must retain the actual fixed SID");
+        let release = lines
+            .iter()
+            .find(|line| {
+                line.contains("workspace CAS verification totals")
+                    && line.contains("operation=\"release_local_pin\"")
+            })
+            .expect("actual pin-release worker must retain owner context and emit its counters");
+        for record in [*hydration, *release] {
+            for field in [
+                "store_root=",
+                "cas_cumulative=",
+                "cas_resume=",
+                "cas_completion_audit=",
+                "cas_hydration_commit=",
+                "cas_materialize=",
+            ] {
+                assert!(
+                    record.contains(field),
+                    "actual daemon CAS record lacks {field}"
+                );
+            }
+        }
+        assert!(
+            cumulative_read_bytes(hydration) > 0,
+            "actual hydration must meter real CAS verification reads"
+        );
+        // These are correctness diagnostics from a small kernel fixture,
+        // without speed thresholds or commit/publication performance claims.
+        eprintln!("SHIPPED_DAEMON_STAGE_METERS_RUN: {metadata_stage}");
+        eprintln!("SHIPPED_DAEMON_METERS_RUN: {hydration}");
+        eprintln!("SHIPPED_DAEMON_RELEASE_METERS_RUN: {release}");
     }
 
     async fn ready(&mut self, client: &reqwest::Client) {
@@ -448,6 +580,9 @@ impl Launcher {
         .await
         .unwrap_or_else(|_| panic!("launcher failed to stop: {}", self.log()));
         assert!(status.success(), "shutdown failed: {}", self.log());
+        if !self.performance {
+            self.assert_performance_disabled();
+        }
     }
 
     fn assert_no_dictionary(&self) {
@@ -474,6 +609,41 @@ impl Launcher {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn strip_ansi(value: &str) -> String {
+    let mut output = String::new();
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' && characters.peek() == Some(&'[') {
+            characters.next();
+            for suffix in characters.by_ref() {
+                if suffix.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+#[cfg(target_os = "linux")]
+fn cumulative_read_bytes(record: &str) -> u64 {
+    record
+        .split("cas_cumulative=")
+        .nth(1)
+        .unwrap()
+        .split("read_bytes: ")
+        .nth(1)
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 fn address() -> std::net::SocketAddr {
@@ -633,6 +803,7 @@ async fn bind_failure_precedes_dictionary_and_workspace_initialization() {
     .await
     .expect("bind failure must return promptly");
     assert_eq!(status.code(), Some(4), "{}", launcher.log());
+    launcher.assert_performance_disabled();
     assert!(f.requests.lock().unwrap().is_empty());
     assert!(!launcher.temp.path().join("dictionary").exists());
     launcher.assert_no_dictionary();
@@ -652,7 +823,7 @@ fn mounted(path: &Path) -> bool {
 async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown() {
     let f = Arc::new(Fixture::new());
     let (upstream, _server) = fixture_server(f.clone()).await;
-    let mut launcher = Launcher::start(&upstream, address());
+    let mut launcher = Launcher::start_performance(&upstream, address());
     let client = client();
     launcher.ready(&client).await;
     let mut ids = Vec::new();
@@ -1105,6 +1276,7 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     eprintln!("RUNNING_HYDRATION_CANCEL_RUN: actual pending OBJECT cancelled through service; fixed owner retried to FullSnapshot");
     drop(old_fd);
     launcher.stop().await;
+    launcher.assert_performance_records(&third);
     assert!(!mounted(&old));
     assert!(!mounted(&new));
     assert_eq!(

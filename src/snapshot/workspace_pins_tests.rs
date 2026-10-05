@@ -116,6 +116,54 @@ fn assert_full(store: &DurableStore, f: &Fixture) {
 }
 
 #[tokio::test]
+async fn opt_in_release_meter_counts_other_owner_audits_and_corrupt_body_reads() {
+    let f = Fixture::new();
+    let mut first = f.owner(2);
+    let second = f.owner(3);
+    let third = f.owner(4);
+    for store in [&first, &second, &third] {
+        f.hydrate(store).await;
+        assert!(store.verification_meters().is_none());
+    }
+    f.add_record();
+    let meters = first.enable_verification_meters();
+    let receipt = first.release_local_pin().unwrap();
+    assert_eq!(meters.snapshot().calls, 2);
+    assert_eq!(meters.snapshot().verified, 2);
+    assert_eq!(meters.snapshot().read_bytes, 2 * f.bytes.len() as u64);
+    assert_eq!(
+        meters
+            .snapshot_for(durable::CasVerificationReason::CompletionAudit)
+            .calls,
+        2
+    );
+    assert!(second.verification_meters().is_none());
+    assert!(third.verification_meters().is_none());
+    assert!(f.cache().record_for("workspace-test-root").is_some());
+
+    let path = first.content_dir().join(hex::encode(
+        parse_digest(&f.closure.files()[0].content_digest).unwrap(),
+    ));
+    fs::write(&path, vec![0x5a; f.bytes.len()]).unwrap();
+    assert_eq!(first.release_local_pin().unwrap(), receipt);
+    let damaged = meters.snapshot();
+    assert_eq!(damaged.digest_mismatches, 2);
+    assert_eq!(damaged.read_bytes, 4 * f.bytes.len() as u64);
+    assert!(
+        f.cache().record_for("workspace-test-root").is_some(),
+        "Unknown owners block pruning even when the caller's own release succeeds"
+    );
+    fs::write(&path, &f.bytes).unwrap();
+    // The inventory revoked damaged completion proofs. Restored bytes alone
+    // cannot restore those proofs; each owner must explicitly hydrate again.
+    f.hydrate(&second).await;
+    f.hydrate(&third).await;
+    assert_eq!(first.release_local_pin().unwrap(), receipt);
+    assert_eq!(meters.snapshot().verified, 4);
+    assert!(f.cache().record_for("workspace-test-root").is_some());
+}
+
+#[tokio::test]
 async fn same_snapshot_owners_keep_independent_complete_closures_and_shared_content() {
     let f = Fixture::new();
     let first = f.owner(2);
