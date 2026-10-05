@@ -33,6 +33,8 @@ enum Mode {
     RetryMissing,
     WrongScope,
     Delay,
+    Canonical,
+    MalformedCanonical,
 }
 
 #[derive(Clone)]
@@ -114,7 +116,17 @@ async fn resolve(
         } else {
             body["scope"].as_str().unwrap()
         };
-        Json(resolved(scope, sequence)).into_response()
+        let mut value = resolved(scope, sequence);
+        if matches!(f.mode, Mode::Canonical | Mode::MalformedCanonical) {
+            value["writer_epoch"] = json!("1");
+            value["resolved_at"] = json!("2026-10-05T00:00:00Z");
+            value["delivery"] = if matches!(f.mode, Mode::Canonical) {
+                json!("full")
+            } else {
+                Value::Null
+            };
+        }
+        Json(value).into_response()
     };
     if !matches!(f.mode, Mode::Missing | Mode::RetryMissing) {
         let id = headers
@@ -381,6 +393,31 @@ async fn observed_attempt_response_wait_uses_the_original_request_deadline() {
         .unwrap_err();
     assert_eq!(error.code, SnapshotErrorCode::TemporaryUnavailable);
     assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(server.fixture.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn observed_resolve_uses_checked_canonical_parser_without_fallback() {
+    let server = Server::start(Mode::Canonical, false).await;
+    let (reader, receipt) = SnapshotReader::resolve_observed(
+        Mst2Client::new(&server.base),
+        "/project",
+        60,
+        "canonical",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reader.snapshot_id(),
+        resolved("/project", 1)["descriptor"]["snapshot_id"]
+    );
+    assert_eq!(receipt.final_attempt_id(), "canonical:a1");
+    let server = Server::start(Mode::MalformedCanonical, false).await;
+    let error = Mst2Client::new(&server.base)
+        .resolve_observed("/project", 60, "malformed")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::IntegrityError);
     assert_eq!(server.fixture.count.load(Ordering::SeqCst), 1);
 }
 
