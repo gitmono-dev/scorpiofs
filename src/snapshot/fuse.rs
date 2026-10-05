@@ -957,7 +957,13 @@ impl Mst2Fuse {
         Ok(entries)
     }
 
-    async fn path_inode(&self, rel_path: &str) -> std::result::Result<Option<u64>, SnapshotError> {
+    /// Validate a scope-relative metadata name without fetching its parent.
+    /// Derived absence under an upper replacement still obeys these bounds.
+    pub fn validate_metadata_path(&self, rel_path: &str) -> std::result::Result<(), SnapshotError> {
+        self.metadata_path(rel_path).map(|_| ())
+    }
+
+    fn metadata_path(&self, rel_path: &str) -> std::result::Result<String, SnapshotError> {
         let relative = if rel_path.is_empty() {
             "/".to_owned()
         } else if rel_path.starts_with('/') {
@@ -966,6 +972,12 @@ impl Mst2Fuse {
             format!("/{rel_path}")
         };
         crate::snapshot::auth::validate_scope(&relative)?;
+        if let Some(reader) = &self.reader {
+            reader
+                .authorized_context()
+                .validate_relative_path(&relative)?;
+            reader.client.validate_path(&relative)?;
+        }
         let scope = self
             .state
             .lock()
@@ -986,6 +998,11 @@ impl Mst2Fuse {
             format!("{scope}{relative}")
         };
         crate::snapshot::auth::validate_scope(&full)?;
+        Ok(relative)
+    }
+
+    async fn path_inode(&self, rel_path: &str) -> std::result::Result<Option<u64>, SnapshotError> {
+        let relative = self.metadata_path(rel_path)?;
         let mut inode = ROOT_INODE;
         if relative == "/" {
             return Ok(Some(inode));
