@@ -14,15 +14,18 @@
 //! that pins the lower to the committed revision and removes exactly the committed
 //! upper entries. See `docs/scorpiofs-libra-complete-spec-v1.md`.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
-use crate::daemon::lower_view::{hash_content, LowerHashKind, LowerView};
-use crate::dicfuse::store::DictionaryStore;
-use crate::dicfuse::tree_store::StorageItem;
+use crate::{
+    daemon::lower_view::{hash_content, LowerHashKind, LowerView},
+    dicfuse::{store::DictionaryStore, tree_store::StorageItem},
+};
 
 /// Effective change kinds, in Git terms. `added`/`modified` compare upper content
 /// against the lower projection; `deleted` is an OCI whiteout over a lower entry.
@@ -66,13 +69,15 @@ pub struct CommittedPath {
 /// Compute the git blob OID of `content`, matching what Mega's `content-hash`
 /// entries contain for the same bytes.
 ///
-/// Uses the process-wide hash kind (SHA-1 unless someone reconfigured it), which is
-/// the format the monorepo server serves for the repositories this integration
-/// targets. A length check against the lower's OID at comparison time catches a
-/// mismatched configuration instead of silently reporting phantom changes.
+/// Hashes Git blob bodies explicitly as SHA-1, the repository format served by
+/// the monorepo backend. This is independent of the worker thread's hash default.
 pub fn git_blob_oid(content: &[u8]) -> String {
-    git_internal::internal::object::blob::Blob::from_content_bytes(content.to_vec())
-        .id
+    use git_internal::{
+        hash::{HashKind, ObjectHash},
+        internal::object::ObjectType,
+    };
+    ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Blob, content)
+        .expect("blob is a canonical Git object type")
         .to_string()
 }
 
@@ -267,7 +272,11 @@ fn chain_base_for(chain: &[PathBuf], rel_path: &str, kind: LowerHashKind) -> Opt
                 continue;
             }
             Ok(meta) if meta.file_type().is_symlink() => {
-                let bytes = fs::read_link(&entry).ok()?.as_os_str().as_encoded_bytes().to_vec();
+                let bytes = fs::read_link(&entry)
+                    .ok()?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec();
                 return Some(ChainBase::Hash(hash_content(kind, &bytes)));
             }
             Ok(_) => {
