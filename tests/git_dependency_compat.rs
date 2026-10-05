@@ -7,9 +7,10 @@ use scorpiofs::{
     manager::store::{BlobFsStore, CommitStore, ModifiedStore, TreeStore},
 };
 
-// git-internal 0.8.7 serde records, using object IDs independently verified by git hash-object.
+// git-internal 0.8.7 serde schema; IDs independently verified by git hash-object.
+// Commit.message includes the header/message separator, as preserved by both versions.
 const LEGACY_TREE: &str = r#"{"id":{"Sha1":[170,169,108,237,45,154,28,142,114,197,107,37,58,14,47,231,131,147,254,183]},"tree_items":[{"mode":"Blob","id":{"Sha1":[206,1,54,37,3,11,168,219,169,6,247,86,150,127,158,156,163,148,70,74]},"name":"hello.txt"}]}"#;
-const LEGACY_COMMIT: &str = r#"{"id":{"Sha1":[124,173,109,7,176,52,251,136,27,222,88,124,90,27,152,36,42,195,240,118]},"tree_id":{"Sha1":[170,169,108,237,45,154,28,142,114,197,107,37,58,14,47,231,131,147,254,183]},"parent_commit_ids":[],"author":{"signature_type":"Author","name":"Test User","email":"test@example.com","timestamp":1700000000,"timezone":"+0000"},"committer":{"signature_type":"Committer","name":"Test User","email":"test@example.com","timestamp":1700000000,"timezone":"+0000"},"message":"compatibility\n"}"#;
+const LEGACY_COMMIT: &str = r#"{"id":{"Sha1":[124,173,109,7,176,52,251,136,27,222,88,124,90,27,152,36,42,195,240,118]},"tree_id":{"Sha1":[170,169,108,237,45,154,28,142,114,197,107,37,58,14,47,231,131,147,254,183]},"parent_commit_ids":[],"author":{"signature_type":"Author","name":"Test User","email":"test@example.com","timestamp":1700000000,"timezone":"+0000"},"committer":{"signature_type":"Committer","name":"Test User","email":"test@example.com","timestamp":1700000000,"timezone":"+0000"},"message":"\ncompatibility\n"}"#;
 const TREE_OID: &str = "aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7";
 const COMMIT_OID: &str = "7cad6d07b034fb881bde587c5a1b98242ac3f076";
 
@@ -31,7 +32,7 @@ fn legacy_git_cache_survives_dependency_upgrade() {
     let commit = db.get_commit().unwrap();
     assert_eq!(commit.id.to_string(), COMMIT_OID);
     assert_eq!(commit.tree_id, tree.id);
-    assert_eq!(commit.message, "compatibility\n");
+    assert_eq!(commit.message, "\ncompatibility\n");
     assert_eq!(
         serde_json::to_value(&tree).unwrap(),
         serde_json::from_str::<serde_json::Value>(LEGACY_TREE).unwrap()

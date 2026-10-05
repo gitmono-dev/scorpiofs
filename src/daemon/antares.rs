@@ -102,21 +102,6 @@ fn lower_view_for(entry: &MountEntry) -> Arc<dyn crate::daemon::lower_view::Lowe
     }
 }
 
-/// MST/2-lowered mounts do not support the worktree-v2 mutations yet: their
-/// lower moves by resolving a new snapshot, not by re-pinning the Dicfuse
-/// projection, and the finalize/refresh plumbing for that is not in place.
-/// Refuse explicitly rather than executing the Dicfuse semantics against the
-/// wrong projection (spec 15 §3).
-fn reject_mst2_mutation(entry: &MountEntry, op: &str) -> Result<(), ServiceError> {
-    if entry.mst2_lower.is_some() {
-        return Err(ServiceError::InvalidRequest(format!(
-            "{op} is not supported on an MST/2-lowered mount yet; re-attach without \
-             mst2_lower_enabled or wait for the snapshot-side finalize/refresh"
-        )));
-    }
-    Ok(())
-}
-
 /// High-level HTTP daemon that exposes Antares orchestration capabilities.
 pub struct AntaresDaemon<S: AntaresService> {
     service: Arc<S>,
@@ -2166,7 +2151,7 @@ impl AntaresServiceImpl {
 
         // Idempotency: re-resolving the same snapshot is a no-op.
         let new_id = new_view.snapshot_id().map(str::to_string);
-        if old_view.snapshot_id() == new_view.snapshot_id().as_deref() {
+        if old_view.snapshot_id() == new_view.snapshot_id() {
             return Ok(RefreshResponse {
                 disposition: RefreshDisposition::AlreadyAtTarget,
                 base_revision: base_revision.clone().unwrap_or_default(),
