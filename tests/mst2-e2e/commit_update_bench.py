@@ -8,6 +8,7 @@ are inherited through M2_TOKEN/M2_GIT_TOKEN and PG* environment variables.
 """
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -64,6 +65,32 @@ SELECT COALESCE((SELECT row_to_json(x) FROM (
  WHERE h.namespace='/'
 ) x), 'null'::json);
 COMMIT;"""
+
+
+class PhaseFailure(AssertionError):
+    """A fixed harness phase, without child output or exception text."""
+
+    def __init__(self, phase, error):
+        self.phase = phase
+        self.failure_type = type(error).__name__
+        super().__init__(phase + " failed")
+
+
+@contextmanager
+def phase(name):
+    try:
+        yield
+    except PhaseFailure:
+        raise
+    except Exception as error:
+        raise PhaseFailure(name, error) from None
+
+
+def failure_record(error):
+    record = {"execution_failed": True, "error_type": type(error).__name__}
+    if isinstance(error, PhaseFailure):
+        record.update(error_type=error.failure_type, phase=error.phase)
+    return record
 
 
 def clean_env(extra=None):
@@ -458,11 +485,12 @@ def execute(options):
         return lines[0].split()[0]
     if tip() != options.expect_initial_commit:
         raise AssertionError("isolated service target moved before any workload mutation")
-    initial = query(IDENTITY_SQL, deadline)
-    project = next(row for row in initial if row["path"] == "/project")
-    identity = validate_identity(initial, options.expect_initial_commit, project["tree"], options.database)
-    if options.publication_mode == "native":
-        validate_native(query(NATIVE_SQL, deadline), identity, options.instance_id, False)
+    with phase("initial_complete_identity"):
+        initial = query(IDENTITY_SQL, deadline)
+        project = next(row for row in initial if row["path"] == "/project")
+        identity = validate_identity(initial, options.expect_initial_commit, project["tree"], options.database)
+        if options.publication_mode == "native":
+            validate_native(query(NATIVE_SQL, deadline), identity, options.instance_id, False)
     root.mkdir(mode=0o700)
     (root / ".mst2-real-update-owned").write_text(root.name + "\n")
     fixture = root / "fixture"
@@ -506,12 +534,13 @@ def execute(options):
             git(fixture, deadline, "push", "--no-thin", options.git_url,
                 f"{commit}:refs/heads/main", env=git_env)
             push_ms = (time.monotonic() - publish_start) * 1000
-            previous_identity = identity
-            identity = validate_identity(query(IDENTITY_SQL, deadline), commit, tree, options.database)
-            native = None
-            if options.publication_mode == "native":
-                native = query(NATIVE_SQL, deadline)
-                validate_native(native, identity, options.instance_id, True, previous_identity)
+            with phase("updated_publication_identity"):
+                previous_identity = identity
+                identity = validate_identity(query(IDENTITY_SQL, deadline), commit, tree, options.database)
+                native = None
+                if options.publication_mode == "native":
+                    native = query(NATIVE_SQL, deadline)
+                    validate_native(native, identity, options.instance_id, True, previous_identity)
             visible_ms = (time.monotonic() - publish_start) * 1000
             current = commit
             driver_env = clean_env({"M2_BASE": options.base_url, "M2_SCOPE": "/project",
@@ -656,5 +685,5 @@ if __name__ == "__main__":
         try:
             execute(opts)
         except Exception as error:
-            print(json.dumps({"execution_failed": True, "error_type": type(error).__name__}), file=sys.stderr)
+            print(json.dumps(failure_record(error)), file=sys.stderr)
             raise SystemExit(1)

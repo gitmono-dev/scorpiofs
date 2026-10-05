@@ -41,23 +41,51 @@ class CommitUpdateBenchTests(unittest.TestCase):
     def test_owned_native_bootstrap_independent_readback_rejects_stale_root_or_epoch(self):
         database = "mst2_bench_" + "a" * 32
         instance = "6ab219b0-4275-45ba-9d7b-7b0b633018cd"
-        commit, tree = "1" * 40, "2" * 40
+        tree = "2" * 40
         raw = b"40000 project\0" + bytes.fromhex(tree)
         root_tree = hashlib.sha1(b"tree " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
         rows = [{"path": "/", "commit": "3" * 40, "tree": root_tree, "commit_tree": root_tree,
-                 "database": database, "raw_tree": raw.hex()},
-                {"path": "/project", "commit": commit, "tree": tree, "commit_tree": tree,
-                 "database": database, "raw_tree": None}]
+                 "database": database, "raw_tree": raw.hex()}]
         native = {"instance_id": instance, "root_commit": "3" * 40, "root_tree": root_tree,
                   "writer_epoch": 1, "sequence": 0, "state": "INITIALIZING", "certificate_receipt_id": None}
         env = {"PGHOST": "127.0.0.1", "PGDATABASE": database}
         with patch.object(CI.bench, "command"), patch.object(CI.bench, "query", side_effect=[rows, native]):
-            CI.initialize_owned_native(database, instance, env, time.monotonic() + 30)
+            record = CI.initialize_owned_native(database, instance, env, time.monotonic() + 30)
+            self.assertEqual(record["global_commit"], rows[0]["commit"])
+            self.assertEqual(record["global_tree"], root_tree)
+            self.assertEqual(record["correctness"], "PASS")
+        # Before the Git route has materialized /project, only the bootstrap
+        # fence can pass. The normal post-readiness fence remains stricter.
+        with self.assertRaises(AssertionError):
+            BENCH.validate_identity(rows, "1" * 40, tree, database)
         for wrong in [None, dict(native, root_commit="4" * 40), dict(native, writer_epoch=2),
-                      dict(native, instance_id="different"), dict(native, sequence=1)]:
+                      dict(native, instance_id="different"), dict(native, sequence=1),
+                      dict(native, state="READY"), dict(native, certificate_receipt_id=1)]:
             with patch.object(CI.bench, "command"), patch.object(CI.bench, "query", side_effect=[rows, wrong]):
                 with self.assertRaises(AssertionError):
                     CI.initialize_owned_native(database, instance, env, time.monotonic() + 30)
+
+        for wrong_rows in [None, [], rows * 2, [dict(rows[0], path="/project")],
+                           [dict(rows[0], database="other")],
+                           [dict(rows[0], commit_tree="4" * 40)],
+                           [dict(rows[0], raw_tree=(raw + b"tampered").hex())]]:
+            with patch.object(CI.bench, "command"), patch.object(CI.bench, "query", side_effect=[wrong_rows, native]):
+                with self.assertRaises(AssertionError):
+                    CI.initialize_owned_native(database, instance, env, time.monotonic() + 30)
+
+    def test_failure_records_expose_fixed_phase_without_private_exception_text(self):
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("owned_native_initialization"):
+                raise AssertionError("private-token-do-not-log")
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record, {"execution_failed": True, "error_type": "AssertionError",
+                                  "phase": "owned_native_initialization"})
+        self.assertNotIn("private-token", json.dumps(record))
+        with self.assertRaises(BENCH.PhaseFailure) as nested:
+            with BENCH.phase("commit_update_benchmark"):
+                with BENCH.phase("updated_publication_identity"):
+                    raise KeyError("private-connection-string")
+        self.assertEqual(BENCH.failure_record(nested.exception)["phase"], "updated_publication_identity")
 
     def test_query_reports_safe_phase_without_echoing_invalid_output(self):
         for sql, phase in [(BENCH.IDENTITY_SQL, "Git identity"), (BENCH.NATIVE_SQL, "native publication")]:

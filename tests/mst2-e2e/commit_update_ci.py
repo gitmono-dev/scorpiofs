@@ -127,12 +127,27 @@ COMMIT;"""
     # Independently read back the actual stored root and initial head before
     # any writer is started. No verified object or publication is fabricated.
     rows = bench.query(bench.IDENTITY_SQL, deadline, env=env)
-    project = next(row for row in rows if row["path"] == "/project")
-    identity = bench.validate_identity(rows, project["commit"], project["tree"], database)
+    # service init stores only the global ref. The Git HTTP route lazily
+    # materializes /project; its full identity fence still runs after ls-remote.
+    if not isinstance(rows, list):
+        raise AssertionError("fresh global root ref is missing")
+    roots = [row for row in rows if isinstance(row, dict) and row.get("path") == "/"]
+    if len(roots) != 1:
+        raise AssertionError("exactly one fresh global main ref is required")
+    root = roots[0]
+    if (root["database"] != database or root["commit_tree"] != root["tree"]
+            or not re.fullmatch(r"[0-9a-f]{40}", root["commit"])
+            or not re.fullmatch(r"[0-9a-f]{40}", root["tree"])):
+        raise AssertionError("fresh global database or stored commit/tree differs")
+    raw = bytes.fromhex(root["raw_tree"])
+    if hashlib.sha1(b"tree " + str(len(raw)).encode() + b"\0" + raw).hexdigest() != root["tree"]:
+        raise AssertionError("fresh global raw tree does not match its Git object ID")
+    identity = {"global_commit": root["commit"], "global_tree": root["tree"]}
     native = bench.query(bench.NATIVE_SQL, deadline, env=env)
-    bench.validate_native(native, identity, instance, False)
-    if native["sequence"] != 0 or native["state"] != "INITIALIZING":
+    if (not native or native["sequence"] != 0 or native["state"] != "INITIALIZING"
+            or native["certificate_receipt_id"] is not None):
         raise AssertionError("fresh native head is not the initial epoch/sequence")
+    bench.validate_native(native, identity, instance, False)
     return {"record": "owned_native_initialization", "instance_id": instance,
             "sequence": 0, "writer_epoch": 1, "state": "INITIALIZING",
             "global_commit": identity["global_commit"],
@@ -273,7 +288,8 @@ def execute(options):
         prefix = [str(binary), "--config", str(config_path)]
         bench.command(prefix + ["config", "validate"], deadline, env=service_env)
         bench.command(prefix + ["service", "init", "--yes"], deadline, env=service_env)
-        print(json.dumps(initialize_owned_native(db, instance, env, deadline)), flush=True)
+        with bench.phase("owned_native_initialization"):
+            print(json.dumps(initialize_owned_native(db, instance, env, deadline)), flush=True)
         log = (root / "service-private.log").open("wb")
         process = subprocess.Popen(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
@@ -312,7 +328,8 @@ def execute(options):
             "--driver-sha256", options.driver_sha256, "--run-root", str(root / "measurements"),
             "--profile", actual_profile, "--rounds", str(actual_rounds),
             "--session-deadline-utc", options.session_deadline_utc])
-        bench.execute(args)
+        with bench.phase("commit_update_benchmark"):
+            bench.execute(args)
     finally:
         try:
             stop_owned(root, project, time.monotonic() + 90, process)
@@ -355,5 +372,5 @@ if __name__ == "__main__":
             signal.signal(signal.SIGTERM, interrupted)
             execute(opts)
     except (Exception, KeyboardInterrupt) as error:
-        print(json.dumps({"execution_failed": True, "error_type": type(error).__name__}), file=sys.stderr)
+        print(json.dumps(bench.failure_record(error)), file=sys.stderr)
         raise SystemExit(1)
