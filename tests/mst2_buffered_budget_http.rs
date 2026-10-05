@@ -1,13 +1,16 @@
 //! Whole-file APIs fail with a typed local limit before unbounded allocation.
 //! Large files remain supported by the separately bounded range-read path.
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -56,10 +59,15 @@ struct Counters {
     objects: AtomicUsize,
 }
 
-async fn wrong_map(State(counters): State<Arc<Counters>>) -> Json<Value> {
+async fn wrong_map(
+    State(counters): State<Arc<Counters>>,
+    Path(snapshot): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
     counters.maps.fetch_add(1, Ordering::SeqCst);
     let map = ChunkMap::new([0xaa; 32], 8 * 1024 * 1024 * 1024 * 1024, [0x11; 32]).unwrap();
     Json(json!({
+        "snapshot_id": snapshot, "path": query["path"], "schema_version": 2,
         "file_content_id": DIGEST, "map_id": format!("sha256:{}", hex::encode(map.map_id())),
         "file_size": map.file_size.to_string(), "chunk_size": 1024 * 1024,
         "chunk_count": map.chunk_count.to_string(), "page_count": map.page_count.to_string(),

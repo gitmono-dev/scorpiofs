@@ -107,9 +107,14 @@ async fn resolve() -> Json<Value> {
     }))
 }
 
-async fn map(State(fixture): State<Arc<Fixture>>) -> Json<Value> {
+async fn map(
+    State(fixture): State<Arc<Fixture>>,
+    Path(snapshot): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
     let map = &fixture.map;
     Json(json!({
+        "snapshot_id": snapshot, "path": query["path"], "schema_version": 2,
         "file_content_id": id(&CONTENT), "map_id": id(&map.map_id()),
         "file_size": map.file_size.to_string(), "chunk_size": CHUNK_SIZE,
         "chunk_count": map.chunk_count.to_string(), "page_count": map.page_count.to_string(),
@@ -119,6 +124,7 @@ async fn map(State(fixture): State<Arc<Fixture>>) -> Json<Value> {
 
 async fn leaf(
     State(fixture): State<Arc<Fixture>>,
+    Path(snapshot): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     let page: u64 = query["page"].parse().unwrap();
@@ -137,7 +143,13 @@ async fn leaf(
             })
         })
         .collect();
-    Json(json!({"leaf": {"data_base64": base64(&leaf.encode().unwrap())}, "proof": proof}))
+    Json(json!({
+        "snapshot_id": snapshot, "path": query["path"], "map_id": id(&fixture.map.map_id()),
+        "page_count": fixture.map.page_count.to_string(),
+        "leaf": {"page_index": page.to_string(), "count": leaf.chunk_sha256.len().to_string(),
+                 "data_base64": base64(&leaf.encode().unwrap())},
+        "proof": proof
+    }))
 }
 
 async fn chunks(

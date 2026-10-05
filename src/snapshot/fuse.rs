@@ -1007,7 +1007,7 @@ impl Filesystem for Mst2Fuse {
     /// `open` prepares a handle, `read` starts I/O).
     ///
     /// Verified bytes in memory are sliced. Small files come from verified
-    /// local CAS or OBJECT requests. Large local CAS files are fully scanned
+    /// local CAS or OBJECT requests. Large local CAS files verify covering chunks after a cold full scan
     /// and hashed with bounded memory, returning the requested range from
     /// those same buffers; large online reads transfer only covering chunks.
     async fn read(
@@ -1054,13 +1054,14 @@ impl Filesystem for Mst2Fuse {
         }
 
         // 3. Large file: serve the requested range only (spec 07 §6, BODY-12).
-        //    Local CAS scans and hashes the whole file with bounded memory,
-        //    collecting only the range from those same verified buffers.
+        //    Local CAS builds private chunk facts with a cold whole scan,
+        //    then verifies complete covering chunks from the returned buffers.
+        //    Uncovered mutations are detected when read or by a strict audit.
         //    The verified chunk reader is the live-transport path when the
         //    CAS does not hold the file.
         if let Some(store) = &self.store {
             if let Some(bytes) = store
-                .read_verified_blob_range(&f.digest, f.size, offset, (end - offset) as usize)
+                .read_indexed_blob_range(&f.digest, f.size, offset, (end - offset) as usize)
                 .map_err(io_err)?
             {
                 if bytes.len() as u64 != end - offset {
@@ -1698,12 +1699,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_large_ranges_reject_same_size_corruption() {
+    async fn local_large_ranges_verify_cold_file_and_warm_covering_chunks() {
         // Invoke filesystem operations directly, without a mount or an
         // offline authorization claim.
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(DurableStore::open(temp.path()).unwrap());
-        let body = vec![0x51; 5 * 64 * 1024 + 7];
+        let body = vec![0x51; 2 * 1024 * 1024 + 7];
         let digest = crate::snapshot::durable::digest_of(&body);
         let path = store
             .content_dir()
@@ -1727,6 +1728,16 @@ mod tests {
             .unwrap()
             .attr
             .ino;
+        // Cold construction must reject an unread bad tail and expose no
+        // fact. Restore the body and retry before exercising warm semantics.
+        let mut corrupt = body.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &corrupt).unwrap();
+        assert_eq!(
+            i32::from(fs.read(req, inode, inode, 0, 13).await.unwrap_err()),
+            -libc::EIO
+        );
+        std::fs::write(&path, &body).unwrap();
         assert_eq!(
             fs.read(req, inode, inode, 0, 13)
                 .await
@@ -1735,7 +1746,24 @@ mod tests {
                 .as_ref(),
             &body[..13]
         );
-        for corrupt_at in [4, body.len() - 1] {
+        std::fs::write(&path, &corrupt).unwrap();
+        assert_eq!(
+            fs.read(req, inode, inode, 0, 13)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            &body[..13]
+        );
+        assert_eq!(
+            i32::from(
+                fs.read(req, inode, inode, body.len() as u64 - 5, 13)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EIO
+        );
+        for corrupt_at in [4, 1024 * 1024 - 1] {
             let mut corrupt = body.clone();
             corrupt[corrupt_at] ^= 1;
             std::fs::write(&path, corrupt).unwrap();
