@@ -283,14 +283,14 @@ async fn warm_1151_file_resume_bounds_real_journal_syncs_and_syncs_every_blob() 
             }
             "concurrent" => {
                 store
-                    .hydrate_concurrent::<_, Vec<u8>>(&view(), &manifest, 8, |_| {
+                    .hydrate_concurrent(&view(), &manifest, 8, |_| {
                         Box::pin(async { panic!("warm source read") })
                     })
                     .await
             }
             "batches" => {
                 store
-                    .hydrate_batches::<_, _, Vec<u8>, Vec<u8>>(
+                    .hydrate_batches(
                         &view(),
                         &manifest,
                         4,
@@ -349,7 +349,7 @@ async fn concurrent_cold_appends_keep_complete_json_records_and_bounded_syncs() 
     let manifest = many_files(257);
     let counter = SyncCounter::install(temp.path());
     let report = store
-        .hydrate_concurrent::<_, Vec<u8>>(&view(), &manifest, 16, |file| {
+        .hydrate_concurrent(&view(), &manifest, 16, |file| {
             Box::pin(async move {
                 tokio::task::yield_now().await;
                 Ok(Arc::new(file.rel_path.into_bytes()))
@@ -601,7 +601,7 @@ async fn repair_failure_revokes_old_complete_in_all_three_hydration_cores() {
             }
             "concurrent" => {
                 store
-                    .hydrate_concurrent::<_, Vec<u8>>(&view(), &files(), 4, |_| {
+                    .hydrate_concurrent(&view(), &files(), 4, |_| {
                         Box::pin(async {
                             Err(SnapshotError::new(
                                 SnapshotErrorCode::ObjectUnavailable,
@@ -613,7 +613,7 @@ async fn repair_failure_revokes_old_complete_in_all_three_hydration_cores() {
             }
             "batch" => {
                 store
-                    .hydrate_batches::<_, _, Vec<u8>, Vec<u8>>(
+                    .hydrate_batches(
                         &view(),
                         &files(),
                         4,
@@ -670,7 +670,7 @@ async fn batch_aliases_commit_logical_totals_and_one_retained_content_dependency
         })
         .collect();
     let report = store
-        .hydrate_batches::<_, _, Vec<u8>, Vec<u8>>(
+        .hydrate_batches(
             &view(),
             &manifest,
             4,
@@ -879,7 +879,7 @@ async fn blob_sync_and_directory_sync_errors_cannot_publish_a_batch_complete() {
         let store = DurableStore::open(temp.path()).unwrap();
         let fault = FaultGuard::install(store.content_dir(), phase, false);
         let error = store
-            .hydrate_batches::<_, _, Vec<u8>, Vec<u8>>(
+            .hydrate_batches(
                 &view(),
                 &files(),
                 4,

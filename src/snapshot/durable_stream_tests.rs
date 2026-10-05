@@ -123,7 +123,7 @@ async fn open_owned(
 async fn accounted_multi_chunk_reversed_response_uses_final_owner_and_verifies_whole_digest() {
     let size = 2 * CHUNK_SIZE as u64 + 17;
     let (_server, fixture, coordinator, file) = open_owned(Fixture::new(size, false)).await;
-    let owner = coordinator.fetch(file, true).await.unwrap();
+    let owner = coordinator.fetch_owned(file, true).await.unwrap();
     assert_eq!(owner.len() as u64, size);
     for index in 0..3 {
         let start = index * CHUNK_SIZE as usize;
@@ -162,7 +162,7 @@ async fn accounted_chunks_with_bad_leaf_or_wrong_whole_identity_publish_no_owner
             fixture.corrupt.store(1, Ordering::SeqCst);
         }
         assert_eq!(
-            coordinator.fetch(file, true).await.unwrap_err().code,
+            coordinator.fetch_owned(file, true).await.unwrap_err().code,
             SnapshotErrorCode::DigestMismatch
         );
         assert_eq!(coordinator.content_usage().output_bytes, 0);
@@ -187,7 +187,7 @@ async fn accounted_fixed_view_mismatch_rejects_large_map_before_chunk_collection
     .unwrap();
     let (_server, fixture, coordinator, file) = open_owned(fixture).await;
     assert_eq!(
-        coordinator.fetch(file, true).await.unwrap_err().code,
+        coordinator.fetch_owned(file, true).await.unwrap_err().code,
         SnapshotErrorCode::DigestMismatch
     );
     assert_eq!(fixture.maps.load(Ordering::SeqCst), 1);
@@ -589,13 +589,13 @@ fn unpublished(store: &DurableStore, digest: &[u8; 32]) {
     assert!(read_optional(&store.root().join(JOURNAL_FILE))
         .unwrap()
         .is_none_or(|bytes| bytes.is_empty()));
-    assert!(
-        !fs::read_dir(store.content_dir()).unwrap().any(|entry| entry
+    assert!(!fs::read_dir(store.content_dir()).unwrap().any(|entry| {
+        entry
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .contains(".tmp."))
-    );
+            .contains(".tmp.")
+    }));
 }
 
 async fn hydrate_parallel(
@@ -623,13 +623,13 @@ async fn hydrate_parallel(
     match core {
         "concurrent" => {
             store
-                .hydrate_snapshot_concurrent::<_, Vec<u8>>(reader, closure, 2, fetch)
+                .hydrate_snapshot_concurrent(reader, closure, 2, fetch)
                 .await
         }
         "batch" => {
             let source = reader.clone();
             store
-                .hydrate_snapshot_batches::<_, _, Vec<u8>, Vec<u8>>(
+                .hydrate_snapshot_batches(
                     reader,
                     closure,
                     2,
@@ -907,13 +907,13 @@ async fn parallel_stream_sync_failures_never_complete_and_can_retry() {
                 "{core} {phase}"
             );
             assert!(store.read_journal().unwrap().is_empty(), "{core} {phase}");
-            assert!(
-                !fs::read_dir(store.content_dir()).unwrap().any(|entry| entry
+            assert!(!fs::read_dir(store.content_dir()).unwrap().any(|entry| {
+                entry
                     .unwrap()
                     .file_name()
                     .to_string_lossy()
-                    .contains(".tmp."))
-            );
+                    .contains(".tmp.")
+            }));
             hydrate_parallel(&store, &reader, &closure, core)
                 .await
                 .unwrap();
@@ -1117,13 +1117,13 @@ async fn streaming_content_sync_failures_do_not_journal_or_complete_the_file() {
         assert!(read_optional(&store.root().join(JOURNAL_FILE))
             .unwrap()
             .is_none_or(|bytes| bytes.is_empty()));
-        assert!(
-            !fs::read_dir(store.content_dir()).unwrap().any(|entry| entry
+        assert!(!fs::read_dir(store.content_dir()).unwrap().any(|entry| {
+            entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".tmp."))
-        );
+                .contains(".tmp.")
+        }));
         if phase == "object-file-sync" {
             assert!(!store.blob_path(&id(&fixture.advertised)).unwrap().exists());
         } else {

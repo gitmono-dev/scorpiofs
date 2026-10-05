@@ -1,4 +1,4 @@
-//! Ownership of coordinator-produced output and managed construction buffers.
+//! Ownership of explicit owned-fetch output and managed construction buffers.
 //! Native codec/HTTP/TLS buffers, metadata/error DTO heaps and caller copies
 //! are separate. These are managed buffer capacity quotas, not RSS limits.
 
