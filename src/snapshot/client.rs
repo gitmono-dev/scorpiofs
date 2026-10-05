@@ -331,6 +331,12 @@ impl Mst2Client {
         snapshot_id: &str,
         paths: &[String],
     ) -> Result<LookupResponse, SnapshotError> {
+        if paths.len() > 128 {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "lookup accepts at most 128 paths",
+            ));
+        }
         let body = serde_json::json!({"paths": paths});
         let resp = self
             .send_retrying(
@@ -352,6 +358,9 @@ impl Mst2Client {
                 }
             {
                 return Err(lookup_binding_error());
+            }
+            if let Some(node) = &result.node {
+                super::lookup::validate_node(node, path)?;
             }
         }
         Ok(response)

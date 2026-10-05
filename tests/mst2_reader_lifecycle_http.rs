@@ -266,7 +266,7 @@ async fn lookup(
     Ok(Json(json!({
         "snapshot_id": snapshot,
         "results": body["paths"].as_array().unwrap().iter().map(|path| json!({
-            "path": path, "status": "found", "node": {"fs_kind": "regular", "size": "1"}
+            "path": path, "status": "found", "node": {"fs_kind": "regular", "name": path.as_str().unwrap().rsplit('/').next().unwrap(), "size": "1", "content_digest": format!("sha256:{}", "aa".repeat(32))}
         })).collect::<Vec<_>>()
     })))
 }
