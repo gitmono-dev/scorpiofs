@@ -391,6 +391,13 @@ mod tests {
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         validate_treeframe_headers(&headers(), expected_snapshot, expected_digest).unwrap();
 
+        let mut spaced = headers();
+        spaced.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("Application/Vnd.Mega.TreeFrame; version = 2"),
+        );
+        validate_treeframe_headers(&spaced, expected_snapshot, expected_digest).unwrap();
+
         let mut missing = headers();
         missing.remove("x-mega-request-digest");
         assert!(validate_treeframe_headers(&missing, expected_snapshot, expected_digest).is_err());
@@ -560,7 +567,17 @@ fn validate_treeframe_headers(
     expected_request_digest: &str,
 ) -> Result<(), SnapshotError> {
     let content_type = one_treeframe_header(headers, "content-type", "Content-Type")?;
-    if !content_type.eq_ignore_ascii_case("application/vnd.mega.treeframe;version=2") {
+    let mut media_parts = content_type.split(';').map(str::trim);
+    let media_type = media_parts.next().unwrap_or_default();
+    let version = media_parts.next().unwrap_or_default();
+    if !media_type.eq_ignore_ascii_case("application/vnd.mega.treeframe")
+        || !version
+            .split_once('=')
+            .is_some_and(|(key, value)| {
+                key.trim().eq_ignore_ascii_case("version") && value.trim() == "2"
+            })
+        || media_parts.next().is_some()
+    {
         return Err(SnapshotError::new(
             SnapshotErrorCode::DigestMismatch,
             format!("unexpected TreeFrame Content-Type: {content_type}"),
