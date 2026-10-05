@@ -21,6 +21,56 @@ import commit_update_ci as ci
 
 
 class SessionBudgetTests(unittest.TestCase):
+    def test_communicate_wait_keeps_leader_pinned_until_explicit_group_cleanup(self):
+        process = object.__new__(budget.PinnedProcess)
+        process._child_created = False
+        process.reap_pinned = True
+        process.returncode = None
+        process.pid = 123
+        process.args = ["owned"]
+        observation = SimpleNamespace(si_code=1, si_status=0)
+        with patch.multiple(budget.os, P_PID=1, WEXITED=2, WNOHANG=4, WNOWAIT=8,
+                            CLD_EXITED=1, create=True), \
+                patch.object(budget.os, "waitid", return_value=observation, create=True) as observe, \
+                patch.object(subprocess.Popen, "wait", return_value=0) as reap:
+            self.assertEqual(process.wait(timeout=1), 0)
+            self.assertEqual(process.wait(timeout=1), 0)
+            self.assertIsNone(process.returncode)
+            reap.assert_not_called()
+            observe.assert_called_with(1, 123, 2 | 4 | 8)
+            budget.reap_owned(process, time.monotonic() + 1)
+            reap.assert_called_once()
+            self.assertFalse(process.reap_pinned)
+
+    def test_timeout_never_kills_reaped_or_replaced_leader_group(self):
+        for changed in ("reaped", "replaced"):
+            class Child:
+                pid = 123
+                returncode = None
+                def communicate(self, *args, **kwargs):
+                    if not hasattr(self, "term_sent"):
+                        self.term_sent = True
+                        raise subprocess.TimeoutExpired("owned", 1)
+                    if changed == "reaped":
+                        self.returncode = 0
+                    return b"", b""
+            child = Child()
+            scans = iter(([123], AssertionError("owned group leader identity was replaced")))
+            def members(*_):
+                result = next(scans)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            with patch.object(budget.sys, "platform", "linux"), \
+                    patch.object(budget.signal, "SIGKILL", 9, create=True), \
+                    patch.object(budget, "PinnedProcess", return_value=child), \
+                    patch.object(budget, "process_start", return_value="1"), \
+                    patch.object(budget, "group_members", side_effect=members), \
+                    patch.object(budget.os, "killpg", create=True) as send:
+                with self.assertRaises(AssertionError):
+                    budget.run_process(["owned"], time.monotonic() + 30)
+                send.assert_called_once_with(123, budget.signal.SIGTERM)
+
     def test_build_setup_round_admission_uses_one_anchor_and_never_grants_more_time(self):
         with patch.object(budget.time, "time", return_value=0), \
                 patch.object(budget.time, "monotonic", return_value=0):
@@ -90,6 +140,25 @@ class SessionBudgetTests(unittest.TestCase):
                 bench.durable_verified(operation, oracle)
 
     @unittest.skipUnless(sys.platform == "linux", "actual Linux process-group ownership")
+    def test_actual_capture_and_inherited_io_keep_exited_leader_pinned_through_group_cleanup(self):
+        original_stop = budget.stop_group
+        for capture in (True, False):
+            seen = []
+            def stop(pgid, started, deadline, process=None):
+                self.assertIsNone(process.returncode)
+                stat = Path(f"/proc/{pgid}/stat").read_text().rsplit(") ", 1)[1].split()
+                self.assertEqual(stat[0], "Z")
+                self.assertEqual(stat[19], started)
+                seen.append(pgid)
+                return original_stop(pgid, started, deadline, process)
+            with patch.object(budget, "stop_group", side_effect=stop):
+                result = budget.run_process([sys.executable, "-c", "pass"],
+                                            time.monotonic() + 5, capture=capture)
+            self.assertEqual(result, (0, b"", b"") if capture else (0, None, None))
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(Path(f"/proc/{seen[0]}").exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux process-group ownership")
     def test_actual_timeout_kills_ignoring_descendant_and_reaps_within_original_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
             pid_file = Path(temp) / "pids"
@@ -131,7 +200,7 @@ class SessionBudgetTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "actual Linux startup abort ownership")
     def test_command_startup_identity_errors_reap_the_direct_child_without_renewing_deadline(self):
-        original = subprocess.Popen
+        original = budget.PinnedProcess
         for error in (PermissionError("fixture identity access"), FileNotFoundError("fixture identity missing")):
             spawned = []
             def start(*args, **kwargs):
@@ -139,7 +208,7 @@ class SessionBudgetTests(unittest.TestCase):
                 spawned.append(process)
                 return process
             deadline = time.monotonic() + 2
-            with patch.object(budget.subprocess, "Popen", side_effect=start), \
+            with patch.object(budget, "PinnedProcess", side_effect=start), \
                     patch.object(budget, "process_start", side_effect=error):
                 with self.assertRaises(PermissionError if isinstance(error, PermissionError) else AssertionError):
                     budget.run_process([sys.executable, "-c", "import time; time.sleep(30)"], deadline)
@@ -151,7 +220,7 @@ class SessionBudgetTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "actual Linux short child reap")
     def test_missing_exited_startup_leader_is_reaped_without_signalling_an_unbound_group(self):
-        original = subprocess.Popen
+        original = budget.PinnedProcess
         spawned = []
         def start(*args, **kwargs):
             process = original(*args, **kwargs)
@@ -161,7 +230,7 @@ class SessionBudgetTests(unittest.TestCase):
             spawned.append(process)
             return process
         deadline = time.monotonic() + 2
-        with patch.object(budget.subprocess, "Popen", side_effect=start), \
+        with patch.object(budget, "PinnedProcess", side_effect=start), \
                 patch.object(budget, "process_start", side_effect=FileNotFoundError), \
                 patch.object(budget.os, "getpgid", side_effect=ProcessLookupError), \
                 patch.object(budget.os, "killpg") as signal_group:

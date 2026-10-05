@@ -313,6 +313,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
     def test_timeout_terminates_whole_child_group_then_kills_if_term_is_ignored(self):
         class Hung:
             pid = 12345
+            returncode = None
             calls = 0
             def communicate(self, data=None, timeout=None):
                 self.calls += 1
@@ -321,7 +322,9 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 return b"", b""
         child = Hung()
         with patch.object(BENCH.budget_module.subprocess, "Popen", return_value=child), \
+                patch.object(BENCH.budget_module, "PinnedProcess", return_value=child), \
                 patch.object(BENCH.budget_module, "process_start", return_value="1"), \
+                patch.object(BENCH.budget_module, "group_members", return_value=[12345]), \
                 patch.object(BENCH.budget_module, "stop_group") as stop_group, \
                 patch.object(BENCH.os, "killpg", create=True) as killpg, \
                 patch.object(BENCH.budget_module.signal, "SIGKILL", 9, create=True):

@@ -105,6 +105,13 @@ def group_members(pgid, started):
     return members
 
 
+def reap_owned(process, deadline):
+    release = getattr(process, "release_reap", None)
+    if release is not None:
+        release()
+    process.wait(timeout=max(0, deadline - time.monotonic()))
+
+
 def stop_group(pgid, started, deadline, process=None):
     """Reaped leaders do not prove that their owned descendants exited."""
     if group_members(pgid, started):
@@ -125,7 +132,7 @@ def stop_group(pgid, started, deadline, process=None):
         if group_members(pgid, started):
             raise TimeoutError("owned group remained active at its original deadline")
     if process is not None:
-        process.wait(timeout=max(0, deadline - time.monotonic()))
+        reap_owned(process, deadline)
     if time.monotonic() >= deadline:
         raise TimeoutError("owned group verification exceeded original deadline")
 
@@ -134,6 +141,38 @@ def process_start(pid):
     if sys.platform == "linux":
         return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
     return None
+
+
+class PinnedProcess(subprocess.Popen):
+    """Observe Linux exit without freeing the PID until group cleanup finishes.
+
+    communicate() calls wait(), including when no pipes are captured. An
+    ordinary wait would release the leader PID before descendant cleanup and
+    permit an unrelated new session to reuse its process-group number.
+    """
+    def __init__(self, *args, **kwargs):
+        self.reap_pinned = True
+        super().__init__(*args, **kwargs)
+
+    def release_reap(self):
+        self.reap_pinned = False
+
+    def wait(self, timeout=None):
+        if not self.reap_pinned:
+            return super().wait(timeout=timeout)
+        if self.returncode is not None:
+            raise AssertionError("owned command leader was reaped before group cleanup")
+        until = None if timeout is None else time.monotonic() + timeout
+        while True:
+            observed = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if observed is not None:
+                if observed.si_code == os.CLD_EXITED:
+                    return observed.si_status
+                return -observed.si_status
+            if until is not None and time.monotonic() >= until:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            pause = .01 if until is None else min(.01, max(0, until - time.monotonic()))
+            time.sleep(pause)
 
 
 def abort_startup(process, deadline):
@@ -148,7 +187,7 @@ def abort_startup(process, deadline):
         # if any active group remains.
         if group_members(process.pid, None):
             raise AssertionError("missing startup leader still has an unbound group") from None
-        process.wait(timeout=max(0, deadline - time.monotonic()))
+        reap_owned(process, deadline)
         if time.monotonic() >= deadline:
             raise TimeoutError("startup reap exceeded original deadline")
         return False
@@ -168,13 +207,20 @@ def run_process(args, deadline, env=None, data=None, capture=True):
         raise TimeoutError("operation deadline reached before child startup")
     reserve = min(10.0, remaining / 4)
     run_until = deadline - reserve
-    process = subprocess.Popen(args, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+    popen = PinnedProcess if sys.platform == "linux" else subprocess.Popen
+    process = popen(args, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE if capture else None,
                                stderr=subprocess.PIPE if capture else None,
                                env=env, start_new_session=True)
     started = None
 
     def signal_group(signum):
+        if process.returncode is not None:
+            raise AssertionError("refusing signal after owned command leader was reaped")
+        # The unreaped direct child pins this number through scan and signal.
+        # Check the recorded identity before every signal, including KILL.
+        if not group_members(process.pid, started):
+            return
         try:
             os.killpg(process.pid, signum)
         except ProcessLookupError:
