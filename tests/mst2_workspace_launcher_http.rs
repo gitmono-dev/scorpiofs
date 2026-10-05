@@ -140,11 +140,7 @@ async fn record(request: axum::extract::Request, next: axum::middleware::Next) -
 }
 
 async fn capabilities() -> Json<Value> {
-    Json(json!({
-        "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
-        "features": {"resolve": true, "directory": true, "leases": true,
-            "metadata_pages": true, "raw_blob": true}
-    }))
+    Json(serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap())
 }
 
 async fn resolve(State(f): State<Arc<Fixture>>, Json(request): Json<Value>) -> Json<Value> {
@@ -162,7 +158,9 @@ async fn resolve(State(f): State<Arc<Fixture>>, Json(request): Json<Value>) -> J
             "metadata_root": digest(&v.root), "snapshot_id": v.sid
         },
         "lease_id": "launcher-lease", "lease_expires_at": "2099-01-01T00:00:00Z",
-        "publication_sequence": "1", "authorization_epoch": "1"
+        "publication_sequence": "1", "authorization_epoch": "1",
+        "writer_epoch": "1", "resolved_at": "2026-10-05T00:00:00Z",
+        "delivery": request["delivery"]
     }))
 }
 
@@ -243,6 +241,7 @@ struct Launcher {
     child: Child,
     temp: tempfile::TempDir,
     base: String,
+    mounts: Vec<PathBuf>,
 }
 
 impl Drop for Launcher {
@@ -252,10 +251,10 @@ impl Drop for Launcher {
         if cfg!(target_os = "linux") {
             // Only exact mount paths owned by this fixture. A failing assertion
             // must not leave either mount behind in the VM.
-            for name in ["mount-old", "mount-new"] {
+            for path in &self.mounts {
                 let _ = Command::new("fusermount3")
                     .args(["-u", "-z"])
-                    .arg(self.temp.path().join(name))
+                    .arg(path)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
@@ -318,6 +317,7 @@ impl Launcher {
             child,
             temp,
             base: format!("http://{addr}"),
+            mounts: Vec::new(),
         }
     }
 
@@ -364,12 +364,13 @@ impl Launcher {
     }
 
     fn assert_no_dictionary(&self) {
-        assert_eq!(
-            std::fs::read_dir(self.temp.path().join("dictionary"))
-                .unwrap()
-                .count(),
-            0
-        );
+        for entry in std::fs::read_dir(self.temp.path().join("dictionary")).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                name == "workspaces-v3" || name == "mst2-cache",
+                "unexpected dictionary artifact: {name:?}"
+            );
+        }
     }
 }
 
@@ -416,6 +417,9 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
         (reqwest::Method::POST, "/api/fs/unmount"),
         (reqwest::Method::GET, "/api/config"),
         (reqwest::Method::POST, "/api/config"),
+        (reqwest::Method::GET, "/antares/mounts"),
+        (reqwest::Method::POST, "/antares/mounts"),
+        (reqwest::Method::GET, "/antares/worktrees"),
     ] {
         assert_eq!(
             client
@@ -429,8 +433,8 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
         );
     }
     let response = client
-        .post(format!("{}/antares/mounts", launcher.base))
-        .json(&json!({"job_id": "rejected", "path": "/project"}))
+        .post(format!("{}/v3/workspaces", launcher.base))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
         .send()
         .await
         .unwrap();
@@ -444,14 +448,18 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
     );
     launcher.assert_no_dictionary();
     let mounts: Value = client
-        .get(format!("{}/antares/mounts", launcher.base))
+        .get(format!("{}/v3/workspaces", launcher.base))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(mounts["mounts"], json!([]));
+    let entries = mounts.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["mount_state"], "failed");
+    assert_eq!(entries[0]["metadata_ready"], false);
+    assert!(entries[0]["snapshot_id"].is_null());
     launcher.stop().await;
 }
 
@@ -493,14 +501,13 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     let mut launcher = Launcher::start(&upstream, address());
     let client = client();
     launcher.ready(&client).await;
-    let old = launcher.temp.path().join("mount-old");
-    let new = launcher.temp.path().join("mount-new");
     let mut ids = Vec::new();
+    let mut generations = Vec::new();
     let mut old_fd = None;
-    for (index, path) in [&old, &new].into_iter().enumerate() {
+    for index in 0..2 {
         f.latest.store(index, Ordering::SeqCst);
-        let response = client.post(format!("{}/antares/mounts", launcher.base))
-            .json(&json!({"job_id": format!("snapshot-{index}"), "path": "/project", "mountpoint": path}))
+        let response = client.post(format!("{}/v3/workspaces", launcher.base))
+            .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
             .send().await.unwrap();
         let status = response.status();
         let body: Value = response.json().await.unwrap();
@@ -509,23 +516,39 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
             "mount rejected: {body}; {}",
             launcher.log()
         );
-        ids.push(body["mount_id"].as_str().unwrap().to_owned());
-        assert!(mounted(path));
+        ids.push(body["workspace_id"].as_str().unwrap().to_owned());
+        generations.push(body["generation"].as_str().unwrap().to_owned());
+        assert_eq!(body["snapshot_id"], f.versions[index].sid);
+        assert_eq!(body["mount_state"], "mounted");
+        assert_eq!(body["metadata_ready"], true);
+        assert_eq!(body["hydration_state"], "idle");
+        assert_eq!(body["local_pin_state"], "incomplete");
+        assert_eq!(
+            body["dirty_state"], "unknown",
+            "creation must not perform a full upper scan"
+        );
+        let path = PathBuf::from(body["mountpoint"].as_str().unwrap());
+        assert!(path.starts_with(launcher.temp.path().join("dictionary/workspaces-v3")));
+        launcher.mounts.push(path.clone());
+        assert!(mounted(&path));
         if index == 0 {
             // Keep this handle and dirty upper alive before changing latest
             // and admitting the second snapshot.
-            old_fd = Some(File::open(old.join("base.txt")).unwrap());
+            old_fd = Some(File::open(path.join("base.txt")).unwrap());
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
-                .open(old.join("dirty.txt"))
+                .open(path.join("dirty.txt"))
                 .unwrap();
             file.write_all(b"keep this dirty upper").unwrap();
             file.sync_all().unwrap();
-            File::open(&old).unwrap().sync_all().unwrap();
+            File::open(&path).unwrap().sync_all().unwrap();
         }
     }
+    let old = launcher.mounts[0].clone();
+    let new = launcher.mounts[1].clone();
     assert_ne!(ids[0], ids[1]);
+    assert_ne!(generations[0], generations[1]);
     assert!(!mounted(&launcher.temp.path().join("unused-root")));
     launcher.assert_no_dictionary();
     // Give the retired background preload walk time to run. A nested leaf must
@@ -552,20 +575,140 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     // Explicit child lookup still fetches and verifies the committed page.
     assert_eq!(std::fs::read_dir(new.join("deep")).unwrap().count(), 0);
     assert_eq!(f.child_pages.load(Ordering::SeqCst), 1);
+    let status: Value = client
+        .get(format!("{}/v3/workspaces/{}", launcher.base, ids[0]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["snapshot_id"], f.versions[0].sid);
+    assert_eq!(status["dirty_state"], "dirty");
+    let refused = client
+        .post(format!(
+            "{}/v3/workspaces/{}/destroy",
+            launcher.base, ids[0]
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["code"],
+        "WORKSPACE_DIRTY"
+    );
+    assert!(mounted(&old));
+    // The rejected scan releases its pause, so an existing writable handle
+    // still accepts real kernel writes. The earlier lower handle stays fixed.
+    let mut old_write = OpenOptions::new()
+        .write(true)
+        .open(old.join("base.txt"))
+        .unwrap();
+    old_write.write_all(b"upper edit").unwrap();
+    old_write.sync_all().unwrap();
+    drop(old_write);
+    old_fd.seek(SeekFrom::Start(0)).unwrap();
+    bytes.clear();
+    old_fd.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, CONTENT[0]);
+    // A pathname replacement must not change which private upper belongs to
+    // the native overlay. An empty replacement would otherwise look clean.
+    let new_upper = new.parent().unwrap().join("upper");
+    let held_upper = new.parent().unwrap().join("upper-original");
+    std::fs::rename(&new_upper, &held_upper).unwrap();
+    std::fs::create_dir(&new_upper).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&new_upper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let replaced: Value = client
+        .get(format!("{}/v3/workspaces/{}", launcher.base, ids[1]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replaced["dirty_state"], "unknown");
+    for discard in [false, true] {
+        let response = client
+            .post(format!(
+                "{}/v3/workspaces/{}/destroy",
+                launcher.base, ids[1]
+            ))
+            .json(&json!({"discard_dirty": discard}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["code"],
+            "WORKSPACE_UNKNOWN"
+        );
+        assert!(mounted(&new));
+        assert!(held_upper.is_dir());
+    }
+    assert_eq!(std::fs::read(new.join("base.txt")).unwrap(), CONTENT[1]);
+    std::fs::remove_dir(&new_upper).unwrap();
+    std::fs::rename(&held_upper, &new_upper).unwrap();
+    let destroyed = client
+        .post(format!(
+            "{}/v3/workspaces/{}/destroy",
+            launcher.base, ids[1]
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(destroyed.status(), StatusCode::NO_CONTENT);
+    assert!(!mounted(&new));
+    assert!(mounted(&old));
+    // An externally lost native mount cannot keep advertising readiness based
+    // on the original create response. The service retains its retirement owner.
+    let third: Value = client
+        .post(format!("{}/v3/workspaces", launcher.base))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let third_id = third["workspace_id"].as_str().unwrap();
+    let third_mount = PathBuf::from(third["mountpoint"].as_str().unwrap());
+    launcher.mounts.push(third_mount.clone());
+    assert!(mounted(&third_mount));
+    scorpiofs::util::fuse_platform::unmount_path(&third_mount, true)
+        .await
+        .unwrap();
+    assert!(!mounted(&third_mount));
+    let unavailable: Value = client
+        .get(format!("{}/v3/workspaces/{third_id}", launcher.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unavailable["mount_state"], "failed");
+    assert_eq!(unavailable["metadata_ready"], false);
+    let retired = client
+        .post(format!(
+            "{}/v3/workspaces/{third_id}/destroy",
+            launcher.base
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retired.status(), StatusCode::NO_CONTENT);
     drop(old_fd);
     launcher.stop().await;
     assert!(!mounted(&old));
     assert!(!mounted(&new));
     assert_eq!(
-        std::fs::read(
-            launcher
-                .temp
-                .path()
-                .join("upper")
-                .join(&ids[0])
-                .join("dirty.txt")
-        )
-        .unwrap(),
+        std::fs::read(old.parent().unwrap().join("upper").join("dirty.txt")).unwrap(),
         b"keep this dirty upper"
     );
     launcher.assert_no_dictionary();

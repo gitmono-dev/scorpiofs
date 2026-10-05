@@ -18,8 +18,10 @@ use tokio::sync::oneshot;
 
 use crate::{
     antares::{AntaresManager, AntaresPaths},
-    daemon::{antares::AntaresServiceImpl, daemon_main},
+    daemon::antares::AntaresServiceImpl,
+    snapshot::Mst2Client,
     util::{config, logging},
+    workspace::{WorkspaceConfig, WorkspaceService},
 };
 
 /// Stable process exit codes shared by the CLIs (scripts depend on these).
@@ -91,9 +93,29 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
     };
     tracing::info!("server running on {http_addr}");
 
-    let service = Arc::new(AntaresServiceImpl::new(None).await);
+    let token = config::mst2_auth_token();
+    let service = match WorkspaceService::new(
+        Mst2Client::with_token(
+            config::mst2_base_url(),
+            (!token.is_empty()).then(|| token.to_owned()),
+        ),
+        WorkspaceConfig::new(
+            PathBuf::from(config::store_path()).join("workspaces-v3"),
+            PathBuf::from(config::store_path()).join("mst2-cache"),
+        ),
+    ) {
+        Ok(service) => service,
+        Err(error) => {
+            tracing::error!("workspace initialization failed: {error}");
+            return exit::CONFIG;
+        }
+    };
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let mut daemon_task = tokio::spawn(daemon_main(service.clone(), shutdown_rx, listener));
+    let mut daemon_task = tokio::spawn(crate::workspace::http::serve(
+        service.clone(),
+        listener,
+        shutdown_rx,
+    ));
 
     let mut exit_code = exit::SUCCESS;
     let mut daemon_finished = false;
@@ -137,8 +159,7 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
                 daemon_task.abort();
                 let _ = daemon_task.await;
                 let _ =
-                    tokio::time::timeout(Duration::from_secs(15), service.shutdown_cleanup_impl())
-                        .await;
+                    tokio::time::timeout(Duration::from_secs(15), service.shutdown_cleanup()).await;
                 exit_code = exit::INTERNAL;
             }
         }

@@ -592,6 +592,23 @@ impl SnapshotReader {
         self.lease.state.ensure(&self.client).await
     }
 
+    /// Observe the existing local grant without renewing or claiming a fresh
+    /// remote authorization decision. Expiry and terminal failures remain
+    /// visible even when a verified local CAS read needs no network contact.
+    pub fn local_lease_status(&self) -> Result<(), SnapshotError> {
+        let window = self.lease.state.window.lock().unwrap();
+        if let Some(error) = &window.failure {
+            return Err(error.clone());
+        }
+        if Instant::now() >= window.deadline {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LeaseExpired,
+                "snapshot retention lease expired",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn client(&self) -> &Mst2Client {
         &self.client
     }
