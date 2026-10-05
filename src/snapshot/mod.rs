@@ -34,6 +34,7 @@ pub mod reader;
 mod resolve_receipt;
 mod resolve_wire;
 pub mod types;
+pub mod workspace_pins;
 
 pub use auth::{AuthorizedSnapshotContext, CacheDomain};
 pub use client::Mst2Client;
@@ -52,3 +53,4 @@ pub use types::{
     Capabilities, Descriptor, DirEntry, DirectoryResponse, LookupResult, ResolveDelivery,
     ResolveRequest, ResolveTarget, SnapshotError, SnapshotErrorCode,
 };
+pub use workspace_pins::{LocalPinState, ReleaseLocalPinReceipt, WorkspaceBinding};
