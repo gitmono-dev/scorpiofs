@@ -278,24 +278,9 @@ impl AntaresFuse {
             // Every mounted wrapper and retained native future owns this exact
             // private Arc; no Weak capability to it is exposed. Once only the
             // control owner remains, no old request can enter the fence later.
-            tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
-                while Arc::strong_count(overlay.inner()) != 1 {
-                    if overlay.fence().is_uncertain() {
-                        return Err(std::io::Error::other(
-                            "native handle retirement has an unknown outcome",
-                        ));
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "native filesystem owners are still retiring",
-                )
-            })??;
+            overlay
+                .wait_for_retired_owners(tokio::time::Duration::from_secs(5))
+                .await?;
         }
         self.recover_copy_up_ownership().await
     }

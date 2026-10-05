@@ -405,6 +405,9 @@ async fn chunks(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Respon
         .unwrap()
         .parse::<u64>()
         .unwrap();
+    if mode == 11 && index >= 4 {
+        f.release.acquire().await.unwrap().forget();
+    }
     if mode == 10 && index >= 4 {
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)

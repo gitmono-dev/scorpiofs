@@ -634,3 +634,68 @@ async fn cancelled_modern_copy_up_recovers_the_written_private_block_and_keeps_o
     idle(&server.reader).await;
     assert_eq!(server.reader.content_usage().output_bytes, 0);
 }
+
+#[tokio::test]
+async fn retirement_wait_tracks_a_cancelled_caller_until_modern_copy_and_orphan_release_finish() {
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::new(false, true).with_large_file(Large::with_full_chunks(5));
+    let server = Server::start(fixture, 32 * 1024 * 1024).await;
+    let (lower, overlay, temp, upper) = overlay(&server).await;
+    let fenced = crate::util::fenced_fs::FencedFilesystem::new(overlay);
+    let req = request();
+    let name = OsStr::new("range000");
+    let file = fenced.lookup(req, ROOT_INODE, name).await.unwrap().attr.ino;
+    server.fixture.mode.store(11, Ordering::SeqCst);
+    let caller = tokio::spawn({
+        let mounted = fenced.clone();
+        async move { mounted.open(req, file, libc::O_RDWR as u32).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.fixture.chunk_requests.load(Ordering::SeqCst) < 5 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let original = original_large_file(5);
+    assert_eq!(
+        std::fs::read(private_payload(temp.path())).unwrap(),
+        original[..4 * CHUNK_SIZE as usize]
+    );
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        fenced
+            .wait_for_retired_owners(Duration::from_millis(30))
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert!(!fenced.fence().is_uncertain());
+    assert!(!upper.join(name).exists());
+    // Canceling the reply keeps the actual mutation alive. Complete both late
+    // HTTP requests; its successful open becomes an orphan and is released.
+    server.fixture.release.add_permits(2);
+    fenced
+        .wait_for_retired_owners(Duration::from_secs(5))
+        .await
+        .unwrap();
+    fenced.fence().seal().await.unwrap();
+    fenced.inner().recover_all_copyups().await.unwrap();
+    assert_eq!(std::fs::read(upper.join(name)).unwrap(), original);
+    assert_private_storage_released(temp.path());
+    assert_eq!(
+        read(&lower, "range000", 0, original.len() as u32)
+            .await
+            .data
+            .as_ref(),
+        original
+    );
+    let inner = fenced.inner().clone();
+    drop(fenced);
+    let overlay = Arc::try_unwrap(inner).unwrap_or_else(|_| panic!("unexpected native owner"));
+    close_overlay(overlay, lower).await;
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
