@@ -8,7 +8,7 @@
 //! chunk is still not a verified file — callers assembling chunks must
 //! recompute the whole-file digest (spec 07 §7).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mst2_codec::{
     chunkmap::{merkle_root, verify_leaf, ChunkLeaf, ChunkMap, ProofSide, CHUNK_SIZE},
@@ -132,7 +132,7 @@ impl Mst2Client {
     }
 
     /// POST `/{sid}/metadata/pages`; returns `(page_id hex, page bytes)` in
-    /// frame order with duplicates removed by the server. `encoding`
+    /// frame order, rejecting duplicate pages and invalid END bindings. `encoding`
     /// negotiates `identity` (default) or `zstd` frame compression.
     pub async fn metadata_pages(
         &self,
@@ -146,28 +146,87 @@ impl Mst2Client {
         }
         let body = serde_json::to_vec(&req)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
+        let request_items = u32::try_from(items.len()).map_err(|_| {
+            SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "metadata request item count overflow",
+            )
+        })?;
         let raw = self
-            .post_octets(self.snap_url(&format!("/{sid}/metadata/pages")), body)
+            .post_octets(self.snap_url(&format!("/{sid}/metadata/pages")), body.clone())
             .await?;
         let frames = mst2_codec::treeframe::parse_stream(&raw)
             .map_err(|e| frame_err("metadata/pages stream", e))?;
         // A terminated-with-ERROR stream is a failure, not an empty page set
         // (spec 04 §5: a failed directory load must never read as "no entries").
+        let (expected_units, expected_bytes) = match frames.last() {
+            Some(Frame::End(end)) => {
+                check_end(&frames, &body, request_items)?;
+                (end.unique_unit_count, end.logical_bytes)
+            }
+            Some(Frame::Error(e)) => {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::Internal,
+                    format!(
+                        "server rejected metadata/pages: {} (request_id {})",
+                        e.code, e.request_id
+                    ),
+                ));
+            }
+            _ => {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "metadata/pages stream missing END frame",
+                ));
+            }
+        };
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut unique_units = 0u32;
+        let mut logical_bytes = 0u64;
         for f in frames {
             match f {
-                Frame::Meta(m) => out.extend(m.pages),
-                Frame::Error(e) => {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::Internal,
-                        format!(
-                            "server rejected metadata/pages: {} (request_id {})",
-                            e.code, e.request_id
-                        ),
-                    ))
+                Frame::Meta(m) => {
+                    for (page_id, bytes) in m.pages {
+                        if !seen.insert(page_id) {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                "metadata/pages repeated a page across frames",
+                            ));
+                        }
+                        unique_units = unique_units.checked_add(1).ok_or_else(|| {
+                            SnapshotError::new(
+                                SnapshotErrorCode::LimitExceeded,
+                                "metadata page count overflow",
+                            )
+                        })?;
+                        logical_bytes = logical_bytes
+                            .checked_add(bytes.len() as u64)
+                            .ok_or_else(|| {
+                                SnapshotError::new(
+                                    SnapshotErrorCode::LimitExceeded,
+                                    "metadata page byte count overflow",
+                                )
+                            })?;
+                        out.push((page_id, bytes));
+                    }
                 }
-                _ => {}
+                Frame::End(_) => {}
+                _ => {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        "metadata/pages stream contains a non-META data frame",
+                    ));
+                }
             }
+        }
+        // A route may return ancestor witness pages, and aliased routes can
+        // share pages. Compare END with the actual unique pages, not items.
+        if unique_units != expected_units || logical_bytes != expected_bytes {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "metadata/pages END page count or logical bytes do not match the stream",
+            ));
         }
         Ok(out)
     }
