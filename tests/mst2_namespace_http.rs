@@ -525,6 +525,39 @@ async fn bounded_upper_diff_compares_modes_empty_directories_and_symlink_target_
     upper_file(&temp.path().join("plain"), b"plain", 0o644);
     upper_directory(&temp.path().join("empty"));
     symlink("used", temp.path().join("sym")).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+        let path = temp.path().join("sym");
+        let original_mode = std::fs::symlink_metadata(&path).unwrap().mode() & 0o7777;
+        let original = scan_upper(
+            &view,
+            &temp.path().canonicalize().unwrap(),
+            &pause,
+            DiffLimits::default(),
+        )
+        .await
+        .unwrap();
+        eprintln!("MAC_SYMLINK_INITIAL_MODE: {original_mode:o}; diff={original:?}");
+        if original_mode != 0o777 {
+            assert_eq!(original.changes.len(), 1, "{original:?}");
+            assert_eq!(original.changes[0].rel_path, "sym");
+            assert_eq!(original.changes[0].kind, UpperChangeKind::Modified);
+        }
+        // Darwin applies umask when creating symlinks. Establish the fixed
+        // profile's 0777 on the link itself, just as files/directories above
+        // explicitly establish their synthesized modes before a clean scan.
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::lchmod(path.as_ptr(), 0o777) }, 0);
+        assert_eq!(
+            std::fs::symlink_metadata(temp.path().join("sym"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o777
+        );
+    }
     let diff = scan_upper(
         &view,
         &temp.path().canonicalize().unwrap(),
@@ -533,7 +566,7 @@ async fn bounded_upper_diff_compares_modes_empty_directories_and_symlink_target_
     )
     .await
     .unwrap();
-    assert!(diff.is_clean());
+    assert!(diff.is_clean(), "{diff:?}");
     assert_eq!(diff.meters.hash_bytes, 9);
     std::fs::set_permissions(
         temp.path().join("plain"),
