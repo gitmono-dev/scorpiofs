@@ -2,7 +2,6 @@ use std::{
     collections::VecDeque,
     io::Write,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -13,11 +12,13 @@ use async_recursion::async_recursion;
 use crossbeam::queue::SegQueue;
 use futures::future::join_all;
 use git_internal::{
-    hash::ObjectHash,
+    hash::{HashKind, ObjectHash},
     internal::object::{
         commit::Commit,
         signature::{Signature, SignatureType},
         tree::{Tree, TreeItemMode},
+        types::ObjectType,
+        ObjectTrait,
     },
 };
 use reqwest::Client;
@@ -32,6 +33,13 @@ use crate::{
     manager::store::store_trees,
     util::{config, GPath},
 };
+
+// Mega's legacy tree endpoint serves SHA-1 object bodies. Never infer its
+// repository format from the worker thread's default hash kind.
+fn parse_git_tree(data: &[u8]) -> Result<Tree, git_internal::errors::GitError> {
+    let id = ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Tree, data)?;
+    Tree::from_bytes(data, id)
+}
 
 ///Download a file needs it's blob_id and save_path.
 #[derive(Debug, Clone)]
@@ -508,7 +516,7 @@ async fn worker_thread(
                 if response.status().is_success() {
                     match response.bytes().await {
                         Ok(bytes) => {
-                            match Tree::try_from(&bytes[..]) {
+                            match parse_git_tree(&bytes) {
                                 Ok(tree) => {
                                     trace!("ID:{id},path:{path}");
                                     send_tree.send(tree.clone()).await;
@@ -803,7 +811,7 @@ pub async fn fetch_tree(path: &GPath) -> Result<Tree, String> {
             .bytes()
             .await
             .map_err(|e| format!("Failed to read response: {e}"))?;
-        let tree = Tree::try_from(&bytes[..]).map_err(|e| format!("Failed to parse tree: {e}"))?;
+        let tree = parse_git_tree(&bytes).map_err(|e| format!("Failed to parse tree: {e}"))?;
         Ok(tree)
     } else {
         Err(format!("Failed to fetch tree: {}", response.status()))
@@ -841,13 +849,14 @@ pub async fn fetch_parent_commit(path: &str) -> Result<Commit, Box<dyn std::erro
             parent_info.committer.clone(),
             String::new(),
         );
-        Ok(Commit::new(
+        Ok(Commit::new_with_kind(
+            HashKind::Sha1,
             author_sign,
             committer_sign,
-            ObjectHash::from_str(&parent_info.oid)?,
+            ObjectHash::from_hex_for_kind(HashKind::Sha1, &parent_info.oid)?,
             Vec::new(),
             &parent_info.short_message,
-        ))
+        )?)
     } else {
         Err(format!("Failed to fetch tree: {}", response.status()).into())
     }
@@ -857,8 +866,23 @@ pub async fn fetch_parent_commit(path: &str) -> Result<Commit, Box<dyn std::erro
 mod tests {
     use std::{error::Error, fs::File};
 
-    use git_internal::internal::object::tree::Tree;
     use reqwest::Client;
+    #[test]
+    fn tree_parser_is_independent_of_worker_hash_kind() {
+        use git_internal::hash::{set_hash_kind_for_test, HashKind};
+        let _guard = set_hash_kind_for_test(HashKind::Blake3);
+        let mut body = b"100644 hello.txt\0".to_vec();
+        body.extend(hex::decode("ce013625030ba8dba906f756967f9e9ca394464a").unwrap());
+        let tree = super::parse_git_tree(&body).unwrap();
+        assert_eq!(tree.id.kind(), HashKind::Sha1);
+        assert_eq!(tree.tree_items[0].name, "hello.txt");
+        assert_eq!(tree.tree_items[0].id.kind(), HashKind::Sha1);
+        body.pop();
+        assert!(super::parse_git_tree(&body).is_err());
+        assert!(super::parse_git_tree(b"not a tree").is_err());
+        assert!(super::parse_git_tree(b"").unwrap().tree_items.is_empty());
+    }
+
     #[tokio::test]
     #[ignore = "requires running Mega server (uses base_url from config)"]
     async fn test_fetch_octet_stream() -> Result<(), Box<dyn Error>> {
@@ -881,7 +905,7 @@ mod tests {
 
             // Store the content in a Vec<u8>
             let data: Vec<u8> = content.to_vec();
-            let tree = Tree::try_from(&data[..]).unwrap();
+            let tree = super::parse_git_tree(&data).unwrap();
             // Print the data length for testing assertions
             // println!("Received {} bytes of data", data.len());
 
