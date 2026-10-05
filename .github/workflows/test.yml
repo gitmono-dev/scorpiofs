@@ -40,6 +40,9 @@ jobs:
       
       - name: Run tests
         run: cargo test --verbose --all-features
+
+      - name: Record native namespace and upper-diff coverage
+        run: cargo test --test mst2_namespace_http -- --nocapture
       
       - name: Run doc tests
         run: cargo test --doc --verbose
@@ -58,6 +61,9 @@ jobs:
 
       - name: cargo test --lib
         run: cargo test --lib --verbose
+
+      - name: Native namespace and upper-diff HTTP cases
+        run: cargo test --test mst2_namespace_http -- --nocapture
 
       - name: cargo build --release
         run: cargo build --release --locked --bin scorpio --bin antares
