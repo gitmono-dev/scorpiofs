@@ -27,6 +27,10 @@ use serde_json::{json, Value};
 use super::*;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(target_os = "linux")]
+#[path = "fuse_layer_tests.rs"]
+mod layer_tests;
 const INSTANCE: &str = "11111111-2222-4333-8444-555555555565";
 fn hash(bytes: &[u8]) -> [u8; 32] {
     ring::digest::digest(&ring::digest::SHA256, bytes)
