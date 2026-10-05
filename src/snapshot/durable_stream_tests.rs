@@ -237,11 +237,16 @@ async fn metadata(
     response(&snapshot, &body, wire)
 }
 
-async fn map(State(fixture): State<Arc<Fixture>>) -> Json<Value> {
+async fn map(
+    State(fixture): State<Arc<Fixture>>,
+    HttpPath(snapshot): HttpPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
     fixture.maps.fetch_add(1, Ordering::SeqCst);
     let m = &fixture.map;
     Json(
-        json!({"file_content_id": id(&fixture.advertised), "map_id": id(&m.map_id()),
+        json!({"snapshot_id": snapshot, "path": query["path"], "schema_version": 2,
+        "file_content_id": id(&fixture.advertised), "map_id": id(&m.map_id()),
         "file_size": m.file_size.to_string(), "chunk_size": CHUNK_SIZE, "chunk_count": m.chunk_count.to_string(),
         "page_count": m.page_count.to_string(), "pages_root": id(&m.pages_root)}),
     )
@@ -249,6 +254,7 @@ async fn map(State(fixture): State<Arc<Fixture>>) -> Json<Value> {
 
 async fn leaf(
     State(fixture): State<Arc<Fixture>>,
+    HttpPath(snapshot): HttpPath<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     let page: u64 = query["page"].parse().unwrap();
@@ -262,7 +268,10 @@ async fn leaf(
         })
         .collect();
     Json(
-        json!({"leaf": {"data_base64": base64(&fixture.leaves[page as usize].encode().unwrap())}, "proof": proof}),
+        json!({"snapshot_id": snapshot, "path": query["path"], "map_id": id(&fixture.map.map_id()),
+        "page_count": fixture.map.page_count.to_string(),
+        "leaf": {"page_index": page.to_string(), "count": fixture.leaves[page as usize].chunk_sha256.len().to_string(),
+        "data_base64": base64(&fixture.leaves[page as usize].encode().unwrap())}, "proof": proof}),
     )
 }
 
