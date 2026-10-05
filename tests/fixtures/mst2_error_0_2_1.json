@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "OBJECT_UNAVAILABLE",
+    "message": "The fixed object is temporarily unavailable.",
+    "request_id": "fixture-request-1",
+    "retryable": true
+  }
+}
