@@ -204,6 +204,7 @@ impl DurableStore {
         let store = Self {
             root: owner_root,
             content,
+            verification_meters: None,
         };
         let _transaction = store.transaction()?;
         match read_record::<WorkspaceBinding>(&store.root.join(OWNER_FILE))? {
@@ -290,7 +291,8 @@ impl DurableStore {
         durable::durability_checkpoint(&self.root, "release-pin-removed")?;
         register(self, &binding, RegistrationState::Released)?;
         durable::durability_checkpoint(&self.root, "release-registry-released")?;
-        super::ScopeCache::open(scope)?.drop_records_for_released_owner(&binding)?;
+        super::ScopeCache::open(scope)?
+            .drop_records_for_released_owner(&binding, self.verification_meters.as_ref())?;
         durable::durability_checkpoint(&self.root, "release-index-pruned")?;
         record.phase = ReleasePhase::Revoked;
         durable::write_atomic(&self.root, REVOKE_FILE, &encode(&record)?)?;
@@ -488,6 +490,7 @@ fn read_registration(scope: &Path, id: &str) -> Result<Option<Registration>, Sna
 pub(super) fn owner_inventory(
     scope: &Path,
     releasing: Option<&WorkspaceBinding>,
+    meters: Option<&durable::CasVerificationMeters>,
 ) -> Result<Vec<(String, PinAudit)>, SnapshotError> {
     let directory = scope.join(REGISTRY_DIR);
     let entries = match fs::read_dir(&directory) {
@@ -522,6 +525,7 @@ pub(super) fn owner_inventory(
         let store = DurableStore {
             root,
             content: scope.join("blobs"),
+            verification_meters: meters.cloned(),
         };
         let binding = require_owner(&store)?;
         if binding != registration.binding {

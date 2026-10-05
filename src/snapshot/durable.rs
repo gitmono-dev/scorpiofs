@@ -30,7 +30,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -309,6 +312,127 @@ pub struct HydrateReport {
 pub struct DurableStore {
     pub(super) root: PathBuf,
     pub(super) content: PathBuf,
+    pub(super) verification_meters: Option<CasVerificationMeters>,
+}
+
+/// Why a durable-store CAS body is reverified. These identify call sites,
+/// not individual requests; concurrent operations on a store share counters.
+#[derive(Debug, Clone, Copy)]
+pub enum CasVerificationReason {
+    Resume,
+    CompletionAudit,
+    HydrationCommit,
+    Materialize,
+}
+
+impl CasVerificationReason {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Cumulative counters from actual CAS verification attempts. A concurrent
+/// snapshot is not transactional; sample after quiescing for exact deltas.
+/// Only whole-body `verify_blob` attempts are counted. Read bytes include
+/// corrupt bodies, but exclude metadata, downloads, CAS writes, indexed range
+/// reads and buffered `read_blob` reads (including symlink-target validation).
+/// A pin release also counts other-owner audits delegated to its inventory.
+/// Independent opens remain off.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CasVerificationSnapshot {
+    pub calls: u64,
+    pub read_bytes: u64,
+    pub verified: u64,
+    pub missing: u64,
+    pub size_or_kind_mismatches: u64,
+    pub digest_mismatches: u64,
+    pub errors: u64,
+}
+
+#[derive(Debug, Default)]
+struct CasVerificationCounters {
+    calls: AtomicU64,
+    read_bytes: AtomicU64,
+    verified: AtomicU64,
+    missing: AtomicU64,
+    size_or_kind_mismatches: AtomicU64,
+    digest_mismatches: AtomicU64,
+    errors: AtomicU64,
+}
+
+/// An opt-in handle shared by this store and clones of its Arc. Counters are
+/// in memory only; reopening the same paths starts with instrumentation off.
+#[derive(Debug, Clone)]
+pub struct CasVerificationMeters(Arc<[CasVerificationCounters; 4]>);
+
+impl CasVerificationMeters {
+    pub fn snapshot_for(&self, reason: CasVerificationReason) -> CasVerificationSnapshot {
+        let counters = &self.0[reason.index()];
+        CasVerificationSnapshot {
+            calls: counters.calls.load(Ordering::Relaxed),
+            read_bytes: counters.read_bytes.load(Ordering::Relaxed),
+            verified: counters.verified.load(Ordering::Relaxed),
+            missing: counters.missing.load(Ordering::Relaxed),
+            size_or_kind_mismatches: counters.size_or_kind_mismatches.load(Ordering::Relaxed),
+            digest_mismatches: counters.digest_mismatches.load(Ordering::Relaxed),
+            errors: counters.errors.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn snapshot(&self) -> CasVerificationSnapshot {
+        let mut total = CasVerificationSnapshot::default();
+        for reason in [
+            CasVerificationReason::Resume,
+            CasVerificationReason::CompletionAudit,
+            CasVerificationReason::HydrationCommit,
+            CasVerificationReason::Materialize,
+        ] {
+            let part = self.snapshot_for(reason);
+            total.calls += part.calls;
+            total.read_bytes += part.read_bytes;
+            total.verified += part.verified;
+            total.missing += part.missing;
+            total.size_or_kind_mismatches += part.size_or_kind_mismatches;
+            total.digest_mismatches += part.digest_mismatches;
+            total.errors += part.errors;
+        }
+        total
+    }
+}
+
+enum VerificationOutcome {
+    Verified,
+    Missing,
+    SizeOrKindMismatch,
+    DigestMismatch,
+    Error,
+}
+
+struct VerificationAttempt<'a> {
+    counters: Option<&'a CasVerificationCounters>,
+    read_bytes: u64,
+    outcome: VerificationOutcome,
+}
+
+impl Drop for VerificationAttempt<'_> {
+    fn drop(&mut self) {
+        if let Some(counters) = self.counters {
+            counters.calls.fetch_add(1, Ordering::Relaxed);
+            if self.read_bytes != 0 {
+                counters
+                    .read_bytes
+                    .fetch_add(self.read_bytes, Ordering::Relaxed);
+            }
+            let outcome = match self.outcome {
+                VerificationOutcome::Verified => &counters.verified,
+                VerificationOutcome::Missing => &counters.missing,
+                VerificationOutcome::SizeOrKindMismatch => &counters.size_or_kind_mismatches,
+                VerificationOutcome::DigestMismatch => &counters.digest_mismatches,
+                VerificationOutcome::Error => &counters.errors,
+            };
+            outcome.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Transaction lifetime owns the lock, even if fork/dup retains a descriptor.
@@ -356,7 +480,11 @@ impl DurableStore {
         let content = content.into();
         create_dirs_durable(&root)?;
         create_dirs_durable(&content)?;
-        let store = Self { root, content };
+        let store = Self {
+            root,
+            content,
+            verification_meters: None,
+        };
         // Recovery uses the same lock as publication: an active writer must
         // never have its in-progress state invalidated by another opener.
         if let Some(_transaction) = store.try_transaction()? {
@@ -369,6 +497,37 @@ impl DurableStore {
     /// views of one scope when opened with `open_with_content`).
     pub fn content_dir(&self) -> &Path {
         &self.content
+    }
+
+    /// Enable counters before wrapping this store in Arc. Repeated calls
+    /// retain the same cumulative handle. Constructor recovery is excluded,
+    /// because instrumentation is disabled until explicitly enabled here.
+    pub fn enable_verification_meters(&mut self) -> CasVerificationMeters {
+        self.verification_meters
+            .get_or_insert_with(|| {
+                CasVerificationMeters(Arc::new(std::array::from_fn(|_| Default::default())))
+            })
+            .clone()
+    }
+
+    pub fn verification_meters(&self) -> Option<CasVerificationMeters> {
+        self.verification_meters.clone()
+    }
+
+    pub(crate) fn trace_verification_meters(&self, operation: &'static str) {
+        if let Some(meters) = &self.verification_meters {
+            tracing::debug!(
+                target: "scorpiofs::workspace::performance",
+                operation,
+                store_root = ?self.root,
+                cas_cumulative = ?meters.snapshot(),
+                cas_resume = ?meters.snapshot_for(CasVerificationReason::Resume),
+                cas_completion_audit = ?meters.snapshot_for(CasVerificationReason::CompletionAudit),
+                cas_hydration_commit = ?meters.snapshot_for(CasVerificationReason::HydrationCommit),
+                cas_materialize = ?meters.snapshot_for(CasVerificationReason::Materialize),
+                "workspace CAS verification totals"
+            );
+        }
     }
 
     /// `root/snapshots/<scope-slug>/<snapshot-hex>` — the conventional layout
@@ -521,6 +680,7 @@ impl DurableStore {
         let store = Self {
             root: root.to_path_buf(),
             content: content.to_path_buf(),
+            verification_meters: None,
         };
         Ok(match store.audit_pin()? {
             super::workspace_pins::PinAudit::Active(id) => Some(id),
@@ -743,7 +903,7 @@ impl DurableStore {
             // from an earlier version is already here. A journal entry is not
             // required — but every hit is re-hashed before it is credited, and
             // a truncated or tampered object is repaired rather than served.
-            match self.verify_blob(&f.content_digest, f.size) {
+            match self.verify_blob(&f.content_digest, f.size, CasVerificationReason::Resume) {
                 Ok(true) => {
                     journal.append(&FileRecord {
                         rel_path: f.rel_path.clone(),
@@ -999,7 +1159,11 @@ impl DurableStore {
                 async move {
                     use std::sync::atomic::Ordering::Relaxed;
                     let logical_files = aliases.len() as u64 + 1;
-                    if store.verify_blob(&f.content_digest, f.size)? {
+                    if store.verify_blob(
+                        &f.content_digest,
+                        f.size,
+                        CasVerificationReason::Resume,
+                    )? {
                         resumed.fetch_add(logical_files, Relaxed);
                         bytes_total.fetch_add(f.size * logical_files, Relaxed);
                         return Ok(());
@@ -1342,27 +1506,30 @@ impl DurableStore {
 
         // Phase 1: CAS reuse check decides what actually needs fetching.
         // Paths sharing a digest are journaled individually but fetched once.
-        let mut need: Vec<SnapshotFile> = Vec::new();
-        for f in manifest {
-            match store.verify_blob(&f.content_digest, f.size) {
-                Ok(true) => {
-                    resumed.fetch_add(1, Relaxed);
-                    bytes_total.fetch_add(f.size, Relaxed);
-                    journal.append(&FileRecord {
-                        rel_path: f.rel_path.clone(),
-                        digest: f.content_digest.clone(),
-                        size: f.size,
-                    })?;
-                }
-                Ok(false) => {
-                    if store.blob_path(&f.content_digest)?.exists() {
-                        repaired.fetch_add(1, Relaxed);
+        let need = super::stage::trace_sync("cas_resume_audit", || {
+            let mut need: Vec<SnapshotFile> = Vec::new();
+            for f in manifest {
+                match store.verify_blob(&f.content_digest, f.size, CasVerificationReason::Resume) {
+                    Ok(true) => {
+                        resumed.fetch_add(1, Relaxed);
+                        bytes_total.fetch_add(f.size, Relaxed);
+                        journal.append(&FileRecord {
+                            rel_path: f.rel_path.clone(),
+                            digest: f.content_digest.clone(),
+                            size: f.size,
+                        })?;
                     }
-                    need.push(f.clone());
+                    Ok(false) => {
+                        if store.blob_path(&f.content_digest)?.exists() {
+                            repaired.fetch_add(1, Relaxed);
+                        }
+                        need.push(f.clone());
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
-        }
+            Ok::<_, SnapshotError>(need)
+        })?;
 
         // Phase 2: split small (OBJECT batch) from large (chunk path).
         const OBJECT_CAP: u64 = 256 * 1024;
@@ -1395,105 +1562,117 @@ impl DurableStore {
         // Phase 3: fetch batches concurrently; verify + write + journal.
         let fetched_b = &fetched;
         let bytes_b = &bytes_total;
-        futures::stream::iter(batches)
-            .map(Ok::<_, SnapshotError>)
-            .try_for_each_concurrent(batch_concurrency.max(1), |batch| {
-                let fetch_batch = fetch_batch.clone();
-                let journal = &journal;
-                async move {
-                    let bytes = fetch_batch(batch.clone()).await?;
-                    for f in &batch {
-                        let data = bytes.content_bytes(&f.content_digest).ok_or_else(|| {
-                            SnapshotError::new(
-                                SnapshotErrorCode::DigestMismatch,
-                                format!(
-                                    "{}: objects batch did not return {}",
-                                    f.rel_path, f.content_digest
-                                ),
-                            )
-                        })?;
-                        let got = digest_of(data);
-                        if got != f.content_digest {
-                            return Err(SnapshotError::new(
-                                SnapshotErrorCode::DigestMismatch,
-                                format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
-                            ));
+        super::stage::trace_async(
+            "small_object_fetch_write",
+            futures::stream::iter(batches)
+                .map(Ok::<_, SnapshotError>)
+                .try_for_each_concurrent(batch_concurrency.max(1), |batch| {
+                    let fetch_batch = fetch_batch.clone();
+                    let journal = &journal;
+                    async move {
+                        let bytes = fetch_batch(batch.clone()).await?;
+                        for f in &batch {
+                            let data = bytes.content_bytes(&f.content_digest).ok_or_else(|| {
+                                SnapshotError::new(
+                                    SnapshotErrorCode::DigestMismatch,
+                                    format!(
+                                        "{}: objects batch did not return {}",
+                                        f.rel_path, f.content_digest
+                                    ),
+                                )
+                            })?;
+                            let got = digest_of(data);
+                            if got != f.content_digest {
+                                return Err(SnapshotError::new(
+                                    SnapshotErrorCode::DigestMismatch,
+                                    format!(
+                                        "{}: expected {}, got {got}",
+                                        f.rel_path, f.content_digest
+                                    ),
+                                ));
+                            }
+                            if data.len() as u64 != f.size {
+                                return Err(SnapshotError::new(
+                                    SnapshotErrorCode::DigestMismatch,
+                                    format!(
+                                        "{}: view advertises {} bytes, content is {}",
+                                        f.rel_path,
+                                        f.size,
+                                        data.len()
+                                    ),
+                                ));
+                            }
+                            // The journal cannot make another file's data durable.
+                            // Each CAS object is synced before the batch journal.
+                            write_atomic(&store.content, &blob_name(&f.content_digest), data)?;
+                            journal.append(&FileRecord {
+                                rel_path: f.rel_path.clone(),
+                                digest: f.content_digest.clone(),
+                                size: f.size,
+                            })?;
+                            fetched_b.fetch_add(1, Relaxed);
+                            bytes_b.fetch_add(f.size, Relaxed);
                         }
-                        if data.len() as u64 != f.size {
-                            return Err(SnapshotError::new(
-                                SnapshotErrorCode::DigestMismatch,
-                                format!(
-                                    "{}: view advertises {} bytes, content is {}",
-                                    f.rel_path,
-                                    f.size,
-                                    data.len()
-                                ),
-                            ));
+                        sync_dir(store.content_dir())?;
+                        Ok(())
+                    }
+                }),
+        )
+        .await?;
+
+        // Phase 4: large files, one chunked fetch per file, concurrent.
+        let fetched_l = &fetched;
+        let bytes_l = &bytes_total;
+        super::stage::trace_async(
+            "large_content_fetch_write",
+            futures::stream::iter(large)
+                .map(Ok::<_, SnapshotError>)
+                .try_for_each_concurrent(large_concurrency.max(1), |f| {
+                    let fetch_large = fetch_large.clone();
+                    let journal = &journal;
+                    async move {
+                        if let Some(reader) = stream_reader
+                            .filter(|reader| reader.capabilities().features.chunk_reads)
+                        {
+                            write_reader_blob(&store.content, reader, &f).await?;
+                        } else {
+                            let owner: std::sync::Arc<BLarge> = fetch_large(f.clone()).await?;
+                            let bytes = owner.as_ref().as_ref();
+                            let got = digest_of(bytes);
+                            if got != f.content_digest {
+                                return Err(SnapshotError::new(
+                                    SnapshotErrorCode::DigestMismatch,
+                                    format!(
+                                        "{}: expected {}, got {got}",
+                                        f.rel_path, f.content_digest
+                                    ),
+                                ));
+                            }
+                            if bytes.len() as u64 != f.size {
+                                return Err(SnapshotError::new(
+                                    SnapshotErrorCode::DigestMismatch,
+                                    format!(
+                                        "{}: view advertises {} bytes, content is {}",
+                                        f.rel_path,
+                                        f.size,
+                                        bytes.len()
+                                    ),
+                                ));
+                            }
+                            write_atomic(&store.content, &blob_name(&f.content_digest), bytes)?;
                         }
-                        // The journal cannot make another file's data durable.
-                        // Each CAS object is synced before the batch journal.
-                        write_atomic(&store.content, &blob_name(&f.content_digest), data)?;
                         journal.append(&FileRecord {
                             rel_path: f.rel_path.clone(),
                             digest: f.content_digest.clone(),
                             size: f.size,
                         })?;
-                        fetched_b.fetch_add(1, Relaxed);
-                        bytes_b.fetch_add(f.size, Relaxed);
+                        fetched_l.fetch_add(1, Relaxed);
+                        bytes_l.fetch_add(f.size, Relaxed);
+                        Ok(())
                     }
-                    sync_dir(store.content_dir())?;
-                    Ok(())
-                }
-            })
-            .await?;
-
-        // Phase 4: large files, one chunked fetch per file, concurrent.
-        let fetched_l = &fetched;
-        let bytes_l = &bytes_total;
-        futures::stream::iter(large)
-            .map(Ok::<_, SnapshotError>)
-            .try_for_each_concurrent(large_concurrency.max(1), |f| {
-                let fetch_large = fetch_large.clone();
-                let journal = &journal;
-                async move {
-                    if let Some(reader) =
-                        stream_reader.filter(|reader| reader.capabilities().features.chunk_reads)
-                    {
-                        write_reader_blob(&store.content, reader, &f).await?;
-                    } else {
-                        let owner: std::sync::Arc<BLarge> = fetch_large(f.clone()).await?;
-                        let bytes = owner.as_ref().as_ref();
-                        let got = digest_of(bytes);
-                        if got != f.content_digest {
-                            return Err(SnapshotError::new(
-                                SnapshotErrorCode::DigestMismatch,
-                                format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
-                            ));
-                        }
-                        if bytes.len() as u64 != f.size {
-                            return Err(SnapshotError::new(
-                                SnapshotErrorCode::DigestMismatch,
-                                format!(
-                                    "{}: view advertises {} bytes, content is {}",
-                                    f.rel_path,
-                                    f.size,
-                                    bytes.len()
-                                ),
-                            ));
-                        }
-                        write_atomic(&store.content, &blob_name(&f.content_digest), bytes)?;
-                    }
-                    journal.append(&FileRecord {
-                        rel_path: f.rel_path.clone(),
-                        digest: f.content_digest.clone(),
-                        size: f.size,
-                    })?;
-                    fetched_l.fetch_add(1, Relaxed);
-                    bytes_l.fetch_add(f.size, Relaxed);
-                    Ok(())
-                }
-            })
-            .await?;
+                }),
+        )
+        .await?;
 
         journal.flush()?;
         let fetched = fetched.load(Relaxed);
@@ -1704,7 +1883,11 @@ impl DurableStore {
             ));
         }
         for blob in dependencies {
-            if !self.verify_blob(&blob.digest, blob.size)? {
+            if !self.verify_blob(
+                &blob.digest,
+                blob.size,
+                CasVerificationReason::CompletionAudit,
+            )? {
                 return Err(integrity_err(format!(
                     "completion dependency missing or corrupt: {}",
                     blob.digest
@@ -1833,7 +2016,11 @@ impl DurableStore {
             ));
         }
         for blob in blobs {
-            if !self.verify_blob(&blob.digest, blob.size)? {
+            if !self.verify_blob(
+                &blob.digest,
+                blob.size,
+                CasVerificationReason::CompletionAudit,
+            )? {
                 return Err(integrity_err(format!(
                     "snapshot blob missing or corrupt: {}",
                     blob.digest
@@ -1883,6 +2070,18 @@ impl DurableStore {
         closure: Option<&ValidatedSnapshotClosure>,
         counts: (u64, u64, u64),
     ) -> Result<HydrateReport, SnapshotError> {
+        super::stage::trace_sync("durable_hydration_commit", || {
+            self.finish_hydration_commit_inner(view, manifest, closure, counts)
+        })
+    }
+
+    fn finish_hydration_commit_inner(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        closure: Option<&ValidatedSnapshotClosure>,
+        counts: (u64, u64, u64),
+    ) -> Result<HydrateReport, SnapshotError> {
         let (fetched, resumed, repaired) = counts;
         let (dependencies, bytes_total) = validate_manifest_policy(manifest, closure.is_some())?;
         if let Some(closure) = closure {
@@ -1892,7 +2091,11 @@ impl DurableStore {
         // Reuse is not a durability certificate. Sync every unique dependency
         // (including cache hits), then its directory, before metadata/pin.
         for blob in &dependencies {
-            if !self.verify_blob(&blob.digest, blob.size)? {
+            if !self.verify_blob(
+                &blob.digest,
+                blob.size,
+                CasVerificationReason::HydrationCommit,
+            )? {
                 return Err(integrity_err(format!(
                     "hydration dependency missing or corrupt: {}",
                     blob.digest
@@ -2211,7 +2414,11 @@ impl DurableStore {
     pub fn verify_all(&self, manifest: &[SnapshotFile]) -> Result<u64, SnapshotError> {
         let mut verified = 0u64;
         for f in manifest {
-            if !self.verify_blob(&f.content_digest, f.size)? {
+            if !self.verify_blob(
+                &f.content_digest,
+                f.size,
+                CasVerificationReason::Materialize,
+            )? {
                 return Err(SnapshotError::new(
                     SnapshotErrorCode::DigestMismatch,
                     format!("{}: local copy does not match the view digest", f.rel_path),
@@ -2273,14 +2480,31 @@ impl DurableStore {
     }
 
     /// True when the blob exists, has the advertised size and hashes correctly.
-    fn verify_blob(&self, digest: &str, expected_size: u64) -> Result<bool, SnapshotError> {
+    fn verify_blob(
+        &self,
+        digest: &str,
+        expected_size: u64,
+        reason: CasVerificationReason,
+    ) -> Result<bool, SnapshotError> {
+        let mut attempt = VerificationAttempt {
+            counters: self
+                .verification_meters
+                .as_ref()
+                .map(|meters| &meters.0[reason.index()]),
+            read_bytes: 0,
+            outcome: VerificationOutcome::Error,
+        };
         let path = self.blob_path(digest)?;
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                attempt.outcome = VerificationOutcome::Missing;
+                return Ok(false);
+            }
             Err(e) => return Err(io_err(e)),
         };
         if !meta.is_file() || meta.len() != expected_size {
+            attempt.outcome = VerificationOutcome::SizeOrKindMismatch;
             return Ok(false);
         }
         // Completion and resume must not collect a potentially 8 TiB CAS
@@ -2298,10 +2522,22 @@ impl DurableStore {
                 break;
             }
             read += count as u64;
+            // Accumulate locally; only an enabled completed attempt writes
+            // atomics, never every 64 KiB read on the normal hot path.
+            attempt.read_bytes += count as u64;
             hash.update(&buffer[..count]);
         }
-        Ok(read == expected_size
-            && format!("sha256:{}", hex::encode(hash.finish().as_ref())) == digest)
+        if read != expected_size {
+            attempt.outcome = VerificationOutcome::SizeOrKindMismatch;
+            return Ok(false);
+        }
+        let valid = format!("sha256:{}", hex::encode(hash.finish().as_ref())) == digest;
+        attempt.outcome = if valid {
+            VerificationOutcome::Verified
+        } else {
+            VerificationOutcome::DigestMismatch
+        };
+        Ok(valid)
     }
 
     /// Read the journal, tolerating a torn final line (crash mid-append) and
@@ -2858,6 +3094,123 @@ mod tests {
             .await
     }
 
+    #[test]
+    fn verification_meters_count_actual_streamed_bytes_and_failed_cas_attempts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = DurableStore::open(tmp.path()).unwrap();
+        let body = vec![0x51; 128 * 1024 + 7];
+        let digest = digest_of(&body);
+        let path = store.blob_path(&digest).unwrap();
+        fs::write(&path, &body).unwrap();
+        assert!(store.verification_meters().is_none());
+        assert!(store
+            .verify_blob(&digest, body.len() as u64, CasVerificationReason::Resume)
+            .unwrap());
+        let meters = store.enable_verification_meters();
+        assert_eq!(meters.snapshot(), CasVerificationSnapshot::default());
+        assert!(Arc::ptr_eq(
+            &meters.0,
+            &store.enable_verification_meters().0
+        ));
+
+        assert!(store
+            .verify_blob(&digest, body.len() as u64, CasVerificationReason::Resume)
+            .unwrap());
+        fs::write(&path, vec![0x52; body.len()]).unwrap();
+        assert!(!store
+            .verify_blob(
+                &digest,
+                body.len() as u64,
+                CasVerificationReason::CompletionAudit
+            )
+            .unwrap());
+        fs::write(&path, &body[..17]).unwrap();
+        assert!(!store
+            .verify_blob(&digest, body.len() as u64, CasVerificationReason::Resume)
+            .unwrap());
+        fs::remove_file(&path).unwrap();
+        assert!(!store
+            .verify_blob(&digest, body.len() as u64, CasVerificationReason::Resume)
+            .unwrap());
+        fs::create_dir(&path).unwrap();
+        assert!(!store
+            .verify_blob(&digest, body.len() as u64, CasVerificationReason::Resume)
+            .unwrap());
+        assert!(store
+            .verify_blob("sha256:../escape", 0, CasVerificationReason::Resume)
+            .is_err());
+        assert_eq!(
+            meters.snapshot(),
+            CasVerificationSnapshot {
+                calls: 6,
+                read_bytes: 2 * body.len() as u64,
+                verified: 1,
+                missing: 1,
+                size_or_kind_mismatches: 2,
+                digest_mismatches: 1,
+                errors: 1,
+            }
+        );
+        assert_eq!(
+            meters
+                .snapshot_for(CasVerificationReason::CompletionAudit)
+                .digest_mismatches,
+            1
+        );
+        assert_eq!(
+            meters
+                .snapshot_for(CasVerificationReason::Resume)
+                .read_bytes,
+            body.len() as u64
+        );
+        fs::remove_dir(&path).unwrap();
+        fs::write(path, body).unwrap();
+        let reopened = DurableStore::open(tmp.path()).unwrap();
+        assert!(reopened.verification_meters().is_none());
+        assert!(reopened
+            .verify_blob(&digest, 128 * 1024 + 7, CasVerificationReason::Resume)
+            .unwrap());
+        assert_eq!(
+            meters.snapshot().calls,
+            6,
+            "independent reopen cannot change an earlier handle"
+        );
+    }
+
+    #[test]
+    fn concurrent_arc_store_verifications_share_cumulative_counters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = DurableStore::open(tmp.path()).unwrap();
+        let body = vec![0x61; 64 * 1024 + 3];
+        let digest = digest_of(&body);
+        fs::write(store.blob_path(&digest).unwrap(), &body).unwrap();
+        let meters = store.enable_verification_meters();
+        let store = Arc::new(store);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let store = store.clone();
+                let digest = &digest;
+                let size = body.len() as u64;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        assert!(store
+                            .verify_blob(digest, size, CasVerificationReason::CompletionAudit)
+                            .unwrap());
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            meters.snapshot(),
+            CasVerificationSnapshot {
+                calls: 32,
+                verified: 32,
+                read_bytes: 32 * body.len() as u64,
+                ..Default::default()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn hydrate_then_resume_refetches_nothing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3008,7 +3361,7 @@ mod tests {
             "/etc/passwd", // no prefix, not hex
         ] {
             let err = store
-                .verify_blob(bad, 0)
+                .verify_blob(bad, 0, CasVerificationReason::Resume)
                 .expect_err("malformed digest must be rejected");
             assert_eq!(err.code, SnapshotErrorCode::DigestMismatch, "{bad}");
         }

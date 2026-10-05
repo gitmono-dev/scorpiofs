@@ -13,10 +13,12 @@ use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
 };
+use tracing::Instrument;
 
 use super::{mount::WorkspaceMount, types::*};
 use crate::snapshot::{
     fuse::Mst2Fuse,
+    stage::{trace_async, trace_blocking, trace_sync},
     upper_diff::{scan_upper, DiffLimits},
     CompletionKind, DurableStore, HydrateReport, LocalPinState, MetadataProofLimits, Mst2Client,
     SnapshotError, SnapshotErrorCode, SnapshotReader,
@@ -230,6 +232,24 @@ impl WorkspaceService {
         runtime: &mut Runtime,
         request: &CreateWorkspace,
     ) -> Result<(), WorkspaceError> {
+        let span = tracing::debug_span!(
+            target: "scorpiofs::workspace::performance",
+            "workspace_operation",
+            workspace_id = %workspace.id,
+            generation = %workspace.generation,
+            operation = "prepare"
+        );
+        self.prepare_inner(workspace, runtime, request)
+            .instrument(span)
+            .await
+    }
+
+    async fn prepare_inner(
+        &self,
+        workspace: &Workspace,
+        runtime: &mut Runtime,
+        request: &CreateWorkspace,
+    ) -> Result<(), WorkspaceError> {
         let full_permit = if matches!(request.delivery, WorkspaceDelivery::Full) {
             Some(self.hydrations.clone().try_acquire_owned().map_err(|_| {
                 WorkspaceError::new("WORKSPACE_BUSY", "hydration capacity exhausted")
@@ -237,9 +257,12 @@ impl WorkspaceService {
         } else {
             None
         };
-        let reader = SnapshotReader::resolve_request(
-            self.client.clone(),
-            &request.resolve_request(self.config.lease_seconds),
+        let reader = trace_async(
+            "resolve",
+            SnapshotReader::resolve_request(
+                self.client.clone(),
+                &request.resolve_request(self.config.lease_seconds),
+            ),
         )
         .await?;
         runtime.reader = Some(reader.clone());
@@ -247,54 +270,79 @@ impl WorkspaceService {
         let id = workspace.id.clone();
         let fixed = reader.clone();
         let store = Arc::new(
-            tokio::task::spawn_blocking(move || {
-                DurableStore::open_for_workspace(cache_root, &id, &fixed)
+            trace_blocking("store_bind", move || {
+                trace_sync("store_bind_work", || {
+                    let mut store = DurableStore::open_for_workspace(cache_root, &id, &fixed)?;
+                    if tracing::enabled!(target: "scorpiofs::workspace::performance", tracing::Level::DEBUG) {
+                        store.enable_verification_meters();
+                    }
+                    Ok::<_, SnapshotError>(store)
+                })
             })
             .await
             .map_err(|_| WorkspaceError::new("WORKSPACE_UNKNOWN", "cache binding task failed"))??,
         );
         runtime.store = Some(store.clone());
         let lower = Arc::new(
-            Mst2Fuse::from_reader_lazy_with_limits(
-                reader,
-                Some(store),
-                self.config.metadata_limits,
+            trace_async(
+                "root_metadata_proof",
+                Mst2Fuse::from_reader_lazy_with_limits(
+                    reader,
+                    Some(store),
+                    self.config.metadata_limits,
+                ),
             )
             .await?,
         );
         runtime.lower = Some(lower.clone());
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&workspace.directory)?;
-        runtime.directory_identity = Some(directory_identity(&workspace.directory)?);
-        initialize_workspace_directory(&workspace.directory, 0o700)?;
-        // The scaffold has the fixed lower's synthesized root mode/owner.
-        // Do not derive it from umask: a later root chmod/chown is a real edit.
-        fs::DirBuilder::new().mode(0o700).create(&workspace.upper)?;
-        runtime.upper_identity = Some(directory_identity(&workspace.upper)?);
-        initialize_workspace_directory(&workspace.upper, 0o755)?;
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&workspace.mountpoint)?;
-        runtime.mountpoint_identity = Some(directory_identity(&workspace.mountpoint)?);
-        initialize_workspace_directory(&workspace.mountpoint, 0o755)?;
+        trace_sync("private_paths_prepare", || {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&workspace.directory)?;
+            runtime.directory_identity = Some(directory_identity(&workspace.directory)?);
+            initialize_workspace_directory(&workspace.directory, 0o700)?;
+            // The scaffold has the fixed lower's synthesized root mode/owner.
+            // Do not derive it from umask: a later root chmod/chown is a real edit.
+            fs::DirBuilder::new().mode(0o700).create(&workspace.upper)?;
+            runtime.upper_identity = Some(directory_identity(&workspace.upper)?);
+            initialize_workspace_directory(&workspace.upper, 0o755)?;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&workspace.mountpoint)?;
+            runtime.mountpoint_identity = Some(directory_identity(&workspace.mountpoint)?);
+            initialize_workspace_directory(&workspace.mountpoint, 0o755)?;
+            check_private_paths(workspace, runtime)?;
+            check_retired_mountpoint(workspace, runtime)?;
+            Ok::<_, WorkspaceError>(())
+        })?;
+        runtime.mount = Some(
+            trace_async(
+                "native_mount_prepare",
+                WorkspaceMount::new(lower, &workspace.upper, workspace.mountpoint.clone()),
+            )
+            .await?,
+        );
         check_private_paths(workspace, runtime)?;
         check_retired_mountpoint(workspace, runtime)?;
-        runtime.mount =
-            Some(WorkspaceMount::new(lower, &workspace.upper, workspace.mountpoint.clone()).await?);
-        check_private_paths(workspace, runtime)?;
-        check_retired_mountpoint(workspace, runtime)?;
-        runtime.mount.as_mut().unwrap().mount().await?;
+        trace_async(
+            "native_mount_ready",
+            runtime.mount.as_mut().unwrap().mount(),
+        )
+        .await?;
         check_private_paths(workspace, runtime)?;
         runtime.mount_state = MountState::Mounted;
         if let Some(permit) = full_permit {
-            spawn_hydrate(runtime, permit);
+            spawn_hydrate(workspace, runtime, permit);
         }
         Ok(())
     }
 
-    fn start_hydrate_locked(&self, runtime: &mut Runtime) -> Result<(), WorkspaceError> {
+    fn start_hydrate_locked(
+        &self,
+        workspace: &Workspace,
+        runtime: &mut Runtime,
+    ) -> Result<(), WorkspaceError> {
         if runtime.hydrate.is_some() {
             return Ok(());
         }
@@ -308,7 +356,7 @@ impl WorkspaceService {
             self.hydrations.clone().try_acquire_owned().map_err(|_| {
                 WorkspaceError::new("WORKSPACE_BUSY", "hydration capacity exhausted")
             })?;
-        spawn_hydrate(runtime, permit);
+        spawn_hydrate(workspace, runtime, permit);
         Ok(())
     }
 
@@ -321,7 +369,7 @@ impl WorkspaceService {
         self.owned(async move {
             let mut runtime = workspace.runtime.lock().await;
             reconcile_hydrate(&mut runtime, false).await;
-            service.start_hydrate_locked(&mut runtime)?;
+            service.start_hydrate_locked(&workspace, &mut runtime)?;
             service.observe(&workspace, &mut runtime, false).await
         })
         .await
@@ -346,24 +394,38 @@ impl WorkspaceService {
         id: &str,
     ) -> Result<crate::snapshot::ReleaseLocalPinReceipt, WorkspaceError> {
         let workspace = self.find(id)?;
-        self.owned(async move {
-            let mut runtime = workspace.runtime.lock().await;
-            reconcile_hydrate(&mut runtime, true).await;
-            let store = runtime
-                .store
-                .as_ref()
-                .ok_or_else(|| {
-                    WorkspaceError::new("WORKSPACE_NOT_READY", "workspace has no fixed store")
-                })?
-                .clone();
-            let result = tokio::task::spawn_blocking(move || store.release_local_pin())
+        let span = tracing::debug_span!(
+            target: "scorpiofs::workspace::performance",
+            "workspace_operation",
+            workspace_id = %workspace.id,
+            generation = %workspace.generation,
+            operation = "release_local_pin"
+        );
+        self.owned(
+            async move {
+                let mut runtime = workspace.runtime.lock().await;
+                reconcile_hydrate(&mut runtime, true).await;
+                let store = runtime
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| {
+                        WorkspaceError::new("WORKSPACE_NOT_READY", "workspace has no fixed store")
+                    })?
+                    .clone();
+                let result = trace_blocking("local_pin_release", move || {
+                    let result = trace_sync("local_pin_release_work", || store.release_local_pin());
+                    store.trace_verification_meters("release_local_pin");
+                    result
+                })
                 .await
                 .map_err(|_| {
                     WorkspaceError::new("WORKSPACE_UNKNOWN", "pin revocation task failed")
                 })??;
-            runtime.hydration_state = HydrationState::Idle;
-            Ok(result)
-        })
+                runtime.hydration_state = HydrationState::Idle;
+                Ok(result)
+            }
+            .instrument(span),
+        )
         .await
     }
 
@@ -398,10 +460,28 @@ impl WorkspaceService {
         runtime: &mut Runtime,
         scan: bool,
     ) -> Result<WorkspaceStatus, WorkspaceError> {
+        let span = tracing::debug_span!(
+            target: "scorpiofs::workspace::performance",
+            "workspace_operation",
+            workspace_id = %workspace.id,
+            generation = %workspace.generation,
+            operation = "observe"
+        );
+        self.observe_inner(workspace, runtime, scan)
+            .instrument(span)
+            .await
+    }
+
+    async fn observe_inner(
+        &self,
+        workspace: &Workspace,
+        runtime: &mut Runtime,
+        scan: bool,
+    ) -> Result<WorkspaceStatus, WorkspaceError> {
         reconcile_hydrate(runtime, false).await;
         if runtime.mount_state == MountState::Mounted {
             let ready = match &runtime.mount {
-                Some(mount) => mount.is_ready().await,
+                Some(mount) => trace_async("native_readiness_check", mount.is_ready()).await,
                 None => Ok(false),
             };
             if !matches!(ready, Ok(true)) {
@@ -414,7 +494,13 @@ impl WorkspaceService {
         }
         let local_pin_state = if let Some(store) = &runtime.store {
             let store = store.clone();
-            match tokio::task::spawn_blocking(move || store.local_pin_state()).await {
+            match trace_blocking("local_pin_audit", move || {
+                let result = trace_sync("local_pin_audit_work", || store.local_pin_state());
+                store.trace_verification_meters("observation");
+                result
+            })
+            .await
+            {
                 Ok(Ok(LocalPinState::Complete(CompletionKind::FullSnapshot))) => {
                     PinState::CompleteSnapshot
                 }
@@ -437,7 +523,7 @@ impl WorkspaceService {
             runtime.hydration_state = HydrationState::Idle;
         }
         let dirty_state = if scan {
-            match self.dirty(workspace, runtime).await {
+            match trace_async("upper_scan", self.dirty(workspace, runtime)).await {
                 Ok(state) => state,
                 Err(error) => {
                     runtime.last_error = Some(error.to_string());
@@ -664,14 +750,25 @@ impl WorkspaceService {
     }
 }
 
-fn spawn_hydrate(runtime: &mut Runtime, permit: OwnedSemaphorePermit) {
+fn spawn_hydrate(workspace: &Workspace, runtime: &mut Runtime, permit: OwnedSemaphorePermit) {
     let reader = runtime.reader.as_ref().unwrap().clone();
     let store = runtime.store.as_ref().unwrap().clone();
     runtime.hydration_state = HydrationState::Running;
-    runtime.hydrate = Some(tokio::spawn(async move {
-        let _permit = permit;
-        super::hydrate::hydrate_workspace(&store, &reader).await
-    }));
+    let span = tracing::debug_span!(
+        target: "scorpiofs::workspace::performance",
+        "workspace_operation",
+        workspace_id = %workspace.id,
+        generation = %workspace.generation,
+        snapshot_id = %reader.snapshot_id(),
+        operation = "hydrate"
+    );
+    runtime.hydrate = Some(tokio::spawn(
+        async move {
+            let _permit = permit;
+            super::hydrate::hydrate_workspace(&store, &reader).await
+        }
+        .instrument(span),
+    ));
 }
 
 async fn reconcile_hydrate(runtime: &mut Runtime, cancel: bool) {

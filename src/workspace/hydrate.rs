@@ -1,20 +1,26 @@
 //! Workspace full hydration uses fixed, bounded OBJECT and streaming lanes.
 
-use crate::snapshot::{DurableStore, HydrateReport, SnapshotError, SnapshotReader};
+use crate::snapshot::{
+    stage::{trace_async, trace_sync},
+    DurableStore, HydrateReport, SnapshotError, SnapshotReader,
+};
 
 pub(crate) async fn hydrate_workspace(
     store: &DurableStore,
     reader: &SnapshotReader,
 ) -> Result<HydrateReport, SnapshotError> {
     if !reader.capabilities().features.objects {
-        return store.hydrate_snapshot(reader).await;
+        let result = trace_async("hydrate_without_objects", store.hydrate_snapshot(reader)).await;
+        store.trace_verification_meters("hydration_without_objects");
+        return result;
     }
-    store.bind_reader(reader)?;
-    let closure = reader.snapshot_closure().await?;
+    trace_sync("hydrate_bind", || store.bind_reader(reader))?;
+    let closure = trace_async("hydrate_metadata_closure", reader.snapshot_closure()).await?;
     let batches = reader.clone();
     let large = reader.clone();
-    store
-        .hydrate_snapshot_content_batches(
+    let result = trace_async(
+        "hydrate_content_and_commit",
+        store.hydrate_snapshot_content_batches(
             reader,
             &closure,
             2,
@@ -29,8 +35,11 @@ pub(crate) async fn hydrate_workspace(
                 // chunk-capable large files and streams verified ranges to CAS.
                 Box::pin(async move { reader.read_content(&file, false).await })
             },
-        )
-        .await
+        ),
+    )
+    .await;
+    store.trace_verification_meters("hydration");
+    result
 }
 
 #[cfg(test)]
@@ -61,7 +70,9 @@ mod tests {
 
     use super::*;
     use crate::snapshot::{
-        durable::digest_of, frames::parse_digest, CompletionKind, LocalPinState, Mst2Client,
+        durable::{digest_of, CasVerificationReason},
+        frames::parse_digest,
+        CompletionKind, LocalPinState, Mst2Client,
     };
 
     fn hash(bytes: &[u8]) -> [u8; 32] {
@@ -425,12 +436,14 @@ mod tests {
         let server = Server::new(Fixture::new(true, true, true)).await;
         let reader = server.reader().await;
         let temp = tempfile::tempdir().unwrap();
-        let first = DurableStore::open_for_workspace(
+        let mut first = DurableStore::open_for_workspace(
             temp.path(),
             "11111111-2222-4333-8444-555555555501",
             &reader,
         )
         .unwrap();
+        assert!(first.verification_meters().is_none());
+        let first_meters = first.enable_verification_meters();
         let report = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             hydrate_workspace(&first, &reader),
@@ -445,13 +458,28 @@ mod tests {
         assert_eq!(server.fixture.chunk_peak.load(Ordering::SeqCst), 2);
         assert_eq!(server.fixture.raw_calls.load(Ordering::SeqCst), 0);
         assert_eq!(server.fixture.chunk_calls.load(Ordering::SeqCst), 6);
+        let unique_bytes: u64 = server
+            .fixture
+            .bodies
+            .values()
+            .map(|bytes| bytes.len() as u64)
+            .sum();
+        let cold_resume = first_meters.snapshot_for(CasVerificationReason::Resume);
+        assert_eq!(cold_resume.calls, 194);
+        assert_eq!(cold_resume.missing, 194);
+        assert_eq!(cold_resume.read_bytes, 0);
+        let cold_commit = first_meters.snapshot_for(CasVerificationReason::HydrationCommit);
+        assert_eq!(cold_commit.calls, 194);
+        assert_eq!(cold_commit.verified, 194);
+        assert_eq!(cold_commit.read_bytes, unique_bytes);
         let second_reader = server.reader().await;
-        let second = DurableStore::open_for_workspace(
+        let mut second = DurableStore::open_for_workspace(
             temp.path(),
             "11111111-2222-4333-8444-555555555502",
             &second_reader,
         )
         .unwrap();
+        let second_meters = second.enable_verification_meters();
         let before = (
             server.fixture.object_calls.load(Ordering::SeqCst),
             server.fixture.chunk_calls.load(Ordering::SeqCst),
@@ -460,6 +488,11 @@ mod tests {
         assert!(report.complete);
         assert_eq!(report.fetched, 0);
         assert_eq!(report.resumed, 194);
+        let warm_resume = second_meters.snapshot_for(CasVerificationReason::Resume);
+        assert_eq!(warm_resume.calls, 194);
+        assert_eq!(warm_resume.verified, 194);
+        assert_eq!(warm_resume.read_bytes, unique_bytes);
+        assert_eq!(second_meters.snapshot().read_bytes, 2 * unique_bytes);
         assert_eq!(
             (
                 server.fixture.object_calls.load(Ordering::SeqCst),
@@ -474,6 +507,18 @@ mod tests {
         assert_eq!(
             second.local_pin_state().unwrap(),
             LocalPinState::Complete(CompletionKind::FullSnapshot)
+        );
+        assert_eq!(
+            first_meters
+                .snapshot_for(CasVerificationReason::CompletionAudit)
+                .read_bytes,
+            unique_bytes
+        );
+        assert_eq!(
+            second_meters
+                .snapshot_for(CasVerificationReason::CompletionAudit)
+                .read_bytes,
+            unique_bytes
         );
     }
 
@@ -527,6 +572,10 @@ mod tests {
         )
         .unwrap();
         let report = hydrate_workspace(&store, &reader).await.unwrap();
+        assert!(
+            store.verification_meters().is_none(),
+            "fallback stays unmetered by default"
+        );
         assert!(report.complete);
         assert_eq!(report.completion_kind, CompletionKind::FullSnapshot);
         assert_eq!(server.fixture.object_calls.load(Ordering::SeqCst), 0);
