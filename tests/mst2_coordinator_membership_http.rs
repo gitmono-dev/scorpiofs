@@ -429,6 +429,64 @@ async fn seeded_membership_does_not_bypass_a_failed_current_lease() {
     assert_current_lease(true).await;
 }
 
+#[tokio::test]
+async fn direct_owned_reader_and_batch_keep_current_lease_checks_after_root_seed() {
+    let mut fixture = Fixture::new(true);
+    fixture.expiry = expiry_in_three_seconds();
+    let server = Server::start(fixture).await;
+    let reader = server.reader(None).await;
+    let closure = reader.snapshot_closure().await.unwrap();
+    reader.seed_content_membership(&closure).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server.fixture.renewal_started.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reader.ensure_lease().await.unwrap_err().code,
+        SnapshotErrorCode::LeaseUnknown
+    );
+    assert_eq!(
+        reader
+            .read_content(&file("a"), false)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::LeaseUnknown
+    );
+    assert_eq!(
+        reader
+            .read_content_batch(&[file("a"), file("b")])
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::LeaseUnknown
+    );
+    assert_eq!(server.fixture.metadata_requests.load(Ordering::SeqCst), 1);
+    assert!(server.fixture.blob_requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn direct_owned_reader_rejects_foreign_seed_and_failed_proof_without_body_http() {
+    let first = Server::start(Fixture::new(true)).await;
+    let reader = first.reader(None).await;
+    let closure = reader.snapshot_closure().await.unwrap();
+    let mut foreign = Fixture::new(true);
+    foreign.descriptor.namespace_view_id[0] ^= 1;
+    let second = Server::start(foreign).await;
+    let other = second.reader(None).await;
+    assert!(other.seed_content_membership(&closure).is_err());
+    assert!(second.fixture.blob_requests.lock().unwrap().is_empty());
+    let corrupt = Fixture::new(true);
+    corrupt.corrupt.store(true, Ordering::SeqCst);
+    let bad = Server::start(corrupt).await;
+    let bad_reader = bad.reader(None).await;
+    assert!(bad_reader.read_content(&file("a"), false).await.is_err());
+    assert!(bad.fixture.blob_requests.lock().unwrap().is_empty());
+    assert_eq!(bad_reader.content_usage().output_bytes, 0);
+}
+
 async fn assert_current_lease(seeded: bool) {
     let mut fixture = Fixture::new(true);
     fixture.expiry = expiry_in_three_seconds();
