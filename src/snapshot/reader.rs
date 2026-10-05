@@ -6,7 +6,10 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -85,6 +88,8 @@ struct LeaseState {
     lease_seconds: u64,
     lease_id: String,
     snapshot_id: String,
+    authorization_epoch: String,
+    authorization_epoch_reported: AtomicBool,
     window: StdMutex<LeaseWindow>,
     renewing: tokio::sync::Mutex<()>,
 }
@@ -172,6 +177,21 @@ impl LeaseState {
                     "lease renewal returned a different lease or snapshot",
                 ));
             }
+            // Legacy renewals omit this field. Once the server reports it,
+            // later renewals cannot remove it or change the resolved authority.
+            match renewed.get("authorization_epoch") {
+                Some(value) if value.as_str() == Some(self.authorization_epoch.as_str()) => {
+                    self.authorization_epoch_reported
+                        .store(true, Ordering::Relaxed);
+                }
+                None if !self.authorization_epoch_reported.load(Ordering::Relaxed) => {}
+                _ => {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::IntegrityError,
+                        "lease renewal changed or invalidated its authorization epoch",
+                    ));
+                }
+            }
             let expiry = renewed
                 .get("lease_expires_at")
                 .and_then(|v| v.as_str())
@@ -202,6 +222,7 @@ impl LeaseKeeper {
         lease_id: &str,
         snapshot_id: &str,
         expiry: &str,
+        authorization_epoch: u64,
     ) -> Result<Self, SnapshotError> {
         if lease_id.is_empty() {
             return Err(SnapshotError::new(
@@ -214,6 +235,8 @@ impl LeaseKeeper {
                 lease_seconds: lease_seconds.clamp(1, 3600),
                 lease_id: lease_id.to_string(),
                 snapshot_id: snapshot_id.to_string(),
+                authorization_epoch: authorization_epoch.to_string(),
+                authorization_epoch_reported: AtomicBool::new(false),
                 window: StdMutex::new(lease_window(expiry)?),
                 renewing: tokio::sync::Mutex::new(()),
             }),
@@ -417,6 +440,7 @@ impl SnapshotReader {
             &res.lease_id,
             &res.descriptor.snapshot_id,
             &res.lease_expires_at,
+            context.authorization_epoch(),
         )?);
         // Keep the retention claim alive for as long as this reader lives
         // (a hydrate or mount may outlast the initial window). Outside a
@@ -1378,7 +1402,7 @@ mod tests {
 
     #[test]
     fn lease_keeper_checks_expiry_and_preserves_failure() {
-        let keeper = LeaseKeeper::new(60, "lease", "snapshot", "2099-01-01T00:00:00Z").unwrap();
+        let keeper = LeaseKeeper::new(60, "lease", "snapshot", "2099-01-01T00:00:00Z", 1).unwrap();
         assert!(!keeper.state.needs_renewal().unwrap());
         {
             let mut window = keeper.state.window.lock().unwrap();
@@ -1394,22 +1418,22 @@ mod tests {
             ("2026-02-29T00:00:00Z", SnapshotErrorCode::IntegrityError),
             ("1970-01-01T00:00:00Z", SnapshotErrorCode::LeaseExpired),
         ] {
-            let error = match LeaseKeeper::new(60, "lease", "snapshot", expiry) {
+            let error = match LeaseKeeper::new(60, "lease", "snapshot", expiry, 1) {
                 Ok(_) => panic!("invalid initial expiry was accepted: {expiry}"),
                 Err(error) => error,
             };
             assert_eq!(error.code, expected);
         }
-        assert!(LeaseKeeper::new(60, "", "snapshot", "2099-01-01T00:00:00Z").is_err());
+        assert!(LeaseKeeper::new(60, "", "snapshot", "2099-01-01T00:00:00Z", 1).is_err());
         assert_eq!(
-            LeaseKeeper::new(99_999, "l", "s", "2099-01-01T00:00:00Z")
+            LeaseKeeper::new(99_999, "l", "s", "2099-01-01T00:00:00Z", 1)
                 .unwrap()
                 .state
                 .lease_seconds,
             3600
         );
         assert_eq!(
-            LeaseKeeper::new(0, "l", "s", "2099-01-01T00:00:00Z")
+            LeaseKeeper::new(0, "l", "s", "2099-01-01T00:00:00Z", 1)
                 .unwrap()
                 .state
                 .lease_seconds,
@@ -1435,7 +1459,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let keeper = LeaseKeeper::new(60, "lease", "snapshot", "2099-01-01T00:00:00Z").unwrap();
+        let keeper = LeaseKeeper::new(60, "lease", "snapshot", "2099-01-01T00:00:00Z", 1).unwrap();
         keeper.state.window.lock().unwrap().renew_at = Instant::now();
         let weak = Arc::downgrade(&keeper.state);
         keeper.spawn(Mst2Client::new(format!("http://{address}")));

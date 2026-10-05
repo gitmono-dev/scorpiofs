@@ -60,6 +60,8 @@ struct Fixture {
     initial_expiry: Expiry,
     renewal_expiry: Expiry,
     renewal_identity: Mutex<RenewalIdentity>,
+    resolve_epoch: &'static str,
+    renewal_epoch: Mutex<Option<Value>>,
     fail_renewal: AtomicBool,
     plain_retry_errors: bool,
     malformed_renewal_json: AtomicBool,
@@ -81,6 +83,8 @@ impl Default for Fixture {
             initial_expiry: Expiry::After(Duration::from_secs(30)),
             renewal_expiry: Expiry::After(Duration::from_secs(30)),
             renewal_identity: Mutex::new(RenewalIdentity::Correct),
+            resolve_epoch: "1",
+            renewal_epoch: Mutex::new(None),
             fail_renewal: AtomicBool::new(false),
             plain_retry_errors: false,
             malformed_renewal_json: AtomicBool::new(false),
@@ -235,7 +239,7 @@ async fn resolve(
             "materialization_policy": 1, "fs_semantics": 1, "access_projection": 0,
             "metadata_root": format!("sha256:{}", hex::encode(METADATA_ROOT)), "snapshot_id": snapshot
         },
-        "lease_id": lease, "publication_sequence": sequence.to_string(), "authorization_epoch": "1"
+        "lease_id": lease, "publication_sequence": sequence.to_string(), "authorization_epoch": f.resolve_epoch
     });
     add_expiry(&mut response, f.initial_expiry);
     Json(response)
@@ -305,6 +309,9 @@ async fn renew(
         RenewalIdentity::WrongSnapshot => (lease, format!("sha256:{}", "ff".repeat(32))),
     };
     let mut response = json!({"lease_id": returned_lease, "snapshot_id": snapshot});
+    if let Some(epoch) = f.renewal_epoch.lock().unwrap().clone() {
+        response["authorization_epoch"] = epoch;
+    }
     add_expiry(&mut response, f.renewal_expiry);
     Json(response).into_response()
 }
@@ -710,6 +717,122 @@ async fn wrong_renewal_identity_is_terminal_after_the_backend_is_corrected() {
         1,
         "identity failure was treated as a retryable outage"
     );
+    assert_eq!(fixture.count("lookup"), 0);
+    assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn changed_and_malformed_renewal_epochs_are_terminal_for_every_reader_clone() {
+    let cases = [
+        json!("0"),
+        json!("2"),
+        json!("01"),
+        json!("+1"),
+        json!(" 1"),
+        json!(""),
+        json!("１"),
+        json!("9223372036854775808"),
+        json!("18446744073709551616"),
+        json!(null),
+        json!(1),
+        json!(true),
+        json!({"epoch": "1"}),
+    ];
+    futures::future::join_all(cases.into_iter().map(|epoch| async move {
+        let fixture = Arc::new(Fixture {
+            initial_expiry: Expiry::After(Duration::from_secs(3)),
+            renewal_epoch: Mutex::new(Some(epoch)),
+            ..Fixture::default()
+        });
+        let server = serve(fixture.clone()).await;
+        let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), "/alpha", 600)
+            .await
+            .unwrap();
+        let fixed_domain = reader.authorized_context().cache_domain().id().to_string();
+        let clone = reader.clone();
+        fixture.wait_for_renewals(1).await;
+        assert_eq!(
+            reader.ensure_lease().await.unwrap_err().code,
+            SnapshotErrorCode::IntegrityError
+        );
+        *fixture.renewal_epoch.lock().unwrap() = Some(json!("1"));
+        assert_eq!(
+            clone.lookup(&["/probe".into()]).await.unwrap_err().code,
+            SnapshotErrorCode::IntegrityError
+        );
+        assert_eq!(reader.authorized_context().authorization_epoch(), 1);
+        assert_eq!(
+            reader.authorized_context().cache_domain().id(),
+            fixed_domain
+        );
+        assert_eq!(fixture.renewal_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.count("lookup"), 0);
+        assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.client().retry_count(), 0);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn matching_renewal_epochs_preserve_fixed_authority_at_the_counter_boundary() {
+    for epoch in ["0", "1", "9223372036854775807"] {
+        let fixture = Arc::new(Fixture {
+            initial_expiry: Expiry::After(Duration::from_secs(3)),
+            resolve_epoch: epoch,
+            renewal_epoch: Mutex::new(Some(json!(epoch))),
+            ..Fixture::default()
+        });
+        let server = serve(fixture.clone()).await;
+        let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), "/alpha", 600)
+            .await
+            .unwrap();
+        let fixed_domain = reader.authorized_context().cache_domain().id().to_string();
+        fixture.wait_for_renewals(1).await;
+        reader.ensure_lease().await.unwrap();
+        probe(&reader).await;
+        assert_eq!(
+            reader
+                .authorized_context()
+                .authorization_epoch()
+                .to_string(),
+            epoch
+        );
+        assert_eq!(
+            reader.authorized_context().cache_domain().id(),
+            fixed_domain
+        );
+        assert_eq!(fixture.renewal_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.count("lookup"), 1);
+        assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn an_epoch_reporting_lease_cannot_downgrade_to_legacy_renewals() {
+    let fixture = Arc::new(Fixture {
+        initial_expiry: Expiry::After(Duration::from_secs(3)),
+        renewal_expiry: Expiry::After(Duration::from_secs(3)),
+        renewal_epoch: Mutex::new(Some(json!("1"))),
+        ..Fixture::default()
+    });
+    let server = serve(fixture.clone()).await;
+    let reader = SnapshotReader::resolve(Mst2Client::new(&server.url), "/alpha", 600)
+        .await
+        .unwrap();
+    fixture.wait_for_renewals(1).await;
+    reader.ensure_lease().await.unwrap();
+    *fixture.renewal_epoch.lock().unwrap() = None;
+    fixture.wait_for_renewals(2).await;
+    assert_eq!(
+        reader.ensure_lease().await.unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    *fixture.renewal_epoch.lock().unwrap() = Some(json!("1"));
+    assert_eq!(
+        reader.lookup(&["/probe".into()]).await.unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(fixture.renewal_count.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.count("lookup"), 0);
     assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
 }
