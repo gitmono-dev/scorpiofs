@@ -966,6 +966,12 @@ impl Mst2Fuse {
             format!("/{rel_path}")
         };
         crate::snapshot::auth::validate_scope(&relative)?;
+        if let Some(reader) = &self.reader {
+            reader
+                .authorized_context()
+                .validate_relative_path(&relative)?;
+            reader.client.validate_path(&relative)?;
+        }
         let scope = self
             .state
             .lock()

@@ -58,6 +58,8 @@ struct Fixture {
     calls: Mutex<Vec<Value>>,
     fault: Option<(&'static str, u16, &'static str)>,
     omit: Option<String>,
+    path_limit: Option<u32>,
+    component_limit: Option<u32>,
 }
 impl Fixture {
     fn with_routes(root: [u8; 32], routes: Routes) -> Self {
@@ -74,6 +76,8 @@ impl Fixture {
             calls: Mutex::new(Vec::new()),
             fault: None,
             omit: None,
+            path_limit: None,
+            component_limit: None,
         }
     }
     fn new() -> Self {
@@ -119,10 +123,16 @@ impl Fixture {
         digest(&self.descriptor.snapshot_id().unwrap())
     }
 }
-async fn caps() -> Json<Value> {
+async fn caps(State(f): State<Arc<Fixture>>) -> Json<Value> {
     let mut value: Value =
         serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap();
     value["limits"]["max_metadata_items"] = json!(2);
+    if let Some(limit) = f.path_limit {
+        value["limits"]["max_path_bytes"] = json!(limit);
+    }
+    if let Some(limit) = f.component_limit {
+        value["limits"]["max_path_components"] = json!(limit);
+    }
     Json(value)
 }
 async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
@@ -431,4 +441,34 @@ async fn old_and_new_fixed_readers_keep_distinct_content_identities() {
     assert_eq!(old_view.path_state("used/data").await.unwrap(), old_state);
     assert_ne!(new_view.path_state("used/data").await.unwrap(), old_state);
     assert_eq!(old_view.path_state("used/data").await.unwrap(), old_state);
+}
+
+#[tokio::test]
+async fn cached_namespace_still_checks_advertised_negative_path_limits() {
+    let mut fixture = Fixture::new();
+    fixture.path_limit = Some(12);
+    let server = Server::start(fixture).await;
+    let view = Mst2Fuse::from_reader_lazy(server.reader().await, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        view.path_state("absent").await.unwrap(),
+        SnapshotPathState::AbsentProven
+    );
+    assert_eq!(
+        view.path_state("neverexistsxx").await.unwrap_err().code,
+        SnapshotErrorCode::LimitExceeded
+    );
+    assert_eq!(server.paths(), ["/"]);
+    let mut fixture = Fixture::new();
+    fixture.component_limit = Some(1);
+    let server = Server::start(fixture).await;
+    let view = Mst2Fuse::from_reader_lazy(server.reader().await, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        view.path_state("absent/child").await.unwrap_err().code,
+        SnapshotErrorCode::LimitExceeded
+    );
+    assert_eq!(server.paths(), ["/"]);
 }
