@@ -66,7 +66,7 @@ jobs:
           install_root="${RUNNER_TEMP}/scorpiofs-installed"
 
           mkdir -p "${asset_root}/${version}/${dist}"
-          cp target/release/scorpio target/release/antares "${asset_root}/${version}/${dist}/"
+          cp target/release/scorpio "${asset_root}/${version}/${dist}/"
           tar -C "${asset_root}/${version}" -czf "${asset_root}/${version}/${dist}.tar.gz" "${dist}"
           (
             cd "${asset_root}/${version}"
@@ -101,7 +101,7 @@ jobs:
             --http-addr 127.0.0.1:2825
 
           "${install_root}/prefix/bin/scorpio" --version
-          "${install_root}/prefix/bin/antares" --version
+          test ! -e "${install_root}/prefix/bin/antares"
           "${install_root}/prefix/bin/scorpio" \
             --config-path "${install_root}/etc/scorpio.toml" config validate
           grep -F 'git_author = "DOMAIN\\Bob \"Builder\""' "${install_root}/etc/scorpio.toml"

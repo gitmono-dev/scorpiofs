@@ -31,9 +31,8 @@ ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=scorpiofs-cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=scorpiofs-cargo-git-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=scorpiofs-target-${TARGETARCH},sharing=locked \
-    cargo build --release --locked --bin scorpio --bin antares \
-    && install -D -m0755 /src/target/release/scorpio /out/scorpio \
-    && install -D -m0755 /src/target/release/antares /out/antares
+    cargo build --release --locked --bin scorpio \
+    && install -D -m0755 /src/target/release/scorpio /out/scorpio
 
 # ---- runtime stage -----------------------------------------------------------
 # debian:bookworm-slim (not distroless, version-pinned) so the FUSE userspace
@@ -54,7 +53,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/scorpio /usr/local/bin/scorpio
-COPY --from=build /out/antares /usr/local/bin/antares
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

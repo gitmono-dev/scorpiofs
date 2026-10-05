@@ -63,7 +63,7 @@ jobs:
         run: cargo test --lib --verbose
 
       - name: Native v3 HTTP lifecycle and launcher contracts
-        run: cargo test --test mst2_workspace_v3_http --test mst2_workspace_launcher_http -- --nocapture
+        run: cargo test --test mst2_workspace_v3_http --test mst2_workspace_launcher_http --test mst2_workspace_cli_http -- --nocapture
 
       - name: Native namespace and upper-diff HTTP cases
         run: |
@@ -71,4 +71,4 @@ jobs:
           cargo test --test mst2_namespace_http -- --nocapture
 
       - name: cargo build --release
-        run: cargo build --release --locked --bin scorpio --bin antares
+        run: cargo build --release --locked --bin scorpio

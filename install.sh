@@ -1052,7 +1052,7 @@ prepare_release_binaries() {
             note "would download ${url}"
             note "would verify ${sumurl} with SHA256"
         fi
-        note "would install ${PREFIX}/bin/scorpio and ${PREFIX}/bin/antares"
+        note "would install ${PREFIX}/bin/scorpio"
         return 0
     fi
 
@@ -1083,18 +1083,15 @@ prepare_release_archive() {
         die "sha256sum or shasum is required for checksum verification"
     fi
 
-    note "extracting and checking release binaries"
+    note "extracting and checking the scorpio release binary"
     tar -xzf "${WORKDIR}/${tarball}" -C "$WORKDIR"
     extracted="${WORKDIR}/scorpiofs-${VERSION}-${target}"
-    if [ ! -x "${extracted}/scorpio" ] || [ ! -x "${extracted}/antares" ]; then
+    if [ ! -x "${extracted}/scorpio" ]; then
         die "release archive has an unexpected layout"
     fi
     local smoke_output
     if ! smoke_output="$("${extracted}/scorpio" --version 2>&1)"; then
         die "downloaded scorpio cannot run on this host: ${smoke_output}. Install a release built for this Linux distribution"
-    fi
-    if ! smoke_output="$("${extracted}/antares" --version 2>&1)"; then
-        die "downloaded antares cannot run on this host: ${smoke_output}. Install a release built for this Linux distribution"
     fi
     EXTRACTED_RELEASE="$extracted"
 }
@@ -1107,7 +1104,9 @@ install_release_binaries() {
     note "installing release binaries to ${PREFIX}/bin"
     run_root install -d "${PREFIX}/bin"
     run_root install -m 0755 "${EXTRACTED_RELEASE}/scorpio" "${PREFIX}/bin/scorpio"
-    run_root install -m 0755 "${EXTRACTED_RELEASE}/antares" "${PREFIX}/bin/antares"
+    # Retire the old entry point only after the replacement binary is installed.
+    # A failed managed upgrade restores it from the artifact backup below.
+    run_root rm -f -- "${PREFIX}/bin/antares"
 }
 
 backup_upgrade_artifacts() {
