@@ -84,6 +84,13 @@ struct FileRecord {
     size: u64,
 }
 
+/// A complete closure may also carry its fixed online reader for bounded
+/// chunk streaming. Callback-only hydration retains its buffered contract.
+struct SnapshotHydration<'a> {
+    closure: &'a ValidatedSnapshotClosure,
+    reader: Option<&'a SnapshotReader>,
+}
+
 /// Resume hints may lag the durable CAS by one bounded chunk. Losing that
 /// chunk on cancellation/crash only requires re-hashing the CAS on resume.
 /// The per-view OS lock protects the transaction; this mutex serializes its
@@ -752,6 +759,9 @@ impl DurableStore {
 
     /// Concurrent hydration of a complete closure selected by a fixed online
     /// reader. Metadata and content share one full-snapshot publication.
+    /// With chunk reads available, files above OBJECT_CAP stream through the
+    /// reader into verified durable CAS; their aliases share one fetch unit.
+    /// Other files retain the supplied buffered fetch callback.
     pub async fn hydrate_snapshot_concurrent<F>(
         &self,
         reader: &SnapshotReader,
@@ -771,15 +781,24 @@ impl DurableStore {
             + 'static,
     {
         let view = self.snapshot_view(reader, closure).await?;
-        self.hydrate_concurrent_closure(&view, closure.files(), Some(closure), concurrency, fetch)
-            .await
+        self.hydrate_concurrent_closure(
+            &view,
+            closure.files(),
+            Some(SnapshotHydration {
+                closure,
+                reader: Some(reader),
+            }),
+            concurrency,
+            fetch,
+        )
+        .await
     }
 
     async fn hydrate_concurrent_closure<F>(
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
-        closure: Option<&ValidatedSnapshotClosure>,
+        snapshot: Option<SnapshotHydration<'_>>,
         concurrency: usize,
         fetch: F,
     ) -> Result<HydrateReport, SnapshotError>
@@ -794,6 +813,8 @@ impl DurableStore {
             + Clone
             + 'static,
     {
+        let closure = snapshot.as_ref().map(|snapshot| snapshot.closure);
+        let stream_reader = snapshot.as_ref().and_then(|snapshot| snapshot.reader);
         if let Some(closure) = closure {
             validate_snapshot_view(view, closure)?;
         }
@@ -810,11 +831,29 @@ impl DurableStore {
         use futures::stream::{StreamExt, TryStreamExt};
         // Every file goes through the same CAS check: content reuse is a
         // property of the shared store, not of this view's journal.
-        let plan: Vec<SnapshotFile> = manifest.to_vec();
+        // Only root-proven online chunk streams merge aliases here. Buffered
+        // callbacks still run for every path, preserving their caller checks.
+        let mut plan: Vec<(SnapshotFile, Vec<SnapshotFile>)> = Vec::new();
+        let mut stream_groups: HashMap<(String, u64), usize> = HashMap::new();
+        for file in manifest {
+            if stream_reader.is_some_and(|reader| {
+                file.size > crate::snapshot::OBJECT_CAP
+                    && reader.capabilities().features.chunk_reads
+            }) {
+                let content = (file.content_digest.clone(), file.size);
+                if let Some(&index) = stream_groups.get(&content) {
+                    let aliases: &mut Vec<SnapshotFile> = &mut plan[index].1;
+                    aliases.push(file.clone());
+                    continue;
+                }
+                stream_groups.insert(content, plan.len());
+            }
+            plan.push((file.clone(), Vec::new()));
+        }
 
         futures::stream::iter(plan)
             .map(Ok::<_, SnapshotError>)
-            .try_for_each_concurrent(concurrency.max(1), |f| {
+            .try_for_each_concurrent(concurrency.max(1), |(f, aliases)| {
                 let fetched = &fetched;
                 let resumed = &resumed;
                 let repaired = &repaired;
@@ -823,44 +862,54 @@ impl DurableStore {
                 let fetch = fetch.clone();
                 async move {
                     use std::sync::atomic::Ordering::Relaxed;
+                    let logical_files = aliases.len() as u64 + 1;
                     if store.verify_blob(&f.content_digest, f.size)? {
-                        resumed.fetch_add(1, Relaxed);
-                        bytes_total.fetch_add(f.size, Relaxed);
+                        resumed.fetch_add(logical_files, Relaxed);
+                        bytes_total.fetch_add(f.size * logical_files, Relaxed);
                         return Ok(());
                     }
                     if store.blob_path(&f.content_digest)?.exists() {
                         // Present but wrong: refetch and atomically replace it.
-                        repaired.fetch_add(1, Relaxed);
+                        repaired.fetch_add(logical_files, Relaxed);
                     }
-                    let bytes: std::sync::Arc<Vec<u8>> = fetch(f.clone()).await?;
-                    // The store independently re-verifies, regardless of
-                    // any verification the fetch path claimed.
-                    let got = digest_of(&bytes);
-                    if got != f.content_digest {
-                        return Err(SnapshotError::new(
-                            SnapshotErrorCode::DigestMismatch,
-                            format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
-                        ));
+                    if let Some(reader) = stream_reader.filter(|reader| {
+                        f.size > crate::snapshot::OBJECT_CAP
+                            && reader.capabilities().features.chunk_reads
+                    }) {
+                        write_reader_blob(&store.content, reader, &f).await?;
+                    } else {
+                        let bytes: std::sync::Arc<Vec<u8>> = fetch(f.clone()).await?;
+                        // The store independently re-verifies, regardless of
+                        // any verification the fetch path claimed.
+                        let got = digest_of(&bytes);
+                        if got != f.content_digest {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
+                            ));
+                        }
+                        if bytes.len() as u64 != f.size {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                format!(
+                                    "{}: view advertises {} bytes, content is {}",
+                                    f.rel_path,
+                                    f.size,
+                                    bytes.len()
+                                ),
+                            ));
+                        }
+                        write_atomic(&store.content, &blob_name(&f.content_digest), &bytes)?;
                     }
-                    if bytes.len() as u64 != f.size {
-                        return Err(SnapshotError::new(
-                            SnapshotErrorCode::DigestMismatch,
-                            format!(
-                                "{}: view advertises {} bytes, content is {}",
-                                f.rel_path,
-                                f.size,
-                                bytes.len()
-                            ),
-                        ));
+                    for file in std::iter::once(&f).chain(aliases.iter()) {
+                        journal.append(&FileRecord {
+                            rel_path: file.rel_path.clone(),
+                            digest: file.content_digest.clone(),
+                            size: file.size,
+                        })?;
                     }
-                    write_atomic(&store.content, &blob_name(&f.content_digest), &bytes)?;
-                    journal.append(&FileRecord {
-                        rel_path: f.rel_path.clone(),
-                        digest: f.content_digest.clone(),
-                        size: f.size,
-                    })?;
                     fetched.fetch_add(1, Relaxed);
-                    bytes_total.fetch_add(f.size, Relaxed);
+                    bytes_total.fetch_add(f.size * logical_files, Relaxed);
                     Ok(())
                 }
             })
@@ -925,6 +974,8 @@ impl DurableStore {
     /// OBJECT batches and concurrent large-file fetches for a complete fixed
     /// closure. Reuses the file-only fetch core, then durably publishes all
     /// descriptor/page/content dependencies before one FullSnapshot marker.
+    /// With chunk reads available, large files use the fixed reader's bounded
+    /// verified stream; fetch_large remains the bounded compatibility fallback.
     pub async fn hydrate_snapshot_batches<FBatch, FLarge>(
         &self,
         reader: &SnapshotReader,
@@ -958,7 +1009,10 @@ impl DurableStore {
         self.hydrate_batches_closure(
             &view,
             closure.files(),
-            Some(closure),
+            Some(SnapshotHydration {
+                closure,
+                reader: Some(reader),
+            }),
             (batch_concurrency, large_concurrency),
             fetch_batch,
             fetch_large,
@@ -970,7 +1024,7 @@ impl DurableStore {
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
-        closure: Option<&ValidatedSnapshotClosure>,
+        snapshot: Option<SnapshotHydration<'_>>,
         concurrency: (usize, usize),
         fetch_batch: FBatch,
         fetch_large: FLarge,
@@ -1000,6 +1054,8 @@ impl DurableStore {
         use futures::stream::{StreamExt, TryStreamExt};
 
         let (batch_concurrency, large_concurrency) = concurrency;
+        let closure = snapshot.as_ref().map(|snapshot| snapshot.closure);
+        let stream_reader = snapshot.as_ref().and_then(|snapshot| snapshot.reader);
         if let Some(closure) = closure {
             validate_snapshot_view(view, closure)?;
         }
@@ -1135,26 +1191,32 @@ impl DurableStore {
                 let fetch_large = fetch_large.clone();
                 let journal = &journal;
                 async move {
-                    let bytes: std::sync::Arc<Vec<u8>> = fetch_large(f.clone()).await?;
-                    let got = digest_of(&bytes);
-                    if got != f.content_digest {
-                        return Err(SnapshotError::new(
-                            SnapshotErrorCode::DigestMismatch,
-                            format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
-                        ));
+                    if let Some(reader) =
+                        stream_reader.filter(|reader| reader.capabilities().features.chunk_reads)
+                    {
+                        write_reader_blob(&store.content, reader, &f).await?;
+                    } else {
+                        let bytes: std::sync::Arc<Vec<u8>> = fetch_large(f.clone()).await?;
+                        let got = digest_of(&bytes);
+                        if got != f.content_digest {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
+                            ));
+                        }
+                        if bytes.len() as u64 != f.size {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                format!(
+                                    "{}: view advertises {} bytes, content is {}",
+                                    f.rel_path,
+                                    f.size,
+                                    bytes.len()
+                                ),
+                            ));
+                        }
+                        write_atomic(&store.content, &blob_name(&f.content_digest), &bytes)?;
                     }
-                    if bytes.len() as u64 != f.size {
-                        return Err(SnapshotError::new(
-                            SnapshotErrorCode::DigestMismatch,
-                            format!(
-                                "{}: view advertises {} bytes, content is {}",
-                                f.rel_path,
-                                f.size,
-                                bytes.len()
-                            ),
-                        ));
-                    }
-                    write_atomic(&store.content, &blob_name(&f.content_digest), &bytes)?;
                     journal.append(&FileRecord {
                         rel_path: f.rel_path.clone(),
                         digest: f.content_digest.clone(),
