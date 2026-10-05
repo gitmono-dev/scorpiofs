@@ -402,6 +402,7 @@ pub struct SnapshotReader {
     lease: Arc<LeaseKeeper>,
     pub(crate) content_scope: Arc<super::content::ContentBudget>,
     pub(crate) content_membership: Arc<tokio::sync::OnceCell<HashMap<String, SnapshotFile>>>,
+    pub(crate) path_membership: Arc<super::proven_file::PathMembership>,
 }
 
 impl SnapshotReader {
@@ -459,6 +460,7 @@ impl SnapshotReader {
             lease,
             content_scope: super::content::ContentBudget::new(super::ContentBudgetLimits::default()),
             content_membership: Arc::new(tokio::sync::OnceCell::new()),
+            path_membership: Arc::new(super::proven_file::PathMembership::new()),
         })
     }
 
