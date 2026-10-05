@@ -30,7 +30,7 @@ use axum::{
 use mst2_codec::{
     descriptor::ServingDescriptor,
     metapage::{page_id, Entry, EntryKind, Page},
-    treeframe::{EndPayload, MetaPayload},
+    treeframe::{EndPayload, MetaPayload, ObjectPayload},
 };
 use scorpiofs::snapshot::{durable::digest_of, frames::parse_digest};
 use serde_json::{json, Value};
@@ -210,6 +210,41 @@ async fn blob(State(f): State<Arc<Fixture>>, AxumPath(sid): AxumPath<String>) ->
     CONTENT[f.version(&sid)].to_vec().into_response()
 }
 
+async fn objects(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(sid): AxumPath<String>,
+    body: Bytes,
+) -> Response {
+    let content = CONTENT[f.version(&sid)];
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let items = request["items"].as_array().unwrap();
+    // All three committed file paths share one digest, so the durable lane
+    // requests one independently verified body for all logical aliases.
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["expected_digest"], digest_of(content));
+    f.blobs.fetch_add(1, Ordering::SeqCst);
+    let mut wire = ObjectPayload {
+        objects: vec![(parse_digest(&digest_of(content)).unwrap(), content.to_vec())],
+    }
+    .encode(7, 0)
+    .unwrap();
+    wire.extend(
+        EndPayload {
+            request_item_count: 1,
+            unique_unit_count: 1,
+            logical_bytes: content.len() as u64,
+            request_body_sha256: parse_digest(&digest_of(&body)).unwrap(),
+        }
+        .encode(7, 1),
+    );
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", sid)
+        .header("x-mega-request-digest", digest_of(&body))
+        .body(Body::from(wire))
+        .unwrap()
+}
+
 struct Server(tokio::task::JoinHandle<()>);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -225,6 +260,7 @@ async fn fixture_server(f: Arc<Fixture>) -> (String, Server) {
         .route("/api/v2/snapshots/resolve", post(resolve))
         .route("/api/v2/snapshots/{sid}/metadata/pages", post(metadata))
         .route("/api/v2/snapshots/{sid}/blob", get(blob))
+        .route("/api/v2/snapshots/{sid}/objects", post(objects))
         .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR })
         .layer(axum::middleware::from_fn(record))
         .layer(axum::Extension(f.clone()))
@@ -386,6 +422,33 @@ fn client() -> reqwest::Client {
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_complete(client: &reqwest::Client, base: &str, id: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: Value = client
+                .get(format!("{base}/v3/workspaces/{id}"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_ne!(status["hydration_state"], "failed", "{status}");
+            if status["hydration_state"] == "complete" {
+                assert_eq!(status["local_pin_state"], "complete_snapshot");
+                assert_eq!(status["metadata_ready"], true);
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("full workspace did not durably complete")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -671,12 +734,75 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     // on the original create response. The service retains its retirement owner.
     let third: Value = client
         .post(format!("{}/v3/workspaces", launcher.base))
-        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"full","upper_policy":"private"}))
         .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     let third_id = third["workspace_id"].as_str().unwrap();
     let third_mount = PathBuf::from(third["mountpoint"].as_str().unwrap());
     launcher.mounts.push(third_mount.clone());
     assert!(mounted(&third_mount));
+    let complete = wait_complete(&client, &launcher.base, third_id).await;
+    assert_eq!(complete["snapshot_id"], f.versions[1].sid);
+    let cancelled: Value = client
+        .post(format!(
+            "{}/v3/workspaces/{third_id}/hydrate/cancel",
+            launcher.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled["hydration_state"], "complete");
+    let mut release_operation = None;
+    for _ in 0..2 {
+        let receipt: Value = client
+            .post(format!(
+                "{}/v3/workspaces/{third_id}/local-pin/release",
+                launcher.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(receipt["workspace_id"], third_id);
+        assert_eq!(receipt["snapshot_id"], f.versions[1].sid);
+        if let Some(operation) = &release_operation {
+            assert_eq!(&receipt["operation_id"], operation);
+        } else {
+            uuid::Uuid::parse_str(receipt["operation_id"].as_str().unwrap()).unwrap();
+            release_operation = Some(receipt["operation_id"].clone());
+        }
+    }
+    let released: Value = client
+        .get(format!("{}/v3/workspaces/{third_id}", launcher.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(released["local_pin_state"], "released");
+    assert_eq!(released["hydration_state"], "idle");
+    client
+        .post(format!(
+            "{}/v3/workspaces/{third_id}/hydrate",
+            launcher.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    wait_complete(&client, &launcher.base, third_id).await;
     scorpiofs::util::fuse_platform::unmount_path(&third_mount, true)
         .await
         .unwrap();
@@ -703,6 +829,30 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
         .await
         .unwrap();
     assert_eq!(retired.status(), StatusCode::NO_CONTENT);
+    let fourth: Value = client
+        .post(format!("{}/v3/workspaces", launcher.base))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let fourth_id = fourth["workspace_id"].as_str().unwrap();
+    let fourth_mount = PathBuf::from(fourth["mountpoint"].as_str().unwrap());
+    launcher.mounts.push(fourth_mount.clone());
+    std::fs::write(
+        fourth_mount.join("discard.txt"),
+        b"explicitly discarded edit",
+    )
+    .unwrap();
+    let discarded = client
+        .post(format!(
+            "{}/v3/workspaces/{fourth_id}/destroy",
+            launcher.base
+        ))
+        .json(&json!({"discard_dirty":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(discarded.status(), StatusCode::NO_CONTENT);
+    assert!(!mounted(&fourth_mount));
+    assert!(!fourth_mount.parent().unwrap().exists());
     drop(old_fd);
     launcher.stop().await;
     assert!(!mounted(&old));

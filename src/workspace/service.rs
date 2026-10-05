@@ -279,9 +279,12 @@ impl WorkspaceService {
             .create(&workspace.mountpoint)?;
         runtime.mountpoint_identity = Some(directory_identity(&workspace.mountpoint)?);
         initialize_workspace_directory(&workspace.mountpoint, 0o755)?;
+        check_private_paths(workspace, runtime)?;
         runtime.mount =
             Some(WorkspaceMount::new(lower, &workspace.upper, workspace.mountpoint.clone()).await?);
+        check_private_paths(workspace, runtime)?;
         runtime.mount.as_mut().unwrap().mount().await?;
+        check_private_paths(workspace, runtime)?;
         runtime.mount_state = MountState::Mounted;
         if let Some(permit) = full_permit {
             spawn_hydrate(runtime, permit);
@@ -665,7 +668,7 @@ fn spawn_hydrate(runtime: &mut Runtime, permit: OwnedSemaphorePermit) {
     runtime.hydration_state = HydrationState::Running;
     runtime.hydrate = Some(tokio::spawn(async move {
         let _permit = permit;
-        store.hydrate_snapshot(&reader).await
+        super::hydrate::hydrate_workspace(&store, &reader).await
     }));
 }
 
@@ -720,7 +723,7 @@ fn prepare_root(path: &Path) -> Result<PathBuf, WorkspaceError> {
     Ok(fs::canonicalize(path)?)
 }
 
-fn initialize_workspace_directory(path: &Path, mode: u32) -> Result<(), WorkspaceError> {
+fn initialize_workspace_directory(path: &Path, mode: libc::mode_t) -> Result<(), WorkspaceError> {
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 
     // The directory is already privately created and its parent's identity
@@ -737,7 +740,7 @@ fn initialize_workspace_directory(path: &Path, mode: u32) -> Result<(), Workspac
     {
         return Err(std::io::Error::last_os_error().into());
     }
-    if unsafe { libc::fchmod(directory.as_raw_fd(), mode as libc::mode_t) } != 0 {
+    if unsafe { libc::fchmod(directory.as_raw_fd(), mode) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())

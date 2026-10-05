@@ -24,6 +24,8 @@ pub(crate) struct WorkspaceMount {
     mountpoint: PathBuf,
     overlay: FencedFilesystem<OverlayFs>,
     handle: Option<MountHandle>,
+    mounted_identity: Option<(u64, u64)>,
+    plain_identity: (u64, u64),
     retry_unmount: bool,
     retired: bool,
 }
@@ -35,6 +37,14 @@ impl WorkspaceMount {
         mountpoint: PathBuf,
     ) -> std::io::Result<Self> {
         crate::server::prepare_mountpoint(&mountpoint)?;
+        use std::os::unix::fs::MetadataExt;
+        let plain = std::fs::symlink_metadata(&mountpoint)?;
+        if !plain.is_dir() || plain.file_type().is_symlink() {
+            return Err(std::io::Error::other(
+                "workspace mountpoint is not a real directory",
+            ));
+        }
+        let plain_identity = (plain.dev(), plain.ino());
         let fs = PassthroughFs::<()>::new(UpperConfig {
             root_dir: upper.to_path_buf(),
             xattr: true,
@@ -59,6 +69,8 @@ impl WorkspaceMount {
             mountpoint,
             overlay: FencedFilesystem::new(overlay),
             handle: None,
+            mounted_identity: None,
+            plain_identity,
             retry_unmount: false,
             retired: false,
         })
@@ -73,13 +85,18 @@ impl WorkspaceMount {
             return Ok(false);
         }
         let path = self.mountpoint.clone();
+        let Some(expected) = self.mounted_identity else {
+            return Ok(false);
+        };
         tokio::time::timeout(
             Duration::from_secs(1),
-            tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
                 if !kernel_mount_present(&path)? {
                     return Ok(false);
                 }
-                Ok(std::fs::metadata(path)?.is_dir())
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::metadata(path)?;
+                Ok(meta.is_dir() && (meta.dev(), meta.ino()) == expected)
             }),
         )
         .await
@@ -111,11 +128,12 @@ impl WorkspaceMount {
         );
         // A timeout is an observable failure with the real handle retained for
         // teardown. It must not become a successful metadata-ready response.
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let identity = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match tokio::fs::metadata(&self.mountpoint).await {
                     Ok(meta) if meta.is_dir() && kernel_mount_present(&self.mountpoint)? => {
-                        return Ok(())
+                        use std::os::unix::fs::MetadataExt;
+                        return Ok((meta.dev(), meta.ino()));
                     }
                     Ok(meta) if meta.is_dir() => {
                         tokio::time::sleep(Duration::from_millis(20)).await
@@ -131,7 +149,9 @@ impl WorkspaceMount {
                 std::io::ErrorKind::TimedOut,
                 "workspace mount was not ready",
             )
-        })?
+        })??;
+        self.mounted_identity = Some(identity);
+        Ok(())
     }
 
     async fn recover(&self) -> std::io::Result<()> {
@@ -145,6 +165,17 @@ impl WorkspaceMount {
     pub(crate) async fn unmount(&mut self) -> std::io::Result<()> {
         if self.retired {
             return self.recover().await;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let meta = tokio::fs::symlink_metadata(&self.mountpoint).await?;
+        let actual = (meta.dev(), meta.ino());
+        if !meta.is_dir()
+            || meta.file_type().is_symlink()
+            || (actual != self.plain_identity && Some(actual) != self.mounted_identity)
+        {
+            return Err(std::io::Error::other(
+                "workspace kernel mount or mountpoint was replaced",
+            ));
         }
         self.recover().await?;
         let result = if let Some(handle) = self.handle.take() {
