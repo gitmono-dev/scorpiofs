@@ -244,12 +244,10 @@ fn legacy_router(state: ScoState) -> Router {
         // router returned by `daemon::git::router()` into this `app`.
         .layer(axum::middleware::from_fn(deprecation_middleware));
 
-    let app = Router::new()
+    Router::new()
         .route("/health", get(health_handler))
         .merge(deprecated)
-        .with_state(state);
-
-    app
+        .with_state(state)
 }
 
 /// Root liveness probe. Lightweight by design: reports process status, version,
