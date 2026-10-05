@@ -153,7 +153,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?
     } else {
-        let coordinator = scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), concurrency);
+        let coordinator = scorpiofs::snapshot::FetchCoordinator::with_verified_closure(
+            reader.clone(),
+            &closure,
+            concurrency,
+        )?;
         store
             .hydrate_snapshot_concurrent(&reader, &closure, concurrency, move |f| {
                 let coordinator = coordinator.clone();
