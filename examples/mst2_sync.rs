@@ -12,6 +12,8 @@
 //! It also asserts that the incrementally produced manifest is *identical* to
 //! a full walk of the same view: reuse must never lose, invent or mis-place a
 //! file.
+//! The complete root proof has separate meters from incremental acquisition;
+//! the independent diagnostic walk below also runs outside those meters.
 //!
 //! Usage:
 //!   M2_BASE=http://127.0.0.1:19700 M2_SCOPE=/project \
@@ -51,8 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     context.bind_scope_cache(&cache_path)?;
     let cache = ScopeCache::open(&cache_path)?;
     let mut sync = IncrementalSync::new(&reader, &cache);
-    let manifest = sync.sync().await?;
+    let closure = sync.sync_snapshot().await?;
+    let manifest = closure.files();
     let meters = sync.meters();
+    let proof = sync.closure_meters();
 
     // Independent correctness check: the same view walked plainly.
     let full = reader.file_manifest().await?;
@@ -66,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect::<BTreeMap<_, _>>()
     };
-    let a = index(&manifest);
+    let a = index(manifest);
     let b = index(&full);
     let consistent = a == b;
     if !consistent {
@@ -90,67 +94,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scope: reader.descriptor().scope.clone(),
         lease_id: reader.lease_id().to_string(),
     };
-    // Hydrate from the *incremental* manifest (never a second full walk):
-    // small files ride OBJECT batches, large files use chunk frames.
+    // Hydrate from the proved incremental closure, without another metadata
+    // RPC in the hydration path. Small files ride OBJECT batches; large
+    // files use chunk frames. Raw transport retains the same concurrency.
+    let concurrency = std::env::var("M2_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4usize);
+    let use_frames =
+        reader.capabilities().features.objects && reader.capabilities().features.chunk_reads;
     let client = reader.client().clone();
     let encoding = reader.encoding_hint().map(str::to_string);
     let sid = reader.snapshot_id().to_string();
-    let report = store
-        .hydrate_batches(
-            &view,
-            &manifest,
-            4,
-            4,
-            move |batch| {
-                let client = client.clone();
-                let encoding = encoding.clone();
-                let sid = sid.clone();
-                Box::pin(async move {
-                    let items: Vec<(String, String)> = batch
-                        .iter()
-                        .map(|f| (format!("/{}", f.rel_path), f.content_digest.clone()))
-                        .collect();
-                    let got = client.objects(&sid, &items, encoding.as_deref()).await?;
-                    let mut out = std::collections::HashMap::new();
-                    for f in &batch {
-                        let want = scorpiofs::snapshot::frames::parse_digest(&f.content_digest)?;
-                        let data = got.get(&want).ok_or_else(|| {
-                            scorpiofs::snapshot::SnapshotError::new(
-                                scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch,
-                                format!("batch missing {}", f.content_digest),
-                            )
-                        })?;
-                        out.insert(f.content_digest.clone(), std::sync::Arc::new(data.clone()));
-                    }
-                    Ok(out)
-                })
-            },
-            {
-                let reader_large = reader.clone();
-                move |f| {
-                    let reader = reader_large.clone();
+    let report = if use_frames {
+        store
+            .hydrate_snapshot_batches(
+                &reader,
+                &closure,
+                concurrency,
+                concurrency,
+                move |batch| {
+                    let client = client.clone();
+                    let encoding = encoding.clone();
+                    let sid = sid.clone();
                     Box::pin(async move {
-                        let bytes = reader
-                            .read_file_frames(&f.rel_path, &f.content_digest, f.size)
-                            .await?;
-                        Ok(std::sync::Arc::new(bytes))
+                        let items: Vec<(String, String)> = batch
+                            .iter()
+                            .map(|f| (format!("/{}", f.rel_path), f.content_digest.clone()))
+                            .collect();
+                        let got = client.objects(&sid, &items, encoding.as_deref()).await?;
+                        let mut out = std::collections::HashMap::new();
+                        for f in &batch {
+                            let want =
+                                scorpiofs::snapshot::frames::parse_digest(&f.content_digest)?;
+                            let data = got.get(&want).ok_or_else(|| {
+                                scorpiofs::snapshot::SnapshotError::new(
+                                    scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch,
+                                    format!("batch missing {}", f.content_digest),
+                                )
+                            })?;
+                            out.insert(f.content_digest.clone(), std::sync::Arc::new(data.clone()));
+                        }
+                        Ok(out)
                     })
-                }
-            },
-        )
-        .await?;
+                },
+                {
+                    let reader_large = reader.clone();
+                    move |f| {
+                        let reader = reader_large.clone();
+                        Box::pin(async move {
+                            let bytes = reader
+                                .read_file_frames(&f.rel_path, &f.content_digest, f.size)
+                                .await?;
+                            Ok(std::sync::Arc::new(bytes))
+                        })
+                    }
+                },
+            )
+            .await?
+    } else {
+        let coordinator = scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), concurrency);
+        store
+            .hydrate_snapshot_concurrent(&reader, &closure, concurrency, move |f| {
+                let coordinator = coordinator.clone();
+                Box::pin(async move { coordinator.fetch(f, use_frames).await })
+            })
+            .await?
+    };
     store.pin(&view)?;
+    if !store.is_snapshot_complete()? {
+        return Err("hydration finished without a full snapshot marker".into());
+    }
 
     println!(
-        "{{\"traversal_nodes\":{},\"fetched_pages\":{},\"reused_pages\":{},\"reused_subtrees\":{},\"hydrate_fetched\":{},\"hydrate_resumed\":{},\"files\":{},\"consistent\":{}}}",
-        meters.traversal_nodes,
-        meters.fetched_pages,
-        meters.reused_pages,
-        meters.reused_subtrees,
-        report.fetched,
-        report.resumed,
-        manifest.len(),
-        consistent
+        "{}",
+        serde_json::json!({
+            "traversal_nodes": meters.traversal_nodes,
+            "fetched_pages": meters.fetched_pages,
+            "reused_pages": meters.reused_pages,
+            "reused_subtrees": meters.reused_subtrees,
+            "closure_index_reads": meters.closure_index_reads,
+            "closure_index_writes": meters.closure_index_writes,
+            "pin_set_reads": meters.pin_set_reads,
+            "page_rehashes": meters.page_rehashes,
+            "unique_page_rehashes": meters.unique_page_rehashes,
+            "page_rehash_bytes": meters.page_rehash_bytes,
+            "closure_proof": proof,
+            "hydrate_fetched": report.fetched,
+            "hydrate_resumed": report.resumed,
+            "hydrate_repaired": report.repaired,
+            "hydrate_bytes": report.bytes_total,
+            "files": manifest.len(),
+            "directories": closure.directories().len(),
+            "metadata_pages": closure.pages().len(),
+            "completion_kind": report.completion_kind,
+            "full_snapshot_complete": true,
+            "consistent": consistent
+        })
     );
     if !consistent {
         std::process::exit(1);

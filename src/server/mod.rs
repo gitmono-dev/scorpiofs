@@ -156,7 +156,17 @@ pub async fn mount_filesystem_with_antares_cache<
 
     tracing::debug!("about to mount FUSE filesystem at: {:?}", mount_path);
     let session = Session::<F>::new(mount_options);
-    session.mount(fs, mount_path).await.map_err(|e| {
+    // Linux's direct mount syscall requires CAP_SYS_ADMIN. Ordinary users
+    // must let the FUSE helper create the connection and own its unmount path.
+    #[cfg(target_os = "linux")]
+    let mounted = if unsafe { libc::geteuid() } == 0 {
+        session.mount(fs, mount_path).await
+    } else {
+        session.mount_with_unprivileged(fs, mount_path).await
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mounted = session.mount(fs, mount_path).await;
+    mounted.map_err(|e| {
         tracing::error!(
             "FUSE mount failed at {:?}: {:?} (os error code: {:?})",
             mountpoint,
