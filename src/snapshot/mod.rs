@@ -22,6 +22,7 @@ pub mod frames;
 pub mod fuse;
 pub mod incremental;
 pub mod layer;
+mod lease_wire;
 mod lookup;
 mod owned_range;
 mod owned_reader;
