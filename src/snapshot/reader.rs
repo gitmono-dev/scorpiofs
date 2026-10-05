@@ -558,7 +558,8 @@ impl SnapshotReader {
         }
         self.ensure_lease().await?;
         let mut out = Vec::new();
-        self.walk_dir("/", &mut out).await?;
+        self.walk_dir("/", &self.descriptor().metadata_root, &mut out)
+            .await?;
         Ok(out)
     }
 
@@ -736,14 +737,20 @@ impl SnapshotReader {
     pub async fn file_manifest_directory(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
         self.ensure_lease().await?;
         let mut out = Vec::new();
-        self.walk_dir("/", &mut out).await?;
+        self.walk_dir("/", &self.descriptor().metadata_root, &mut out)
+            .await?;
         Ok(out)
     }
 
-    async fn walk_dir(&self, dir: &str, out: &mut Vec<SnapshotFile>) -> Result<(), SnapshotError> {
+    async fn walk_dir(
+        &self,
+        dir: &str,
+        expected_root: &str,
+        out: &mut Vec<SnapshotFile>,
+    ) -> Result<(), SnapshotError> {
         self.context.validate_relative_path(dir)?;
         let mut cursor: Option<String> = None;
-        let mut progress = super::directory::Progress::default();
+        let mut progress = super::directory::Progress::for_root(expected_root);
         loop {
             let page = self
                 .client
@@ -757,8 +764,8 @@ impl SnapshotReader {
                     format!("{}/{}", dir.trim_start_matches('/'), e.name)
                 };
                 self.context.validate_relative_path(&rel)?;
-                if e.directory_root.is_some() {
-                    Box::pin(self.walk_dir(&format!("/{rel}"), out)).await?;
+                if let Some(child_root) = e.directory_root {
+                    Box::pin(self.walk_dir(&format!("/{rel}"), &child_root, out)).await?;
                 } else if let Some(digest) = e.content_digest {
                     let size = crate::snapshot::frames::parse_count(
                         e.size.as_deref().ok_or_else(super::directory::integrity)?,

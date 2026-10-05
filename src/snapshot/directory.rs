@@ -116,11 +116,20 @@ pub(crate) fn validate_page(
 pub(crate) struct Progress {
     root: Option<String>,
     count: Option<u64>,
+    node_class: Option<String>,
+    lifecycle: Option<String>,
     seen: u64,
     last: Option<String>,
 }
 
 impl Progress {
+    pub(crate) fn for_root(root: &str) -> Self {
+        Self {
+            root: Some(root.to_owned()),
+            ..Self::default()
+        }
+    }
+
     /// Validate before exposing entries or descending into a child directory.
     pub(crate) fn accept(
         &mut self,
@@ -139,6 +148,14 @@ impl Progress {
                 .as_ref()
                 .is_some_and(|root| root != &page.directory_root)
             || self.count.is_some_and(|fixed| fixed != count)
+            || self
+                .node_class
+                .as_ref()
+                .is_some_and(|fixed| fixed != &page.node_class)
+            || self
+                .lifecycle
+                .as_ref()
+                .is_some_and(|fixed| fixed != &page.lifecycle)
             || page.range_start_exclusive != self.last
             || seen > count
             || (page.next_cursor.is_none() && seen != count)
@@ -147,6 +164,8 @@ impl Progress {
         }
         self.root = Some(page.directory_root.clone());
         self.count = Some(count);
+        self.node_class = Some(page.node_class.clone());
+        self.lifecycle = Some(page.lifecycle.clone());
         self.seen = seen;
         self.last = page.entries.last().map(|entry| entry.name.clone());
         Ok(())

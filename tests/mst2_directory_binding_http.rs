@@ -148,7 +148,7 @@ async fn recursive_directories_preserve_kinds_and_accept_legal_provenance_hints(
     let mut subtree = page(vec![executable, symlink], "2", None, None);
     subtree["path"] = json!("/d");
     subtree["directory_root"] = json!(digest(0x55));
-    let server = Server::start(vec![root, subtree]).await;
+    let server = Server::start(vec![root.clone(), subtree.clone()]).await;
     let files = server
         .reader()
         .await
@@ -161,6 +161,19 @@ async fn recursive_directories_preserve_kinds_and_accept_legal_provenance_hints(
             .map(|file| (file.rel_path.as_str(), file.fs_kind.as_str()))
             .collect::<Vec<_>>(),
         [("d/executable", "executable"), ("d/link", "symlink")]
+    );
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    subtree["directory_root"] = json!(digest(0x77));
+    let server = Server::start(vec![root, subtree]).await;
+    assert_eq!(
+        server
+            .reader()
+            .await
+            .file_manifest_directory()
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::IntegrityError
     );
     assert_eq!(server.calls.load(Ordering::SeqCst), 2);
     for (size, code) in [
@@ -307,6 +320,8 @@ async fn pagination_cannot_change_roots_counts_boundaries_or_claim_early_eof() {
     for (field, bad) in [
         ("metadata_root", json!(digest(0x66))),
         ("directory_root", json!(digest(0x77))),
+        ("node_class", json!("import_tree")),
+        ("lifecycle", json!("immutable_release")),
         ("entry_count", json!("3")),
         ("range_start_exclusive", json!("x")),
         ("next_cursor", json!("opaque-one")),
