@@ -127,6 +127,7 @@ jobs:
         run: |
           python3 -B tests/mst2-e2e/test_commit_update_bench.py -v
           python3 -B tests/mst2-e2e/test_commit_update_budget.py -v
+          python3 -B tests/mst2-e2e/test_commit_update_projection.py -v
 
       - name: Check measurement driver old-view audit
         run: |

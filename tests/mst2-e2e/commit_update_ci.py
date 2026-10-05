@@ -22,6 +22,7 @@ import uuid
 
 import commit_update_bench as bench
 import commit_update_budget as budget_module
+import commit_update_projection as projection_module
 
 
 def hosted_root(root):
@@ -188,14 +189,18 @@ def stop_owned(root, project, deadline, process=None):
         if service.get("pgid") != pid or service.get("sid") != pid:
             raise AssertionError("owned new-session group binding is missing")
         proc = Path(f"/proc/{pid}")
-        reaped = process is not None and process.poll() is not None
+        reaped = process is not None and process.returncode is not None
         if not reaped and proc.exists():
-            started = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[19]
+            fields = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()
+            started = fields[19]
             argv = [x.decode() for x in proc.joinpath("cmdline").read_bytes().split(b"\0") if x]
             if (started != service["starttime"]
-                    or argv[:3] != [state["binary"], "--config", str(root / "service.toml")]
+                    or (fields[0] not in ("Z", "X")
+                        and argv[:3] != [state["binary"], "--config", str(root / "service.toml")])
                     or os.getpgid(pid) != pid or os.getsid(pid) != pid):
                 raise AssertionError("refusing cleanup of a replaced or unrelated service")
+        elif not reaped and not proc.exists() and budget_module.group_members(pid, service["starttime"]):
+            raise AssertionError("refusing to signal a group whose owned leader is missing")
         budget_module.stop_group(pid, service["starttime"], deadline, process)
     bench.command(["docker", "compose", "-p", project, "-f", str(compose), "down", "--volumes"], deadline)
     containers = bench.command(["docker", "ps", "-aq", "--filter",
@@ -213,6 +218,47 @@ def stop_owned(root, project, deadline, process=None):
     print(json.dumps({"record": "owned_cleanup", "project": project, "correctness": "PASS"}), flush=True)
 
 
+def owned_service_exit(process):
+    """Observe readiness/exit without releasing the owned leader's PID."""
+    if process.returncode is not None or not isinstance(process, budget_module.PinnedProcess):
+        raise AssertionError("owned service leader must remain pinned")
+    observed = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    if observed is None:
+        return None
+    return observed.si_status if observed.si_code == os.CLD_EXITED else -observed.si_status
+
+
+def graceful_owned(root, project, deadline, process):
+    """Only this newly owned service group; final fallback retains the same H."""
+    state_path = root / "owned.json"
+    state = json.loads(state_path.read_text())
+    service = state.get("service", {})
+    if (state["project"] != project or service.get("pid") != process.pid
+            or service.get("pgid") != process.pid or service.get("sid") != process.pid
+            or hashlib.sha256((root / "dependencies.json").read_bytes()).hexdigest() != state["compose_sha256"]):
+        raise AssertionError("graceful stop ownership differs from this job")
+    proc = Path(f"/proc/{process.pid}")
+    fields = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()
+    argv = [x.decode() for x in proc.joinpath("cmdline").read_bytes().split(b"\0") if x]
+    if (fields[19] != service["starttime"] or fields[0] in ("Z", "X")
+            or argv[:3] != [state["binary"], "--config", str(root / "service.toml")]
+            or os.getpgid(process.pid) != process.pid or os.getsid(process.pid) != process.pid
+            or owned_service_exit(process) is not None):
+        raise AssertionError("refusing graceful stop of a changed or exited service")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("no original budget remains for projection drain")
+    os.killpg(process.pid, signal.SIGINT)
+    until = min(deadline, time.monotonic() + 7)
+    while budget_module.group_members(process.pid, service["starttime"]) and time.monotonic() < until:
+        time.sleep(min(.01, max(0, until - time.monotonic())))
+    if (budget_module.group_members(process.pid, service["starttime"])
+            or owned_service_exit(process) != 0 or time.monotonic() >= deadline):
+        raise TimeoutError("owned service did not complete its bounded graceful drain")
+    budget_module.reap_owned(process, deadline)
+    state.pop("service")
+    state_path.write_text(json.dumps(state))
+
+
 def execute(options):
     root, project = hosted_root(options.run_root)
     if root.exists():
@@ -220,6 +266,10 @@ def execute(options):
     if not re.fullmatch(r"[0-9a-f]{40}", options.mega_sha):
         raise ValueError("server source must be an immutable full SHA-1")
     budget = budget_module.from_options(options)
+    if getattr(options, "projection_traces", False):
+        original = projection_module.window_anchor(options.session_started_utc, options.session_deadline_utc)
+        if budget.cleanup_deadline > original + 1:
+            raise ValueError("projection work deadline exceeds its original dispatch anchor")
     deadline = budget.stage_deadline("setup")
     source = options.mega_source.resolve(strict=True)
     source_sha = bench.git(source, deadline, "rev-parse", "HEAD").decode().strip()
@@ -275,6 +325,8 @@ def execute(options):
         instance = str(uuid.uuid4())
         config["mst2"] = {"enabled": True, "instance_uuid": instance, "publication_enabled": True,
                            "auth_token": "${file:" + str(root / "mst2-token") + "}"}
+        if getattr(options, "projection_traces", False):
+            config["mst2"]["projection_observation_enabled"] = True
         for name in ("oci", "agent_capture", "storage_events"):
             config[name] = {"enabled": False}
         config_path = root / "service.toml"
@@ -288,7 +340,7 @@ def execute(options):
         with bench.phase("owned_native_initialization"):
             print(json.dumps(initialize_owned_native(db, instance, env, deadline)), flush=True)
         log = (root / "service-private.log").open("wb")
-        process = subprocess.Popen(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
+        process = budget_module.PinnedProcess(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                    env=service_env, start_new_session=True)
         started = None
@@ -308,7 +360,7 @@ def execute(options):
         base = f"http://127.0.0.1:{ports['http']}"
         ready_until = min(deadline, time.monotonic() + 180)
         while True:
-            if process.poll() is not None or time.monotonic() >= ready_until:
+            if owned_service_exit(process) is not None or time.monotonic() >= ready_until:
                 raise RuntimeError("owned service failed readiness")
             try:
                 with urlopen(base + "/api/v2/snapshots/capabilities",
@@ -339,6 +391,9 @@ def execute(options):
             "--profile", options.profile, "--rounds", str(options.rounds),
             "--session-deadline-utc", options.session_deadline_utc])
         args.budget = budget
+        if getattr(options, "projection_traces", False):
+            args.projection_traces = True
+            args.finalize_projection = lambda original_deadline: graceful_owned(root, project, original_deadline, process)
         if time.monotonic() >= deadline:
             raise TimeoutError("owned setup exceeded its fixed stage budget")
         with bench.phase("commit_update_benchmark"):
@@ -355,6 +410,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--cleanup", action="store_true")
+    parser.add_argument("--projection-traces", action="store_true")
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--mega-source", type=Path)
     parser.add_argument("--mega-sha")
@@ -362,6 +418,7 @@ if __name__ == "__main__":
     parser.add_argument("--driver", type=Path)
     parser.add_argument("--driver-sha256")
     parser.add_argument("--session-deadline-utc")
+    parser.add_argument("--session-started-utc")
     parser.add_argument("--work-cleanup-deadline-monotonic", type=float,
                         default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     parser.add_argument("--profile", choices=("smoke", "medium"), default="medium")

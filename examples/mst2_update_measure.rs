@@ -154,7 +154,17 @@ async fn measure(stage: &mut &'static str) -> Result<(), Box<dyn std::error::Err
     let client = Mst2Client::with_token(base, std::env::var("M2_TOKEN").ok());
     *stage = "resolve";
     let started = Instant::now();
-    let reader = SnapshotReader::resolve(client, &scope, 3600).await?;
+    let (reader, resolve_receipt) = match std::env::var("M2_RESOLVE_TRACE_ID") {
+        Ok(logical_id) => {
+            let (reader, receipt) =
+                SnapshotReader::resolve_observed(client, &scope, 3600, &logical_id).await?;
+            (reader, Some(receipt))
+        }
+        Err(std::env::VarError::NotPresent) => {
+            (SnapshotReader::resolve(client, &scope, 3600).await?, None)
+        }
+        Err(error) => return Err(error.into()),
+    };
     let resolve_ms = elapsed_ms(started);
     if reader.descriptor().namespace_view_id != expected_view
         || reader.descriptor().instance_id != expected_instance
@@ -291,6 +301,8 @@ async fn measure(stage: &mut &'static str) -> Result<(), Box<dyn std::error::Err
             "record": "mst2_real_update", "snapshot_id": reader.snapshot_id(),
             "driver_source_digest": scorpiofs::snapshot::durable::digest_of(include_bytes!("mst2_update_measure.rs")),
             "namespace_view_id": reader.descriptor().namespace_view_id,
+            "resolve_trace_receipt": resolve_receipt,
+            "descriptor_bytes_hex": hex::encode(closure.descriptor_bytes()),
             "publication_sequence": context.publication_sequence(),
             "store": view_dir, "content_store": store.content_dir(), "resolve_ms": resolve_ms,
             "cache_setup_ms": cache_setup_ms, "metadata_ms": metadata_ms,

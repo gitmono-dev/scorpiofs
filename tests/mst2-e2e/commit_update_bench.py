@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 import uuid
 
 import commit_update_budget as budget_module
+import commit_update_projection as projection_module
 
 try:
     import tomllib
@@ -231,6 +232,10 @@ def service_binding(options):
         raise AssertionError("service MST/2 instance/publication mode differs from explicit arguments")
     if config["monorepo"]["object_format"] != "sha1" or config["monorepo"]["push_policy"] != "trunk":
         raise AssertionError("benchmark requires SHA-1 trunk ingest")
+    projection = getattr(options, "projection_traces", False)
+    if projection and (config["mst2"].get("projection_observation_enabled") is not True
+                       or not inherited.get("MEGA_CACHE_DIR")):
+        raise AssertionError("typed projection sink must use the owned service's explicit cache")
     sockets = set()
     for fd in proc.joinpath("fd").iterdir():
         try:
@@ -248,9 +253,12 @@ def service_binding(options):
             listener = f"socket:[{fields[9]}]" in sockets
     if not listener:
         raise AssertionError("requested loopback listener is not owned by the explicit service PID")
-    return {"pid": options.service_pid, "starttime_ticks": started,
+    binding = {"pid": options.service_pid, "starttime_ticks": started,
             "exe": str(proc.joinpath("exe").resolve()),
             "config_sha256": hashlib.sha256(raw).hexdigest()}
+    if projection:
+        binding["projection_cache"] = inherited["MEGA_CACHE_DIR"]
+    return binding
 
 
 def query(sql, deadline, env=None):
@@ -488,6 +496,10 @@ def execute(options):
     if not re.fullmatch(r"[0-9a-f]{40}", options.expect_initial_commit):
         raise ValueError("expected initial project commit must be a fixed SHA-1")
     endpoint_pair(options.base_url, options.git_url)
+    projection = getattr(options, "projection_traces", False)
+    if projection and (options.publication_mode != "native"
+                       or not callable(getattr(options, "finalize_projection", None))):
+        raise ValueError("projection collection requires the owned native runner and final drain")
     budget = budget_module.from_options(options)
     budget.require(options.rounds * budget_module.ROUND_SECONDS
                    + budget_module.REPORT_RESERVE + budget_module.CLEANUP_RESERVE
@@ -498,6 +510,8 @@ def execute(options):
     measurement_limit = min(budget.measurement_deadline, started + options.deadline_seconds)
     deadline = measurement_limit
     owner = service_binding(options)
+    collector = projection_module.ProjectionCollector(owner["projection_cache"]) if projection else None
+    run_id = str(uuid.uuid4()) if projection else None
     driver_binding(options)
     root = options.run_root.parent.resolve(strict=True) / options.run_root.name
     checkout = Path(__file__).resolve().parents[2]
@@ -540,6 +554,7 @@ def execute(options):
         print(json.dumps(record, sort_keys=True), flush=True)
     emit({"record": "environment", "profile": options.profile, "rounds": options.rounds,
           "publication_mode": options.publication_mode, "service_binding": owner,
+          "instrumentation_mode": "typed-projection-writer-v1" if projection else "disabled",
           "driver_sha256": hashlib.sha256(options.driver.read_bytes()).hexdigest(),
           "driver_source_sha256": hashlib.sha256((checkout / "examples/mst2_update_measure.rs").read_bytes()).hexdigest(),
           "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -585,6 +600,9 @@ def execute(options):
                                    "M2_TOKEN": os.environ.get("M2_TOKEN", "")})
             if native:
                 driver_env["M2_EXPECTED_SEQUENCE"] = str(native["sequence"])
+            logical_id = f"mst2:{run_id}:r{round_number}:{version}:resolve" if projection else None
+            if projection:
+                driver_env["M2_RESOLVE_TRACE_ID"] = logical_id
             def scorpio_sync():
                 with phase("scorpio_sync"):
                     got = json.loads(command([str(options.driver), "sync", str(expected_path)],
@@ -645,6 +663,12 @@ def execute(options):
                 measured, git_measured = scorpio(), baseline()
             else:
                 git_measured, measured = baseline(), scorpio()
+            trace = None
+            if projection:
+                # All timed side operations and immediate byte oracles ended.
+                # Durable trace parsing/waiting still consumes this round's wall budget.
+                with phase("projection_trace_collection"):
+                    trace = collector.collect(measured, native, identity, logical_id, deadline)
             # Each side's new-view byte oracle ran immediately within that
             # side's verified timer. Old-view checks are separate wall time.
             with phase("old_complete_view_audit"):
@@ -667,8 +691,8 @@ def execute(options):
                       "publication_and_client_scope": "sum of publication observation and client segments; excludes interleaved Git baseline and harness oracle setup",
                       "publication_timing_scope": "push start through read-only DB certificate observation; an upper bound, not internal server projection duration",
                       "native_publication": native, "publication_mode": options.publication_mode,
-                      "server_projection_rebuilt_pages": None, "server_projection_reused_pages": None,
-                      "server_projection_stats": "NOT_EXPOSED: native certificates bind Git roots; metadata projection work is not instrumented",
+                      "server_projection": trace,
+                      "server_projection_stats": "typed directory-root work; codec-internal radix work is NOT_EXPOSED" if projection else "NOT_EXPOSED",
                       "durable_verified_scope": "each side operation through its immediate independent full-byte oracle; old-view audits excluded",
                       "side_order": side_order, "scorpio": measured, "git": git_measured,
                       "correctness": "PASS", "old_local_complete_views_equal": True,
@@ -681,6 +705,10 @@ def execute(options):
     if len(records) != options.rounds * 3:
         raise AssertionError("all requested complete V1/V2/V3 rounds are required")
     deadline = budget.report_deadline()
+    if projection:
+        with phase("projection_trace_finalization"):
+            options.finalize_projection(deadline)
+            collector.finish(options.rounds * 3, deadline)
     for version in ("v1", "v2", "v3"):
         if time.monotonic() >= deadline:
             raise TimeoutError("summary exceeded its fixed report budget")
@@ -698,6 +726,10 @@ def execute(options):
                 "git_durable_complete_ms": lambda r: r["git"]["durable_complete_ms"]}.items():
             values = [select(r) for r in samples if select(r) is not None]
             summary[metric] = {"p50": percentile(values, 50), "p95": percentile(values, 95)} if values else None
+        if projection:
+            for metric in ["projection_elapsed_micros", *sorted(projection_module.WORK_FIELDS)]:
+                values = [r["server_projection"]["payload"][metric] for r in samples]
+                summary[metric] = {"p50": percentile(values, 50), "p95": percentile(values, 95)}
         emit(summary)
     emit({"record": "complete", "round_scenarios": len(records),
           "elapsed_seconds": time.monotonic() - started, "correctness": "PASS"})
@@ -717,6 +749,7 @@ def parser():
     p.add_argument("--driver-sha256", required=True)
     p.add_argument("--run-root", type=Path, required=True)
     p.add_argument("--publication-mode", choices=("native", "on-demand"), default="native")
+    p.add_argument("--projection-traces", action="store_true")
     p.add_argument("--profile", choices=("medium", "smoke"), default="medium")
     p.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     p.add_argument("--deadline-seconds", type=int, choices=range(60, 14401), default=14400)
