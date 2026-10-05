@@ -1799,9 +1799,9 @@ impl DurableStore {
     /// Bounded range read of one CAS object: `None` when the object is not in
     /// the store, `Some(bytes)` (exactly `len`, clamped to EOF) when it is.
     ///
-    /// This is what keeps a hydrated large file from being materialised whole
-    /// on every FUSE read (spec 07 §6 / BODY-12): the digest is validated
-    /// before it becomes a path, and the read is a bounded `pread`.
+    /// The digest is validated before it becomes a path. This primitive
+    /// bounds output but does not prove content integrity; FUSE uses
+    /// read_verified_blob_range for local CAS content.
     pub fn pread_blob(
         &self,
         digest: &str,
@@ -1828,6 +1828,81 @@ impl DurableStore {
         buf.resize(want, 0);
         f.read_exact(&mut buf).map_err(io_err)?;
         Ok(Some(buf))
+    }
+
+    /// Read a CAS range only after verifying its fixed size and whole digest.
+    /// The returned bytes are copied from the same buffers that are hashed,
+    /// so a separate read cannot race that verification. A single open file
+    /// and a 64 KiB scan buffer keep memory bounded by the requested output.
+    /// Each call scans the whole file; this is not a range I/O fast path.
+    /// Missing content returns None. Even EOF/empty output verifies the file.
+    pub fn read_verified_blob_range(
+        &self,
+        digest: &str,
+        expected_size: u64,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Vec<u8>>, SnapshotError> {
+        if expected_size > crate::snapshot::range::MAX_FILE_SIZE {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "file size exceeds the 8 TiB serving profile",
+            ));
+        }
+        let path = self.blob_path(digest)?;
+        let mut input = match File::open(&path) {
+            Ok(input) => input,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_err(error)),
+        };
+        let metadata = input.metadata().map_err(io_err)?;
+        if !metadata.is_file() || metadata.len() != expected_size {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "local CAS object size/type differs from the fixed view",
+            ));
+        }
+        let want = buffered_size(expected_size.saturating_sub(offset).min(len as u64))?;
+        let end = offset.saturating_add(want as u64);
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(want)
+            .map_err(|_| buffered_allocation_error())?;
+        let mut hash = Context::new(&SHA256);
+        let mut buffer = [0u8; 64 * 1024];
+        let mut read = 0u64;
+        // Actual growth/shrink is checked as well as the initial metadata.
+        let mut input = (&mut input).take(expected_size.saturating_add(1));
+        loop {
+            let count = input.read(&mut buffer).map_err(io_err)?;
+            if count == 0 {
+                break;
+            }
+            let next = read.saturating_add(count as u64);
+            if next > expected_size {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "local CAS object grew past its fixed size",
+                ));
+            }
+            hash.update(&buffer[..count]);
+            let from = read.max(offset);
+            let to = next.min(end);
+            if from < to {
+                output.extend_from_slice(&buffer[(from - read) as usize..(to - read) as usize]);
+            }
+            read = next;
+        }
+        if read != expected_size
+            || output.len() != want
+            || format!("sha256:{}", hex::encode(hash.finish().as_ref())) != digest
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "local CAS object does not match the fixed whole-file identity",
+            ));
+        }
+        Ok(Some(output))
     }
 
     /// Re-verify every blob of `manifest` against its digest. Full re-hash —
