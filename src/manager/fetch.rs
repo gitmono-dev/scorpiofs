@@ -17,7 +17,8 @@ use git_internal::{
         commit::Commit,
         signature::{Signature, SignatureType},
         tree::{Tree, TreeItemMode},
-        ObjectTrait, ObjectType,
+        types::ObjectType,
+        ObjectTrait,
     },
 };
 use reqwest::Client;

@@ -2475,7 +2475,7 @@ impl AntaresServiceImpl {
         source_path: String,
         source_upper: PathBuf,
         source_pinned: String,
-        mut source_chain: Vec<String>,
+        source_chain: Vec<String>,
         inherited_base: String,
         start: Instant,
     ) -> Result<ForkMountResponse, ServiceError> {
@@ -2483,7 +2483,7 @@ impl AntaresServiceImpl {
         let frozen = upper_root.join(format!("sealed-{}", Uuid::new_v4()));
         let source_new_upper = upper_root.join(Uuid::new_v4().to_string());
         // Parent's VCS pointer target (host gitdir), captured while sealing.
-        let mut source_pointer_target: Option<PathBuf> = None;
+        let source_pointer_target: Option<PathBuf>;
 
         // 1. Quiesce the source and seal its upper with one rename (same filesystem,
         //    atomic). Rollback restores the rename and the mount.
@@ -4169,7 +4169,7 @@ impl AntaresService for AntaresServiceImpl {
             }
         };
 
-        let mut new_fuse = match Self::remount_with_lower(
+        let new_fuse = match Self::remount_with_lower(
             &mountpoint,
             new_dicfuse.clone(),
             &upper_dir,
@@ -4398,7 +4398,7 @@ impl AntaresService for AntaresServiceImpl {
             }
         }
 
-        let mut new_fuse = match Self::remount_with_lower(
+        let new_fuse = match Self::remount_with_lower(
             &mountpoint,
             new_dicfuse.clone(),
             &upper_dir,

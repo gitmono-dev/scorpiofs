@@ -74,7 +74,7 @@ pub struct CommittedPath {
 pub fn git_blob_oid(content: &[u8]) -> String {
     use git_internal::{
         hash::{HashKind, ObjectHash},
-        internal::object::ObjectType,
+        internal::object::types::ObjectType,
     };
     ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Blob, content)
         .expect("blob is a canonical Git object type")
