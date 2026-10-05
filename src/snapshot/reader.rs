@@ -356,33 +356,53 @@ impl SnapshotReader {
             route: Vec::new(),
             expected: self.descriptor.metadata_root.clone(),
         }];
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Immutable page bytes may be shared, but each logical directory
+        // must still be expanded. Identical directories have identical page
+        // ids; deduplicating the walk by id would omit one of their paths.
+        let mut decoded = HashMap::new();
+        let mut route_ids = HashMap::new();
         while !frontier.is_empty() {
             let take = frontier.len().min(PAGES_BATCH);
             let batch: Vec<PageFrontier> = frontier.drain(..take).collect();
-            let mut by_id: HashMap<String, PageFrontier> = HashMap::new();
             let mut items = Vec::with_capacity(batch.len());
             for f in &batch {
-                by_id.insert(f.expected.clone(), f.clone());
-                items.push(MetadataPageItem {
-                    directory_path: f.dir.clone(),
-                    route: f.route.clone(),
-                    expected_digest: Some(f.expected.clone()),
-                });
+                route_ids.insert((f.dir.clone(), f.route.clone()), f.expected.clone());
+                if !decoded.contains_key(&f.expected) {
+                    items.push(MetadataPageItem {
+                        directory_path: f.dir.clone(),
+                        route: f.route.clone(),
+                        expected_digest: Some(f.expected.clone()),
+                    });
+                }
             }
-            let pages = self
-                .client
-                .metadata_pages(self.snapshot_id(), &items, self.content_encoding())
-                .await?;
-            let mut returned: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut fresh: Vec<(String, mst2_codec::metapage::Page)> = Vec::new();
+            let pages = if items.is_empty() {
+                Vec::new()
+            } else {
+                self.ensure_lease().await?;
+                self.client
+                    .metadata_pages(self.snapshot_id(), &items, self.content_encoding())
+                    .await?
+            };
+            // The server returns root-to-terminal witness chains. Their
+            // ancestor ids are already committed by the pages that led us
+            // to each requested route; unrelated cached pages are excluded.
+            let mut allowed = std::collections::HashSet::new();
+            for item in &items {
+                for depth in 0..=item.route.len() {
+                    if let Some(id) =
+                        route_ids.get(&(item.directory_path.clone(), item.route[..depth].to_vec()))
+                    {
+                        allowed.insert(id.clone());
+                    }
+                }
+            }
             for (pid, bytes) in pages {
                 let id = format!("sha256:{}", crate::snapshot::frames::hex32(&pid));
-                returned.insert(id.clone());
-                // The server dedupes; a page already verified through another
-                // item's route chain needs no second decode.
-                if seen.contains(&id) {
-                    continue;
+                if !allowed.contains(&id) {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        format!("metadata/pages returned an unrequested page {id}"),
+                    ));
                 }
                 // Re-hash the wire bytes ourselves: a (id, bytes) pair is a
                 // claim, not evidence.
@@ -398,12 +418,12 @@ impl SnapshotReader {
                         format!("metadata/pages page {id}: {e}"),
                     )
                 })?;
-                fresh.push((id, page));
+                decoded.insert(id, page);
             }
             // Proven completeness: every page the parent committed to must be
             // in the response — never silently enumerated as absent.
             for f in &batch {
-                if !returned.contains(&f.expected) {
+                if !decoded.contains_key(&f.expected) {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::DigestMismatch,
                         format!(
@@ -413,12 +433,11 @@ impl SnapshotReader {
                     ));
                 }
             }
-            for (id, page) in fresh {
-                seen.insert(id.clone());
-                let f = &by_id[&id];
+            for f in batch {
+                let page = &decoded[&f.expected];
                 match page {
                     mst2_codec::metapage::Page::Leaf { entries } => {
-                        for e in &entries {
+                        for e in entries {
                             collect_entry(&f.dir, e, &mut out, &mut frontier)?;
                         }
                     }
@@ -426,9 +445,9 @@ impl SnapshotReader {
                         terminal, children, ..
                     } => {
                         if let Some(e) = terminal {
-                            collect_entry(&f.dir, &e, &mut out, &mut frontier)?;
+                            collect_entry(&f.dir, e, &mut out, &mut frontier)?;
                         }
-                        for c in &children {
+                        for c in children {
                             let mut route = f.route.clone();
                             route.push(c.label);
                             frontier.push(PageFrontier {

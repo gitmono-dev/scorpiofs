@@ -148,8 +148,8 @@ impl Mst2Fuse {
         Self::build(None, Some(store), manifest)
     }
 
-    /// Lazy mount (LAZY-MOUNT-SPEC): the tree starts at the scope root page —
-    /// ONE metadata request — and directory pages are fetched on first
+    /// Lazy mount: the tree starts at the scope root's verified page tree,
+    /// and child directory pages are fetched on first
     /// readdir/lookup. File content materializes on open through the existing
     /// per-file paths (memory -> CAS -> OBJECT -> chunk ranges). The view is
     /// fixed, so lazily created inodes never go stale.
@@ -158,35 +158,6 @@ impl Mst2Fuse {
         store: Option<Arc<DurableStore>>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         let root_page_id = reader.descriptor.metadata_root.clone();
-        let sid = reader.snapshot_id().to_string();
-        let items = [crate::snapshot::frames::MetadataPageItem {
-            directory_path: "/".to_string(),
-            route: Vec::new(),
-            expected_digest: Some(root_page_id.clone()),
-        }];
-        let pages = reader
-            .client
-            .metadata_pages(&sid, &items, reader.encoding_hint())
-            .await?;
-        let root_bytes = pages
-            .iter()
-            .find(|(pid, _)| {
-                format!("sha256:{}", crate::snapshot::frames::hex32(pid)) == root_page_id
-            })
-            .map(|(_, b)| b.clone())
-            .ok_or_else(|| {
-                crate::snapshot::SnapshotError::new(
-                    crate::snapshot::SnapshotErrorCode::Internal,
-                    "metadata/pages did not return the scope root page",
-                )
-            })?;
-        let (page, _) = mst2_codec::metapage::Page::decode(&root_bytes).map_err(|e| {
-            crate::snapshot::SnapshotError::new(
-                crate::snapshot::SnapshotErrorCode::Internal,
-                format!("scope root page decode failed: {e}"),
-            )
-        })?;
-
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
@@ -200,25 +171,17 @@ impl Mst2Fuse {
                 path: String::new(),
                 children: HashMap::new(),
                 parent: ROOT_INODE,
-                loaded: true,
+                loaded: false,
                 page_id: Some(root_page_id.clone()),
             }),
         );
-        let entries = match &page {
-            mst2_codec::metapage::Page::Leaf { entries } => entries,
-            mst2_codec::metapage::Page::Branch { .. } => {
-                return Err(crate::snapshot::SnapshotError::new(
-                    crate::snapshot::SnapshotErrorCode::Internal,
-                    "scope root page must be a leaf for the lazy mount root",
-                ));
-            }
-        };
-        Self::apply_page_entries(&mut state, ROOT_INODE, "", entries)?;
-        Ok(Mst2Fuse {
+        let view = Mst2Fuse {
             reader: Some(reader),
             store,
             state: StdMutex::new(state),
-        })
+        };
+        view.ensure_dir_loaded(ROOT_INODE).await?;
+        Ok(view)
     }
 
     /// Fetch one directory's MTP2 page tree (the root page plus, for wide
@@ -249,6 +212,7 @@ impl Mst2Fuse {
                 "directory page id missing",
             )
         })?;
+        reader.ensure_lease().await?;
         let sid = reader.snapshot_id().to_string();
         let dir_path = format!("/{path}");
 
@@ -661,9 +625,9 @@ pub(crate) fn dir_attr(inode: u64) -> FileAttr {
         inode,
         0,
         0,
-        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
+        asyncfuse::Timestamp::new(0, 0),
+        asyncfuse::Timestamp::new(0, 0),
+        asyncfuse::Timestamp::new(0, 0),
         FileType::Directory,
         0o755,
         2,
@@ -681,10 +645,10 @@ pub(crate) fn file_attr(inode: u64, f: &FileNode) -> FileAttr {
         inode,
         // For a symlink this is the target's length, per POSIX.
         f.size,
-        (f.size / 512) + 1,
-        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
-        asyncfuse::Timestamp::new(TTL.as_secs() as i64, 0),
+        f.size.div_ceil(512),
+        asyncfuse::Timestamp::new(0, 0),
+        asyncfuse::Timestamp::new(0, 0),
+        asyncfuse::Timestamp::new(0, 0),
         if symlink {
             FileType::Symlink
         } else {
@@ -793,6 +757,7 @@ impl Filesystem for Mst2Fuse {
     ) -> Result<
         ReplyDirectoryPlus<impl futures::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>,
     > {
+        self.ensure_loaded(inode).await?;
         let listing = self.listing(inode, offset as i64)?;
         let mut entries: Vec<Result<DirectoryEntryPlus>> = Vec::with_capacity(listing.len());
         for e in listing {
@@ -856,14 +821,18 @@ impl Filesystem for Mst2Fuse {
         })
     }
 
-    async fn open(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
-        let _ = _flags;
+    async fn open(&self, _req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
         let node = self.node(inode)?;
         if is_symlink(&node) {
             // The kernel resolves symlinks itself; opening the link inode
             // directly (e.g. O_NOFOLLOW) is ELOOP, never "serve target text
             // as file content".
             return Err(Errno::from(libc::ELOOP));
+        }
+        if flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32
+            || flags & (libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT | libc::O_EXCL) as u32 != 0
+        {
+            return Err(Errno::from(libc::EROFS));
         }
         match node {
             Node::File(_) => Ok(ReplyOpen {
@@ -887,6 +856,11 @@ impl Filesystem for Mst2Fuse {
         // Copy-up releases its lower read handle before opening the upper.
         // Returning the trait default ENOSYS here would escape through OPEN,
         // making the kernel skip later opens, including atomic O_TRUNC.
+        Ok(())
+    }
+
+    async fn fsync(&self, _req: Request, inode: Inode, _fh: u64, _datasync: bool) -> Result<()> {
+        self.node(inode)?;
         Ok(())
     }
 
@@ -917,10 +891,8 @@ impl Filesystem for Mst2Fuse {
 
         // 1. Whole content already in memory (verified when it was read).
         if let Some(bytes) = self.state.lock().unwrap().contents.get(&inode).cloned() {
-            let start = (offset as usize).min(bytes.len());
-            let stop = (end as usize).min(bytes.len());
             return Ok(ReplyData {
-                data: Bytes::copy_from_slice(&bytes[start..stop]),
+                data: verified_slice(&bytes, f.size, offset, end)?,
             });
         }
 
@@ -931,17 +903,13 @@ impl Filesystem for Mst2Fuse {
             if let Some(store) = &self.store {
                 if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
                     let arc = Arc::new(bytes);
-                    let start = (offset as usize).min(arc.len());
-                    let stop = (end as usize).min(arc.len());
-                    let out = Bytes::copy_from_slice(&arc[start..stop]);
+                    let out = verified_slice(&arc, f.size, offset, end)?;
                     self.state.lock().unwrap().contents.insert(inode, arc);
                     return Ok(ReplyData { data: out });
                 }
             }
             let bytes = Arc::new(self.fetch_content(&f).await?);
-            let start = (offset as usize).min(bytes.len());
-            let stop = (end as usize).min(bytes.len());
-            let out = Bytes::copy_from_slice(&bytes[start..stop]);
+            let out = verified_slice(&bytes, f.size, offset, end)?;
             self.state.lock().unwrap().contents.insert(inode, bytes);
             return Ok(ReplyData { data: out });
         }
@@ -955,6 +923,9 @@ impl Filesystem for Mst2Fuse {
                 .pread_blob(&f.digest, offset, (end - offset) as usize)
                 .map_err(io_err)?
             {
+                if bytes.len() as u64 != end - offset {
+                    return Err(Errno::from(libc::EIO));
+                }
                 return Ok(ReplyData {
                     data: Bytes::from(bytes),
                 });
@@ -989,6 +960,9 @@ impl Filesystem for Mst2Fuse {
             .read_range(offset, end - offset)
             .await
             .map_err(io_err)?;
+        if data.len() as u64 != end - offset {
+            return Err(Errno::from(libc::EIO));
+        }
         Ok(ReplyData {
             data: Bytes::from(data),
         })
@@ -1215,14 +1189,147 @@ impl Filesystem for Mst2Fuse {
     }
 }
 
+fn verified_slice(bytes: &[u8], file_size: u64, offset: u64, end: u64) -> Result<Bytes> {
+    if bytes.len() as u64 != file_size {
+        return Err(Errno::from(libc::EIO));
+    }
+    let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
+    let stop = usize::try_from(end).map_err(|_| Errno::from(libc::EIO))?;
+    bytes
+        .get(start..stop)
+        .map(Bytes::copy_from_slice)
+        .ok_or_else(|| Errno::from(libc::EIO))
+}
+
 fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
     use crate::snapshot::SnapshotErrorCode::*;
     let code = match e.code {
-        PathNotFound | ViewNotFound | SnapshotGone => libc::ENOENT,
+        PathNotFound => libc::ENOENT,
         Unauthenticated | ScopeForbidden | LeaseExpired | LeaseUnknown => libc::EACCES,
         NotDirectory => libc::ENOTDIR,
         DigestMismatch => libc::EIO,
         _ => libc::EIO,
     };
     Errno::from(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_view(size: u64) -> Mst2Fuse {
+        Mst2Fuse::build(
+            None,
+            None,
+            vec![SnapshotFile {
+                rel_path: "file".into(),
+                fs_kind: "regular".into(),
+                size,
+                content_digest: crate::snapshot::durable::digest_of(b"data"),
+            }],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lower_open_rejects_write_flags_without_fetching_content() {
+        let fs = file_view(4);
+        let req = Request::default();
+        let inode = fs
+            .lookup(req, ROOT_INODE, OsStr::new("file"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        fs.open(req, inode, libc::O_RDONLY as u32).await.unwrap();
+        for flags in [
+            libc::O_WRONLY,
+            libc::O_RDWR,
+            libc::O_TRUNC,
+            libc::O_RDONLY | libc::O_APPEND,
+            libc::O_RDONLY | libc::O_CREAT,
+        ] {
+            let error = fs.open(req, inode, flags as u32).await.unwrap_err();
+            assert_eq!(i32::from(error), -libc::EROFS, "flags {flags}");
+        }
+        assert!(fs.state.lock().unwrap().contents.is_empty());
+        fs.fsync(req, inode, inode, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lower_attributes_use_exact_blocks_and_fixed_times() {
+        for (size, blocks) in [(0, 0), (1, 1), (511, 1), (512, 1), (513, 2)] {
+            let fs = file_view(size);
+            let entry = fs
+                .lookup(Request::default(), ROOT_INODE, OsStr::new("file"))
+                .await
+                .unwrap();
+            assert_eq!(entry.attr.size, size);
+            assert_eq!(entry.attr.blocks, blocks);
+            assert_eq!(entry.attr.atime, asyncfuse::Timestamp::new(0, 0));
+            assert_eq!(entry.attr.mtime, asyncfuse::Timestamp::new(0, 0));
+            assert_eq!(entry.attr.ctime, asyncfuse::Timestamp::new(0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_short_content_is_eio_and_true_eof_is_empty() {
+        let fs = file_view(4);
+        let req = Request::default();
+        let inode = fs
+            .lookup(req, ROOT_INODE, OsStr::new("file"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        fs.state
+            .lock()
+            .unwrap()
+            .contents
+            .insert(inode, Arc::new(b"dat".to_vec()));
+        let error = fs.read(req, inode, inode, 0, 4).await.unwrap_err();
+        assert_eq!(i32::from(error), -libc::EIO);
+        for (offset, size) in [(4, 10), (u64::MAX, u32::MAX), (0, 0)] {
+            assert!(fs
+                .read(req, inode, inode, offset, size)
+                .await
+                .unwrap()
+                .data
+                .is_empty());
+        }
+        fs.state
+            .lock()
+            .unwrap()
+            .contents
+            .insert(inode, Arc::new(b"data".to_vec()));
+        assert_eq!(
+            fs.read(req, inode, inode, 3, u32::MAX)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            b"a"
+        );
+    }
+
+    #[test]
+    fn unavailable_view_does_not_become_a_negative_path_entry() {
+        use crate::snapshot::{SnapshotError, SnapshotErrorCode};
+        for code in [
+            SnapshotErrorCode::ViewNotFound,
+            SnapshotErrorCode::SnapshotGone,
+        ] {
+            assert_eq!(
+                i32::from(io_err(SnapshotError::new(code, "unavailable"))),
+                -libc::EIO
+            );
+        }
+        assert_eq!(
+            i32::from(io_err(SnapshotError::new(
+                SnapshotErrorCode::PathNotFound,
+                "absent"
+            ))),
+            -libc::ENOENT
+        );
+    }
 }

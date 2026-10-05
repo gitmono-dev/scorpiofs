@@ -34,6 +34,9 @@ pub enum SnapshotErrorCode {
     CursorStale,
     ProofBudgetExceeded,
     DigestMismatch,
+    /// A retained object is missing or violates the verified storage contract.
+    IntegrityError,
+    ObjectUnavailable,
     RangeNotSupported,
     SymlinkTraversal,
     /// A durable local store already holds a different fixed view; hydration
@@ -80,6 +83,8 @@ impl SnapshotErrorCode {
             "CURSOR_STALE" => Self::CursorStale,
             "PROOF_BUDGET_EXCEEDED" => Self::ProofBudgetExceeded,
             "EXPECTED_DIGEST_MISMATCH" => Self::DigestMismatch,
+            "INTEGRITY_ERROR" => Self::IntegrityError,
+            "OBJECT_UNAVAILABLE" => Self::ObjectUnavailable,
             // Pre-0.3 server builds used this spelling.
             "OBJECT_DIGEST_MISMATCH" => Self::DigestMismatch,
             "RANGE_NOT_SUPPORTED" => Self::RangeNotSupported,
