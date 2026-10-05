@@ -1135,3 +1135,107 @@ async fn selected_membership_rejects_wrong_kinds_missing_paths_and_serving_profi
         assert_eq!(server.fixture.bodies.load(Ordering::SeqCst), 0);
     }
 }
+
+#[tokio::test]
+async fn scope_root_existing_directory_and_intermediate_symlink_have_distinct_typed_errors() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::wide()).await;
+    for path in ["", "/"] {
+        assert_eq!(
+            server.reader.prove_file(path).await.unwrap_err().code,
+            SnapshotErrorCode::NotFile
+        );
+    }
+    assert!(server.fixture.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        server.reader.prove_file("wanted").await.unwrap_err().code,
+        SnapshotErrorCode::NotFile
+    );
+    assert_eq!(
+        server.fixture.requests.lock().unwrap().as_slice(),
+        [("/".into(), Vec::new())]
+    );
+    assert_eq!(server.fixture.bodies.load(Ordering::SeqCst), 0);
+    let mut witnesses = BTreeMap::new();
+    let mut pages = BTreeMap::new();
+    let root = add_directory(
+        "/",
+        &[Entry::file(
+            EntryKind::Symlink,
+            b"link",
+            BODY.len() as u64,
+            hash(BODY),
+        )],
+        &mut witnesses,
+        &mut pages,
+    );
+    let server = Server::start(Fixture::from_parts(root, witnesses, pages)).await;
+    assert_eq!(
+        server
+            .reader
+            .prove_file("link/target")
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::SymlinkTraversal
+    );
+    assert_eq!(
+        server.fixture.requests.lock().unwrap().as_slice(),
+        [("/".into(), Vec::new())]
+    );
+    assert_eq!(server.fixture.bodies.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn full_closure_seed_distinguishes_known_directories_from_absent_paths_without_http() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut witnesses = BTreeMap::new();
+    let mut pages = BTreeMap::new();
+    let empty = add_directory("/empty", &[], &mut witnesses, &mut pages);
+    let root = add_directory(
+        "/",
+        &[
+            Entry::dir(b"empty", empty),
+            Entry::file(EntryKind::Regular, b"file", BODY.len() as u64, hash(BODY)),
+            Entry::file(EntryKind::Symlink, b"link", BODY.len() as u64, hash(BODY)),
+        ],
+        &mut witnesses,
+        &mut pages,
+    );
+    let server = Server::start(Fixture::from_parts(root, witnesses, pages)).await;
+    let closure = super::super::ValidatedSnapshotClosure::from_pages(
+        server.reader.descriptor(),
+        server.fixture.pages.clone(),
+    )
+    .unwrap();
+    server.reader.seed_content_membership(&closure).unwrap();
+    assert_eq!(
+        server.reader.prove_file("empty").await.unwrap_err().code,
+        SnapshotErrorCode::NotFile
+    );
+    assert_eq!(
+        server.reader.prove_file("absent").await.unwrap_err().code,
+        SnapshotErrorCode::PathNotFound
+    );
+    assert!(server.reader.prove_file("file").await.is_ok());
+    assert_eq!(
+        server
+            .reader
+            .prove_file("file/child")
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::NotDirectory
+    );
+    assert_eq!(
+        server
+            .reader
+            .prove_file("link/target")
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::SymlinkTraversal
+    );
+    assert!(server.fixture.requests.lock().unwrap().is_empty());
+    assert_eq!(server.fixture.bodies.load(Ordering::SeqCst), 0);
+}

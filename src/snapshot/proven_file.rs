@@ -120,6 +120,7 @@ pub(crate) struct PathMembership {
     callers: Arc<Semaphore>,
     initializers: Arc<Semaphore>,
     deadline: Duration,
+    complete_directories: OnceLock<Box<[String]>>,
 }
 impl PathMembership {
     pub(crate) fn new() -> Self {
@@ -131,7 +132,19 @@ impl PathMembership {
             callers: Arc::new(Semaphore::new(128)),
             initializers: Arc::new(Semaphore::new(4)),
             deadline: PROOF_DEADLINE,
+            complete_directories: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn seed_directories(&self, closure: &super::ValidatedSnapshotClosure) {
+        self.complete_directories.get_or_init(|| {
+            closure
+                .directories()
+                .iter()
+                .map(|directory| directory.rel_path.clone())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
     }
 }
 struct ProcessAdmission {
@@ -234,12 +247,39 @@ impl SnapshotReader {
         let path = path.strip_prefix('/').unwrap_or(path);
         if path.is_empty() {
             return Err(SnapshotError::new(
-                SnapshotErrorCode::PathNotFound,
+                SnapshotErrorCode::NotFile,
                 "scope root is not a file",
             ));
         }
         if let Some(files) = self.content_membership.get() {
+            for (separator, _) in path.match_indices('/') {
+                if let Some(ancestor) = files.get(&path[..separator]) {
+                    return Err(SnapshotError::new(
+                        if ancestor.fs_kind == "symlink" {
+                            SnapshotErrorCode::SymlinkTraversal
+                        } else {
+                            SnapshotErrorCode::NotDirectory
+                        },
+                        "seeded fixed-root ancestor is not a directory",
+                    ));
+                }
+            }
             let file = files.get(path).ok_or_else(|| {
+                if self
+                    .path_membership
+                    .complete_directories
+                    .get()
+                    .is_some_and(|directories| {
+                        directories
+                            .binary_search_by(|directory| directory.as_str().cmp(path))
+                            .is_ok()
+                    })
+                {
+                    return SnapshotError::new(
+                        SnapshotErrorCode::NotFile,
+                        "seeded fixed-root path is a directory",
+                    );
+                }
                 SnapshotError::new(
                     SnapshotErrorCode::PathNotFound,
                     "file absent from seeded fixed root",
@@ -296,6 +336,12 @@ impl SnapshotReader {
                 .prove_component(&directory, root, component.as_bytes(), &mut work)
                 .await?;
             if components.peek().is_some() {
+                if entry.kind == EntryKind::Symlink {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::SymlinkTraversal,
+                        "selected ancestor is a symlink; membership does not follow it",
+                    ));
+                }
                 if entry.kind != EntryKind::Directory {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::NotDirectory,
@@ -310,7 +356,7 @@ impl SnapshotReader {
             } else {
                 if entry.kind == EntryKind::Directory {
                     return Err(SnapshotError::new(
-                        SnapshotErrorCode::PathNotFound,
+                        SnapshotErrorCode::NotFile,
                         "selected path is a directory",
                     ));
                 }
