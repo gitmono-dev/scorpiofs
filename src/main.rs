@@ -12,6 +12,14 @@ struct Cli {
     #[arg(short, long, default_value = "scorpio.toml", global = true)]
     config_path: String,
 
+    /// MST/2 snapshot service base URL. Overrides SCORPIO_MST2_BASE_URL and config.
+    #[arg(long, global = true)]
+    mst2_base_url: Option<String>,
+
+    /// Persistent store root. Workspace and cache roots derive from this path.
+    #[arg(long, global = true)]
+    store_path: Option<String>,
+
     /// HTTP bind address for the v3 workspace daemon.
     #[arg(long, default_value = "0.0.0.0:2725", global = true)]
     http_addr: SocketAddr,
@@ -142,7 +150,16 @@ async fn main() {
         }
         cli => cli,
     };
-    let overrides = HashMap::new();
+    let mut overrides = HashMap::new();
+    for (key, value) in [
+        ("mst2_base_url", &cli.mst2_base_url),
+        ("store_path", &cli.store_path),
+        ("log_level", &cli.log_level),
+    ] {
+        if let Some(value) = value {
+            overrides.insert(key.into(), value.clone());
+        }
+    }
 
     // These commands need neither a loaded config nor logging; handle them
     // before `cli::init` so they work even when the config is missing/invalid.

@@ -1,4 +1,4 @@
-//! Actual modern HTTP snapshot lower and real writable Antares upper.
+//! Actual MST/2 HTTP snapshot lower and a private writable workspace upper.
 
 use std::path::PathBuf;
 

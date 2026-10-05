@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     io::{self, Write},
     net::SocketAddr,
-    path::PathBuf,
     time::Duration,
 };
 
@@ -59,15 +58,13 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
     tracing::info!("server running on {http_addr}");
 
     let token = config::mst2_auth_token();
+    let paths = config::runtime_paths();
     let service = match WorkspaceService::new(
         Mst2Client::with_token(
             config::mst2_base_url(),
             (!token.is_empty()).then(|| token.to_owned()),
         ),
-        WorkspaceConfig::new(
-            PathBuf::from(config::store_path()).join("workspaces-v3"),
-            PathBuf::from(config::store_path()).join("mst2-cache"),
-        ),
+        WorkspaceConfig::new(paths.workspace_root.into(), paths.cache_root.into()),
     ) {
         Ok(service) => service,
         Err(error) => {
@@ -301,7 +298,7 @@ pub fn config_init(path: &str, force: bool) -> i32 {
     match std::fs::write(path, CONFIG_TEMPLATE) {
         Ok(()) => {
             println!("wrote config template to {path}");
-            println!("edit base_url/lfs_url, then: scorpio --config-path {path} doctor");
+            println!("edit mst2_base_url, then: scorpio --config-path {path} doctor");
             exit::SUCCESS
         }
         Err(e) => {
@@ -338,8 +335,7 @@ pub fn config_show() -> i32 {
 
 /// Emit effective runtime paths as NUL-delimited records for `install.sh`.
 ///
-/// This deliberately avoids global config initialization because initialization
-/// creates runtime directories, which would be unsafe during installer checks.
+/// Resolution is read-only and uses the same derived roots as the daemon.
 pub fn config_installer_paths(config_path: &str, overrides: HashMap<String, String>) -> i32 {
     let paths = match config::resolve_runtime_paths(config_path, overrides) {
         Ok(paths) => paths,
@@ -348,15 +344,7 @@ pub fn config_installer_paths(config_path: &str, overrides: HashMap<String, Stri
             return exit::CONFIG;
         }
     };
-    let values = [
-        paths.workspace,
-        paths.store_path,
-        paths.config_file,
-        paths.antares_upper_root,
-        paths.antares_cl_root,
-        paths.antares_mount_root,
-        paths.antares_state_file,
-    ];
+    let values = [paths.store_path, paths.workspace_root, paths.cache_root];
     let mut stdout = io::stdout().lock();
     for value in values {
         if value.as_bytes().contains(&0) {
@@ -376,19 +364,11 @@ pub fn config_installer_paths(config_path: &str, overrides: HashMap<String, Stri
 
 /// Template used by `scorpio config init`.
 const CONFIG_TEMPLATE: &str = r#"# ScorpioFS configuration. Every key can be overridden by SCORPIO_<KEY> env vars
-# and on the CLI; precedence is CLI > env > this file > built-in defaults.
-base_url = "http://localhost:8000"
-lfs_url = "http://localhost:8000/lfs"
-workspace = "/tmp/scorpio-megadir/mount"
+# precedence is CLI > env > this file > built-in defaults.
+mst2_base_url = "http://127.0.0.1:19700"
+mst2_auth_token = ""
 store_path = "/tmp/scorpio-megadir/store"
-config_file = "config.toml"
-git_author = "MEGA"
-git_email = "admin@mega.org"
 log_level = "info"
-antares_upper_root = "/tmp/scorpio-megadir/antares/upper"
-antares_cl_root = "/tmp/scorpio-megadir/antares/cl"
-antares_mount_root = "/tmp/scorpio-megadir/antares/mnt"
-antares_state_file = "/tmp/scorpio-megadir/antares/state.toml"
 "#;
 
 /// Wait for SIGTERM/SIGINT (Unix) or Ctrl-C (other platforms).

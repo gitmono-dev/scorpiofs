@@ -451,7 +451,22 @@ impl Launcher {
     }
 
     fn assert_no_dictionary(&self) {
-        for entry in std::fs::read_dir(self.temp.path().join("dictionary")).unwrap() {
+        assert_eq!(
+            std::fs::read_to_string(self.temp.path().join("invalid-legacy-state.toml")).unwrap(),
+            "this is not TOML"
+        );
+        for name in ["unused-root", "upper", "cl", "mounts", "antares-state.toml"] {
+            assert!(
+                !self.temp.path().join(name).exists(),
+                "retired path created: {name}"
+            );
+        }
+        let root = self.temp.path().join("dictionary");
+        // Pure config loading leaves the store absent on HTTP bind failure.
+        if !root.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(root).unwrap() {
             let name = entry.unwrap().file_name();
             assert!(
                 name == "workspaces-v3" || name == "mst2-cache",
@@ -619,6 +634,7 @@ async fn bind_failure_precedes_dictionary_and_workspace_initialization() {
     .expect("bind failure must return promptly");
     assert_eq!(status.code(), Some(4), "{}", launcher.log());
     assert!(f.requests.lock().unwrap().is_empty());
+    assert!(!launcher.temp.path().join("dictionary").exists());
     launcher.assert_no_dictionary();
 }
 
@@ -666,6 +682,18 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
         assert!(path.starts_with(launcher.temp.path().join("dictionary/workspaces-v3")));
         launcher.mounts.push(path.clone());
         assert!(mounted(&path));
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let mount = mountinfo
+            .lines()
+            .find(|line| line.split_whitespace().nth(4) == path.to_str())
+            .unwrap();
+        let (_, filesystem) = mount.split_once(" - ").unwrap();
+        let fields: Vec<_> = filesystem.split_whitespace().collect();
+        assert_eq!(fields[0], "fuse");
+        assert_eq!(fields[1], "scorpiofs-v3");
+        let expected_uid = format!("user_id={}", unsafe { libc::getuid() });
+        assert!(fields[2].split(',').any(|option| option == expected_uid));
+        println!("V3_KERNEL_MOUNT_IDENTITY_RUN");
         if index == 0 {
             // Keep this handle and dirty upper alive before changing latest
             // and admitting the second snapshot.
