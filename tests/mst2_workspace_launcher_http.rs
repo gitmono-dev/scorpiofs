@@ -58,6 +58,18 @@ impl Version {
             entries: vec![
                 Entry::file(
                     EntryKind::Regular,
+                    b".wh..wh..opq",
+                    content.len() as u64,
+                    parse_digest(&digest_of(content)).unwrap(),
+                ),
+                Entry::file(
+                    EntryKind::Regular,
+                    b".wh.base.txt",
+                    content.len() as u64,
+                    parse_digest(&digest_of(content)).unwrap(),
+                ),
+                Entry::file(
+                    EntryKind::Regular,
                     b"base.txt",
                     content.len() as u64,
                     parse_digest(&digest_of(content)).unwrap(),
@@ -526,6 +538,11 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     old_fd.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, CONTENT[0]);
     assert_eq!(std::fs::read(new.join("base.txt")).unwrap(), CONTENT[1]);
+    // These are ordinary committed filenames in the complete snapshot,
+    // even though the writable upper uses OCI names for its private deltas.
+    for name in [".wh..wh..opq", ".wh.base.txt"] {
+        assert_eq!(std::fs::read(new.join(name)).unwrap(), CONTENT[1]);
+    }
     let dirty = old.join("dirty.txt");
     assert_eq!(std::fs::read(&dirty).unwrap(), b"keep this dirty upper");
     old_fd.seek(SeekFrom::Start(0)).unwrap();
