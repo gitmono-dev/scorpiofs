@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "metadata_codec": 1,
+  "instance_id": "11111111-2222-4333-8444-555555555555",
+  "namespace_view_id": "sha256:05e7a37712e7808b31c9459eb759b682b5e8ffdfb9f3f50a919a44d48f84d1f5",
+  "scope": "/project/app",
+  "materialization_policy": 1,
+  "fs_semantics": 1,
+  "access_projection": 0,
+  "metadata_root": "sha256:4a24ad330e3a44fb48a63997566f488407c23567780e94b85c26604fb87bc778",
+  "snapshot_id": "sha256:f94af7bddec0603b40dbf5c2b17952bbfef30093af9f5653734ac05983cbbfee"
+}

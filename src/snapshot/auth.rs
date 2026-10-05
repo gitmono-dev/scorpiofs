@@ -309,7 +309,7 @@ fn validate_scope(scope: &str) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn validate_descriptor(descriptor: &Descriptor) -> Result<(), SnapshotError> {
+pub(crate) fn validate_descriptor(descriptor: &Descriptor) -> Result<(), SnapshotError> {
     use mst2_codec::descriptor::{
         ServingDescriptor, ACCESS_PROJECTION_EXACT_FULL, FS_SEMANTICS_LINUX_CODE_V1,
         MATERIALIZATION_POLICY_GIT_RAW_V1, METADATA_CODEC, SCHEMA_VERSION,
