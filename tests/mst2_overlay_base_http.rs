@@ -33,7 +33,12 @@ async fn reply(State(state): State<Arc<Requests>>, request: Request) -> impl Int
             if state.reject_discovery.load(Ordering::SeqCst) {
                 "{}"
             } else {
-                include_str!("fixtures/mst2_capabilities_0_2_1.json")
+                // Use the capabilities contract consumed by SnapshotReader.
+                // Canonical discovery is checked by its separate parser; it
+                // does not yet configure the reader's request planners.
+                r#"{"protocol_versions":[2],"metadata_codecs":[1],
+                    "frame_encodings":["identity"],
+                    "features":{"resolve":true,"directory":true,"leases":true}}"#
             },
         ),
         // A malformed selected resolve contract is terminal. A dictionary
