@@ -214,6 +214,10 @@ async fn resolve_counters_lease_ids_and_actual_timestamps_are_semantically_check
             json!("2026-09-15"),
             json!("2026-09-15T25:00:00Z"),
             json!("2026-09-15T12:00:00-00:00"),
+            json!("2026-09-15 12:00:00Z"),
+            json!("2026-09-15@12:00:00Z"),
+            json!("2026-09-15\n12:00:00Z"),
+            json!("2026-09-16T02:28:60Z"),
             json!(true),
         ] {
             let mut value = fixture();
@@ -234,6 +238,11 @@ async fn resolve_counters_lease_ids_and_actual_timestamps_are_semantically_check
         server.client.resolve(SCOPE, 600).await.is_ok(),
         "actual grant need not equal suggested seconds"
     );
+    let mut value = fixture();
+    value["resolved_at"] = json!("2026-09-15t12:00:00z");
+    value["lease_expires_at"] = json!("2026-09-15t12:20:00z");
+    let server = Server::start(value.to_string()).await;
+    assert!(server.client.resolve(SCOPE, 600).await.is_ok());
 }
 
 #[tokio::test]

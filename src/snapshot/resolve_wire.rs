@@ -63,9 +63,11 @@ pub(crate) fn opaque(value: &str) -> bool {
 }
 
 pub(crate) fn timestamp(value: &str) -> Result<OffsetDateTime, SnapshotError> {
+    // The time parser also accepts application-selected date/time separators.
+    // Our wire contract uses the RFC3339 T separator (case-insensitive).
     // RFC3339 -00:00 explicitly means an unknown local offset; it cannot
     // identify an actual lease expiry instant.
-    if value.ends_with("-00:00") {
+    if !matches!(value.as_bytes().get(10), Some(b'T' | b't')) || value.ends_with("-00:00") {
         return Err(invalid());
     }
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| invalid())
