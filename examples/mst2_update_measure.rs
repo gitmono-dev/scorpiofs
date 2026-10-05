@@ -45,7 +45,26 @@ fn elapsed_ms(start: Instant) -> f64 {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    let mut stage = "arguments";
+    match measure(&mut stage).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // Stages are fixed harness labels. Error messages and environment
+            // values are private; only the actual typed client code is public.
+            let mut failure = serde_json::json!({
+                "record": "measurement_failure", "stage": stage,
+            });
+            if let Some(snapshot) = error.downcast_ref::<scorpiofs::snapshot::SnapshotError>() {
+                failure["snapshot_error_code"] = serde_json::json!(format!("{:?}", snapshot.code));
+            }
+            eprintln!("{failure}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn measure(stage: &mut &'static str) -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mode = args.next().ok_or("sync or audit required")?;
     let expected_path = PathBuf::from(args.next().ok_or("expected Git manifest required")?);
@@ -54,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("duplicate paths in independent Git manifest".into());
     }
     if mode == "audit" {
+        *stage = "old_complete_view_audit";
         let root = PathBuf::from(args.next().ok_or("old store required")?);
         if args.next().is_some() {
             return Err("audit accepts exactly one expected manifest and store".into());
@@ -79,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let expected_view = std::env::var("M2_EXPECTED_VIEW")?;
     let expected_instance = std::env::var("M2_EXPECTED_INSTANCE")?;
     let client = Mst2Client::with_token(base, std::env::var("M2_TOKEN").ok());
+    *stage = "resolve";
     let started = Instant::now();
     let reader = SnapshotReader::resolve(client, &scope, 3600).await?;
     let resolve_ms = elapsed_ms(started);
@@ -88,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("stale or wrong resolved snapshot after the publication fence".into());
     }
+    *stage = "cache_setup";
     let cache_start = Instant::now();
     let context = reader.authorized_context();
     if let Ok(expected_sequence) = std::env::var("M2_EXPECTED_SEQUENCE") {
@@ -105,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &reader,
     )?);
     let cache_setup_ms = elapsed_ms(cache_start);
+    *stage = "metadata";
     let metadata_start = Instant::now();
     let before_metadata_bytes = reader.client().received_bytes();
     let mut sync = IncrementalSync::new(&reader, &cache);
@@ -116,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proof = sync.closure_meters();
     // Keep the independent oracle outside each reported timing segment, but
     // account for it explicitly in overall wall time.
+    *stage = "metadata_oracle";
     let oracle_start = Instant::now();
     if index(closure.files()) != index(&expected.files)
         || closure.files().len() != expected.files.len()
@@ -124,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("incremental closure differs from the independent fixed Git tree".into());
     }
     let metadata_oracle_ms = elapsed_ms(oracle_start);
+    *stage = "hydrate";
     let content_start = Instant::now();
     let before_content_bytes = reader.client().received_bytes();
     let frames =
@@ -199,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scope: scope.clone(),
         lease_id: reader.lease_id().to_owned(),
     };
+    *stage = "completion_audit";
     let audit_start = Instant::now();
     store.pin(&view)?;
     if !store.is_snapshot_complete()? {
