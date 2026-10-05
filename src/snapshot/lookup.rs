@@ -42,18 +42,6 @@ pub(crate) fn validate_node(node: &LookupNode, path: &str) -> Result<(), Snapsho
     {
         return Err(integrity());
     }
-    if node.node_class.as_deref().is_some_and(|class| {
-        !matches!(
-            class,
-            "native_tree" | "native_checkout_root" | "import_root" | "import_tree" | "aggregate"
-        )
-    }) || node
-        .lifecycle
-        .as_deref()
-        .is_some_and(|value| !matches!(value, "mutable" | "immutable_release"))
-    {
-        return Err(integrity());
-    }
     match node.fs_kind.as_str() {
         "directory" => {
             if node.size.is_some()
@@ -67,7 +55,6 @@ pub(crate) fn validate_node(node: &LookupNode, path: &str) -> Result<(), Snapsho
         }
         "regular" | "executable" | "symlink" => {
             if node.directory_root.is_some()
-                || node.node_class.is_some()
                 || !node.content_digest.as_deref().is_some_and(digest_valid)
             {
                 return Err(integrity());

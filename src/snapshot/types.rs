@@ -219,19 +219,62 @@ fn optional_nonnull_lookup_node<'de, D: serde::Deserializer<'de>>(
     LookupNode::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LookupNode {
     pub fs_kind: String,
-    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub name: Option<String>,
-    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub size: Option<String>,
-    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub content_digest: Option<String>,
-    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub directory_root: Option<String>,
+}
+
+// Preserve LookupNode's original public struct-literal API. Provenance hints
+// belong to the wire representation and are validated before being discarded.
+#[derive(Deserialize)]
+struct LookupNodeWire {
+    fs_kind: String,
     #[serde(default, deserialize_with = "optional_nonnull_string")]
-    pub node_class: Option<String>,
+    name: Option<String>,
     #[serde(default, deserialize_with = "optional_nonnull_string")]
-    pub lifecycle: Option<String>,
+    size: Option<String>,
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
+    content_digest: Option<String>,
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
+    directory_root: Option<String>,
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
+    node_class: Option<String>,
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
+    lifecycle: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for LookupNode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = LookupNodeWire::deserialize(deserializer)?;
+        if wire.node_class.as_deref().is_some_and(|class| {
+            wire.fs_kind != "directory"
+                || !matches!(
+                    class,
+                    "native_tree"
+                        | "native_checkout_root"
+                        | "import_root"
+                        | "import_tree"
+                        | "aggregate"
+                )
+        }) || wire
+            .lifecycle
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "mutable" | "immutable_release"))
+        {
+            return Err(serde::de::Error::custom(
+                "invalid lookup node provenance fields",
+            ));
+        }
+        Ok(Self {
+            fs_kind: wire.fs_kind,
+            name: wire.name,
+            size: wire.size,
+            content_digest: wire.content_digest,
+            directory_root: wire.directory_root,
+        })
+    }
 }
