@@ -266,15 +266,24 @@ impl AntaresFuse {
     pub async fn unmount(&mut self) -> std::io::Result<()> {
         // Do not consume the native handle while a write or orphan-handle
         // cleanup is still running, or when its outcome is unknown.
-        if let Some(fence) = self.mutation_fence() {
-            fence.seal().await?;
+        if let Some(overlay) = &self.overlay {
+            overlay.fence().seal().await?;
+            // The void FUSE destroy callback can only log cleanup errors.
+            // Keep this exact overlay and its source ledger until recovery
+            // confirms real closure; an error or caller cancellation must
+            // leave the native handle available for an explicit retry.
+            overlay.inner().recover_all_copyups().await?;
         }
         let Some(handle) = self.mount_handle.take() else {
             if self.unmount_failed {
                 let result = fuse_platform::unmount_path(&self.mountpoint, true).await;
                 self.unmount_failed = result.is_err();
+                if result.is_ok() {
+                    self.overlay = None;
+                }
                 return result;
             }
+            self.overlay = None;
             return Ok(());
         };
         let mount_path = self.mountpoint.clone();
@@ -303,6 +312,9 @@ impl AntaresFuse {
                 }
             };
         self.unmount_failed = result.is_err();
+        if result.is_ok() {
+            self.overlay = None;
+        }
         result
     }
 }
