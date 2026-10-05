@@ -63,6 +63,7 @@ struct Fixture {
     resolve_epoch: &'static str,
     renewal_epoch: Mutex<Option<Value>>,
     fail_renewal: AtomicBool,
+    canonical_retry_error: Option<(&'static str, StatusCode)>,
     plain_retry_errors: bool,
     malformed_renewal_json: AtomicBool,
     pause_next_resolve: AtomicBool,
@@ -86,6 +87,7 @@ impl Default for Fixture {
             resolve_epoch: "1",
             renewal_epoch: Mutex::new(None),
             fail_renewal: AtomicBool::new(false),
+            canonical_retry_error: None,
             plain_retry_errors: false,
             malformed_renewal_json: AtomicBool::new(false),
             pause_next_resolve: AtomicBool::new(false),
@@ -290,6 +292,16 @@ async fn renew(
     f.renewal_count.fetch_add(1, Ordering::SeqCst);
     f.renewal_changed.notify_one();
     if f.fail_renewal.load(Ordering::SeqCst) {
+        if let Some((code, status)) = f.canonical_retry_error {
+            return (
+                status,
+                Json(json!({"error": {
+                    "code": code, "message": "fixture renewal is temporarily unavailable",
+                    "request_id": "renewal-fixture", "retryable": true
+                }})),
+            )
+                .into_response();
+        }
         if f.plain_retry_errors {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
@@ -690,6 +702,101 @@ async fn persistent_transient_failures_stop_at_the_original_deadline() {
     );
     assert_eq!(fixture.count("lookup"), 0);
     assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+}
+
+async fn canonical_renewal_failure(
+    code: &'static str,
+    status: StatusCode,
+    expected: SnapshotErrorCode,
+    recover: bool,
+) {
+    let fixture = Arc::new(Fixture {
+        initial_expiry: Expiry::After(Duration::from_secs(6)),
+        fail_renewal: AtomicBool::new(true),
+        canonical_retry_error: Some((code, status)),
+        ..Fixture::default()
+    });
+    let server = serve(fixture.clone()).await;
+    let client = Mst2Client::new(&server.url);
+    let reader = SnapshotReader::resolve(client.clone(), "/alpha", 600)
+        .await
+        .unwrap();
+    let clone = reader.clone();
+    fixture.wait_for_renewals(4).await;
+    for view in [&reader, &clone] {
+        let error = view.lookup(&["/probe".into()]).await.unwrap_err();
+        assert_eq!(error.code, expected, "{code}");
+        assert_eq!(error.http_status, status.as_u16());
+    }
+    assert_eq!(fixture.count("lookup"), 0);
+    assert!(client.retry_count() >= 3);
+    if recover {
+        let failed = fixture.renewal_count.load(Ordering::SeqCst);
+        fixture.fail_renewal.store(false, Ordering::SeqCst);
+        fixture.wait_for_renewals(failed + 1).await;
+        probe(&reader).await;
+        probe(&clone).await;
+        assert_eq!(fixture.count("lookup"), 2);
+        assert_eq!(reader.snapshot_id(), clone.snapshot_id());
+        assert_eq!(reader.lease_id(), clone.lease_id());
+    } else {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for view in [&reader, &clone] {
+            assert_eq!(
+                view.lookup(&["/probe".into()]).await.unwrap_err().code,
+                SnapshotErrorCode::LeaseExpired,
+                "{code} did not stop at the original grant"
+            );
+        }
+        let stopped = fixture.renewal_count.load(Ordering::SeqCst);
+        assert!((4..=20).contains(&stopped));
+        fixture.fail_renewal.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(fixture.renewal_count.load(Ordering::SeqCst), stopped);
+        assert_eq!(
+            clone.lookup(&["/probe".into()]).await.unwrap_err().code,
+            SnapshotErrorCode::LeaseExpired,
+            "late recovery revived the expired lease"
+        );
+        assert_eq!(fixture.count("lookup"), 0);
+    }
+    assert_eq!(fixture.resolve_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn typed_rate_limit_and_metadata_outages_recover_without_changing_the_fixed_view() {
+    tokio::join!(
+        canonical_renewal_failure(
+            "RATE_LIMITED",
+            StatusCode::TOO_MANY_REQUESTS,
+            SnapshotErrorCode::RateLimited,
+            true
+        ),
+        canonical_renewal_failure(
+            "METADATA_NOT_READY",
+            StatusCode::SERVICE_UNAVAILABLE,
+            SnapshotErrorCode::MetadataNotReady,
+            true
+        )
+    );
+}
+
+#[tokio::test]
+async fn typed_rate_limit_and_metadata_outages_cannot_extend_or_revive_the_original_grant() {
+    tokio::join!(
+        canonical_renewal_failure(
+            "RATE_LIMITED",
+            StatusCode::TOO_MANY_REQUESTS,
+            SnapshotErrorCode::RateLimited,
+            false
+        ),
+        canonical_renewal_failure(
+            "METADATA_NOT_READY",
+            StatusCode::SERVICE_UNAVAILABLE,
+            SnapshotErrorCode::MetadataNotReady,
+            false
+        )
+    );
 }
 
 #[tokio::test]
