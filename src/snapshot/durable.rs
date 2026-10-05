@@ -1228,6 +1228,11 @@ impl DurableStore {
                 ));
             }
         }
+        // The journal is only a resume hint, so validate and repair it before
+        // revoking a still-valid COMPLETE claim. A non-tail corruption must
+        // not make an otherwise verified store permanently unavailable.
+        let _journal = self.read_journal()?;
+        self.truncate_journal_tail()?;
         // COMPLETE is a current claim, not a historical flag. Revoke it
         // durably before a repair can fail or be cancelled partway through.
         self.invalidate_complete()?;
@@ -1237,8 +1242,6 @@ impl DurableStore {
             .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))?;
         write_atomic(&self.root, VIEW_FILE, &view_bytes)?;
         durability_checkpoint(&self.root, "marker-revoked")?;
-        let _journal = self.read_journal()?;
-        self.truncate_journal_tail()?;
         Ok(transaction)
     }
 
@@ -2361,6 +2364,40 @@ mod tests {
             .expect_err("must not graft a second view onto the store");
         assert_eq!(err.code, SnapshotErrorCode::DurableViewConflict);
         assert!(store.is_complete().unwrap(), "original marker untouched");
+    }
+
+    #[tokio::test]
+    async fn non_tail_journal_corruption_does_not_revoke_complete_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, content) = manifest_fixture();
+        let store = DurableStore::open(tmp.path()).unwrap();
+        let calls = RefCell::new(Vec::new());
+        hydrate_counted(&store, &manifest, &content, &calls)
+            .await
+            .unwrap();
+
+        let journal = tmp.path().join(JOURNAL_FILE);
+        let original = fs::read(&journal).unwrap();
+        let split = original
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|idx| idx + 1)
+            .expect("hydration writes newline-terminated journal records");
+        let mut corrupted = original[..split].to_vec();
+        corrupted.extend_from_slice(b"not json at all\n");
+        corrupted.extend_from_slice(&original[split..]);
+        fs::write(&journal, corrupted).unwrap();
+
+        let failed_calls = RefCell::new(Vec::new());
+        let err = hydrate_counted(&store, &manifest, &content, &failed_calls)
+            .await
+            .expect_err("non-tail journal corruption must abort before repair");
+        assert_eq!(err.code, SnapshotErrorCode::Internal);
+        assert!(
+            store.is_complete().unwrap(),
+            "valid completion must remain usable"
+        );
+        assert_eq!(store.manifest().unwrap(), manifest);
     }
 
     #[tokio::test]
