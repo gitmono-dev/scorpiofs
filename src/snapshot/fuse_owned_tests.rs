@@ -769,3 +769,298 @@ async fn cached_content_readlink_and_true_eof_require_the_current_lease() {
     assert_eq!(server.fixture.requests.load(Ordering::SeqCst), before);
     assert_eq!(prior.data.as_ref(), [0; 4]);
 }
+
+#[tokio::test]
+async fn actual_cross_chunk_reply_survives_range_reader_eviction_and_mount_drop() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true).with_large(), 32 * 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let reply = read(&fs, "range000", CHUNK_SIZE as u64 - 2, 5).await;
+    assert_eq!(reply.data.as_ref(), [0, 0, 1, 1, 1]);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 2);
+    let clone = reply.clone();
+    let last = clone.data.slice(1..4);
+    assert_eq!(last.as_ptr(), reply.data.as_ptr().wrapping_add(1));
+    for index in 1..17 {
+        let eof = read(
+            &fs,
+            &format!("range{index:03}"),
+            2 * CHUNK_SIZE as u64 + 3,
+            u32::MAX,
+        )
+        .await;
+        assert_eq!(eof.data.as_ref(), [2; 4]);
+    }
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 17);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 18);
+    {
+        let state = fs.state.lock().unwrap();
+        assert_eq!(state.owned.as_ref().unwrap().ranges.len(), 16);
+        assert!(state.chunked.is_empty());
+        assert!(state.contents.is_empty());
+    }
+    // The real first reader was evicted: opening this inode again requests its
+    // map and both covering chunks. Its old reply continues owning its range.
+    drop(read(&fs, "range000", CHUNK_SIZE as u64 - 2, 5).await);
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 18);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 20);
+    drop(reply);
+    drop(clone);
+    drop(fs);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 2048);
+    assert_eq!(last.as_ref(), [0, 1, 1]);
+    drop(last);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn actual_range_reply_retention_blocks_admission_until_the_last_bytes_drop() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true).with_large(), 5 * 1024).await;
+    let fs = server.view(false).await;
+    let reply = read(&fs, "range000", 2 * CHUNK_SIZE as u64, 7).await;
+    assert_eq!(reply.data.as_ref(), [2; 7]);
+    let retained = reply.data.clone();
+    drop(reply);
+    drop(fs);
+    assert_eq!(server.reader.content_usage().output_bytes, 2048);
+    let fs = server.view(false).await;
+    let file = inode(&fs, "range001").await;
+    let before = server.fixture.chunk_requests.load(Ordering::SeqCst);
+    assert!(fs
+        .read(Request::default(), file, file, 2 * CHUNK_SIZE as u64, 7)
+        .await
+        .is_err());
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), before);
+    assert_eq!(server.reader.content_usage().output_bytes, 3072);
+    assert_eq!(retained.as_ref(), [2; 7]);
+    drop(retained);
+    assert_eq!(
+        read(&fs, "range001", 2 * CHUNK_SIZE as u64, 7)
+            .await
+            .data
+            .as_ref(),
+        [2; 7]
+    );
+    drop(fs);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn malformed_actual_range_map_chunk_and_end_publish_no_reply_or_reader_cache() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true).with_large(), 8 * 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let file = inode(&fs, "range000").await;
+    let slots = server.reader.content_usage().output_bytes;
+    for (mode, chunks) in [(5, 0), (1, 1), (2, 1), (6, 1), (7, 2)] {
+        server.fixture.mode.store(mode, Ordering::SeqCst);
+        let maps_before = server.fixture.map_requests.load(Ordering::SeqCst);
+        let chunks_before = server.fixture.chunk_requests.load(Ordering::SeqCst);
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), file, file, CHUNK_SIZE as u64 - 2, 5)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EIO
+        );
+        idle(&server.reader).await;
+        assert_eq!(
+            server.fixture.map_requests.load(Ordering::SeqCst),
+            maps_before + 1
+        );
+        assert_eq!(
+            server.fixture.chunk_requests.load(Ordering::SeqCst),
+            chunks_before + chunks
+        );
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(server.reader.content_usage().output_bytes, slots);
+        let state = fs.state.lock().unwrap();
+        assert_eq!(state.owned.as_ref().unwrap().ranges.len(), 0);
+        assert!(state.chunked.is_empty());
+    }
+    server.fixture.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        read(&fs, "range000", CHUNK_SIZE as u64 - 2, 5)
+            .await
+            .data
+            .as_ref(),
+        [0, 0, 1, 1, 1]
+    );
+}
+
+#[tokio::test]
+async fn actual_range_cancellation_before_and_after_chunk_body_keeps_other_reply_paid() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true).with_large(), 8 * 1024 * 1024).await;
+    let fs = Arc::new(server.view(false).await);
+    let retained = read(&fs, "range000", 2 * CHUNK_SIZE as u64, 7).await;
+    let baseline = server.reader.content_usage().output_bytes;
+    for (mode, name) in [(4, "range001"), (3, "range002")] {
+        server.fixture.mode.store(mode, Ordering::SeqCst);
+        let file = inode(&fs, name).await;
+        let before = server.fixture.chunk_requests.load(Ordering::SeqCst);
+        let emitted = server.fixture.emitted.load(Ordering::SeqCst);
+        let task = tokio::spawn({
+            let fs = fs.clone();
+            async move { fs.read(Request::default(), file, file, 0, 4).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.fixture.chunk_requests.load(Ordering::SeqCst) == before
+                || mode == 3 && server.fixture.emitted.load(Ordering::SeqCst) == emitted
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !task.is_finished(),
+            "actual pending chunk HTTP published a reply"
+        );
+        assert!(server.reader.content_usage().output_bytes > baseline);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        if mode == 4 {
+            server.fixture.release.add_permits(1);
+        }
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage().output_bytes, baseline);
+        assert_eq!(retained.data.as_ref(), [2; 7]);
+        assert_eq!(
+            fs.state
+                .lock()
+                .unwrap()
+                .owned
+                .as_ref()
+                .unwrap()
+                .ranges
+                .len(),
+            1
+        );
+    }
+    server.fixture.mode.store(0, Ordering::SeqCst);
+    for name in ["range001", "range002"] {
+        assert_eq!(read(&fs, name, 0, 4).await.data.as_ref(), [0; 4]);
+    }
+    drop(retained);
+    drop(fs);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn cached_actual_range_tuple_and_revoked_lease_reject_before_http_including_eof() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, true).with_large();
+    let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(4);
+    fixture.expiry = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        expiry.year(),
+        u8::from(expiry.month()),
+        expiry.day(),
+        expiry.hour(),
+        expiry.minute(),
+        expiry.second()
+    );
+    let server = Server::start(fixture, 8 * 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let file = inode(&fs, "range000").await;
+    let prior = read(&fs, "range000", 2 * CHUNK_SIZE as u64, 7).await;
+    let original = match fs.node(file).unwrap() {
+        Node::File(file) => file,
+        _ => panic!("range inode"),
+    };
+    let before = (
+        server.fixture.map_requests.load(Ordering::SeqCst),
+        server.fixture.chunk_requests.load(Ordering::SeqCst),
+    );
+    for case in 0..4 {
+        let mut node = original.clone();
+        match case {
+            0 => node.path = "range001".into(),
+            1 => node.fs_kind = "executable".into(),
+            2 => node.size += 1,
+            _ => node.digest = id(&[0x99; 32]),
+        }
+        fs.state
+            .lock()
+            .unwrap()
+            .nodes
+            .insert(file, Node::File(node));
+        for (offset, size) in [(0, 1), (u64::MAX, 0)] {
+            assert_eq!(
+                i32::from(
+                    fs.read(Request::default(), file, file, offset, size)
+                        .await
+                        .unwrap_err()
+                ),
+                -libc::EIO
+            );
+        }
+    }
+    fs.state
+        .lock()
+        .unwrap()
+        .nodes
+        .insert(file, Node::File(original));
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while server.fixture.renewals.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        server.reader.ensure_lease().await.unwrap_err().code,
+        crate::snapshot::SnapshotErrorCode::ScopeForbidden
+    );
+    for (offset, size) in [
+        (0, 1),
+        (0, 0),
+        (2 * CHUNK_SIZE as u64 + 7, 1),
+        (u64::MAX, u32::MAX),
+    ] {
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), file, file, offset, size)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EACCES
+        );
+    }
+    assert_eq!(
+        (
+            server.fixture.map_requests.load(Ordering::SeqCst),
+            server.fixture.chunk_requests.load(Ordering::SeqCst)
+        ),
+        before
+    );
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(prior.data.as_ref(), [2; 7]);
+}
+
+#[tokio::test]
+async fn fixed_cache_construction_admission_failure_leaks_no_slots_or_reply_owners() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 3 * 1024).await;
+    let fs = server.view(false).await;
+    let link = inode(&fs, "link").await;
+    let retained = fs.readlink(Request::default(), link).await.unwrap();
+    drop(fs);
+    assert_eq!(server.reader.content_usage().output_bytes, 2048);
+    let fs = server.view(false).await;
+    assert!(Mst2Fuse::from_reader(server.reader.clone()).await.is_err());
+    assert_eq!(server.reader.content_usage().output_bytes, 3072);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
+    drop(fs);
+    drop(retained);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+    drop(server.view(false).await);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
