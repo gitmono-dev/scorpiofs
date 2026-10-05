@@ -11,6 +11,7 @@ mod cas_index;
 pub mod client;
 pub mod closure;
 pub mod coordinator;
+mod descriptor_wire;
 mod directory;
 pub mod durable;
 pub mod frames;
