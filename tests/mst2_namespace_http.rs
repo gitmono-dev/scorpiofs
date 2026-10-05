@@ -488,6 +488,14 @@ fn upper_directory(path: &std::path::Path) {
 }
 
 #[cfg(unix)]
+fn upper_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    temp
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn bounded_upper_diff_compares_modes_empty_directories_and_symlink_target_bytes() {
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -502,7 +510,7 @@ async fn bounded_upper_diff_compares_modes_empty_directories_and_symlink_target_
             .await
             .unwrap(),
     );
-    let temp = tempfile::tempdir().unwrap();
+    let temp = upper_tempdir();
     let fence = MutationFence::new(4);
     let pause = fence.pause().await.unwrap();
     assert!(scan_upper(
@@ -569,7 +577,7 @@ async fn upper_whiteouts_include_directories_and_opaque_ancestors_hide_nested_lo
             .await
             .unwrap(),
     );
-    let temp = tempfile::tempdir().unwrap();
+    let temp = upper_tempdir();
     let fence = MutationFence::new(4);
     let pause = fence.pause().await.unwrap();
     upper_file(&temp.path().join(".wh.plain"), b"", 0o644);
@@ -597,7 +605,7 @@ async fn upper_whiteouts_include_directories_and_opaque_ancestors_hide_nested_lo
         Some(SnapshotNodeIdentity::Directory { .. })
     ));
     assert_eq!(server.paths(), ["/"]);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = upper_tempdir();
     upper_file(&temp.path().join(".wh..wh..opq"), b"", 0o644);
     upper_directory(&temp.path().join("used"));
     let diff = scan_upper(
@@ -650,7 +658,7 @@ async fn upper_directory_replacing_lower_file_derives_child_absence_and_streams_
             .await
             .unwrap(),
     );
-    let temp = tempfile::tempdir().unwrap();
+    let temp = upper_tempdir();
     let fence = MutationFence::new(4);
     let pause = fence.pause().await.unwrap();
     upper_directory(&temp.path().join("plain"));
@@ -679,6 +687,8 @@ async fn upper_directory_replacing_lower_file_derives_child_absence_and_streams_
         diff.changes[1].upper.as_ref().unwrap(),
         &scorpiofs::snapshot::upper_diff::UpperNodeIdentity::Regular {
             mode: 0o644,
+            uid: scorpiofs::util::mount_owner::mount_owner().uid,
+            gid: scorpiofs::util::mount_owner::mount_owner().gid,
             size: bytes.len() as u64,
             content_digest: digest_of(&bytes)
         }
@@ -746,7 +756,7 @@ async fn upper_scan_proof_errors_conflicting_markers_and_unsupported_nodes_canno
             .await
             .unwrap(),
     );
-    let temp = tempfile::tempdir().unwrap();
+    let temp = upper_tempdir();
     let fence = MutationFence::new(4);
     let pause = fence.pause().await.unwrap();
     upper_directory(&temp.path().join("used"));
@@ -763,7 +773,7 @@ async fn upper_scan_proof_errors_conflicting_markers_and_unsupported_nodes_canno
         .code,
         SnapshotErrorCode::ObjectUnavailable
     );
-    let temp = tempfile::tempdir().unwrap();
+    let temp = upper_tempdir();
     upper_file(&temp.path().join(".wh.plain"), b"", 0o644);
     upper_file(&temp.path().join("plain"), b"plain", 0o644);
     assert!(scan_upper(
@@ -774,7 +784,7 @@ async fn upper_scan_proof_errors_conflicting_markers_and_unsupported_nodes_canno
     )
     .await
     .is_err());
-    let temp = tempfile::tempdir().unwrap();
+    let temp = upper_tempdir();
     upper_file(&temp.path().join(".wh..wh..opq"), b"invalid", 0o644);
     assert!(scan_upper(
         &view,
@@ -787,7 +797,7 @@ async fn upper_scan_proof_errors_conflicting_markers_and_unsupported_nodes_canno
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::OsStrExt;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = upper_tempdir();
         let fifo = std::ffi::CString::new(temp.path().join("fifo").as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         assert_eq!(
@@ -803,4 +813,152 @@ async fn upper_scan_proof_errors_conflicting_markers_and_unsupported_nodes_canno
             SnapshotErrorCode::UnsupportedEntry
         );
     }
+}
+
+#[cfg(unix)]
+fn set_test_xattr(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let name = c"user.scorpiofs-test";
+    #[cfg(target_os = "linux")]
+    let result =
+        unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"state".as_ptr().cast(), 5, 0) };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            b"state".as_ptr().cast(),
+            5,
+            0,
+            0,
+        )
+    };
+    assert_eq!(result, 0, "fixture xattr could not be set");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_chmod_and_xattr_only_edits_cannot_be_destroyed_as_clean() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits, UpperChangeKind},
+        util::mutation_fence::MutationFence,
+    };
+    let server = Server::start(Fixture::new()).await;
+    let view = Arc::new(
+        Mst2Fuse::from_reader_lazy(server.reader().await, None)
+            .await
+            .unwrap(),
+    );
+    let fence = MutationFence::new(4);
+    let pause = fence.pause().await.unwrap();
+    let temp = upper_tempdir();
+    let path = temp.path().canonicalize().unwrap();
+    assert!(scan_upper(&view, &path, &pause, DiffLimits::default())
+        .await
+        .unwrap()
+        .is_clean());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let diff = scan_upper(&view, &path, &pause, DiffLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(diff.changes.len(), 1);
+    assert_eq!(diff.changes[0].rel_path, "");
+    assert_eq!(diff.changes[0].kind, UpperChangeKind::Modified);
+    let temp = upper_tempdir();
+    let path = temp.path().canonicalize().unwrap();
+    upper_file(&path.join("plain"), b"plain", 0o644);
+    assert!(scan_upper(&view, &path, &pause, DiffLimits::default())
+        .await
+        .unwrap()
+        .is_clean());
+    set_test_xattr(&path.join("plain"));
+    assert_eq!(
+        scan_upper(&view, &path, &pause, DiffLimits::default())
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::UnsupportedEntry
+    );
+    let temp = upper_tempdir();
+    let path = temp.path().canonicalize().unwrap();
+    set_test_xattr(&path);
+    assert_eq!(
+        scan_upper(&view, &path, &pause, DiffLimits::default())
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::UnsupportedEntry
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_and_root_owner_only_group_changes_are_dirty_when_the_host_permits_them() {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits, UpperChangeKind},
+        util::mutation_fence::MutationFence,
+    };
+    let owner = scorpiofs::util::mount_owner::mount_owner();
+    let mut groups = [0; 64];
+    let group_count = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+    let different_gid = if unsafe { libc::geteuid() } == 0 {
+        Some(owner.gid.wrapping_add(1))
+    } else if group_count >= 0 {
+        groups[..group_count as usize]
+            .iter()
+            .copied()
+            .find(|gid| *gid != owner.gid)
+    } else {
+        None
+    };
+    let Some(different_gid) = different_gid else {
+        eprintln!("OWNER_ONLY_NOT_RUN: no permitted distinct group on this host");
+        return;
+    };
+    let server = Server::start(Fixture::new()).await;
+    let view = Arc::new(
+        Mst2Fuse::from_reader_lazy(server.reader().await, None)
+            .await
+            .unwrap(),
+    );
+    let fence = MutationFence::new(4);
+    let pause = fence.pause().await.unwrap();
+    for root in [false, true] {
+        let temp = upper_tempdir();
+        let directory = temp.path().canonicalize().unwrap();
+        let path = if root {
+            directory.clone()
+        } else {
+            directory.join("plain")
+        };
+        if !root {
+            upper_file(&path, b"plain", 0o644);
+        }
+        assert!(scan_upper(&view, &directory, &pause, DiffLimits::default())
+            .await
+            .unwrap()
+            .is_clean());
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(name.as_ptr(), !0, different_gid) },
+            0,
+            "host advertised a group but rejected the fixture chown"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().gid(),
+            different_gid
+        );
+        let diff = scan_upper(&view, &directory, &pause, DiffLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].rel_path, if root { "" } else { "plain" });
+        assert_eq!(diff.changes[0].kind, UpperChangeKind::Modified);
+    }
+    eprintln!("OWNER_ONLY_GROUP_CHANGE_RUN: actual file and root chown to gid {different_gid}");
 }
