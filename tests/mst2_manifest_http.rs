@@ -354,7 +354,7 @@ async fn blob(
 
 async fn objects(
     State(f): State<Arc<Fixture>>,
-    HttpPath(snapshot_id): HttpPath<String>,
+    AxumPath(snapshot_id): AxumPath<String>,
     body: Bytes,
 ) -> Response {
     let req: Value = serde_json::from_slice(&body).unwrap();
