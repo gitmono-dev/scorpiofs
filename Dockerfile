@@ -7,7 +7,7 @@
 #
 # `.dockerignore` keeps `target/`, `.libra/` and other host artifacts out of the
 # build context, so `COPY . .` only ships sources + the few runtime files below.
-FROM rust:1.97-slim-bookworm AS build
+FROM rust:1.98-slim-bookworm AS build
 WORKDIR /src
 
 # Build-time system dependencies: FUSE headers + OpenSSL + pkg-config, plus
