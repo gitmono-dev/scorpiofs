@@ -36,7 +36,11 @@ use scorpiofs::snapshot::{durable::digest_of, frames::parse_digest};
 use serde_json::{json, Value};
 
 const INSTANCE: &str = "11111111-2222-4333-8444-555555555555";
-const CONTENT: [&[u8]; 2] = [b"old fixed content", b"new fixed content"];
+const CONTENT: [&[u8]; 3] = [
+    b"old fixed content",
+    b"new fixed content",
+    b"cancelled fixed content must be fetched independently",
+];
 
 fn digest(id: &[u8; 32]) -> String {
     format!("sha256:{}", hex::encode(id))
@@ -101,12 +105,16 @@ impl Version {
 }
 
 struct Fixture {
-    versions: [Version; 2],
+    versions: [Version; 3],
     latest: AtomicUsize,
     reject_resolve: AtomicBool,
     requests: Mutex<Vec<String>>,
     child_pages: AtomicUsize,
     blobs: AtomicUsize,
+    block_objects: AtomicBool,
+    objects_started: tokio::sync::Notify,
+    objects_release: tokio::sync::Semaphore,
+    pending_object_calls: AtomicUsize,
 }
 
 impl Fixture {
@@ -118,6 +126,10 @@ impl Fixture {
             requests: Mutex::new(Vec::new()),
             child_pages: AtomicUsize::new(0),
             blobs: AtomicUsize::new(0),
+            block_objects: AtomicBool::new(false),
+            objects_started: tokio::sync::Notify::new(),
+            objects_release: tokio::sync::Semaphore::new(0),
+            pending_object_calls: AtomicUsize::new(0),
         }
     }
 
@@ -215,7 +227,8 @@ async fn objects(
     AxumPath(sid): AxumPath<String>,
     body: Bytes,
 ) -> Response {
-    let content = CONTENT[f.version(&sid)];
+    let version = f.version(&sid);
+    let content = CONTENT[version];
     let request: Value = serde_json::from_slice(&body).unwrap();
     let items = request["items"].as_array().unwrap();
     // All three committed file paths share one digest, so the durable lane
@@ -223,6 +236,13 @@ async fn objects(
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["expected_digest"], digest_of(content));
     f.blobs.fetch_add(1, Ordering::SeqCst);
+    if version == 2 {
+        f.pending_object_calls.fetch_add(1, Ordering::SeqCst);
+        if f.block_objects.load(Ordering::SeqCst) {
+            f.objects_started.notify_one();
+            f.objects_release.acquire().await.unwrap().forget();
+        }
+    }
     let mut wire = ObjectPayload {
         objects: vec![(parse_digest(&digest_of(content)).unwrap(), content.to_vec())],
     }
@@ -853,6 +873,96 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     assert_eq!(discarded.status(), StatusCode::NO_CONTENT);
     assert!(!mounted(&fourth_mount));
     assert!(!fourth_mount.parent().unwrap().exists());
+
+    // A third digest has never entered this shared CAS. Hold its actual
+    // OBJECT response until the already-returned Full workspace is cancelled
+    // through the shipped service endpoint, then retry the same fixed owner.
+    assert_ne!(digest_of(CONTENT[2]), digest_of(CONTENT[0]));
+    assert_ne!(digest_of(CONTENT[2]), digest_of(CONTENT[1]));
+    f.latest.store(2, Ordering::SeqCst);
+    f.block_objects.store(true, Ordering::SeqCst);
+    let pending: Value = client
+        .post(format!("{}/v3/workspaces", launcher.base))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"full","upper_policy":"private"}))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let pending_id = pending["workspace_id"].as_str().unwrap();
+    let pending_mount = PathBuf::from(pending["mountpoint"].as_str().unwrap());
+    launcher.mounts.push(pending_mount.clone());
+    assert_eq!(pending["snapshot_id"], f.versions[2].sid);
+    assert_eq!(pending["metadata_ready"], true);
+    assert_eq!(pending["hydration_state"], "running");
+    assert_ne!(pending["local_pin_state"], "complete_snapshot");
+    assert!(mounted(&pending_mount));
+    tokio::time::timeout(Duration::from_secs(5), f.objects_started.notified())
+        .await
+        .expect("new content must actually reach the pending OBJECT request");
+    assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 1);
+    let cancelled: Value = client
+        .post(format!(
+            "{}/v3/workspaces/{pending_id}/hydrate/cancel",
+            launcher.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled["hydration_state"], "cancelled");
+    assert_eq!(cancelled["local_pin_state"], "incomplete");
+    assert_eq!(cancelled["metadata_ready"], true);
+    for _ in 0..2 {
+        let status: Value = client
+            .get(format!("{}/v3/workspaces/{pending_id}", launcher.base))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["hydration_state"], "cancelled");
+        assert_eq!(status["local_pin_state"], "incomplete");
+        assert_eq!(status["snapshot_id"], f.versions[2].sid);
+        assert_eq!(status["metadata_ready"], true);
+    }
+    // A semaphore permit releases even a handler that has not yet reached its
+    // await. Future retry requests bypass the hold; no shared CAS is deleted.
+    f.block_objects.store(false, Ordering::SeqCst);
+    f.objects_release.add_permits(1);
+    client
+        .post(format!(
+            "{}/v3/workspaces/{pending_id}/hydrate",
+            launcher.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let retried = wait_complete(&client, &launcher.base, pending_id).await;
+    assert_eq!(retried["snapshot_id"], f.versions[2].sid);
+    assert_eq!(
+        std::fs::read(pending_mount.join("base.txt")).unwrap(),
+        CONTENT[2]
+    );
+    assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 2);
+    let destroyed = client
+        .post(format!(
+            "{}/v3/workspaces/{pending_id}/destroy",
+            launcher.base
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(destroyed.status(), StatusCode::NO_CONTENT);
+    assert!(!mounted(&pending_mount));
+    assert!(!pending_mount.parent().unwrap().exists());
+    eprintln!("RUNNING_HYDRATION_CANCEL_RUN: actual pending OBJECT cancelled through service; fixed owner retried to FullSnapshot");
     drop(old_fd);
     launcher.stop().await;
     assert!(!mounted(&old));
