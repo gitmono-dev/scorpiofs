@@ -39,7 +39,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    antares::fuse::AntaresFuse,
+    antares::fuse::FixedLayerFuse,
     daemon::{
         lower_view::DicfuseLower,
         upper_fork::{fork_upper, ForkCopyError, ForkCopyStats},
@@ -1073,7 +1073,7 @@ struct MountEntry {
     upper_dir: String,
     /// Auto-generated CL directory (if cl is provided)
     cl_dir: Option<String>,
-    fuse: AntaresFuse,
+    fuse: FixedLayerFuse,
     lower: MountLower,
     state: MountLifecycle,
     created_at_epoch_ms: u64,
@@ -2113,9 +2113,9 @@ impl AntaresServiceImpl {
         upper_dir: &Path,
         cl_dir: Option<&Path>,
         sealed_chain: &[String],
-    ) -> Result<AntaresFuse, ServiceError> {
+    ) -> Result<FixedLayerFuse, ServiceError> {
         let frozen = sealed_chain.iter().map(PathBuf::from).collect::<Vec<_>>();
-        let mut fuse = AntaresFuse::new(
+        let mut fuse = FixedLayerFuse::new(
             mountpoint.to_path_buf(),
             dicfuse,
             upper_dir.to_path_buf(),
@@ -2136,8 +2136,8 @@ impl AntaresServiceImpl {
         view: Arc<Mst2Fuse>,
         upper_dir: &Path,
         cl_dir: Option<&Path>,
-    ) -> Result<AntaresFuse, ServiceError> {
-        let mut fuse = AntaresFuse::new(
+    ) -> Result<FixedLayerFuse, ServiceError> {
+        let mut fuse = FixedLayerFuse::new(
             mountpoint.to_path_buf(),
             view,
             upper_dir.to_path_buf(),
@@ -2566,7 +2566,7 @@ impl AntaresServiceImpl {
             }
         };
 
-        let source_fuse = match AntaresFuse::new(
+        let source_fuse = match FixedLayerFuse::new(
             PathBuf::from(&source_mountpoint),
             source_dicfuse.clone(),
             source_new_upper.clone(),
@@ -2837,13 +2837,13 @@ impl AntaresServiceImpl {
             let upper_dir = PathBuf::from(&persisted.upper_dir);
             let cl_dir = persisted.cl_dir.as_ref().map(PathBuf::from);
 
-            // Try to create and mount AntaresFuse
+            // Try to create and mount FixedLayerFuse
             let frozen = persisted
                 .sealed_chain
                 .iter()
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            match AntaresFuse::new(
+            match FixedLayerFuse::new(
                 mountpoint.clone(),
                 dicfuse.clone(),
                 upper_dir,
@@ -2883,7 +2883,7 @@ impl AntaresServiceImpl {
                         // Recovery only restores Dicfuse-lowered mounts; the
                         // MST/2 ones are skipped above and must be re-attached.
                         lower: MountLower::Dictionary(dicfuse),
-                        // Dicfuse is ready after AntaresFuse::new() completes import_arc.
+                        // Dicfuse is ready after FixedLayerFuse::new() completes import_arc.
                         state: MountLifecycle::Ready,
                         created_at_epoch_ms: persisted.created_at_epoch_ms,
                         last_seen_epoch_ms: current_epoch_ms(),
@@ -2907,7 +2907,7 @@ impl AntaresServiceImpl {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to create AntaresFuse for recovery of {}: {}",
+                        "Failed to create FixedLayerFuse for recovery of {}: {}",
                         persisted.mount_id,
                         e
                     );
@@ -3189,13 +3189,13 @@ impl AntaresService for AntaresServiceImpl {
         };
         let snapshot_lower = matches!(&lower, MountLower::Snapshot(_));
 
-        // 6. Create AntaresFuse instance (may take time, not holding lock)
+        // 6. Create FixedLayerFuse instance (may take time, not holding lock)
         let sealed = request
             .sealed_chain
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        let mut fuse = AntaresFuse::new(mountpoint, lower.layer(), upper_dir, cl_dir)
+        let mut fuse = FixedLayerFuse::new(mountpoint, lower.layer(), upper_dir, cl_dir)
             .await
             .and_then(|fuse| fuse.with_frozen_layers(sealed))
             .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
@@ -4506,9 +4506,9 @@ impl AntaresService for AntaresServiceImpl {
         let cl_dir = entry.cl_dir.as_ref().map(PathBuf::from);
         let base_layer = entry.fuse.base_layer();
         let mut fuse = std::mem::replace(&mut entry.fuse, {
-            // Create a placeholder AntaresFuse to replace (will be removed anyway if unmount succeeds)
+            // Create a placeholder FixedLayerFuse to replace (will be removed anyway if unmount succeeds)
             // This is safe because we're about to remove the entry on success, or restore fuse on failure
-            AntaresFuse::new(
+            FixedLayerFuse::new(
                 mountpoint.clone(),
                 base_layer,
                 upper_dir.clone(),
@@ -4660,7 +4660,7 @@ impl AntaresService for AntaresServiceImpl {
         entry.state = MountLifecycle::Quiescing;
         entry.update_last_seen();
         let mut old_fuse = std::mem::replace(&mut entry.fuse, {
-            AntaresFuse::new(
+            FixedLayerFuse::new(
                 mountpoint.clone(),
                 base_layer.clone(),
                 upper_dir.clone(),
@@ -4732,7 +4732,7 @@ impl AntaresService for AntaresServiceImpl {
             return Err(e);
         }
 
-        let mut new_fuse = AntaresFuse::new(
+        let mut new_fuse = FixedLayerFuse::new(
             mountpoint.clone(),
             base_layer,
             upper_dir.clone(),
@@ -4849,7 +4849,7 @@ impl AntaresService for AntaresServiceImpl {
         entry.state = MountLifecycle::Quiescing;
         entry.update_last_seen();
         let mut old_fuse = std::mem::replace(&mut entry.fuse, {
-            AntaresFuse::new(
+            FixedLayerFuse::new(
                 mountpoint.clone(),
                 base_layer.clone(),
                 upper_dir.clone(),
@@ -4899,7 +4899,7 @@ impl AntaresService for AntaresServiceImpl {
         }
 
         let mut new_fuse =
-            AntaresFuse::new(mountpoint.clone(), base_layer, upper_dir.clone(), None)
+            FixedLayerFuse::new(mountpoint.clone(), base_layer, upper_dir.clone(), None)
                 .await
                 .map_err(|e| ServiceError::FuseFailure(format!("failed to create fuse: {}", e)))?;
         if let Err(e) = new_fuse.mount().await {

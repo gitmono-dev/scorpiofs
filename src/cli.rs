@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     antares::{AntaresManager, AntaresPaths},
-    daemon::{antares::AntaresServiceImpl, daemon_main},
+    daemon::{antares::AntaresServiceImpl, workspace_daemon_main},
     util::{config, logging},
 };
 
@@ -93,7 +93,11 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
 
     let service = Arc::new(AntaresServiceImpl::new(None).await);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let mut daemon_task = tokio::spawn(daemon_main(service.clone(), shutdown_rx, listener));
+    let mut daemon_task = tokio::spawn(workspace_daemon_main(
+        service.clone(),
+        shutdown_rx,
+        listener,
+    ));
 
     let mut exit_code = exit::SUCCESS;
     let mut daemon_finished = false;

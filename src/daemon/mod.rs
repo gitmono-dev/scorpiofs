@@ -1,5 +1,6 @@
 //! Workspace control daemon. Mount creation belongs to the Antares service;
 //! startup does not construct a separate full-repository dictionary mount.
+//! The explicit legacy entry remains available for existing dictionary callers.
 
 use std::{sync::Arc, time::Instant};
 
@@ -8,6 +9,8 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 
 pub mod antares;
+mod legacy;
+pub use legacy::daemon_main;
 pub mod lower_view;
 pub mod upper_fork;
 pub mod worktree_v2;
@@ -33,8 +36,8 @@ async fn process_health(State(started): State<Instant>) -> Json<ProcessHealth> {
     })
 }
 
-/// The root surface exposes process health and the workspace service only.
-/// The retired /api/fs/* and mutable /api/config handlers are removed.
+/// The workspace surface exposes process health and the workspace service.
+/// Deprecated dictionary routes remain on the explicit legacy entry only.
 pub fn daemon_router<S: AntaresService + 'static>(service: Arc<S>) -> Router {
     Router::new()
         .route("/health", get(process_health))
@@ -44,7 +47,7 @@ pub fn daemon_router<S: AntaresService + 'static>(service: Arc<S>) -> Router {
 
 /// Serve on the caller's bound listener, drain admitted HTTP requests, then
 /// clean up the mounts owned by this service.
-pub async fn daemon_main<S: AntaresService + 'static>(
+pub async fn workspace_daemon_main<S: AntaresService + 'static>(
     service: Arc<S>,
     shutdown_rx: oneshot::Receiver<()>,
     listener: tokio::net::TcpListener,
@@ -138,7 +141,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let mut server = tokio::spawn(daemon_main(service.clone(), shutdown_rx, listener));
+        let mut server = tokio::spawn(workspace_daemon_main(
+            service.clone(),
+            shutdown_rx,
+            listener,
+        ));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
