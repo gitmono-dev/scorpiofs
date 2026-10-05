@@ -1757,10 +1757,13 @@ impl DurableStore {
         if offset >= file_len {
             return Ok(Some(Vec::new()));
         }
-        let avail = (file_len - offset) as usize;
-        let want = len.min(avail);
+        let want = (file_len - offset).min(len as u64);
+        let want = buffered_size(want)?;
         f.seek(SeekFrom::Start(offset)).map_err(io_err)?;
-        let mut buf = vec![0u8; want];
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(want)
+            .map_err(|_| buffered_allocation_error())?;
+        buf.resize(want, 0);
         f.read_exact(&mut buf).map_err(io_err)?;
         Ok(Some(buf))
     }
@@ -1783,13 +1786,45 @@ impl DurableStore {
 
     /// Read a hydrated file by CAS digest, re-verifying before returning it.
     pub fn read_blob(&self, digest: &str, expected_size: u64) -> Result<Vec<u8>, SnapshotError> {
+        let capacity = buffered_size(expected_size)?;
         let path = self.blob_path(digest)?;
-        let bytes = fs::read(&path).map_err(|e| {
-            SnapshotError::new(
-                SnapshotErrorCode::PathNotFound,
-                format!("{}: {e}", path.display()),
-            )
+        let mut input = File::open(&path).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                SnapshotError::new(
+                    SnapshotErrorCode::PathNotFound,
+                    format!("{}: {e}", path.display()),
+                )
+            } else {
+                io_err(e)
+            }
         })?;
+        let metadata = input.metadata().map_err(io_err)?;
+        if !metadata.is_file() || metadata.len() != expected_size {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "local CAS object size/type differs from the fixed view",
+            ));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| buffered_allocation_error())?;
+        let mut buffer = [0u8; 64 * 1024];
+        // Check the actual read length too: a file can grow after metadata().
+        let mut input = (&mut input).take(expected_size + 1);
+        loop {
+            let count = input.read(&mut buffer).map_err(io_err)?;
+            if count == 0 {
+                break;
+            }
+            if count > capacity - bytes.len() {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "local CAS object grew past its fixed size",
+                ));
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
         if digest_of(&bytes) != digest || bytes.len() as u64 != expected_size {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::DigestMismatch,
@@ -2062,6 +2097,20 @@ impl Drop for PendingBlob {
         // Preserve the original error; only an unpublished temp is disposable.
         let _ = fs::remove_file(&self.0);
     }
+}
+
+fn buffered_size(size: u64) -> Result<usize, SnapshotError> {
+    if size > crate::snapshot::client::MAX_BUFFERED_FILE_BYTES {
+        return Err(buffered_allocation_error());
+    }
+    usize::try_from(size).map_err(|_| buffered_allocation_error())
+}
+
+fn buffered_allocation_error() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::LimitExceeded,
+        "local CAS read exceeds the 64 MiB output budget; request a smaller range",
+    )
 }
 
 fn sync_file(path: &Path) -> Result<(), SnapshotError> {
