@@ -107,7 +107,7 @@ async fn hydrate_full_core(
     match core {
         "batch" => {
             store
-                .hydrate_batches_closure(
+                .hydrate_batches_closure::<_, _, Vec<u8>, Vec<u8>>(
                     view,
                     closure.files(),
                     Some(SnapshotHydration {
@@ -142,7 +142,7 @@ async fn hydrate_full_core(
         }
         "concurrent" => {
             store
-                .hydrate_concurrent_closure(
+                .hydrate_concurrent_closure::<_, Vec<u8>>(
                     view,
                     closure.files(),
                     Some(SnapshotHydration {
@@ -196,7 +196,7 @@ async fn full_batch_merges_small_and_large_aliases_and_resumes_all_logical_paths
     assert_eq!(local.files(), closure.files());
     assert_eq!(local.directories(), closure.directories());
     let warm = store
-        .hydrate_batches_closure(
+        .hydrate_batches_closure::<_, _, Vec<u8>, Vec<u8>>(
             &view,
             closure.files(),
             Some(SnapshotHydration {

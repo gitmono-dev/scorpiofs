@@ -1,9 +1,12 @@
 //! Online streaming CAS transactions through canonical HTTP metadata/chunks.
 //! Local completion/reopen prove integrity; no offline authorization is granted.
 
-use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use axum::{
@@ -25,6 +28,172 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use super::{durability_tests::FaultGuard, *};
+
+// This batch fixture exercises the coordinator's fixed final allocation while
+// the existing single-chunk fixture below keeps testing streaming CAS writes.
+async fn owned_chunks(
+    State(fixture): State<Arc<Fixture>>,
+    HttpPath(snapshot): HttpPath<String>,
+    body: Bytes,
+) -> Response {
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let items = request["items"].as_array().unwrap();
+    fixture.chunks.fetch_add(1, Ordering::SeqCst);
+    let mut wire = Vec::new();
+    let mut logical = 0;
+    for (sequence, item) in items.iter().rev().enumerate() {
+        let index: u64 = item["chunk_index"].as_str().unwrap().parse().unwrap();
+        assert_eq!(item["path"], "/large.bin");
+        assert_eq!(item["map_id"], id(&fixture.map.map_id()));
+        assert_eq!(item["expected_digest"], id(&fixture.advertised));
+        let length = fixture.map.chunk_len(index).unwrap();
+        let mut bytes = vec![pattern(index); length as usize];
+        if fixture.corrupt.load(Ordering::SeqCst) == index {
+            bytes[0] ^= 1;
+        }
+        logical += length;
+        wire.extend(
+            ChunkPayload {
+                map_id: fixture.map.map_id(),
+                file_content_id: fixture.advertised,
+                chunk_index: index,
+                chunk_bytes: bytes,
+            }
+            .encode(31, sequence as u64)
+            .unwrap(),
+        );
+    }
+    wire.extend(
+        EndPayload {
+            request_item_count: items.len() as u32,
+            unique_unit_count: items.len() as u32,
+            logical_bytes: logical,
+            request_body_sha256: hash(&body),
+        }
+        .encode(31, items.len() as u64),
+    );
+    response(&snapshot, &body, wire)
+}
+
+async fn open_owned(
+    fixture: Fixture,
+) -> (
+    Server,
+    Arc<Fixture>,
+    Arc<crate::snapshot::FetchCoordinator>,
+    SnapshotFile,
+) {
+    let fixture = Arc::new(fixture);
+    let app = Router::new()
+        .route("/api/v2/snapshots/capabilities", get(capabilities))
+        .route("/api/v2/snapshots/resolve", post(resolve))
+        .route("/api/v2/snapshots/{snapshot}/chunk-map", get(map))
+        .route("/api/v2/snapshots/{snapshot}/chunk-map/pages", get(leaf))
+        .route("/api/v2/snapshots/{snapshot}/chunks", post(owned_chunks))
+        .with_state(fixture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap()
+    }));
+    let reader = SnapshotReader::resolve(crate::snapshot::Mst2Client::new(base), "/project", 600)
+        .await
+        .unwrap();
+    let closure = ValidatedSnapshotClosure::from_pages(
+        reader.descriptor(),
+        std::collections::BTreeMap::from([(
+            id(&fixture.descriptor.metadata_root),
+            fixture.page.clone(),
+        )]),
+    )
+    .unwrap();
+    let file = closure.files()[0].clone();
+    let coordinator = crate::snapshot::FetchCoordinator::with_verified_closure_and_budgets(
+        reader,
+        &closure,
+        1,
+        crate::snapshot::FetchCoordinatorLimits::default(),
+        crate::snapshot::ContentBudgetLimits::new(16 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+    )
+    .unwrap();
+    (server, fixture, coordinator, file)
+}
+
+#[tokio::test]
+async fn accounted_multi_chunk_reversed_response_uses_final_owner_and_verifies_whole_digest() {
+    let size = 2 * CHUNK_SIZE as u64 + 17;
+    let (_server, fixture, coordinator, file) = open_owned(Fixture::new(size, false)).await;
+    let owner = coordinator.fetch_owned(file, true).await.unwrap();
+    assert_eq!(owner.len() as u64, size);
+    for index in 0..3 {
+        let start = index * CHUNK_SIZE as usize;
+        let end = owner.len().min(start + CHUNK_SIZE as usize);
+        assert!(owner.as_bytes()[start..end]
+            .iter()
+            .all(|byte| *byte == pattern(index as u64)));
+    }
+    assert_eq!(hash(owner.as_bytes()), fixture.whole);
+    assert_eq!(
+        fixture.chunks.load(Ordering::SeqCst),
+        1,
+        "all three chunks kept their existing batch request"
+    );
+    assert_eq!(coordinator.counts().pending_jobs, 0);
+    let charged = coordinator.content_usage().output_bytes;
+    assert!(charged >= size as usize && charged < size as usize + 1024);
+    drop(owner);
+    assert_eq!(coordinator.content_usage().output_bytes, 0);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while coordinator.content_usage().construction_bytes != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn accounted_chunks_with_bad_leaf_or_wrong_whole_identity_publish_no_owner() {
+    let size = 2 * CHUNK_SIZE as u64 + 17;
+    for wrong_whole in [false, true] {
+        let (_server, fixture, coordinator, file) =
+            open_owned(Fixture::new(size, wrong_whole)).await;
+        if !wrong_whole {
+            fixture.corrupt.store(1, Ordering::SeqCst);
+        }
+        assert_eq!(
+            coordinator.fetch_owned(file, true).await.unwrap_err().code,
+            SnapshotErrorCode::DigestMismatch
+        );
+        assert_eq!(coordinator.content_usage().output_bytes, 0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while coordinator.content_usage().construction_bytes != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn accounted_fixed_view_mismatch_rejects_large_map_before_chunk_collection() {
+    let mut fixture = Fixture::new(2 * CHUNK_SIZE as u64 + 17, false);
+    fixture.map = ChunkMap::new(
+        fixture.advertised,
+        128 * 1024 * 1024,
+        fixture.map.pages_root,
+    )
+    .unwrap();
+    let (_server, fixture, coordinator, file) = open_owned(fixture).await;
+    assert_eq!(
+        coordinator.fetch_owned(file, true).await.unwrap_err().code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    assert_eq!(fixture.maps.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.chunks.load(Ordering::SeqCst), 0);
+    assert_eq!(coordinator.content_usage().output_bytes, 0);
+}
 
 const NONE: u64 = u64::MAX;
 const INSTANCE: &str = "11111111-2222-4333-8444-555555555559";
@@ -420,13 +589,13 @@ fn unpublished(store: &DurableStore, digest: &[u8; 32]) {
     assert!(read_optional(&store.root().join(JOURNAL_FILE))
         .unwrap()
         .is_none_or(|bytes| bytes.is_empty()));
-    assert!(
-        !fs::read_dir(store.content_dir()).unwrap().any(|entry| entry
+    assert!(!fs::read_dir(store.content_dir()).unwrap().any(|entry| {
+        entry
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .contains(".tmp."))
-    );
+            .contains(".tmp.")
+    }));
 }
 
 async fn hydrate_parallel(
@@ -738,13 +907,13 @@ async fn parallel_stream_sync_failures_never_complete_and_can_retry() {
                 "{core} {phase}"
             );
             assert!(store.read_journal().unwrap().is_empty(), "{core} {phase}");
-            assert!(
-                !fs::read_dir(store.content_dir()).unwrap().any(|entry| entry
+            assert!(!fs::read_dir(store.content_dir()).unwrap().any(|entry| {
+                entry
                     .unwrap()
                     .file_name()
                     .to_string_lossy()
-                    .contains(".tmp."))
-            );
+                    .contains(".tmp.")
+            }));
             hydrate_parallel(&store, &reader, &closure, core)
                 .await
                 .unwrap();
@@ -948,13 +1117,13 @@ async fn streaming_content_sync_failures_do_not_journal_or_complete_the_file() {
         assert!(read_optional(&store.root().join(JOURNAL_FILE))
             .unwrap()
             .is_none_or(|bytes| bytes.is_empty()));
-        assert!(
-            !fs::read_dir(store.content_dir()).unwrap().any(|entry| entry
+        assert!(!fs::read_dir(store.content_dir()).unwrap().any(|entry| {
+            entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".tmp."))
-        );
+                .contains(".tmp.")
+        }));
         if phase == "object-file-sync" {
             assert!(!store.blob_path(&id(&fixture.advertised)).unwrap().exists());
         } else {

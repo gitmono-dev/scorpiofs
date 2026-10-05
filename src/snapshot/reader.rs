@@ -975,6 +975,261 @@ impl SnapshotReader {
         Ok(assembled)
     }
 
+    /// Private sized coordinator path. Its final allocation is admitted before
+    /// any body request and stays owned through publication and the last Arc.
+    pub(crate) async fn read_owned_file(
+        &self,
+        file: &SnapshotFile,
+        use_frames: bool,
+        budget: &super::content::ContentBudget,
+    ) -> Result<Arc<super::VerifiedContent>, SnapshotError> {
+        use mst2_codec::{
+            chunkmap::{ChunkMap, CHUNK_SIZE},
+            treeframe::{self, Frame},
+        };
+
+        use super::{
+            content::{AccountedBuffer, BudgetClass, VerifiedContent},
+            owned_transport,
+        };
+        if file.size > super::client::MAX_BUFFERED_FILE_BYTES {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "whole-file accounted read exceeds the local 64 MiB budget; use range reads",
+            ));
+        }
+        let size = usize::try_from(file.size).map_err(|_| {
+            SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "file size does not fit local address space",
+            )
+        })?;
+        self.context.validate_relative_path(&file.rel_path)?;
+        self.ensure_lease().await?;
+        let digest = super::frames::parse_digest(&file.content_digest)?;
+        let mut output = AccountedBuffer::new(
+            budget,
+            BudgetClass::Output,
+            size,
+            std::mem::size_of::<VerifiedContent>(),
+        )?;
+        let request_path = if file.rel_path.starts_with('/') {
+            file.rel_path.clone()
+        } else {
+            format!("/{}", file.rel_path)
+        };
+        if !use_frames {
+            let receipt = owned_transport::raw_content(
+                &self.client,
+                self.snapshot_id(),
+                &request_path,
+                &file.content_digest,
+                &mut output,
+                budget,
+            )
+            .await?;
+            return VerifiedContent::publish(output, size, &digest, receipt);
+        }
+        #[derive(serde::Serialize)]
+        struct ObjectItem<'a> {
+            path: &'a str,
+            expected_digest: &'a str,
+        }
+        #[derive(serde::Serialize)]
+        struct Request<'a, T: serde::Serialize> {
+            items: &'a [T],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            encoding: Option<&'static str>,
+        }
+        fn invalid(message: impl Into<String>) -> SnapshotError {
+            SnapshotError::new(SnapshotErrorCode::DigestMismatch, message)
+        }
+        if file.size <= super::OBJECT_CAP {
+            let item = ObjectItem {
+                path: &request_path,
+                expected_digest: &file.content_digest,
+            };
+            let body = owned_transport::request_body(
+                budget,
+                &Request {
+                    items: &[item],
+                    encoding: self.content_encoding(),
+                },
+            )?;
+            let mut seen = false;
+            let receipt = owned_transport::consume_frames(
+                &self.client,
+                owned_transport::FrameRequest {
+                    snapshot: self.snapshot_id(),
+                    endpoint: "objects",
+                    body,
+                    data_kind: treeframe::KIND_OBJECT,
+                    item_count: 1,
+                    logical_max: size,
+                    allow_zstd: self.content_encoding() == Some("zstd"),
+                },
+                budget,
+                |frame| {
+                    let Frame::Object(objects) = frame else {
+                        return Err(invalid("non-object data frame"));
+                    };
+                    if seen || objects.objects.len() != 1 || objects.objects[0].0 != digest {
+                        return Err(invalid("unrequested or duplicate object unit"));
+                    }
+                    output.append(&objects.objects[0].1)?;
+                    seen = true;
+                    Ok((1, objects.objects[0].1.len() as u64))
+                },
+            )
+            .await?;
+            return VerifiedContent::publish(output, size, &digest, receipt.into_content());
+        }
+
+        let map = self
+            .client
+            .chunk_map(self.snapshot_id(), &request_path, &file.content_digest)
+            .await?;
+        if map.file_size != file.size || map.chunk_count > 64 {
+            return Err(invalid(
+                "chunk map differs from fixed view or bounded output",
+            ));
+        }
+        // The 64-MiB file policy permits at most 64 fixed-profile chunks.
+        // Proof DTOs are the existing metadata scope; retained hashes and
+        // coverage are bounded stack state, independent of advertised counts.
+        let mut hashes = [[0u8; 32]; 64];
+        let mut covered_hashes = 0usize;
+        for page in 0..map.page_count {
+            let leaf = self
+                .client
+                .chunk_map_page(
+                    self.snapshot_id(),
+                    &request_path,
+                    &file.content_digest,
+                    &map,
+                    page,
+                )
+                .await?;
+            let end = covered_hashes
+                .checked_add(leaf.chunk_sha256.len())
+                .filter(|end| *end <= map.chunk_count as usize)
+                .ok_or_else(|| invalid("leaf coverage exceeds fixed chunk count"))?;
+            hashes[covered_hashes..end].copy_from_slice(&leaf.chunk_sha256);
+            covered_hashes = end;
+        }
+        if covered_hashes != map.chunk_count as usize {
+            return Err(invalid("leaf pages omit chunks"));
+        }
+        let length_map = ChunkMap::new(digest, file.size, map.pages_root)
+            .map_err(|error| invalid(error.to_string()))?;
+        let map_id = super::frames::parse_digest(&map.map_id)?;
+        output.initialize();
+        fn string_count<S: serde::Serializer>(
+            index: &u64,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.collect_str(index)
+        }
+        #[derive(serde::Serialize)]
+        struct ChunkItem<'a> {
+            path: &'a str,
+            expected_digest: &'a str,
+            map_id: &'a str,
+            #[serde(serialize_with = "string_count")]
+            chunk_index: u64,
+        }
+        let items: [ChunkItem<'_>; 64] = std::array::from_fn(|index| ChunkItem {
+            path: &request_path,
+            expected_digest: &file.content_digest,
+            map_id: &map.map_id,
+            chunk_index: index as u64,
+        });
+        let mut coverage = 0u64;
+        let mut start = 0usize;
+        let mut last_receipt = None;
+        while start < map.chunk_count as usize {
+            self.ensure_lease().await?;
+            let mut end = map.chunk_count as usize;
+            let body = loop {
+                match owned_transport::request_body(
+                    budget,
+                    &Request {
+                        items: &items[start..end],
+                        encoding: self.content_encoding(),
+                    },
+                ) {
+                    Ok(body) => break body,
+                    Err(error)
+                        if error.code == SnapshotErrorCode::LimitExceeded && end - start > 1 =>
+                    {
+                        end = start + (end - start) / 2;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let logical_max = (start..end)
+                .try_fold(0usize, |total, index| {
+                    length_map
+                        .chunk_len(index as u64)
+                        .map(|length| total + length as usize)
+                })
+                .map_err(|error| invalid(error.to_string()))?;
+            let receipt = owned_transport::consume_frames(
+                &self.client,
+                owned_transport::FrameRequest {
+                    snapshot: self.snapshot_id(),
+                    endpoint: "chunks",
+                    body,
+                    data_kind: treeframe::KIND_CHUNK,
+                    item_count: (end - start) as u32,
+                    logical_max,
+                    allow_zstd: self.content_encoding() == Some("zstd"),
+                },
+                budget,
+                |frame| {
+                    let Frame::Chunk(chunk) = frame else {
+                        return Err(invalid("non-chunk data frame"));
+                    };
+                    let index = usize::try_from(chunk.chunk_index)
+                        .map_err(|_| invalid("chunk index overflow"))?;
+                    if index < start
+                        || index >= end
+                        || chunk.map_id != map_id
+                        || chunk.file_content_id != digest
+                        || coverage & (1u64 << index) != 0
+                    {
+                        return Err(invalid("unrequested or duplicate chunk unit"));
+                    }
+                    let length = length_map
+                        .chunk_len(chunk.chunk_index)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    if chunk.chunk_bytes.len() as u64 != length
+                        || ring::digest::digest(&ring::digest::SHA256, &chunk.chunk_bytes).as_ref()
+                            != hashes[index]
+                    {
+                        return Err(invalid("chunk length or leaf digest differs"));
+                    }
+                    output.write_at(index * CHUNK_SIZE as usize, &chunk.chunk_bytes)?;
+                    coverage |= 1u64 << index;
+                    Ok((1, length))
+                },
+            )
+            .await?;
+            last_receipt = Some(receipt);
+            start = end;
+        }
+        let expected_coverage = if map.chunk_count == 64 {
+            u64::MAX
+        } else {
+            (1u64 << map.chunk_count) - 1
+        };
+        if coverage != expected_coverage {
+            return Err(invalid("missing final chunk coverage"));
+        }
+        let receipt = last_receipt.ok_or_else(|| invalid("chunk stream has no successful END"))?;
+        VerifiedContent::publish(output, size, &digest, receipt.into_content())
+    }
+
     /// Convenience: manifest keyed by scope-relative path.
     pub async fn file_map(&self) -> Result<HashMap<String, SnapshotFile>, SnapshotError> {
         Ok(self
