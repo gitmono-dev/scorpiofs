@@ -75,6 +75,7 @@ struct Fixture {
     metadata_pages: bool,
     corrupt_metadata: AtomicBool,
     corrupt_blob: AtomicBool,
+    body_mode: AtomicUsize,
     block_metadata: AtomicBool,
     metadata_requests: AtomicUsize,
     requests: Mutex<Vec<String>>,
@@ -120,6 +121,7 @@ impl Fixture {
             metadata_pages,
             corrupt_metadata: AtomicBool::new(false),
             corrupt_blob: AtomicBool::new(false),
+            body_mode: AtomicUsize::new(0),
             block_metadata: AtomicBool::new(false),
             metadata_requests: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
@@ -225,7 +227,20 @@ async fn blob(
     if f.corrupt_blob.load(Ordering::SeqCst) {
         bytes[0] ^= 1;
     }
-    bytes.into_response()
+    match f.body_mode.load(Ordering::SeqCst) {
+        1 => {
+            bytes.push(0);
+            return bytes.into_response();
+        }
+        2 => bytes.push(0),
+        3 => {
+            bytes.pop();
+        }
+        _ => return bytes.into_response(),
+    }
+    Response::new(axum::body::Body::from_stream(futures::stream::iter([
+        Ok::<_, std::io::Error>(Bytes::from(bytes)),
+    ])))
 }
 
 struct Server {
@@ -288,7 +303,9 @@ fn coordinator(
 fn start(
     c: &Arc<FetchCoordinator>,
     path: &str,
-) -> tokio::task::JoinHandle<Result<Arc<Vec<u8>>, scorpiofs::snapshot::SnapshotError>> {
+) -> tokio::task::JoinHandle<
+    Result<Arc<scorpiofs::snapshot::VerifiedContent>, scorpiofs::snapshot::SnapshotError>,
+> {
     let c = c.clone();
     let file = file(path);
     tokio::spawn(async move { c.fetch(file, false).await })
@@ -698,4 +715,124 @@ async fn invalid_limits_and_extreme_concurrency_are_bounded_without_constructor_
         );
         idle(&c).await;
     }
+}
+
+async fn small_budget_coordinator(s: &Server) -> Arc<FetchCoordinator> {
+    let reader = s.reader().await;
+    let closure = reader.snapshot_closure().await.unwrap();
+    FetchCoordinator::with_verified_closure_and_budgets(
+        reader,
+        &closure,
+        1,
+        FetchCoordinatorLimits::new(4, 8).unwrap(),
+        scorpiofs::snapshot::ContentBudgetLimits::new(1024, 2 * 1024 * 1024).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn returned_aliases_and_unreceived_task_results_keep_capacity_until_last_arc() {
+    let _serial = TEST_LOCK.lock().await;
+    let s = Server::start(true).await;
+    let c = small_budget_coordinator(&s).await;
+    let first = start(&c, "a");
+    until(|| s.fixture.request_count() == 1).await;
+    let waiter = start(&c, "b");
+    until(|| c.counts().active_callers == 2).await;
+    s.fixture.blob_release.add_permits(1);
+    let owner = first.await.unwrap().unwrap();
+    let identity = Arc::downgrade(&owner);
+    idle(&c).await;
+    assert_eq!(c.content_usage().output_bytes, 1024);
+    let clone = owner.clone();
+    assert_eq!(c.content_usage().output_bytes, 1024);
+    assert_eq!(
+        c.fetch(file("f00"), false).await.unwrap_err().code,
+        SnapshotErrorCode::LimitExceeded
+    );
+    assert_eq!(
+        s.fixture.request_count(),
+        1,
+        "capacity rejection sent no extra body HTTP"
+    );
+    drop((owner, clone));
+    assert_eq!(
+        c.content_usage().output_bytes,
+        1024,
+        "unreceived JoinHandle result is still an actual owner"
+    );
+    let alias = waiter.await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&identity.upgrade().unwrap(), &alias));
+    assert_eq!(alias.as_slice(), content("b"));
+    assert_eq!(c.content_usage().output_bytes, 1024);
+    drop(alias);
+    assert_eq!(c.content_usage().output_bytes, 0);
+    s.fixture.blob_release.add_permits(1);
+    let next = c.fetch(file("f00"), false).await.unwrap();
+    assert_eq!(next.as_slice(), content("f00"));
+    drop(next);
+    idle(&c).await;
+    assert_eq!(c.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn sized_raw_rejects_length_digest_and_stream_overflow_without_publishing() {
+    let _serial = TEST_LOCK.lock().await;
+    let s = Server::start(true).await;
+    let c = small_budget_coordinator(&s).await;
+    for mode in 1..=3 {
+        s.fixture.body_mode.store(mode, Ordering::SeqCst);
+        s.fixture.blob_release.add_permits(1);
+        assert_eq!(
+            c.fetch(file("a"), false).await.unwrap_err().code,
+            SnapshotErrorCode::DigestMismatch
+        );
+        idle(&c).await;
+        assert_eq!(c.content_usage().output_bytes, 0);
+        assert_eq!(c.content_usage().construction_bytes, 0);
+    }
+    s.fixture.body_mode.store(0, Ordering::SeqCst);
+    s.fixture.corrupt_blob.store(true, Ordering::SeqCst);
+    s.fixture.blob_release.add_permits(1);
+    assert_eq!(
+        c.fetch(file("a"), false).await.unwrap_err().code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    idle(&c).await;
+    assert_eq!(c.content_usage().output_bytes, 0);
+    s.fixture.corrupt_blob.store(false, Ordering::SeqCst);
+    s.fixture.blob_release.add_permits(1);
+    assert_eq!(
+        c.fetch(file("a"), false).await.unwrap().as_slice(),
+        content("a")
+    );
+    idle(&c).await;
+    assert_eq!(c.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn queued_and_running_cancellation_drop_actual_fixed_output_owners() {
+    let _serial = TEST_LOCK.lock().await;
+    let s = Server::start(true).await;
+    let c = small_budget_coordinator(&s).await;
+    let first = start(&c, "a");
+    until(|| s.fixture.request_count() == 1).await;
+    assert_eq!(c.content_usage().output_bytes, 1024);
+    let queued = start(&c, "f00");
+    until(|| c.counts().pending_jobs == 2).await;
+    assert_eq!(
+        c.content_usage().output_bytes,
+        1024,
+        "queued leader did not allocate output"
+    );
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    until(|| c.counts().pending_jobs == 1).await;
+    assert_eq!(c.content_usage().output_bytes, 1024);
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    idle(&c).await;
+    assert_eq!(c.content_usage().output_bytes, 0);
+    assert_eq!(c.content_usage().construction_bytes, 0);
+    assert_eq!(s.fixture.request_count(), 1);
 }

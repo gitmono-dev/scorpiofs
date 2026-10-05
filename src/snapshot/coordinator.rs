@@ -19,7 +19,7 @@ use crate::snapshot::{
     SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader, ValidatedSnapshotClosure,
 };
 
-type FetchResult = Result<Arc<Vec<u8>>, Arc<SnapshotError>>;
+type FetchResult = Result<Arc<super::VerifiedContent>, Arc<SnapshotError>>;
 
 /// Maximum queued/running coordinator content jobs in one process.
 pub const MAX_PROCESS_PENDING_JOBS: usize = 256;
@@ -199,7 +199,7 @@ impl JobGuard {
         }
     }
 
-    fn complete(mut self, result: Result<Arc<Vec<u8>>, SnapshotError>) {
+    fn complete(mut self, result: Result<Arc<super::VerifiedContent>, SnapshotError>) {
         let waiters = self.take_waiters();
         self.completed = true;
         let shared = result.map_err(Arc::new);
@@ -234,6 +234,7 @@ pub struct FetchCoordinator {
     jobs: Arc<Semaphore>,
     callers: Arc<Semaphore>,
     limits: FetchCoordinatorLimits,
+    content: Arc<super::content::ContentBudget>,
 }
 
 impl FetchCoordinator {
@@ -250,7 +251,24 @@ impl FetchCoordinator {
         max_concurrent: usize,
         limits: FetchCoordinatorLimits,
     ) -> Arc<Self> {
-        Self::with_membership(reader, max_concurrent, limits, None)
+        Self::with_membership(
+            reader,
+            max_concurrent,
+            limits,
+            super::ContentBudgetLimits::default(),
+            None,
+        )
+    }
+
+    /// Configure independent retained-output and managed-construction budgets.
+    /// Count admission and byte admission both reject excess work immediately.
+    pub fn new_with_budgets(
+        reader: SnapshotReader,
+        max_concurrent: usize,
+        limits: FetchCoordinatorLimits,
+        content_limits: super::ContentBudgetLimits,
+    ) -> Arc<Self> {
+        Self::with_membership(reader, max_concurrent, limits, content_limits, None)
     }
 
     /// Reuse a complete root proof already acquired for this fixed reader.
@@ -275,11 +293,28 @@ impl FetchCoordinator {
         max_concurrent: usize,
         limits: FetchCoordinatorLimits,
     ) -> Result<Arc<Self>, SnapshotError> {
+        Self::with_verified_closure_and_budgets(
+            reader,
+            closure,
+            max_concurrent,
+            limits,
+            super::ContentBudgetLimits::default(),
+        )
+    }
+
+    pub fn with_verified_closure_and_budgets(
+        reader: SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+        max_concurrent: usize,
+        limits: FetchCoordinatorLimits,
+        content_limits: super::ContentBudgetLimits,
+    ) -> Result<Arc<Self>, SnapshotError> {
         closure.matches_descriptor(reader.descriptor())?;
         Ok(Self::with_membership(
             reader,
             max_concurrent,
             limits,
+            content_limits,
             Some(membership_index(closure)),
         ))
     }
@@ -288,6 +323,7 @@ impl FetchCoordinator {
         reader: SnapshotReader,
         max_concurrent: usize,
         limits: FetchCoordinatorLimits,
+        content_limits: super::ContentBudgetLimits,
         membership: Option<HashMap<String, SnapshotFile>>,
     ) -> Arc<Self> {
         Arc::new(FetchCoordinator {
@@ -300,6 +336,7 @@ impl FetchCoordinator {
             jobs: Arc::new(Semaphore::new(limits.max_pending_jobs)),
             callers: Arc::new(Semaphore::new(limits.max_active_callers)),
             limits,
+            content: super::content::ContentBudget::new(content_limits),
         })
     }
 
@@ -308,6 +345,14 @@ impl FetchCoordinator {
             pending_jobs: self.limits.max_pending_jobs - self.jobs.available_permits(),
             active_callers: self.limits.max_active_callers - self.callers.available_permits(),
         }
+    }
+
+    pub fn content_usage(&self) -> super::ContentBudgetUsage {
+        self.content.usage()
+    }
+
+    pub fn process_content_usage() -> super::ContentBudgetUsage {
+        super::content::ContentBudget::process_usage()
     }
 
     pub fn process_counts() -> FetchCoordinatorCounts {
@@ -336,7 +381,7 @@ impl FetchCoordinator {
         self: &Arc<Self>,
         file: SnapshotFile,
         use_frames: bool,
-    ) -> Result<Arc<Vec<u8>>, SnapshotError> {
+    ) -> Result<Arc<super::VerifiedContent>, SnapshotError> {
         // A canonical path is not a membership proof. A caller cannot bypass
         // its own fixed-view check by naming another leader's content id.
         self.reader
@@ -466,7 +511,7 @@ impl FetchCoordinator {
         file: &SnapshotFile,
         use_frames: bool,
         cancellation: Option<watch::Receiver<bool>>,
-    ) -> Result<Arc<Vec<u8>>, SnapshotError> {
+    ) -> Result<Arc<super::VerifiedContent>, SnapshotError> {
         let _permit = self.semaphore.clone().acquire_owned().await.map_err(|e| {
             SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
@@ -482,15 +527,10 @@ impl FetchCoordinator {
                 "fetch has no live waiters",
             ));
         }
-        let bytes = if use_frames {
-            self.reader
-                .read_file_frames(&file.rel_path, &file.content_digest, file.size)
-                .await?
-        } else {
-            self.reader
-                .read_file(&file.rel_path, &file.content_digest)
-                .await?
-        };
+        let bytes = self
+            .reader
+            .read_owned_file(file, use_frames, &self.content)
+            .await?;
         // The fetch paths verify content; the size must also match the view.
         if bytes.len() as u64 != file.size {
             return Err(SnapshotError::new(
@@ -503,7 +543,7 @@ impl FetchCoordinator {
                 ),
             ));
         }
-        Ok(Arc::new(bytes))
+        Ok(bytes)
     }
 }
 
