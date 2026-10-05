@@ -342,12 +342,25 @@ fn assert_manifest(actual: &[SnapshotFile], expected: &[SnapshotFile]) {
     );
 }
 
-fn pin(cache: &ScopeCache, snapshot_id: &str) {
+async fn pin(cache: &ScopeCache, snapshot_id: &str, fixture: &Fixture) {
     let dir = cache.dir().join(snapshot_id.trim_start_matches("sha256:"));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("pin.json"), serde_json::to_vec(&json!({
-        "snapshot_id": snapshot_id, "scope": "/project", "lease_id": "fixture-lease", "pinned_at_unix": 1
-    })).unwrap()).unwrap();
+    let store =
+        scorpiofs::snapshot::DurableStore::open_with_content(&dir, cache.dir().join("blobs"))
+            .unwrap();
+    let view = scorpiofs::snapshot::ViewMeta {
+        snapshot_id: snapshot_id.into(),
+        namespace_view_id: id_string(&[0x55; 32]),
+        scope: "/project".into(),
+        lease_id: "fixture-lease".into(),
+    };
+    store
+        .hydrate_with(&view, &fixture.expected, |file| {
+            let data = fixture.blobs[&format!("/{}", file.rel_path)].clone();
+            async move { Ok(data) }
+        })
+        .await
+        .unwrap();
+    store.pin(&view).unwrap();
 }
 
 #[tokio::test]
@@ -382,7 +395,7 @@ async fn mixed_reused_and_new_children_preserve_both_manifests() {
         &IncrementalSync::new(&old, &cache).sync().await.unwrap(),
         &first.fixture.expected,
     );
-    pin(&cache, old.snapshot_id());
+    pin(&cache, old.snapshot_id(), &first.fixture).await;
     let next = HttpFixture::start(nested_fixture("a", b"target-two")).await;
     let reader = next.reader().await;
     let mut sync = IncrementalSync::new(&reader, &cache);
@@ -412,7 +425,7 @@ async fn moved_subtree_rebases_once_and_keeps_its_descendant_pages() {
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path()).unwrap();
     IncrementalSync::new(&old, &cache).sync().await.unwrap();
-    pin(&cache, old.snapshot_id());
+    pin(&cache, old.snapshot_id(), &first.fixture).await;
     let next = HttpFixture::start(nested_fixture("moved", b"target-one")).await;
     let reader = next.reader().await;
     let mut sync = IncrementalSync::new(&reader, &cache);
@@ -448,7 +461,7 @@ async fn identical_page_ids_expand_under_every_logical_directory() {
         3,
         "three logical page visits"
     );
-    pin(&cache, reader.snapshot_id());
+    pin(&cache, reader.snapshot_id(), &http.fixture).await;
     let mut warm = IncrementalSync::new(&reader, &cache);
     assert_manifest(&warm.sync().await.unwrap(), &http.fixture.expected);
     assert_eq!(warm.meters().fetched_pages, 0);
@@ -462,7 +475,7 @@ async fn missing_descendant_page_refetches_only_that_page_without_trusting_root_
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path()).unwrap();
     IncrementalSync::new(&reader, &cache).sync().await.unwrap();
-    pin(&cache, reader.snapshot_id());
+    pin(&cache, reader.snapshot_id(), &http.fixture).await;
     let missing = http.fixture.routes[&("/a/nested".into(), vec![])];
     std::fs::remove_file(cache.dir().join("pages").join(hex::encode(missing))).unwrap();
     http.fixture.requests.lock().unwrap().clear();
@@ -583,7 +596,7 @@ async fn malformed_closure_page_id_cannot_read_write_or_remove_an_outside_file()
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path().join("cache")).unwrap();
     IncrementalSync::new(&reader, &cache).sync().await.unwrap();
-    pin(&cache, reader.snapshot_id());
+    pin(&cache, reader.snapshot_id(), &http.fixture).await;
     let sentinel = tmp.path().join("sentinel");
     std::fs::write(&sentinel, b"must remain untouched").unwrap();
     let invalid = "sha256:../../sentinel";

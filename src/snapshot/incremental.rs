@@ -165,11 +165,15 @@ impl ScopeCache {
                 if !pin.exists() {
                     continue;
                 }
-                if let Ok(bytes) = fs::read(&pin) {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        if let Some(id) = v.get("snapshot_id").and_then(|s| s.as_str()) {
-                            out.push(id.to_string());
-                        }
+                if let Ok(Some(id)) = crate::snapshot::durable::DurableStore::committed_snapshot_at(
+                    &e.path(),
+                    &self.dir.join("blobs"),
+                ) {
+                    if id
+                        .strip_prefix("sha256:")
+                        .is_some_and(|hex| e.file_name() == hex)
+                    {
+                        out.push(id);
                     }
                 }
             }
@@ -248,6 +252,7 @@ impl<'a> IncrementalSync<'a> {
         const PAGE_BATCH: usize = 64;
         self.meters = SyncMeters::default();
         self.reused_page_ids.clear();
+        let live_pins: HashSet<_> = self.cache.live_pins().into_iter().collect();
 
         enum Item {
             /// One page of a directory's own page tree. The route grows one
@@ -281,7 +286,7 @@ impl<'a> IncrementalSync<'a> {
         // the parent (or the result) without fetching anything.
         macro_rules! finish_from_record {
             ($dir:expr, $expected:expr, $parent:expr, $base:expr) => {{
-                if let Some(record) = self.try_reuse(&$expected, &$dir).await? {
+                if let Some(record) = self.try_reuse(&$expected, &$dir, &live_pins).await? {
                     match &$parent {
                         Some(parent_path) => {
                             if let Some(ps) = states.get_mut(parent_path) {
@@ -578,6 +583,7 @@ impl<'a> IncrementalSync<'a> {
         &mut self,
         root_page_id: &str,
         dir: &str,
+        live_pins: &HashSet<String>,
     ) -> Result<Option<ClosureRecord>, SnapshotError> {
         let Some(record) = self.cache.record_for(root_page_id) else {
             return Ok(None);
@@ -586,8 +592,7 @@ impl<'a> IncrementalSync<'a> {
             return Ok(None);
         }
         // The record must be backed by a pin that is still live here.
-        let live = self.cache.live_pins();
-        if !live.iter().any(|p| p == &record.pin_ref) {
+        if !live_pins.contains(&record.pin_ref) {
             return Ok(None);
         }
         // A record that names no pages proves nothing: refuse it outright
@@ -728,19 +733,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_pins_come_from_the_view_directories() {
+    #[tokio::test]
+    async fn live_pins_require_a_committed_dependency_audit() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = ScopeCache::open(tmp.path()).unwrap();
         assert!(cache.live_pins().is_empty());
-        let view = tmp.path().join("abc123");
+        let id = format!("sha256:{}", "ab".repeat(32));
+        let view = tmp.path().join(id.trim_start_matches("sha256:"));
         std::fs::create_dir_all(&view).unwrap();
         std::fs::write(
             view.join("pin.json"),
-            br#"{"snapshot_id":"sha256:abc","scope":"/p","lease_id":"l","pinned_at_unix":1}"#,
+            serde_json::to_vec(&serde_json::json!({"snapshot_id": id, "scope": "/p", "lease_id": "l", "pinned_at_unix": 1})).unwrap(),
         )
         .unwrap();
-        assert_eq!(cache.live_pins(), vec!["sha256:abc".to_string()]);
+        assert!(
+            cache.live_pins().is_empty(),
+            "a prepare pin cannot authorize reuse"
+        );
+        let store =
+            crate::snapshot::DurableStore::open_with_content(&view, tmp.path().join("blobs"))
+                .unwrap();
+        let meta = crate::snapshot::ViewMeta {
+            snapshot_id: id.clone(),
+            namespace_view_id: format!("sha256:{}", "55".repeat(32)),
+            scope: "/p".into(),
+            lease_id: "l".into(),
+        };
+        store
+            .hydrate_with(&meta, &[], |_| async { Ok(Vec::new()) })
+            .await
+            .unwrap();
+        assert_eq!(cache.live_pins(), vec![id]);
+        fs::remove_file(view.join("DURABLE_COMPLETE")).unwrap();
+        assert!(
+            cache.live_pins().is_empty(),
+            "an orphan pin cannot authorize reuse"
+        );
     }
 
     #[test]
