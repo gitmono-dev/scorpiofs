@@ -89,27 +89,7 @@ impl ValidatedSnapshotClosure {
         include_facts: bool,
     ) -> Result<(Self, Vec<VerifiedSubtreeFacts>, SnapshotClosureMeters), SnapshotError> {
         let descriptor_bytes = canonical_descriptor(descriptor)?;
-        let mut validator = ClosureValidator {
-            bytes: &pages,
-            decoded: HashMap::new(),
-            entries: HashMap::new(),
-            reached: HashSet::new(),
-            paths: BTreeSet::new(),
-            content_sizes: HashMap::new(),
-            directories: Vec::new(),
-            files: Vec::new(),
-            meters: SnapshotClosureMeters::default(),
-        };
-        for (id, bytes) in &pages {
-            validator.meters.proof_page_hashes += 1;
-            validator.meters.proof_page_hash_bytes += bytes.len() as u64;
-            let expected = parse_digest(id)?;
-            if page_id(bytes) != expected {
-                return Err(integrity(format!("metadata page bytes do not match {id}")));
-            }
-            validator.decoded.insert(id.clone(), decode_page(bytes)?);
-            validator.meters.proof_page_decodes += 1;
-        }
+        let mut validator = ClosureValidator::new(&pages, usize::MAX)?;
         validator.walk_directory(
             &descriptor.scope,
             "",
@@ -266,6 +246,24 @@ fn canonical_descriptor(descriptor: &Descriptor) -> Result<Vec<u8>, SnapshotErro
     serving.encode().map_err(|e| integrity(e.to_string()))
 }
 
+/// Prove one directory's complete radix partition without visiting any
+/// logical child directory. This uses the full-closure verifier's exact
+/// hash, count, cycle and canonical Build(S) checks.
+pub(crate) fn verify_directory_pages(
+    root: &str,
+    pages: &BTreeMap<String, Vec<u8>>,
+    max_entries: usize,
+) -> Result<Arc<Vec<Entry>>, SnapshotError> {
+    let mut validator = ClosureValidator::new(pages, max_entries)?;
+    let entries = validator.radix_entries(root, 0, &mut HashSet::new())?;
+    if validator.reached.len() != pages.len() {
+        return Err(integrity(
+            "directory proof contains unreachable radix pages",
+        ));
+    }
+    Ok(entries)
+}
+
 struct ClosureValidator<'a> {
     bytes: &'a BTreeMap<String, Vec<u8>>,
     decoded: HashMap<String, Page>,
@@ -276,9 +274,38 @@ struct ClosureValidator<'a> {
     directories: Vec<SnapshotDirectory>,
     files: Vec<SnapshotFile>,
     meters: SnapshotClosureMeters,
+    max_radix_entries: usize,
 }
 
 impl ClosureValidator<'_> {
+    fn new(
+        bytes: &BTreeMap<String, Vec<u8>>,
+        max_radix_entries: usize,
+    ) -> Result<ClosureValidator<'_>, SnapshotError> {
+        let mut validator = ClosureValidator {
+            bytes,
+            decoded: HashMap::new(),
+            entries: HashMap::new(),
+            reached: HashSet::new(),
+            paths: BTreeSet::new(),
+            content_sizes: HashMap::new(),
+            directories: Vec::new(),
+            files: Vec::new(),
+            meters: SnapshotClosureMeters::default(),
+            max_radix_entries,
+        };
+        for (id, bytes) in bytes {
+            validator.meters.proof_page_hashes += 1;
+            validator.meters.proof_page_hash_bytes += bytes.len() as u64;
+            if page_id(bytes) != parse_digest(id)? {
+                return Err(integrity(format!("metadata page bytes do not match {id}")));
+            }
+            validator.decoded.insert(id.clone(), decode_page(bytes)?);
+            validator.meters.proof_page_decodes += 1;
+        }
+        Ok(validator)
+    }
+
     fn radix_page_ids(
         &self,
         id: &str,
@@ -389,11 +416,21 @@ impl ClosureValidator<'_> {
                             "branch child subtree_entries does not match its entries",
                         ));
                     }
+                    if entries
+                        .len()
+                        .checked_add(child_entries.len())
+                        .is_none_or(|len| len > self.max_radix_entries)
+                    {
+                        return Err(limit("directory entry proof budget exceeded"));
+                    }
                     entries.extend(child_entries.iter().cloned());
                 }
                 entries
             }
         };
+        if entries.len() > self.max_radix_entries {
+            return Err(limit("directory entry proof budget exceeded"));
+        }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let rebuilt = Page::build(&entries)
             .map_err(|e| integrity(format!("invalid metadata entry partition: {e}")))?;

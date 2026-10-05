@@ -12,7 +12,7 @@
 //! decides how to traverse it. Opening a symlink inode directly is ELOOP.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -30,7 +30,10 @@ use futures::stream::iter;
 
 use crate::{
     snapshot::{
-        closure::ValidatedSnapshotClosure, durable::DurableStore, SnapshotFile, SnapshotReader,
+        closure::{verify_directory_pages, ValidatedSnapshotClosure},
+        durable::DurableStore,
+        MetadataProofLimits, SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode,
+        SnapshotFile, SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
     },
     util::file_attr::make_file_attr,
 };
@@ -78,6 +81,8 @@ struct State {
     chunked: HashMap<u64, Arc<crate::snapshot::range::ChunkedFile>>,
     /// Lazy mounts: directory pages are fetched on first readdir/lookup.
     lazy: bool,
+    /// None for legacy file-only manifests, which cannot prove namespace absence.
+    namespace_scope: Option<String>,
 }
 
 /// Kernel file type for one view entry. Symlinks are their own type, not
@@ -108,6 +113,7 @@ pub struct Mst2Fuse {
     reader: Option<SnapshotReader>,
     store: Option<Arc<DurableStore>>,
     state: StdMutex<State>,
+    metadata_limits: MetadataProofLimits,
 }
 
 impl Mst2Fuse {
@@ -200,6 +206,24 @@ impl Mst2Fuse {
         reader: SnapshotReader,
         store: Option<Arc<DurableStore>>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        Self::from_reader_lazy_with_limits(reader, store, MetadataProofLimits::default()).await
+    }
+
+    /// Same fixed lazy view, with explicit local namespace-proof bounds.
+    pub async fn from_reader_lazy_with_limits(
+        reader: SnapshotReader,
+        store: Option<Arc<DurableStore>>,
+        metadata_limits: MetadataProofLimits,
+    ) -> std::result::Result<Self, SnapshotError> {
+        if metadata_limits.max_directory_pages == 0
+            || metadata_limits.max_directory_entries == 0
+            || metadata_limits.max_cached_nodes == 0
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                "metadata proof bounds must be nonzero",
+            ));
+        }
         if let Some(store) = &store {
             store.bind_reader(&reader)?;
         }
@@ -210,6 +234,7 @@ impl Mst2Fuse {
             contents: HashMap::new(),
             chunked: HashMap::new(),
             lazy: true,
+            namespace_scope: Some(reader.descriptor().scope.clone()),
         };
         state.nodes.insert(
             ROOT_INODE,
@@ -225,6 +250,7 @@ impl Mst2Fuse {
             reader: Some(reader),
             store,
             state: StdMutex::new(state),
+            metadata_limits,
         };
         view.ensure_dir_loaded(ROOT_INODE).await?;
         Ok(view)
@@ -262,16 +288,24 @@ impl Mst2Fuse {
         let sid = reader.snapshot_id().to_string();
         let dir_path = format!("/{path}");
 
-        // BFS over the directory's own page tree: root page first, then the
-        // branch children each root/branch commits to. Bounded: pages are
-        // ≤16KiB and the tree is finite (spec 05 limits).
-        let mut all_entries: Vec<mst2_codec::metapage::Entry> = Vec::new();
+        reader.authorized_context().validate_relative_path(&path)?;
+        // Fetch only this directory's radix dependencies. Hashes alone do
+        // not certify namespace absence: the complete canonical partition
+        // and every child's actual count are proved before publishing nodes.
+        let mut proof_pages = BTreeMap::new();
         let mut routes: Vec<(Vec<u8>, String)> = vec![(Vec::new(), page_id.clone())];
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut route_ids = HashMap::new();
+        let mut seen = HashSet::new();
         seen.insert(page_id.clone());
         while !routes.is_empty() {
-            let take = routes.len().min(64);
+            let take = routes
+                .len()
+                .min(64)
+                .min(reader.client.metadata_item_limit());
             let batch: Vec<(Vec<u8>, String)> = routes.drain(..take).collect();
+            for (route, expected) in &batch {
+                route_ids.insert(route.clone(), expected.clone());
+            }
             let items: Vec<crate::snapshot::frames::MetadataPageItem> = batch
                 .iter()
                 .map(
@@ -282,54 +316,60 @@ impl Mst2Fuse {
                     },
                 )
                 .collect();
+            reader.ensure_lease().await?;
             let pages = reader
                 .client
                 .metadata_pages(&sid, &items, reader.encoding_hint())
-                .await
-                .map_err(|e| {
-                    crate::snapshot::SnapshotError::new(
-                        crate::snapshot::SnapshotErrorCode::Internal,
-                        format!("lazy page fetch failed: {e}"),
-                    )
-                })?;
-            let mut by_id: HashMap<String, Vec<u8>> = HashMap::new();
-            for (pid, bytes) in &pages {
-                by_id.insert(
-                    format!("sha256:{}", crate::snapshot::frames::hex32(pid)),
-                    bytes.clone(),
-                );
+                .await?;
+            let mut allowed = HashSet::new();
+            for (route, _) in &batch {
+                for depth in 0..=route.len() {
+                    if let Some(id) = route_ids.get(&route[..depth]) {
+                        allowed.insert(id.clone());
+                    }
+                }
+            }
+            for (pid, bytes) in pages {
+                let id = format!("sha256:{}", crate::snapshot::frames::hex32(&pid));
+                if !allowed.contains(&id) || mst2_codec::metapage::page_id(&bytes) != pid {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        "lazy directory returned an uncommitted or corrupt radix page",
+                    ));
+                }
+                proof_pages.insert(id, bytes);
             }
             for (route, expected) in &batch {
-                let bytes = by_id.get(expected).ok_or_else(|| {
-                    crate::snapshot::SnapshotError::new(
-                        crate::snapshot::SnapshotErrorCode::Internal,
+                let bytes = proof_pages.get(expected).ok_or_else(|| {
+                    SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
                         "lazy page walk did not return an expected page",
                     )
                 })?;
-                let (page, _) = mst2_codec::metapage::Page::decode(bytes).map_err(|e| {
-                    crate::snapshot::SnapshotError::new(
-                        crate::snapshot::SnapshotErrorCode::Internal,
-                        format!("lazy page decode failed: {e}"),
-                    )
-                })?;
+                let page = crate::snapshot::closure::decode_page(bytes)?;
                 match &page {
-                    mst2_codec::metapage::Page::Leaf { entries } => {
-                        all_entries.extend(entries.iter().cloned());
-                    }
-                    mst2_codec::metapage::Page::Branch {
-                        terminal, children, ..
-                    } => {
-                        if let Some(e) = terminal {
-                            all_entries.push(e.clone());
-                        }
+                    mst2_codec::metapage::Page::Leaf { .. } => {}
+                    mst2_codec::metapage::Page::Branch { children, .. } => {
                         for c in children {
                             let mut next = route.clone();
                             next.push(c.label);
+                            if next.len() > mst2_codec::metapage::MAX_DEPTH {
+                                return Err(SnapshotError::new(
+                                    SnapshotErrorCode::LimitExceeded,
+                                    "metadata radix depth exceeds 255",
+                                ));
+                            }
                             let child_id = format!(
                                 "sha256:{}",
                                 crate::snapshot::frames::hex32(&c.child_page_id)
                             );
                             if seen.insert(child_id.clone()) {
+                                if seen.len() > self.metadata_limits.max_directory_pages {
+                                    return Err(SnapshotError::new(
+                                        SnapshotErrorCode::ProofBudgetExceeded,
+                                        "lazy directory radix page budget exceeded",
+                                    ));
+                                }
                                 routes.push((next, child_id));
                             }
                         }
@@ -338,7 +378,54 @@ impl Mst2Fuse {
             }
         }
 
+        let all_entries = verify_directory_pages(
+            &page_id,
+            &proof_pages,
+            self.metadata_limits.max_directory_entries,
+        )?;
+        let max_file_bytes = match reader.capability_advertisement() {
+            crate::snapshot::capabilities::CapabilityAdvertisement::Canonical(caps) => {
+                caps.limits().max_file_bytes
+            }
+            _ => 8 * 1024 * 1024 * 1024 * 1024,
+        };
+        for entry in all_entries.iter() {
+            let name = std::str::from_utf8(&entry.name).map_err(|_| {
+                SnapshotError::new(SnapshotErrorCode::IntegrityError, "non-UTF-8 MTP2 name")
+            })?;
+            let full = if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path}/{name}")
+            };
+            reader.authorized_context().validate_relative_path(&full)?;
+            reader.client.validate_path(&full)?;
+            if entry.size > max_file_bytes
+                || (entry.kind == mst2_codec::metapage::EntryKind::Symlink
+                    && !(1..=4095).contains(&entry.size))
+            {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::LimitExceeded,
+                    "lazy directory file size exceeds serving profile",
+                ));
+            }
+        }
+
         let mut state = self.state.lock().unwrap();
+        if matches!(state.nodes.get(&inode), Some(Node::Dir(d)) if d.loaded) {
+            return Ok(());
+        }
+        if state
+            .nodes
+            .len()
+            .checked_add(all_entries.len())
+            .is_none_or(|count| count > self.metadata_limits.max_cached_nodes)
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ProofBudgetExceeded,
+                "lazy namespace node budget exceeded",
+            ));
+        }
         Self::apply_page_entries(&mut state, inode, &path, &all_entries)?;
         if let Node::Dir(d) = state.nodes.get_mut(&inode).expect("inode exists") {
             d.loaded = true;
@@ -444,6 +531,7 @@ impl Mst2Fuse {
             contents: HashMap::new(),
             chunked: HashMap::new(),
             lazy: false,
+            namespace_scope: None,
         };
         state.nodes.insert(
             ROOT_INODE,
@@ -473,6 +561,7 @@ impl Mst2Fuse {
             reader,
             store,
             state: StdMutex::new(state),
+            metadata_limits: MetadataProofLimits::default(),
         })
     }
 
@@ -491,6 +580,7 @@ impl Mst2Fuse {
             contents: HashMap::new(),
             chunked: HashMap::new(),
             lazy: false,
+            namespace_scope: Some(closure.descriptor().scope.clone()),
         };
         let mut directories: Vec<_> = closure.directories().iter().collect();
         directories.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -566,6 +656,7 @@ impl Mst2Fuse {
             reader,
             store,
             state: StdMutex::new(state),
+            metadata_limits: MetadataProofLimits::default(),
         })
     }
 
@@ -657,6 +748,129 @@ impl Mst2Fuse {
             .ok_or_else(|| Errno::from(libc::ENOENT))
     }
 
+    /// Query fixed metadata without reading content or following a symlink.
+    /// A missing child is proven only after its parent's entire canonical
+    /// radix is verified. Legacy file-only manifests cannot prove namespace.
+    pub async fn path_state(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<SnapshotPathState, SnapshotError> {
+        match self.path_inode(rel_path).await? {
+            Some(inode) => {
+                let state = self.state.lock().unwrap();
+                let node = state.nodes.get(&inode).ok_or_else(|| {
+                    SnapshotError::new(
+                        SnapshotErrorCode::IntegrityError,
+                        "fixed metadata inode missing",
+                    )
+                })?;
+                Ok(SnapshotPathState::Present(node_identity(node)?))
+            }
+            None => Ok(SnapshotPathState::AbsentProven),
+        }
+    }
+
+    /// Complete, ordered immediate children. Logical child directories are
+    /// not expanded; opaque upper diff can inspect only metadata it needs.
+    pub async fn directory_entries(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<Vec<SnapshotDirectoryEntry>, SnapshotError> {
+        let inode = self.path_inode(rel_path).await?.ok_or_else(|| {
+            SnapshotError::new(SnapshotErrorCode::PathNotFound, "fixed directory is absent")
+        })?;
+        self.ensure_dir_loaded(inode).await?;
+        let state = self.state.lock().unwrap();
+        let directory = match state.nodes.get(&inode) {
+            Some(Node::Dir(directory)) => directory,
+            Some(Node::File(file)) if file.fs_kind == "symlink" => {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::SymlinkTraversal,
+                    "directory query would follow a symlink",
+                ));
+            }
+            _ => {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::NotDirectory,
+                    "fixed path is not a directory",
+                ))
+            }
+        };
+        let mut entries = Vec::with_capacity(directory.children.len());
+        for (name, inode) in &directory.children {
+            let node = state.nodes.get(inode).ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "fixed directory child missing",
+                )
+            })?;
+            entries.push(SnapshotDirectoryEntry {
+                name: name.clone(),
+                identity: node_identity(node)?,
+            });
+        }
+        entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+        Ok(entries)
+    }
+
+    async fn path_inode(&self, rel_path: &str) -> std::result::Result<Option<u64>, SnapshotError> {
+        let relative = if rel_path.is_empty() {
+            "/".to_owned()
+        } else if rel_path.starts_with('/') {
+            rel_path.to_owned()
+        } else {
+            format!("/{rel_path}")
+        };
+        crate::snapshot::auth::validate_scope(&relative)?;
+        let scope = self
+            .state
+            .lock()
+            .unwrap()
+            .namespace_scope
+            .clone()
+            .ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "file-only manifest cannot prove fixed namespace",
+                )
+            })?;
+        let full = if scope == "/" {
+            relative.clone()
+        } else if relative == "/" {
+            scope
+        } else {
+            format!("{scope}{relative}")
+        };
+        crate::snapshot::auth::validate_scope(&full)?;
+        let mut inode = ROOT_INODE;
+        if relative == "/" {
+            return Ok(Some(inode));
+        }
+        for name in relative.trim_start_matches('/').split('/') {
+            self.ensure_dir_loaded(inode).await?;
+            let state = self.state.lock().unwrap();
+            match state.nodes.get(&inode) {
+                Some(Node::Dir(directory)) => match directory.children.get(name) {
+                    Some(child) => inode = *child,
+                    None => return Ok(None),
+                },
+                Some(Node::File(file)) if file.fs_kind == "symlink" => {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::SymlinkTraversal,
+                        "fixed path traverses a symlink",
+                    ));
+                }
+                _ => {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::NotDirectory,
+                        "fixed ancestor is not a directory",
+                    ))
+                }
+            }
+        }
+        Ok(Some(inode))
+    }
+
     /// Content digest of `rel_path` in the fixed view, in the view's wire form
     /// (`sha256:<hex>`). Directory pages are loaded on demand, so a lazy mount
     /// resolves the path with the same metadata requests a lookup would make.
@@ -682,6 +896,37 @@ impl Mst2Fuse {
             Node::File(f) => Some(f.digest.clone()),
             Node::Dir(_) => None,
         }
+    }
+}
+
+fn node_identity(node: &Node) -> std::result::Result<SnapshotNodeIdentity, SnapshotError> {
+    match node {
+        Node::Dir(directory) => Ok(SnapshotNodeIdentity::Directory {
+            directory_root: directory.page_id.clone().ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "directory identity was not proved",
+                )
+            })?,
+        }),
+        Node::File(file) => match file.fs_kind.as_str() {
+            "regular" => Ok(SnapshotNodeIdentity::Regular {
+                size: file.size,
+                content_digest: file.digest.clone(),
+            }),
+            "executable" => Ok(SnapshotNodeIdentity::Executable {
+                size: file.size,
+                content_digest: file.digest.clone(),
+            }),
+            "symlink" => Ok(SnapshotNodeIdentity::Symlink {
+                size: file.size,
+                content_digest: file.digest.clone(),
+            }),
+            _ => Err(SnapshotError::new(
+                SnapshotErrorCode::UnsupportedEntry,
+                "unsupported fixed node kind",
+            )),
+        },
     }
 }
 
@@ -1419,6 +1664,45 @@ mod tests {
             ],
         );
         closure_for_pages(root, pages)
+    }
+
+    #[tokio::test]
+    async fn typed_namespace_rejects_file_only_proofs_and_keeps_empty_directory_identity() {
+        let legacy = Mst2Fuse::build(None, None, vec![]).unwrap();
+        assert_eq!(
+            legacy.path_state("missing").await.unwrap_err().code,
+            SnapshotErrorCode::SnapshotNotReady
+        );
+        assert_eq!(
+            legacy.path_state("../escape").await.unwrap_err().code,
+            SnapshotErrorCode::ScopeInvalid
+        );
+        let closure = directory_closure();
+        let complete = Mst2Fuse::build_snapshot_closure(None, None, &closure).unwrap();
+        assert!(matches!(
+            complete.path_state("empty").await.unwrap(),
+            SnapshotPathState::Present(SnapshotNodeIdentity::Directory { .. })
+        ));
+        assert_eq!(
+            complete.path_state("empty/missing").await.unwrap(),
+            SnapshotPathState::AbsentProven
+        );
+        assert_eq!(
+            complete
+                .path_state("left/link/child")
+                .await
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::SymlinkTraversal
+        );
+        assert_eq!(
+            complete
+                .path_state("left/plain/child")
+                .await
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::NotDirectory
+        );
     }
 
     async fn directory_names(fs: &Mst2Fuse, inode: u64) -> Vec<String> {
