@@ -4,7 +4,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
-    net::TcpListener as StdTcpListener,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -14,8 +13,8 @@ use std::{
 
 use asyncfuse::raw::prelude::{Filesystem, Request};
 use axum::{
-    body::Bytes,
-    extract::{Query, State},
+    body::{Body, Bytes},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -23,9 +22,8 @@ use axum::{
 };
 use futures::StreamExt;
 use mst2_codec::{
-    descriptor::ServingDescriptor,
     metapage::{page_id, BranchChild, Entry, EntryKind, Page},
-    treeframe::{EndPayload, MetaPayload},
+    treeframe::{EndPayload, MetaPayload, ObjectPayload},
 };
 use scorpiofs::snapshot::{
     durable::digest_of, frames::parse_digest, fuse::Mst2Fuse, FetchCoordinator, IncrementalSync,
@@ -33,9 +31,6 @@ use scorpiofs::snapshot::{
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
-
-const INSTANCE_ID: &str = "11111111-2222-4333-8444-555555555555";
-const NAMESPACE_VIEW_ID: [u8; 32] = [0x22; 32];
 
 #[derive(Default)]
 struct Fixture {
@@ -48,6 +43,10 @@ struct Fixture {
     omit: Mutex<Option<[u8; 32]>>,
     extra_route_page: Mutex<Option<[u8; 32]>>,
     blob_requests: AtomicUsize,
+    frame_content: AtomicBool,
+    object_requests: Mutex<Vec<Vec<String>>>,
+    omit_object: AtomicBool,
+    object_barrier: Option<Arc<tokio::sync::Barrier>>,
     pause_blob: AtomicBool,
     fail_blob_once: AtomicBool,
     blob_started: Notify,
@@ -92,16 +91,7 @@ impl Fixture {
     }
 
     fn snapshot_id(&self) -> String {
-        id_string(
-            &ServingDescriptor {
-                instance_uuid: *uuid::Uuid::parse_str(INSTANCE_ID).unwrap().as_bytes(),
-                namespace_view_id: NAMESPACE_VIEW_ID,
-                scope: "/project".into(),
-                metadata_root: self.root,
-            }
-            .snapshot_id()
-            .unwrap(),
-        )
+        id_string(&self.root)
     }
 
     fn requested_ids(&self) -> Vec<String> {
@@ -163,6 +153,45 @@ fn identical_directories_fixture() -> Fixture {
     f
 }
 
+// Expected paths are written from the fixture's declared logical namespace,
+// never obtained from either production walker.
+fn complete_fixture(stable_name: &str, changed: &[u8]) -> Fixture {
+    let mut f = nested_fixture(stable_name, changed);
+    let old_root = f.root;
+    let stable = f.routes[&(format!("/{stable_name}"), vec![])];
+    let deep = f.routes[&(format!("/{stable_name}/nested"), vec![])];
+    let other = f.routes[&("/other".into(), vec![])];
+    f.routes.insert(("/alias".into(), vec![]), stable);
+    f.routes.insert(("/alias/nested".into(), vec![]), deep);
+    f.expect_file("alias/f.txt", "regular", b"stable");
+    f.expect_file("alias/nested/deep.txt", "executable", b"deep");
+    let empty = f.leaf("/empty-a", vec![]);
+    f.routes.insert(("/empty-b".into(), vec![]), empty);
+    let mut wide = wide_fixture();
+    for ((path, route), id) in wide.routes.drain() {
+        assert_eq!(path, "/");
+        f.routes.insert(("/wide".into(), route), id);
+    }
+    f.pages.extend(wide.pages.drain());
+    for file in wide.expected {
+        let body = file.rel_path.as_bytes().to_vec();
+        f.expect_file(&format!("wide/{}", file.rel_path), "regular", &body);
+    }
+    f.root = f.leaf(
+        "/",
+        vec![
+            Entry::dir(stable_name.as_bytes(), stable),
+            Entry::dir(b"alias", stable),
+            Entry::dir(b"empty-a", empty),
+            Entry::dir(b"empty-b", empty),
+            Entry::dir(b"other", other),
+            Entry::dir(b"wide", wide.root),
+        ],
+    );
+    f.pages.remove(&old_root);
+    f
+}
+
 fn wide_fixture() -> Fixture {
     let mut f = Fixture::default();
     let mut children = Vec::new();
@@ -193,27 +222,33 @@ fn wide_fixture() -> Fixture {
     f
 }
 
-async fn capabilities() -> Json<Value> {
+async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
     Json(json!({
         "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
-        "features": {"resolve": true, "directory": true, "leases": true, "metadata_pages": true}
+        "features": {"resolve": true, "directory": true, "leases": true, "metadata_pages": true,
+            "objects": f.frame_content.load(Ordering::SeqCst),
+            "chunk_reads": f.frame_content.load(Ordering::SeqCst)}
     }))
 }
 
 async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
     Json(json!({
         "descriptor": {
-            "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE_ID,
-            "namespace_view_id": id_string(&NAMESPACE_VIEW_ID), "scope": "/project",
-            "materialization_policy": 1, "fs_semantics": 1, "access_projection": 0,
+            "schema_version": 2, "metadata_codec": 1, "instance_id": "fixture",
+            "namespace_view_id": "fixed-fixture-view", "scope": "/project",
+            "materialization_policy": 1, "fs_semantics": 1, "access_projection": 1,
             "metadata_root": id_string(&f.root), "snapshot_id": f.snapshot_id()
         },
         "lease_id": "fixture-lease", "lease_expires_at": "2099-01-01T00:00:00Z",
-        "publication_sequence": "1", "authorization_epoch": "1"
+        "publication_sequence": "1"
     }))
 }
 
-async fn metadata(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
+async fn metadata(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    body: Bytes,
+) -> Response {
     let req: Value = serde_json::from_slice(&body).unwrap();
     let items = req["items"].as_array().unwrap();
     let mut pages = Vec::new();
@@ -276,9 +311,9 @@ async fn metadata(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
     );
     Response::builder()
         .header("content-type", "application/vnd.mega.treeframe;version=2")
-        .header("x-mega-snapshot-id", f.snapshot_id())
+        .header("x-mega-snapshot-id", snapshot_id)
         .header("x-mega-request-digest", digest_of(&body))
-        .body(axum::body::Body::from(wire))
+        .body(Body::from(wire))
         .unwrap()
 }
 
@@ -303,50 +338,93 @@ async fn blob(
     bytes.clone().into_response()
 }
 
+async fn objects(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    body: Bytes,
+) -> Response {
+    let req: Value = serde_json::from_slice(&body).unwrap();
+    let items = req["items"].as_array().unwrap();
+    let mut seen = HashSet::new();
+    let mut objects = Vec::new();
+    for item in items {
+        let bytes = &f.blobs[item["path"].as_str().unwrap()];
+        assert_eq!(item["expected_digest"], digest_of(bytes));
+        let digest = parse_digest(&digest_of(bytes)).unwrap();
+        assert!(
+            seen.insert(digest),
+            "batch must deduplicate logical aliases"
+        );
+        objects.push((digest, bytes.clone()));
+    }
+    assert!(!items.is_empty() && items.len() <= 128);
+    f.object_requests.lock().unwrap().push(
+        items
+            .iter()
+            .map(|item| item["expected_digest"].as_str().unwrap().to_string())
+            .collect(),
+    );
+    if let Some(barrier) = &f.object_barrier {
+        barrier.wait().await;
+    }
+    if f.omit_object.swap(false, Ordering::SeqCst) {
+        objects.pop();
+    }
+    let logical_bytes = objects.iter().map(|(_, data)| data.len() as u64).sum();
+    let mut wire = Vec::new();
+    let sequence = if objects.is_empty() {
+        0
+    } else {
+        wire.extend(
+            ObjectPayload {
+                objects: objects.clone(),
+            }
+            .encode(8, 0)
+            .unwrap(),
+        );
+        1
+    };
+    wire.extend(
+        EndPayload {
+            request_item_count: items.len() as u32,
+            unique_unit_count: objects.len() as u32,
+            logical_bytes,
+            request_body_sha256: parse_digest(&digest_of(&body)).unwrap(),
+        }
+        .encode(8, sequence),
+    );
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", snapshot_id)
+        .header("x-mega-request-digest", digest_of(&body))
+        .body(Body::from(wire))
+        .unwrap()
+}
+
 struct HttpFixture {
     fixture: Arc<Fixture>,
     base: String,
-    listener: StdTcpListener,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl HttpFixture {
     async fn start(fixture: Fixture) -> Self {
         let fixture = Arc::new(fixture);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .into_std()
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let task = Self::serve(&listener, fixture.clone());
-        Self {
-            fixture,
-            base,
-            listener,
-            task,
-        }
-    }
-
-    fn serve(listener: &StdTcpListener, fixture: Arc<Fixture>) -> tokio::task::JoinHandle<()> {
-        let listener = tokio::net::TcpListener::from_std(listener.try_clone().unwrap()).unwrap();
         let app = Router::new()
             .route("/api/v2/snapshots/capabilities", get(capabilities))
             .route("/api/v2/snapshots/resolve", post(resolve))
             .route("/api/v2/snapshots/{sid}/metadata/pages", post(metadata))
             .route("/api/v2/snapshots/{sid}/blob", get(blob))
+            .route("/api/v2/snapshots/{sid}/objects", post(objects))
             .with_state(fixture.clone());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
-    }
-
-    async fn restart(mut self, fixture: Fixture) -> Self {
-        self.task.abort();
-        let _ = (&mut self.task).await;
-        // Keep the listening socket bound while replacing the server. V1 and
-        // V2 share the deployment URL, independently of ephemeral port reuse.
-        self.fixture = Arc::new(fixture);
-        self.task = Self::serve(&self.listener, self.fixture.clone());
-        self
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self {
+            fixture,
+            base,
+            task,
+        }
     }
 
     async fn reader(&self) -> SnapshotReader {
@@ -382,14 +460,8 @@ fn assert_manifest(actual: &[SnapshotFile], expected: &[SnapshotFile]) {
     );
 }
 
-async fn pin(cache: &ScopeCache, reader: &SnapshotReader, fixture: &Fixture) {
-    let snapshot_id = reader.snapshot_id();
+async fn pin(cache: &ScopeCache, snapshot_id: &str, fixture: &Fixture) {
     let dir = cache.dir().join(snapshot_id.trim_start_matches("sha256:"));
-    reader.authorized_context().bind_view_cache(&dir).unwrap();
-    reader
-        .authorized_context()
-        .bind_scope_cache(&cache.dir().join("blobs"))
-        .unwrap();
     let store =
         scorpiofs::snapshot::DurableStore::open_with_content(&dir, cache.dir().join("blobs"))
             .unwrap();
@@ -409,6 +481,531 @@ async fn pin(cache: &ScopeCache, reader: &SnapshotReader, fixture: &Fixture) {
     store.pin(&view).unwrap();
 }
 
+async fn hydrate_full(
+    cache: &ScopeCache,
+    reader: &SnapshotReader,
+    closure: &scorpiofs::snapshot::ValidatedSnapshotClosure,
+) -> scorpiofs::snapshot::HydrateReport {
+    let dir = cache
+        .dir()
+        .join(reader.snapshot_id().trim_start_matches("sha256:"));
+    let store =
+        scorpiofs::snapshot::DurableStore::open_for_reader(&dir, cache.dir().join("blobs"), reader)
+            .unwrap();
+    let report = store
+        .hydrate_snapshot_from_closure(reader, closure)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.completion_kind,
+        scorpiofs::snapshot::CompletionKind::FullSnapshot
+    );
+    assert!(store.is_snapshot_complete().unwrap());
+    assert_eq!(
+        store.snapshot_manifest().unwrap().directories(),
+        closure.directories()
+    );
+    report
+}
+
+async fn hydrate_full_batches(
+    store: &scorpiofs::snapshot::DurableStore,
+    reader: &SnapshotReader,
+    closure: &scorpiofs::snapshot::ValidatedSnapshotClosure,
+) -> Result<scorpiofs::snapshot::HydrateReport, scorpiofs::snapshot::SnapshotError> {
+    let client = reader.client().clone();
+    let sid = reader.snapshot_id().to_string();
+    store
+        .hydrate_snapshot_batches(
+            reader,
+            closure,
+            2,
+            2,
+            move |batch| {
+                let client = client.clone();
+                let sid = sid.clone();
+                Box::pin(async move {
+                    let items: Vec<_> = batch
+                        .iter()
+                        .map(|f| (format!("/{}", f.rel_path), f.content_digest.clone()))
+                        .collect();
+                    let got = client.objects(&sid, &items, None).await?;
+                    Ok(got
+                        .into_iter()
+                        .map(|(id, bytes)| (id_string(&id), Arc::new(bytes)))
+                        .collect())
+                })
+            },
+            |_| Box::pin(async { panic!("all HTTP batch fixture files are small") }),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn full_snapshot_http_batches_preserve_concurrency_alias_reuse_and_metadata() {
+    let mut fixture = complete_fixture("a", b"target-one");
+    fixture.frame_content.store(true, Ordering::SeqCst);
+    // Both batches must be in flight together; a serial implementation fails
+    // the bounded test instead of quietly losing the tuning knob.
+    fixture.object_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
+    let http = HttpFixture::start(fixture).await;
+    let reader = http.reader().await;
+    assert!(reader.capabilities().features.objects);
+    let temp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(temp.path()).unwrap();
+    let closure = IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    let before_metadata = http.fixture.requested_ids();
+    let store = scorpiofs::snapshot::DurableStore::open_for_reader(
+        cache.dir().join("full-batches"),
+        cache.dir().join("blobs"),
+        &reader,
+    )
+    .unwrap();
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        hydrate_full_batches(&store, &reader, &closure),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let unique: HashSet<_> = http
+        .fixture
+        .expected
+        .iter()
+        .map(|f| &f.content_digest)
+        .collect();
+    assert_eq!(report.fetched, unique.len() as u64);
+    assert_eq!(report.total_files, http.fixture.expected.len() as u64);
+    assert_eq!(
+        report.bytes_total,
+        http.fixture.expected.iter().map(|f| f.size).sum::<u64>()
+    );
+    assert_eq!(
+        report.completion_kind,
+        scorpiofs::snapshot::CompletionKind::FullSnapshot
+    );
+    let batches = http.fixture.object_requests.lock().unwrap().clone();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), unique.len());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(http.fixture.requested_ids(), before_metadata);
+    let local = store.snapshot_manifest().unwrap();
+    assert_manifest(local.files(), &http.fixture.expected);
+    assert_eq!(local.directories(), closure.directories());
+    assert_eq!(local.pages(), closure.pages());
+    let resumed = hydrate_full_batches(&store, &reader, &closure)
+        .await
+        .unwrap();
+    assert_eq!(resumed.fetched, 0);
+    assert_eq!(resumed.resumed, http.fixture.expected.len() as u64);
+    assert_eq!(http.fixture.object_requests.lock().unwrap().len(), 2);
+    assert!(store.is_snapshot_complete().unwrap());
+}
+
+#[tokio::test]
+async fn full_snapshot_http_batch_failure_revokes_complete_and_can_resume() {
+    let fixture = identical_directories_fixture();
+    fixture.frame_content.store(true, Ordering::SeqCst);
+    let http = HttpFixture::start(fixture).await;
+    let reader = http.reader().await;
+    let temp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(temp.path()).unwrap();
+    let closure = IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    let store = scorpiofs::snapshot::DurableStore::open_for_reader(
+        cache.dir().join("full-batch-failure"),
+        cache.dir().join("blobs"),
+        &reader,
+    )
+    .unwrap();
+    hydrate_full_batches(&store, &reader, &closure)
+        .await
+        .unwrap();
+    let digest = &http.fixture.expected[0].content_digest;
+    std::fs::write(
+        store
+            .content_dir()
+            .join(digest.trim_start_matches("sha256:")),
+        b"corrupt",
+    )
+    .unwrap();
+    http.fixture.omit_object.store(true, Ordering::SeqCst);
+    assert_eq!(
+        hydrate_full_batches(&store, &reader, &closure)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    assert!(!store.root().join("DURABLE_COMPLETE").exists());
+    assert!(!store.is_complete().unwrap());
+    assert_eq!(
+        store.snapshot_manifest().unwrap_err().code,
+        SnapshotErrorCode::SnapshotNotReady
+    );
+    let retry = hydrate_full_batches(&store, &reader, &closure)
+        .await
+        .unwrap();
+    assert_eq!(retry.fetched, 1, "retry deduplicates both logical paths");
+    assert_eq!(retry.repaired, 2);
+    assert!(store.is_snapshot_complete().unwrap());
+    assert_manifest(
+        store.snapshot_manifest().unwrap().files(),
+        &http.fixture.expected,
+    );
+}
+
+#[tokio::test]
+async fn full_snapshot_http_raw_concurrent_fallback_preserves_metadata_and_resume() {
+    let http = HttpFixture::start(nested_fixture("a", b"target-one")).await;
+    let reader = http.reader().await;
+    assert!(!reader.capabilities().features.objects);
+    let temp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(temp.path()).unwrap();
+    let closure = IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    let before_metadata = http.fixture.requested_ids();
+    let store = scorpiofs::snapshot::DurableStore::open_for_reader(
+        cache.dir().join("full-raw"),
+        cache.dir().join("blobs"),
+        &reader,
+    )
+    .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let coordinator = FetchCoordinator::new(reader.clone(), 3);
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.hydrate_snapshot_concurrent(&reader, &closure, 3, move |file| {
+            let barrier = barrier.clone();
+            let coordinator = coordinator.clone();
+            Box::pin(async move {
+                barrier.wait().await;
+                coordinator.fetch(file, false).await
+            })
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.fetched, 3);
+    assert_eq!(
+        report.completion_kind,
+        scorpiofs::snapshot::CompletionKind::FullSnapshot
+    );
+    assert_eq!(http.fixture.requested_ids(), before_metadata);
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(store.snapshot_manifest().unwrap().pages(), closure.pages());
+    let resumed = store
+        .hydrate_snapshot_concurrent(&reader, &closure, 3, |_| {
+            Box::pin(async { panic!("cache hits must not fetch") })
+        })
+        .await
+        .unwrap();
+    assert_eq!(resumed.fetched, 0);
+    assert_eq!(resumed.resumed, 3);
+}
+
+#[tokio::test]
+async fn full_snapshot_cache_preserves_empty_alias_radix_and_reports_full_proof() {
+    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
+    let reader = http.reader().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(tmp.path()).unwrap();
+    let mut sync = IncrementalSync::new(&reader, &cache);
+    let closure = sync.sync_snapshot().await.unwrap();
+    assert_manifest(closure.files(), &http.fixture.expected);
+    assert_eq!(
+        closure
+            .directories()
+            .iter()
+            .map(|d| d.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "",
+            "a",
+            "a/nested",
+            "alias",
+            "alias/nested",
+            "empty-a",
+            "empty-b",
+            "other",
+            "wide"
+        ]
+    );
+    assert_eq!(closure.pages().len(), http.fixture.pages.len());
+    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(sync.meters().closure_index_writes, 1);
+    assert_eq!(sync.meters().pin_set_reads, 1);
+    assert_eq!(
+        sync.closure_meters().proof_page_hashes,
+        closure.pages().len() as u64
+    );
+    assert_eq!(sync.closure_meters().proof_logical_directories, 9);
+    assert_eq!(
+        sync.closure_meters().proof_logical_files,
+        http.fixture.expected.len() as u64
+    );
+    let before = http.fixture.requested_ids();
+    hydrate_full(&cache, &reader, &closure).await;
+    assert_eq!(
+        http.fixture.requested_ids(),
+        before,
+        "hydrate must not perform a second metadata walk"
+    );
+    http.fixture.requests.lock().unwrap().clear();
+    let mut warm = IncrementalSync::new(&reader, &cache);
+    let next = warm.sync_snapshot().await.unwrap();
+    assert_eq!(next.pages(), closure.pages());
+    assert_eq!(next.directories(), closure.directories());
+    assert_eq!(next.files(), closure.files());
+    assert!(http.fixture.requested_ids().is_empty());
+    assert_eq!(warm.meters().fetched_pages, 0);
+    assert_eq!(
+        warm.meters().traversal_nodes,
+        0,
+        "acquisition reused the pinned root hint"
+    );
+    assert_eq!(warm.meters().closure_index_reads, 1);
+    assert_eq!(warm.meters().closure_index_writes, 0);
+    assert!(
+        warm.closure_meters().collector_route_visits >= 9,
+        "full proof still expands logical aliases"
+    );
+    assert_eq!(
+        warm.meters().page_rehashes,
+        closure.pages().len() as u64,
+        "owned bytes are not re-read from disk for the proof collector"
+    );
+    assert_eq!(
+        warm.closure_meters().proof_page_hashes,
+        closure.pages().len() as u64
+    );
+}
+
+#[tokio::test]
+async fn full_snapshot_ignores_forged_files_and_repairs_truncated_or_extra_page_hints() {
+    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
+    let reader = http.reader().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(tmp.path()).unwrap();
+    let closure = IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    hydrate_full(&cache, &reader, &closure).await;
+    let foreign = Page::build(&[file_entry("foreign", EntryKind::Regular, b"foreign")]).unwrap();
+    let foreign_id = id_string(&page_id(&foreign));
+    cache.put_page(&foreign_id, &foreign).unwrap();
+    let root_id = id_string(&http.fixture.root);
+    let mut records: HashMap<String, scorpiofs::snapshot::ClosureRecord> =
+        serde_json::from_slice(&std::fs::read(cache.dir().join("closures.json")).unwrap()).unwrap();
+    for record in records.values_mut() {
+        record.files = vec![SnapshotFile {
+            rel_path: "forged.txt".into(),
+            fs_kind: "regular".into(),
+            size: 999,
+            content_digest: id_string(&[0x88; 32]),
+        }];
+        record.total_entries = u64::MAX;
+    }
+    records.get_mut(&root_id).unwrap().page_ids = vec![root_id.clone(), foreign_id.clone()];
+    std::fs::write(
+        cache.dir().join("closures.json"),
+        serde_json::to_vec(&records).unwrap(),
+    )
+    .unwrap();
+    http.fixture.requests.lock().unwrap().clear();
+    let mut repair = IncrementalSync::new(&reader, &cache);
+    let fixed = repair.sync_snapshot().await.unwrap();
+    assert_manifest(fixed.files(), &http.fixture.expected);
+    assert_eq!(fixed.directories(), closure.directories());
+    assert_eq!(fixed.pages(), closure.pages());
+    assert!(!fixed.pages().contains_key(&foreign_id));
+    assert!(
+        http.fixture.requested_ids().is_empty(),
+        "dependencies omitted by the hint still exist in the cache"
+    );
+    assert!(repair.closure_meters().repaired_records > 0);
+    let root = cache.record_for(&root_id).unwrap();
+    assert_manifest(&root.files, &http.fixture.expected);
+    assert_eq!(
+        root.total_entries,
+        (fixed.files().len() + fixed.directories().len() - 1) as u64
+    );
+    assert_eq!(root.page_ids.len(), fixed.pages().len());
+    assert!(!root.page_ids.contains(&foreign_id));
+    let alias = cache
+        .record_for(&id_string(&http.fixture.routes[&("/alias".into(), vec![])]))
+        .unwrap();
+    assert_eq!(
+        alias
+            .files
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        ["f.txt", "nested/deep.txt"]
+    );
+}
+
+#[tokio::test]
+async fn full_snapshot_commit_update_and_rename_keep_old_view_and_reuse_content() {
+    let first = HttpFixture::start(complete_fixture("a", b"target-one")).await;
+    let old = first.reader().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(tmp.path()).unwrap();
+    let old_closure = IncrementalSync::new(&old, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    hydrate_full(&cache, &old, &old_closure).await;
+    let next = first.restart(complete_fixture("a", b"target-two")).await;
+    let reader = next.reader().await;
+    let mut sync = IncrementalSync::new(&reader, &cache);
+    let closure = sync.sync_snapshot().await.unwrap();
+    assert_manifest(closure.files(), &next.fixture.expected);
+    assert_eq!(
+        sync.meters().fetched_pages,
+        2,
+        "only changed root and changed other directory"
+    );
+    assert!(sync.meters().reused_subtrees > 0);
+    assert_eq!(hydrate_full(&cache, &reader, &closure).await.fetched, 1);
+    let wrong_store = scorpiofs::snapshot::DurableStore::open_for_reader(
+        cache.dir().join("wrong-view"),
+        cache.dir().join("blobs"),
+        &reader,
+    )
+    .unwrap();
+    assert_eq!(
+        wrong_store
+            .hydrate_snapshot_from_closure(&reader, &old_closure)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    assert_eq!(
+        hydrate_full_batches(&wrong_store, &reader, &old_closure)
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    assert_eq!(
+        wrong_store
+            .hydrate_snapshot_concurrent(&reader, &old_closure, 4, |_| Box::pin(async {
+                panic!("mismatched fixed closure must be rejected before fetch")
+            }))
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    assert!(!wrong_store.is_complete().unwrap());
+    let renamed = next.restart(complete_fixture("moved", b"target-two")).await;
+    let latest = renamed.reader().await;
+    let mut moved = IncrementalSync::new(&latest, &cache);
+    let closure = moved.sync_snapshot().await.unwrap();
+    assert_manifest(closure.files(), &renamed.fixture.expected);
+    assert_eq!(moved.meters().fetched_pages, 1);
+    assert_eq!(hydrate_full(&cache, &latest, &closure).await.fetched, 0);
+    let old_store = scorpiofs::snapshot::DurableStore::open_with_content(
+        cache
+            .dir()
+            .join(old.snapshot_id().trim_start_matches("sha256:")),
+        cache.dir().join("blobs"),
+    )
+    .unwrap();
+    let reopened = old_store.snapshot_manifest().unwrap();
+    assert_eq!(reopened.files(), old_closure.files());
+    assert_eq!(reopened.directories(), old_closure.directories());
+}
+
+#[tokio::test]
+async fn full_snapshot_root_proof_failure_keeps_the_previous_index_transaction() {
+    let first = HttpFixture::start(wide_fixture()).await;
+    let old = first.reader().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(tmp.path()).unwrap();
+    let closure = IncrementalSync::new(&old, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    hydrate_full(&cache, &old, &closure).await;
+    let previous = std::fs::read(cache.dir().join("closures.json")).unwrap();
+    let mut malformed = wide_fixture();
+    let original_root = malformed.root;
+    let (mut page, _) = Page::decode(&malformed.pages[&original_root]).unwrap();
+    if let Page::Branch { children, .. } = &mut page {
+        children[0].subtree_entries += 1;
+    } else {
+        panic!("wide root must be a branch")
+    }
+    malformed.root = malformed.page("/", vec![], page);
+    malformed.pages.remove(&original_root);
+    let next = first.restart(malformed).await;
+    let reader = next.reader().await;
+    let mut sync = IncrementalSync::new(&reader, &cache);
+    assert_eq!(
+        sync.sync_snapshot().await.unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(sync.meters().closure_index_writes, 0);
+    assert_eq!(
+        std::fs::read(cache.dir().join("closures.json")).unwrap(),
+        previous
+    );
+    assert!(cache
+        .record_for(reader.descriptor().metadata_root.as_str())
+        .is_none());
+    // The failed transaction releases its OS lock without poisoning retry.
+    cache
+        .put_record(
+            &cache
+                .record_for(old.descriptor().metadata_root.as_str())
+                .unwrap(),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn full_snapshot_truncated_hint_cannot_hide_a_missing_wire_dependency() {
+    let http = HttpFixture::start(nested_fixture("a", b"target-one")).await;
+    let reader = http.reader().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(tmp.path()).unwrap();
+    let closure = IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    hydrate_full(&cache, &reader, &closure).await;
+    let mut root = cache.record_for(&id_string(&http.fixture.root)).unwrap();
+    root.page_ids = vec![root.root_page_id.clone()];
+    cache.put_record(&root).unwrap();
+    let previous = std::fs::read(cache.dir().join("closures.json")).unwrap();
+    let missing = http.fixture.routes[&("/a/nested".into(), vec![])];
+    std::fs::remove_file(cache.dir().join("pages").join(hex::encode(missing))).unwrap();
+    *http.fixture.omit.lock().unwrap() = Some(missing);
+    let mut sync = IncrementalSync::new(&reader, &cache);
+    assert_eq!(
+        sync.sync_snapshot().await.unwrap_err().code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    assert_eq!(sync.meters().closure_index_writes, 0);
+    assert_eq!(
+        std::fs::read(cache.dir().join("closures.json")).unwrap(),
+        previous
+    );
+}
+
 #[tokio::test]
 async fn cold_nested_manifest_has_exact_paths_and_descendant_closure_pages() {
     let http = HttpFixture::start(nested_fixture("a", b"target-one")).await;
@@ -419,6 +1016,24 @@ async fn cold_nested_manifest_has_exact_paths_and_descendant_closure_pages() {
     assert_manifest(&sync.sync().await.unwrap(), &http.fixture.expected);
     assert_eq!(sync.meters().fetched_pages, 4);
     assert_eq!(sync.meters().traversal_nodes, 4);
+    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(
+        sync.meters().closure_index_writes,
+        1,
+        "all four records publish together"
+    );
+    assert_eq!(sync.meters().pin_set_reads, 1);
+    assert_eq!(
+        sync.meters().page_rehashes,
+        0,
+        "cold pages are initially verified on receipt"
+    );
+    assert_eq!(
+        sync.meters().closure_index_write_bytes,
+        std::fs::metadata(cache.dir().join("closures.json"))
+            .unwrap()
+            .len()
+    );
     let root = cache.record_for(&id_string(&http.fixture.root)).unwrap();
     assert_eq!(root.total_entries, 6, "three directories and three files");
     assert_eq!(root.page_ids.len(), http.fixture.pages.len());
@@ -441,14 +1056,9 @@ async fn mixed_reused_and_new_children_preserve_both_manifests() {
         &IncrementalSync::new(&old, &cache).sync().await.unwrap(),
         &first.fixture.expected,
     );
-    pin(&cache, &old, &first.fixture).await;
-    let next = first.restart(nested_fixture("a", b"target-two")).await;
+    pin(&cache, old.snapshot_id(), &first.fixture).await;
+    let next = HttpFixture::start(nested_fixture("a", b"target-two")).await;
     let reader = next.reader().await;
-    assert_ne!(old.snapshot_id(), reader.snapshot_id());
-    assert_eq!(
-        old.authorized_context().cache_domain(),
-        reader.authorized_context().cache_domain()
-    );
     let mut sync = IncrementalSync::new(&reader, &cache);
     assert_manifest(&sync.sync().await.unwrap(), &next.fixture.expected);
     assert_eq!(sync.meters().reused_subtrees, 1);
@@ -459,6 +1069,15 @@ async fn mixed_reused_and_new_children_preserve_both_manifests() {
     );
     assert_eq!(sync.meters().fetched_pages, 2);
     assert_eq!(sync.meters().traversal_nodes, 2);
+    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(
+        sync.meters().closure_index_writes,
+        1,
+        "pin transfer and new records share one commit"
+    );
+    assert_eq!(sync.meters().pin_set_reads, 1);
+    assert_eq!(sync.meters().page_rehashes, 2);
+    assert_eq!(sync.meters().unique_page_rehashes, 2);
     assert_eq!(
         cache
             .record_for(&id_string(&next.fixture.root))
@@ -476,14 +1095,9 @@ async fn moved_subtree_rebases_once_and_keeps_its_descendant_pages() {
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path()).unwrap();
     IncrementalSync::new(&old, &cache).sync().await.unwrap();
-    pin(&cache, &old, &first.fixture).await;
-    let next = first.restart(nested_fixture("moved", b"target-one")).await;
+    pin(&cache, old.snapshot_id(), &first.fixture).await;
+    let next = HttpFixture::start(nested_fixture("moved", b"target-one")).await;
     let reader = next.reader().await;
-    assert_ne!(old.snapshot_id(), reader.snapshot_id());
-    assert_eq!(
-        old.authorized_context().cache_domain(),
-        reader.authorized_context().cache_domain()
-    );
     let mut sync = IncrementalSync::new(&reader, &cache);
     assert_manifest(&sync.sync().await.unwrap(), &next.fixture.expected);
     assert_eq!(
@@ -496,45 +1110,6 @@ async fn moved_subtree_rebases_once_and_keeps_its_descendant_pages() {
     assert_manifest(
         &reader.file_manifest_pages().await.unwrap(),
         &next.fixture.expected,
-    );
-}
-
-#[tokio::test]
-async fn identical_pages_from_another_deployment_cannot_reuse_a_scope_cache() {
-    let first = HttpFixture::start(nested_fixture("a", b"target-one")).await;
-    let old = first.reader().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let cache = ScopeCache::open(tmp.path()).unwrap();
-    assert_manifest(
-        &IncrementalSync::new(&old, &cache).sync().await.unwrap(),
-        &first.fixture.expected,
-    );
-    pin(&cache, &old, &first.fixture).await;
-    let previous_records = std::fs::read(cache.dir().join("closures.json")).unwrap();
-
-    // The first listener stays bound: this second port represents a genuinely
-    // different deployment even though it advertises identical snapshot bytes.
-    let other = HttpFixture::start(nested_fixture("a", b"target-one")).await;
-    let reader = other.reader().await;
-    assert_ne!(first.base, other.base);
-    assert_eq!(old.snapshot_id(), reader.snapshot_id());
-    assert_ne!(
-        old.authorized_context().cache_domain(),
-        reader.authorized_context().cache_domain()
-    );
-    let mut sync = IncrementalSync::new(&reader, &cache);
-    assert_eq!(
-        sync.sync().await.unwrap_err().code,
-        SnapshotErrorCode::ScopeForbidden
-    );
-    assert_eq!(sync.meters().reused_subtrees, 0);
-    assert_eq!(sync.meters().reused_pages, 0);
-    assert_eq!(sync.meters().fetched_pages, 0);
-    assert_eq!(sync.meters().traversal_nodes, 0);
-    assert!(other.fixture.requested_ids().is_empty());
-    assert_eq!(
-        std::fs::read(cache.dir().join("closures.json")).unwrap(),
-        previous_records
     );
 }
 
@@ -556,11 +1131,20 @@ async fn identical_page_ids_expand_under_every_logical_directory() {
         3,
         "three logical page visits"
     );
-    pin(&cache, &reader, &http.fixture).await;
+    pin(&cache, reader.snapshot_id(), &http.fixture).await;
     let mut warm = IncrementalSync::new(&reader, &cache);
     assert_manifest(&warm.sync().await.unwrap(), &http.fixture.expected);
     assert_eq!(warm.meters().fetched_pages, 0);
     assert_eq!(warm.meters().traversal_nodes, 0);
+    assert_eq!(warm.meters().closure_index_reads, 1);
+    assert_eq!(
+        warm.meters().closure_index_writes,
+        0,
+        "same pinned view needs no index mutation"
+    );
+    assert_eq!(warm.meters().pin_set_reads, 1);
+    assert_eq!(warm.meters().page_rehashes, 2);
+    assert_eq!(warm.meters().unique_page_rehashes, 2);
 }
 
 #[tokio::test]
@@ -570,7 +1154,7 @@ async fn missing_descendant_page_refetches_only_that_page_without_trusting_root_
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path()).unwrap();
     IncrementalSync::new(&reader, &cache).sync().await.unwrap();
-    pin(&cache, &reader, &http.fixture).await;
+    pin(&cache, reader.snapshot_id(), &http.fixture).await;
     let missing = http.fixture.routes[&("/a/nested".into(), vec![])];
     std::fs::remove_file(cache.dir().join("pages").join(hex::encode(missing))).unwrap();
     http.fixture.requests.lock().unwrap().clear();
@@ -585,7 +1169,7 @@ async fn missing_descendant_page_refetches_only_that_page_without_trusting_root_
     );
     assert_eq!(
         cache
-            .record_for(&id_string(&http.fixture.root))
+            .record_for(reader.snapshot_id())
             .unwrap()
             .page_ids
             .len(),
@@ -601,12 +1185,16 @@ async fn missing_server_page_is_an_error_and_never_writes_a_closure_record() {
     let reader = http.reader().await;
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path()).unwrap();
-    let err = IncrementalSync::new(&reader, &cache)
-        .sync()
-        .await
-        .unwrap_err();
+    let mut sync = IncrementalSync::new(&reader, &cache);
+    let err = sync.sync().await.unwrap_err();
     assert_eq!(err.code, SnapshotErrorCode::DigestMismatch);
     assert!(cache.record_for(&id_string(&http.fixture.root)).is_none());
+    assert!(
+        !cache.dir().join("closures.json").exists(),
+        "even completed sibling records stay uncommitted on failure"
+    );
+    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(sync.meters().closure_index_writes, 0);
     assert_eq!(
         reader.file_manifest_pages().await.unwrap_err().code,
         SnapshotErrorCode::DigestMismatch
@@ -691,11 +1279,11 @@ async fn malformed_closure_page_id_cannot_read_write_or_remove_an_outside_file()
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path().join("cache")).unwrap();
     IncrementalSync::new(&reader, &cache).sync().await.unwrap();
-    pin(&cache, &reader, &http.fixture).await;
+    pin(&cache, reader.snapshot_id(), &http.fixture).await;
     let sentinel = tmp.path().join("sentinel");
     std::fs::write(&sentinel, b"must remain untouched").unwrap();
     let invalid = "sha256:../../sentinel";
-    let mut record = cache.record_for(&id_string(&http.fixture.root)).unwrap();
+    let mut record = cache.record_for(reader.snapshot_id()).unwrap();
     record.page_ids.insert(0, invalid.into());
     // Use the current policy and a live pin so the corrupted record reaches
     // the id verifier; policy mismatch must not mask this regression.
@@ -713,7 +1301,7 @@ async fn malformed_closure_page_id_cannot_read_write_or_remove_an_outside_file()
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"must remain untouched");
     assert!(!cache
-        .record_for(&id_string(&http.fixture.root))
+        .record_for(reader.snapshot_id())
         .unwrap()
         .page_ids
         .contains(&invalid.to_string()));

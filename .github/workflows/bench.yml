@@ -1,0 +1,31 @@
+name: Benchmark harness
+
+on:
+  pull_request:
+    paths: ['bench/**', '.github/workflows/bench.yml']
+  push:
+    branches: [main]
+    paths: ['bench/**', '.github/workflows/bench.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: Benchmark correctness gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install PyYAML
+      - run: python -m compileall -q bench
+      - run: python -m unittest discover -s bench/bin -p 'test_*.py'
+      - run: python -m unittest discover -s bench/tests -p 'test_*.py'
+      - name: Check shell syntax and render the isolated stack
+        run: |
+          bash -n bench/infra/build-medium-images.sh
+          python bench/infra/render-medium-stack.py --runner example/runner:test --backend example/mega2:test --fixture example/fixture:test --out "$RUNNER_TEMP/medium-stack.json"
+          python -c 'import json, sys; d=json.load(open(sys.argv[1])); assert not any(x["kind"] == "Secret" for x in d["items"]); assert "git-shallow-gate.py" in next(x for x in d["items"] if x["kind"] == "ConfigMap" and x["metadata"]["name"] == "medium-drivers")["data"]' "$RUNNER_TEMP/medium-stack.json"

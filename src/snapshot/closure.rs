@@ -22,6 +22,32 @@ use crate::snapshot::{
 
 const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 
+/// Full-proof work, separate from incremental acquisition traversal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SnapshotClosureMeters {
+    pub collector_route_visits: u64,
+    pub collector_page_decodes: u64,
+    pub proof_page_hashes: u64,
+    pub proof_page_hash_bytes: u64,
+    pub proof_page_decodes: u64,
+    pub proof_radix_rebuilds: u64,
+    pub proof_logical_directories: u64,
+    pub proof_logical_files: u64,
+    pub fact_directory_summaries: u64,
+    pub fact_radix_visits: u64,
+    pub fact_entry_visits: u64,
+    pub fact_file_copies: u64,
+    pub repaired_records: u64,
+}
+
+/// Derived only after the complete descriptor-root graph has been proved.
+pub(crate) struct VerifiedSubtreeFacts {
+    pub root_page_id: String,
+    pub page_ids: Vec<String>,
+    pub files: Vec<SnapshotFile>,
+    pub total_entries: u64,
+}
+
 /// A logical directory, including the scope root and empty directories.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +73,21 @@ impl ValidatedSnapshotClosure {
         descriptor: &Descriptor,
         pages: BTreeMap<String, Vec<u8>>,
     ) -> Result<Self, SnapshotError> {
+        Ok(Self::validate_pages(descriptor, pages, false)?.0)
+    }
+
+    pub(crate) fn with_subtree_facts(
+        descriptor: &Descriptor,
+        pages: BTreeMap<String, Vec<u8>>,
+    ) -> Result<(Self, Vec<VerifiedSubtreeFacts>, SnapshotClosureMeters), SnapshotError> {
+        Self::validate_pages(descriptor, pages, true)
+    }
+
+    fn validate_pages(
+        descriptor: &Descriptor,
+        pages: BTreeMap<String, Vec<u8>>,
+        include_facts: bool,
+    ) -> Result<(Self, Vec<VerifiedSubtreeFacts>, SnapshotClosureMeters), SnapshotError> {
         let descriptor_bytes = canonical_descriptor(descriptor)?;
         let mut validator = ClosureValidator {
             bytes: &pages,
@@ -57,13 +98,17 @@ impl ValidatedSnapshotClosure {
             content_sizes: HashMap::new(),
             directories: Vec::new(),
             files: Vec::new(),
+            meters: SnapshotClosureMeters::default(),
         };
         for (id, bytes) in &pages {
+            validator.meters.proof_page_hashes += 1;
+            validator.meters.proof_page_hash_bytes += bytes.len() as u64;
             let expected = parse_digest(id)?;
             if page_id(bytes) != expected {
                 return Err(integrity(format!("metadata page bytes do not match {id}")));
             }
             validator.decoded.insert(id.clone(), decode_page(bytes)?);
+            validator.meters.proof_page_decodes += 1;
         }
         validator.walk_directory(
             &descriptor.scope,
@@ -78,16 +123,49 @@ impl ValidatedSnapshotClosure {
             .directories
             .sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         validator.files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let mut meters = validator.meters;
+        let facts = if include_facts {
+            let roots: BTreeSet<_> = validator
+                .directories
+                .iter()
+                .map(|d| d.directory_root.clone())
+                .collect();
+            let mut memo = HashMap::new();
+            for root in roots {
+                validator.subtree_facts(&root, &mut memo, &mut meters)?;
+            }
+            let mut facts: Vec<_> = memo
+                .into_values()
+                .map(|fact| VerifiedSubtreeFacts {
+                    root_page_id: fact.root_page_id.clone(),
+                    page_ids: fact.page_ids.clone(),
+                    files: fact.files.clone(),
+                    total_entries: fact.total_entries,
+                })
+                .collect();
+            meters.fact_file_copies += facts
+                .iter()
+                .map(|fact| fact.files.len() as u64)
+                .sum::<u64>();
+            facts.sort_by(|a, b| a.root_page_id.cmp(&b.root_page_id));
+            facts
+        } else {
+            Vec::new()
+        };
         let directories = std::mem::take(&mut validator.directories);
         let files = std::mem::take(&mut validator.files);
         drop(validator);
-        Ok(Self {
-            descriptor: descriptor.clone(),
-            descriptor_bytes,
-            pages,
-            directories,
-            files,
-        })
+        Ok((
+            Self {
+                descriptor: descriptor.clone(),
+                descriptor_bytes,
+                pages,
+                directories,
+                files,
+            },
+            facts,
+            meters,
+        ))
     }
 
     /// Reopen from canonical MSD2 bytes and independently verify every page.
@@ -143,6 +221,16 @@ impl ValidatedSnapshotClosure {
     pub fn files(&self) -> &[SnapshotFile] {
         &self.files
     }
+
+    pub(crate) fn matches_descriptor(&self, descriptor: &Descriptor) -> Result<(), SnapshotError> {
+        if canonical_descriptor(descriptor)? != self.descriptor_bytes {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeForbidden,
+                "closure differs from the fixed authorized serving descriptor",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn canonical_descriptor(descriptor: &Descriptor) -> Result<Vec<u8>, SnapshotError> {
@@ -187,9 +275,85 @@ struct ClosureValidator<'a> {
     content_sizes: HashMap<String, u64>,
     directories: Vec<SnapshotDirectory>,
     files: Vec<SnapshotFile>,
+    meters: SnapshotClosureMeters,
 }
 
 impl ClosureValidator<'_> {
+    fn radix_page_ids(
+        &self,
+        id: &str,
+        ids: &mut BTreeSet<String>,
+        meters: &mut SnapshotClosureMeters,
+    ) {
+        if !ids.insert(id.to_owned()) {
+            return;
+        }
+        meters.fact_radix_visits += 1;
+        if let Page::Branch { children, .. } = &self.decoded[id] {
+            for child in children {
+                self.radix_page_ids(&digest(&child.child_page_id), ids, meters);
+            }
+        }
+    }
+
+    fn subtree_facts(
+        &self,
+        root: &str,
+        memo: &mut HashMap<String, Arc<VerifiedSubtreeFacts>>,
+        meters: &mut SnapshotClosureMeters,
+    ) -> Result<Arc<VerifiedSubtreeFacts>, SnapshotError> {
+        if let Some(facts) = memo.get(root) {
+            return Ok(facts.clone());
+        }
+        meters.fact_directory_summaries += 1;
+        let mut page_ids = BTreeSet::new();
+        self.radix_page_ids(root, &mut page_ids, meters);
+        let mut files = Vec::new();
+        let mut total_entries = 0u64;
+        for entry in self.entries[root].iter() {
+            meters.fact_entry_visits += 1;
+            total_entries = total_entries
+                .checked_add(1)
+                .ok_or_else(|| limit("subtree entry count overflow"))?;
+            let name =
+                std::str::from_utf8(&entry.name).map_err(|_| integrity("non-UTF-8 entry"))?;
+            if entry.kind == EntryKind::Directory {
+                let child = self.subtree_facts(&digest(&entry.child_root), memo, meters)?;
+                page_ids.extend(child.page_ids.iter().cloned());
+                total_entries = total_entries
+                    .checked_add(child.total_entries)
+                    .ok_or_else(|| limit("subtree entry count overflow"))?;
+                files.extend(child.files.iter().map(|file| SnapshotFile {
+                    rel_path: format!("{name}/{}", file.rel_path),
+                    ..file.clone()
+                }));
+                meters.fact_file_copies += child.files.len() as u64;
+            } else {
+                files.push(SnapshotFile {
+                    rel_path: name.to_owned(),
+                    size: entry.size,
+                    content_digest: digest(&entry.content_id),
+                    fs_kind: match entry.kind {
+                        EntryKind::Regular => "regular",
+                        EntryKind::Executable => "executable",
+                        EntryKind::Symlink => "symlink",
+                        EntryKind::Directory => unreachable!(),
+                    }
+                    .to_owned(),
+                });
+            }
+        }
+        files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let facts = Arc::new(VerifiedSubtreeFacts {
+            root_page_id: root.to_owned(),
+            page_ids: page_ids.into_iter().collect(),
+            files,
+            total_entries,
+        });
+        memo.insert(root.to_owned(), facts.clone());
+        Ok(facts)
+    }
+
     fn radix_entries(
         &mut self,
         id: &str,
@@ -238,6 +402,7 @@ impl ClosureValidator<'_> {
                 "metadata page is not the canonical partition of its entries",
             ));
         }
+        self.meters.proof_radix_rebuilds += 1;
         active.remove(id);
         let entries = Arc::new(entries);
         self.entries.insert(id.to_string(), entries.clone());
@@ -262,6 +427,7 @@ impl ClosureValidator<'_> {
             rel_path: rel_path.to_string(),
             directory_root: root.to_string(),
         });
+        self.meters.proof_logical_directories += 1;
         let entries = self.radix_entries(root, 0, &mut HashSet::new())?;
         for entry in entries.iter() {
             let name =
@@ -304,6 +470,7 @@ impl ClosureValidator<'_> {
                     size: entry.size,
                     content_digest,
                 });
+                self.meters.proof_logical_files += 1;
             }
         }
         active.remove(root);
