@@ -2693,9 +2693,8 @@ dependencies = [
 
 [[package]]
 name = "mst2-codec"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a83966abccfebdbee64d702c76273aaf819ca24ad61c420e15208df6f8c4fdb"
+version = "0.4.0"
+source = "git+https://github.com/gitmono-dev/mst2-codec?rev=dc5ec7650a221ec07a62f4dea4be9ddf17ad924e#dc5ec7650a221ec07a62f4dea4be9ddf17ad924e"
 dependencies = [
  "sha2 0.10.9",
  "zstd",
@@ -4936,7 +4935,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",

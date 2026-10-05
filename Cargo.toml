@@ -65,10 +65,11 @@ url = "2.5.8"
 async-trait = "0.1.92"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# Shared MST/2 byte codec (specs 03/05/06/07), published to crates.io. Pure
+# Shared MST/2 byte codec (specs 03/05/06/07). Pure
 # codec only — no HTTP/DB/FUSE types leak through it. `zstd` enables the
-# optional strict single-frame frame encoding (spec 06 §3), wire fixes in 0.3.0.
-mst2-codec = { version = "0.3.1", features = ["zstd"] }
+# optional strict single-frame frame encoding (spec 06 §3). Pin the reviewed
+# raw-payload digest fix until the corresponding registry release is available.
+mst2-codec = { git = "https://github.com/gitmono-dev/mst2-codec", rev = "dc5ec7650a221ec07a62f4dea4be9ddf17ad924e", version = "=0.4.0", features = ["zstd"] }
 
 
 # libfuse-fs pulls reqwest 0.12 → native-tls → openssl-sys. Vendored OpenSSL
