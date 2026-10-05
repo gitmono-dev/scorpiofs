@@ -272,6 +272,10 @@ impl AntaresFuse {
         let Some(handle) = self.mount_handle.take() else {
             if self.unmount_failed {
                 let result = fuse_platform::unmount_path(&self.mountpoint, true).await;
+                let result = match result {
+                    Ok(()) => self.drain_mutations().await,
+                    Err(error) => Err(error),
+                };
                 self.unmount_failed = result.is_err();
                 return result;
             }
@@ -302,8 +306,21 @@ impl AntaresFuse {
                     fuse_platform::unmount_path(&mount_path, true).await
                 }
             };
+        let result = match result {
+            Ok(()) => self.drain_mutations().await,
+            Err(error) => Err(error),
+        };
         self.unmount_failed = result.is_err();
         result
+    }
+
+    /// Native teardown can process additional handle retirement. Re-audit
+    /// it before reporting success; keep the same owner on failure/cancel.
+    async fn drain_mutations(&self) -> std::io::Result<()> {
+        match self.mutation_fence() {
+            Some(fence) => fence.seal().await,
+            None => Ok(()),
+        }
     }
 }
 
