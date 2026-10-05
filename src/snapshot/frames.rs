@@ -258,9 +258,25 @@ impl Mst2Client {
     /// Idempotent lease release. Returns whether an active lease was
     /// removed; this never deletes Git content.
     pub async fn release_lease(&self, lease_id: &str) -> Result<bool, SnapshotError> {
+        #[derive(serde::Deserialize)]
+        struct ReleaseReceipt {
+            lease_id: String,
+            released: bool,
+        }
+
         let url = format!("{}/api/v2/snapshots/leases/{lease_id}", self.base());
         let v = self.delete_json(&url).await?;
-        Ok(v.get("released").and_then(|v| v.as_bool()).unwrap_or(false))
+        let invalid = || {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "lease release receipt does not bind to the requested lease",
+            )
+        };
+        let receipt: ReleaseReceipt = serde_json::from_value(v).map_err(|_| invalid())?;
+        if receipt.lease_id != lease_id {
+            return Err(invalid());
+        }
+        Ok(receipt.released)
     }
 
     /// HEAD blob: exact size and strong ETag without downloading content.
