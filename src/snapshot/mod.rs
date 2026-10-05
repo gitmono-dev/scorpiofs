@@ -23,6 +23,7 @@ pub mod fuse;
 mod fuse_owned;
 pub mod incremental;
 pub mod layer;
+mod lease_wire;
 mod lookup;
 mod owned_range;
 mod owned_reader;
@@ -30,6 +31,7 @@ mod owned_transport;
 mod proven_file;
 pub mod range;
 pub mod reader;
+mod resolve_receipt;
 mod resolve_wire;
 pub mod types;
 
@@ -45,6 +47,7 @@ pub use owned_range::{OwnedChunkedFile, VerifiedRange};
 pub use proven_file::{FileMembershipError, ProvenSnapshotFile};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
+pub use resolve_receipt::ResolveTraceReceipt;
 pub use types::{
     Capabilities, Descriptor, DirEntry, DirectoryResponse, LookupResult, SnapshotError,
     SnapshotErrorCode,

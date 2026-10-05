@@ -282,9 +282,18 @@ impl Mst2Client {
         lease_id: &str,
         lease_seconds: u64,
     ) -> Result<serde_json::Value, SnapshotError> {
-        let url = format!("{}/api/v2/snapshots/leases/{lease_id}/renew", self.base());
-        self.post_json(&url, serde_json::json!({ "lease_seconds": lease_seconds }))
-            .await
+        if !(60..=3600).contains(&lease_seconds) {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                "renewal lease suggestion must be between 60 and 3600 seconds",
+            ));
+        }
+        let url = super::lease_wire::url(self, lease_id, true)?;
+        let value = self
+            .post_json(&url, serde_json::json!({ "lease_seconds": lease_seconds }))
+            .await?;
+        super::lease_wire::validate(&value, lease_id)?;
+        Ok(value)
     }
 
     /// Idempotent lease release. Canonical 204 returns true for acknowledgement;
@@ -307,7 +316,7 @@ impl Mst2Client {
             released: bool,
         }
 
-        let url = format!("{}/api/v2/snapshots/leases/{lease_id}", self.base());
+        let url = super::lease_wire::url(self, lease_id, false)?;
         let Some(v) = self.delete_release_json(&url).await? else {
             return Ok(LeaseReleaseOutcome::Acknowledged);
         };
