@@ -125,6 +125,66 @@ class SessionBudgetTests(unittest.TestCase):
     def test_owned_reaped_leader_cannot_hide_live_descendant_that_ignores_term(self):
         self.actual_owned_failure("leader")
 
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux startup identity failure")
+    def test_failed_owned_startup_identity_still_reaps_before_owned_finally(self):
+        self.actual_owned_failure("startup")
+
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux startup abort ownership")
+    def test_command_startup_identity_errors_reap_the_direct_child_without_renewing_deadline(self):
+        original = subprocess.Popen
+        for error in (PermissionError("fixture identity access"), FileNotFoundError("fixture identity missing")):
+            spawned = []
+            def start(*args, **kwargs):
+                process = original(*args, **kwargs)
+                spawned.append(process)
+                return process
+            deadline = time.monotonic() + 2
+            with patch.object(budget.subprocess, "Popen", side_effect=start), \
+                    patch.object(budget, "process_start", side_effect=error):
+                with self.assertRaises(PermissionError if isinstance(error, PermissionError) else AssertionError):
+                    budget.run_process([sys.executable, "-c", "import time; time.sleep(30)"], deadline)
+            self.assertIsNotNone(spawned[0].returncode)
+            self.assertFalse(Path(f"/proc/{spawned[0].pid}").exists())
+            self.assertLess(time.monotonic(), deadline)
+            for pipe in (spawned[0].stdout, spawned[0].stderr):
+                pipe.close()
+
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux short child reap")
+    def test_missing_exited_startup_leader_is_reaped_without_signalling_an_unbound_group(self):
+        original = subprocess.Popen
+        spawned = []
+        def start(*args, **kwargs):
+            process = original(*args, **kwargs)
+            # EOF proves the short child exited, without poll/wait releasing its
+            # PID before the production startup error path reaps it.
+            self.assertEqual(process.stdout.read(), b"")
+            spawned.append(process)
+            return process
+        deadline = time.monotonic() + 2
+        with patch.object(budget.subprocess, "Popen", side_effect=start), \
+                patch.object(budget, "process_start", side_effect=FileNotFoundError), \
+                patch.object(budget.os, "getpgid", side_effect=ProcessLookupError), \
+                patch.object(budget.os, "killpg") as signal_group:
+            self.assertEqual(budget.run_process([sys.executable, "-c", "pass"], deadline), (0, b"", b""))
+            signal_group.assert_not_called()
+        self.assertEqual(spawned[0].returncode, 0)
+        self.assertFalse(Path(f"/proc/{spawned[0].pid}").exists())
+        self.assertLess(time.monotonic(), deadline)
+
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux group scan checkpoint")
+    def test_empty_group_scan_finishing_after_deadline_cannot_report_cleanup_success(self):
+        original = budget.group_members
+        deadline = time.monotonic() + .05
+        def late_scan(*args):
+            members = original(*args)
+            time.sleep(.07)
+            return members
+        with patch.object(budget, "group_members", side_effect=late_scan), \
+                patch.object(budget.os, "killpg") as signal_group:
+            with self.assertRaises(TimeoutError):
+                budget.stop_group(-1, "0", deadline)
+            signal_group.assert_not_called()
+
     @unittest.skipUnless(sys.platform == "linux", "actual Linux successful leader cleanup")
     def test_successful_short_command_still_cleans_child_that_closed_inherited_pipes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -209,6 +269,11 @@ class SessionBudgetTests(unittest.TestCase):
                 deadline = min(time.monotonic() + 2, args.budget.cleanup_deadline - 1)
                 original_command([sys.executable, "-c", "import time; time.sleep(30)"], deadline)
             ready = {"return_value": Ready()} if failure == "round" else {"side_effect": OSError}
+            original_process_start = budget.process_start
+            def process_start(pid):
+                if failure == "startup":
+                    raise PermissionError("fixture startup identity failure")
+                return original_process_start(pid)
             # Docker/DB are fixture stubs; the service Popen, /proc identity,
             # owned finally, TERM/group cleanup and reap are actual Linux code.
             with patch.dict(os.environ), \
@@ -221,9 +286,12 @@ class SessionBudgetTests(unittest.TestCase):
                     patch.object(ci, "initialize_owned_native", return_value={"correctness": "PASS"}), \
                     patch.object(ci, "urlopen", **ready), \
                     patch.object(ci.bench, "execute", side_effect=round_timeout), \
+                    patch.object(budget, "process_start", side_effect=process_start), \
                     patch.object(ci, "stop_owned", side_effect=stop), \
                     patch("sys.stdout", new_callable=io.StringIO):
-                with self.assertRaises(bench.PhaseFailure if failure == "round" else RuntimeError):
+                expected_error = (PermissionError if failure == "startup"
+                                  else bench.PhaseFailure if failure == "round" else RuntimeError)
+                with self.assertRaises(expected_error):
                     ci.execute(opts)
             self.assertEqual(cleanup_deadlines, [shared.cleanup_deadline])
             state = json.loads((root / "owned.json").read_text())
@@ -253,6 +321,23 @@ class SessionBudgetTests(unittest.TestCase):
                 self.assertNotIn('"correctness": "PASS"', output.getvalue())
             self.assertEqual(seen, [deadline, deadline, deadline])
             self.assertEqual(json.loads((root / "owned.json").read_text()), state)
+
+    def test_cleanup_final_inventory_and_metadata_checkpoints_never_emit_late_pass(self):
+        for checkpoint in ("inventory", "metadata"):
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                compose = b"{}"
+                (root / "dependencies.json").write_bytes(compose)
+                state = {"project": "owned", "compose_sha256": hashlib.sha256(compose).hexdigest()}
+                (root / "owned.json").write_text(json.dumps(state))
+                # Inventory and state serialization each have a final checkpoint.
+                times = [0, 2] if checkpoint == "metadata" else [2]
+                with patch.object(ci.bench, "command", return_value=b""), \
+                        patch.object(ci.time, "monotonic", side_effect=times), \
+                        patch("sys.stdout", new_callable=io.StringIO) as output:
+                    with self.assertRaises(TimeoutError):
+                        ci.stop_owned(root, "owned", 1)
+                    self.assertNotIn('"correctness": "PASS"', output.getvalue())
 
 
 if __name__ == "__main__":

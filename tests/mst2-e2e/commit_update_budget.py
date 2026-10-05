@@ -95,9 +95,10 @@ def group_members(pgid, started):
             continue
         if int(fields[2]) != pgid:
             continue
-        if int(fields[3]) != pgid or int(fields[19]) < int(started):
+        if (int(fields[3]) != pgid
+                or (started is not None and int(fields[19]) < int(started))):
             raise AssertionError("owned process group identity changed")
-        if int(proc.name) == pgid and fields[19] != str(started):
+        if started is not None and int(proc.name) == pgid and fields[19] != str(started):
             raise AssertionError("owned group leader identity was replaced")
         if fields[0] not in ("Z", "X"):
             members.append(int(proc.name))
@@ -125,12 +126,38 @@ def stop_group(pgid, started, deadline, process=None):
             raise TimeoutError("owned group remained active at its original deadline")
     if process is not None:
         process.wait(timeout=max(0, deadline - time.monotonic()))
+    if time.monotonic() >= deadline:
+        raise TimeoutError("owned group verification exceeded original deadline")
 
 
 def process_start(pid):
     if sys.platform == "linux":
         return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
     return None
+
+
+def abort_startup(process, deadline):
+    """A direct unreaped Popen child pins its PID while startup is rejected."""
+    if process.returncode is not None:
+        raise AssertionError("startup abort requires an unreaped owned child")
+    try:
+        pgid, sid = os.getpgid(process.pid), os.getsid(process.pid)
+    except ProcessLookupError:
+        # No leader is distinct from an unreadable/replaced leader. Do not
+        # signal an unbound group; still reap this direct child and fail closed
+        # if any active group remains.
+        if group_members(process.pid, None):
+            raise AssertionError("missing startup leader still has an unbound group") from None
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+        if time.monotonic() >= deadline:
+            raise TimeoutError("startup reap exceeded original deadline")
+        return False
+    if pgid != process.pid or sid != process.pid:
+        raise AssertionError("startup child is outside its owned new-session group")
+    # No poll/communicate/wait has released this direct child PID. Group scans
+    # and signals finish before stop_group reaps it, even if its leader exits.
+    stop_group(process.pid, None, deadline, process)
+    return True
 
 
 def run_process(args, deadline, env=None, data=None, capture=True):
@@ -145,7 +172,7 @@ def run_process(args, deadline, env=None, data=None, capture=True):
                                stdout=subprocess.PIPE if capture else None,
                                stderr=subprocess.PIPE if capture else None,
                                env=env, start_new_session=True)
-    started = process_start(process.pid)
+    started = None
 
     def signal_group(signum):
         try:
@@ -154,6 +181,10 @@ def run_process(args, deadline, env=None, data=None, capture=True):
             pass
 
     def terminate():
+        if started is None:
+            if process.returncode is None:
+                abort_startup(process, deadline)
+            return
         signal_group(signal.SIGTERM)
         killed = False
         term_until = min(deadline, time.monotonic() + reserve / 2)
@@ -177,6 +208,14 @@ def run_process(args, deadline, env=None, data=None, capture=True):
             stop_group(process.pid, started, deadline, process)
 
     try:
+        started = process_start(process.pid)
+    except FileNotFoundError:
+        if abort_startup(process, deadline):
+            raise AssertionError("startup process identity could not be established") from None
+    except BaseException:
+        abort_startup(process, deadline)
+        raise
+    try:
         output, error = process.communicate(data, timeout=max(0, run_until - time.monotonic()))
     except subprocess.TimeoutExpired:
         terminate()
@@ -188,6 +227,8 @@ def run_process(args, deadline, env=None, data=None, capture=True):
     # close inherited pipes and its leader returns a successful exit status.
     if started is not None:
         stop_group(process.pid, started, deadline, process)
+    if time.monotonic() >= deadline:
+        raise TimeoutError("owned child verification exceeded original deadline")
     return process.returncode, output, error
 
 

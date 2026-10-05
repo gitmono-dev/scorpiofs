@@ -204,8 +204,12 @@ def stop_owned(root, project, deadline, process=None):
                              "name=^" + project + "-network$"], deadline)
     if containers.strip() or network.strip():
         raise AssertionError("owned cleanup left project containers or network")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("owned cleanup inventory exceeded original deadline")
     state.pop("service", None)
     state_path.write_text(json.dumps(state))
+    if time.monotonic() >= deadline:
+        raise TimeoutError("owned cleanup metadata exceeded original deadline")
     print(json.dumps({"record": "owned_cleanup", "project": project, "correctness": "PASS"}), flush=True)
 
 
@@ -287,9 +291,20 @@ def execute(options):
         process = subprocess.Popen(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                    env=service_env, start_new_session=True)
-        state["service"] = {"pid": process.pid, "pgid": process.pid, "sid": process.pid,
-                            "starttime": budget_module.process_start(process.pid)}
-        state_path.write_text(json.dumps(state))
+        started = None
+        try:
+            started = budget_module.process_start(process.pid)
+            state["service"] = {"pid": process.pid, "pgid": process.pid, "sid": process.pid,
+                                "starttime": started}
+            state_path.write_text(json.dumps(state))
+        except BaseException:
+            # Startup identity/state failures must not bypass owned finally.
+            # The direct Popen child is still unreaped and pins its group ID.
+            if started is None:
+                budget_module.abort_startup(process, budget.cleanup_deadline)
+            else:
+                budget_module.stop_group(process.pid, started, budget.cleanup_deadline, process)
+            raise
         base = f"http://127.0.0.1:{ports['http']}"
         ready_until = min(deadline, time.monotonic() + 180)
         while True:

@@ -321,7 +321,8 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 return b"", b""
         child = Hung()
         with patch.object(BENCH.budget_module.subprocess, "Popen", return_value=child), \
-                patch.object(BENCH.budget_module, "process_start", return_value=None), \
+                patch.object(BENCH.budget_module, "process_start", return_value="1"), \
+                patch.object(BENCH.budget_module, "stop_group") as stop_group, \
                 patch.object(BENCH.os, "killpg", create=True) as killpg, \
                 patch.object(BENCH.budget_module.signal, "SIGKILL", 9, create=True):
             with self.assertRaises(TimeoutError):
@@ -330,6 +331,8 @@ class CommitUpdateBenchTests(unittest.TestCase):
                              [BENCH.budget_module.signal.SIGTERM, BENCH.budget_module.signal.SIGKILL])
             self.assertTrue(all(call.args[0] == 12345 for call in killpg.call_args_list))
             self.assertEqual(child.calls, 3)
+            self.assertEqual(stop_group.call_args.args[:2], (12345, "1"))
+            self.assertIs(stop_group.call_args.args[3], child)
 
     @unittest.skipUnless(hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"), "Linux durability primitive")
     def test_durable_flush_includes_regular_files_and_directories_without_following_symlinks(self):
