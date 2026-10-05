@@ -147,7 +147,7 @@ impl Mst2Client {
         let body = serde_json::to_vec(&req)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         let raw = self
-            .post_octets(self.snap_url(&format!("/{sid}/metadata/pages")), body)
+            .post_treeframe(self.snap_url(&format!("/{sid}/metadata/pages")), body, sid)
             .await?;
         let frames = mst2_codec::treeframe::parse_stream(&raw)
             .map_err(|e| frame_err("metadata/pages stream", e))?;
@@ -198,7 +198,7 @@ impl Mst2Client {
         let body = serde_json::to_vec(&req)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         let raw = self
-            .post_octets(self.snap_url(&format!("/{sid}/objects")), body.clone())
+            .post_treeframe(self.snap_url(&format!("/{sid}/objects")), body.clone(), sid)
             .await?;
         let frames = mst2_codec::treeframe::parse_stream(&raw)
             .map_err(|e| frame_err("objects stream", e))?;
@@ -378,7 +378,7 @@ impl Mst2Client {
         let body = serde_json::to_vec(&req)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         let raw = self
-            .post_octets(self.snap_url(&format!("/{sid}/chunks")), body.clone())
+            .post_treeframe(self.snap_url(&format!("/{sid}/chunks")), body.clone(), sid)
             .await?;
         let frames =
             mst2_codec::treeframe::parse_stream(&raw).map_err(|e| frame_err("chunks stream", e))?;
