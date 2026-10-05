@@ -155,16 +155,18 @@ jobs:
           docker run --rm scorpiofs:ci workspace --help
           docker run --rm --entrypoint sh scorpiofs:ci -c 'test ! -e /usr/local/bin/antares'
 
-          # The entrypoint must refuse `serve` without backend URLs.
+          # The entrypoint must refuse `serve` without the actual MST/2 URL.
           if docker run --rm scorpiofs:ci serve; then
-            echo "entrypoint accepted serve without SCORPIO_BASE_URL/SCORPIO_LFS_URL" >&2
+            echo "entrypoint accepted serve without SCORPIO_MST2_BASE_URL" >&2
             exit 1
           fi
 
+          # The shipped CLI endpoint flag is also an explicit live endpoint.
+          docker run --rm scorpiofs:ci --mst2-base-url http://mega.example:8000 config validate
+
           # The baked config plus the image ENV overrides must validate.
           docker run --rm \
-            -e SCORPIO_BASE_URL=http://mega.example:8000 \
-            -e SCORPIO_LFS_URL=http://mega.example:8000/api/v1/lfs \
+            -e SCORPIO_MST2_BASE_URL=http://mega.example:8000 \
             scorpiofs:ci config validate
 
           # FUSE prerequisites inside the container (the same device/cap/apparmor
@@ -172,6 +174,5 @@ jobs:
           # non-writable runtime dirs; an unreachable mega server is only a warning.
           docker run --rm \
             --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
-            -e SCORPIO_BASE_URL=http://mega.example:8000 \
-            -e SCORPIO_LFS_URL=http://mega.example:8000/api/v1/lfs \
+            -e SCORPIO_MST2_BASE_URL=http://mega.example:8000 \
             scorpiofs:ci doctor

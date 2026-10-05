@@ -172,12 +172,11 @@ fn check_fuse_conf() {
 }
 
 fn check_directories(failures: &mut u32) {
+    let paths = config::runtime_paths();
     for (name, path) in [
-        ("workspace", config::workspace()),
-        ("store_path", config::store_path()),
-        ("antares_upper_root", config::antares_upper_root()),
-        ("antares_cl_root", config::antares_cl_root()),
-        ("antares_mount_root", config::antares_mount_root()),
+        ("store_path", paths.store_path.as_str()),
+        ("workspace_root", paths.workspace_root.as_str()),
+        ("cache_root", paths.cache_root.as_str()),
     ] {
         match check_writable(path) {
             Ok(()) => report(Status::Ok, name, &format!("{path} is writable")),
@@ -217,7 +216,7 @@ fn check_writable(path: &str) -> Result<(), String> {
 }
 
 async fn check_mega() {
-    let base = config::base_url();
+    let base = config::mst2_base_url();
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

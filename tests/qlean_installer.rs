@@ -100,6 +100,7 @@ async fn run_workspace_kernel_checked(vm: &mut qlean::Machine, command: &str) ->
     let combined = format!("{stdout}\n{stderr}");
     let named_result = format!("test {WORKSPACE_KERNEL_TEST} ... ok");
     let markers = [
+        "V3_KERNEL_MOUNT_IDENTITY_RUN",
         "PRE_TRANSACTION_HYDRATION_OBSERVE_RUN:",
         "RUNNING_HYDRATION_OBSERVE_RUN:",
         "RUNNING_HYDRATION_CANCEL_RUN:",

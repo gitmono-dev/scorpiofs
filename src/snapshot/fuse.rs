@@ -2,9 +2,8 @@
 //!
 //! Minimal, self-contained mount over [`SnapshotReader`]: every name maps
 //! through the fixed view (no live-ref following); file content comes from
-//! digest-verified blob reads cached in memory. The Antares overlay also uses
-//! this view as its read-only lower layer; writes
-//! stay in the upper layer.
+//! digest-verified blob reads cached in memory. A workspace OverlayFs uses
+//! this view as its read-only lower layer; writes stay in its private upper.
 //!
 //! Symlinks are served with real symlink semantics (spec 07 §1): the view
 //! exposes them as `fs_kind = "symlink"` whose content is the target bytes,
@@ -1561,9 +1560,8 @@ impl Filesystem for Mst2Fuse {
     // ---- Read-only layer: deny every mutation with EROFS (spec 12 §7).
     //
     // The snapshot view is immutable; writes belong to the upper layer of the
-    // overlay. Answering EROFS (not the trait default ENOSYS) keeps the
-    // behaviour identical to the Dicfuse lower layer, so the union filesystem
-    // and the kernel treat this layer as read-only rather than unsupported.
+    // overlay. Answering EROFS (not the trait default ENOSYS) lets the union
+    // filesystem and kernel treat this layer as read-only rather than unsupported.
 
     async fn setattr(
         &self,

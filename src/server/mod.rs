@@ -90,7 +90,9 @@ pub async fn mount_filesystem_with_writeback_cache<
     let gid = unsafe { libc::getgid() };
 
     let mut mount_options = MountOptions::default();
-    mount_options.uid(uid).gid(gid);
+    // The kernel source label supports installer checks against a live owner's
+    // workspace observations. The label alone never establishes ownership.
+    mount_options.uid(uid).gid(gid).fs_name("scorpiofs-v3");
     // allow_other / force_readdir_plus are Linux FUSE concepts. macFUSE does
     // not advertise READDIRPLUS, and same-user Finder/Terminal access does not
     // need allow_other.

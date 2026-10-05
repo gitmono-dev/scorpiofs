@@ -2,7 +2,7 @@
 #
 # ScorpioFS interactive installer.
 #
-# With no arguments this script asks for the Mega/monorepo URLs, local paths,
+# With no arguments this script asks for the MST/2 URL, local paths,
 # HTTP bind address, and whether to install a systemd service. It also keeps a
 # non-interactive mode for automation and the original release-install flags.
 #
@@ -24,19 +24,16 @@ RELEASE_BASE_URL="${SCORPIO_RELEASE_BASE_URL:-https://github.com/${REPO}/release
 PREFIX="${SCORPIO_PREFIX:-/usr/local}"
 CONFDIR="${SCORPIO_CONFDIR:-/etc/scorpiofs}"
 DATA_ROOT="${SCORPIO_DATA_ROOT:-/var/lib/scorpiofs}"
-BASE_URL="${SCORPIO_BASE_URL:-}"
-LFS_URL="${SCORPIO_LFS_URL:-}"
-WORKSPACE="${SCORPIO_WORKSPACE:-}"
+MST2_BASE_URL="${SCORPIO_MST2_BASE_URL:-}"
 STORE_PATH="${SCORPIO_STORE_PATH:-}"
+WORKSPACE_ROOT=""
+CACHE_ROOT=""
+PREVIOUS_WORKSPACE_ROOT=""
+PREVIOUS_CACHE_ROOT=""
+OWNED_MOUNTS_FILE=""
+OWNED_SERVICE_PID=""
 HTTP_ADDR="${SCORPIO_HTTP_ADDR:-127.0.0.1:2725}"
-GIT_AUTHOR="${SCORPIO_GIT_AUTHOR:-MEGA}"
-GIT_EMAIL="${SCORPIO_GIT_EMAIL:-admin@mega.org}"
 SERVICE_USER="${SCORPIO_SERVICE_USER:-scorpiofs}"
-CONFIG_FILE=""
-ANTARES_UPPER_ROOT=""
-ANTARES_CL_ROOT=""
-ANTARES_MOUNT_ROOT=""
-ANTARES_STATE_FILE=""
 
 DRY_RUN=0
 DO_UNINSTALL=0
@@ -51,7 +48,6 @@ SERVICE_CHOICE_SET=0
 FUSE_CHOICE_SET=0
 CONFIG_CHOICE_SET=0
 DATA_ROOT_SET=0
-WORKSPACE_SET=0
 STORE_PATH_SET=0
 EXISTING_CONFIG=0
 RETAIN_CONFIG=0
@@ -68,17 +64,9 @@ HAD_OLD_SCORPIO=0
 HAD_OLD_ANTARES=0
 HAD_OLD_CONFIG=0
 HAD_OLD_UNIT=0
-PREVIOUS_WORKSPACE=""
-PREVIOUS_ANTARES_MOUNT_ROOT=""
 PREVIOUS_DATA_ROOT=""
 PREVIOUS_STORE_PATH=""
-PREVIOUS_ANTARES_UPPER_ROOT=""
-PREVIOUS_ANTARES_CL_ROOT=""
-PREVIOUS_CONFIG_FILE=""
-PREVIOUS_ANTARES_STATE_FILE=""
-PREVIOUS_RUNTIME_PARENT_DIRS=()
 EXTRACTED_RELEASE=""
-REQUESTED_WORKSPACE=""
 REQUESTED_STORE_PATH=""
 WORKDIR=""
 SUDO_BIN=""
@@ -89,7 +77,6 @@ BIND_HOST=""
 BIND_PORT=""
 
 [ -z "${SCORPIO_DATA_ROOT:-}" ] || DATA_ROOT_SET=1
-[ -z "${SCORPIO_WORKSPACE:-}" ] || WORKSPACE_SET=1
 [ -z "${SCORPIO_STORE_PATH:-}" ] || STORE_PATH_SET=1
 
 cleanup() {
@@ -139,7 +126,7 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [options]
 
-Interactive mode is the default. It asks for the remote URLs, local paths,
+Interactive mode is the default. It asks for the MST/2 URL, local paths,
 HTTP bind address, FUSE permission, and whether to install a systemd service.
 
 Options:
@@ -148,9 +135,7 @@ Options:
   --prefix <dir>            Binary prefix (default: /usr/local).
   --config-dir <dir>        Config directory (default: /etc/scorpiofs).
   --data-root <dir>         Runtime/data root (default: /var/lib/scorpiofs).
-  --base-url <url>          Mega/monorepo service URL.
-  --lfs-url <url>           Git LFS endpoint URL.
-  --workspace <dir>         FUSE workspace inside data-root.
+  --mst2-base-url <url>     MST/2 service URL.
   --store-path <dir>        Local cache/store inside data-root.
   --http-addr <socket>      IPv4:port or [IPv6]:port (default: 127.0.0.1:2725).
   --allow-public-api        Permit a non-loopback HTTP bind (use a firewall/auth proxy).
@@ -167,7 +152,7 @@ Options:
 
 Examples:
   sudo bash install.sh
-  bash install.sh --base-url https://mega.example.com --lfs-url https://mega.example.com/lfs
+  bash install.sh --mst2-base-url https://mega.example.com
   bash install.sh --version v0.4.0 --non-interactive --overwrite-config --dry-run
 
 The HTTP API has no authentication. The installer therefore defaults to
@@ -270,7 +255,8 @@ prompt_yes_no() {
 
 validate_url() {
     local field="$1" value="$2"
-    validate_toml_text "$field" "$value"
+    local LC_ALL=C
+    [[ ! "$value" =~ [[:cntrl:]] ]] || die "$field must not contain control characters"
     case "$value" in
         http://*|https://*) ;;
         *) die "$field must start with http:// or https:// (got: $value)" ;;
@@ -371,7 +357,6 @@ canonicalize_paths() {
     PREFIX="$(realpath -m -- "$PREFIX")"
     CONFDIR="$(realpath -m -- "$CONFDIR")"
     DATA_ROOT="$(realpath -m -- "$DATA_ROOT")"
-    WORKSPACE="$(realpath -m -- "$WORKSPACE")"
     STORE_PATH="$(realpath -m -- "$STORE_PATH")"
 }
 
@@ -412,12 +397,7 @@ require_path_in_data_root() {
 
 validate_data_paths() {
     validate_data_root
-    require_path_in_data_root workspace "$WORKSPACE"
     require_path_in_data_root store-path "$STORE_PATH"
-    local runtime_file
-    for runtime_file in "$DATA_ROOT/config.toml" "$DATA_ROOT/antares/state.toml"; do
-        [ ! -L "$runtime_file" ] || die "runtime state file must not be a symbolic link: $runtime_file"
-    done
     [ ! -L "$CONFDIR/scorpio.toml" ] || die "config file must not be a symbolic link: $CONFDIR/scorpio.toml"
     if [ "$EXISTING_CONFIG" -eq 0 ] && data_root_is_nonempty; then
         die "refusing to change ownership of a nonempty data-root without an existing ScorpioFS config: $DATA_ROOT"
@@ -425,33 +405,27 @@ validate_data_paths() {
 }
 
 canonicalize_runtime_paths() {
-    WORKSPACE="$(realpath -m -- "$WORKSPACE")"
     STORE_PATH="$(realpath -m -- "$STORE_PATH")"
-    CONFIG_FILE="$(realpath -m -- "$CONFIG_FILE")"
-    ANTARES_UPPER_ROOT="$(realpath -m -- "$ANTARES_UPPER_ROOT")"
-    ANTARES_CL_ROOT="$(realpath -m -- "$ANTARES_CL_ROOT")"
-    ANTARES_MOUNT_ROOT="$(realpath -m -- "$ANTARES_MOUNT_ROOT")"
-    ANTARES_STATE_FILE="$(realpath -m -- "$ANTARES_STATE_FILE")"
+    WORKSPACE_ROOT="$STORE_PATH/workspaces-v3"
+    CACHE_ROOT="$STORE_PATH/mst2-cache"
 }
 
 validate_runtime_paths() {
     local field value i
-    local -a fields=(workspace store-path config-file antares-upper-root antares-cl-root antares-mount-root antares-state-file)
-    local -a values=("$WORKSPACE" "$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" "$ANTARES_STATE_FILE")
+    local -a fields=(store-path workspace-root cache-root)
+    local -a values=("$STORE_PATH" "$WORKSPACE_ROOT" "$CACHE_ROOT")
     for ((i = 0; i < ${#fields[@]}; i++)); do
         validate_path "${fields[$i]}" "${values[$i]}"
     done
     canonicalize_runtime_paths
-    values=("$WORKSPACE" "$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" "$ANTARES_STATE_FILE")
     validate_data_root
+    values=("$STORE_PATH" "$WORKSPACE_ROOT" "$CACHE_ROOT")
     for ((i = 0; i < ${#fields[@]}; i++)); do
         field="${fields[$i]}"
         value="${values[$i]}"
         validate_path "$field" "$value"
         require_path_in_data_root "$field" "$value"
     done
-    [ ! -L "$CONFIG_FILE" ] || die "runtime state file must not be a symbolic link: $CONFIG_FILE"
-    [ ! -L "$ANTARES_STATE_FILE" ] || die "runtime state file must not be a symbolic link: $ANTARES_STATE_FILE"
     validate_runtime_path_separation
 }
 
@@ -469,47 +443,21 @@ path_is_at_or_below() {
 }
 
 validate_runtime_path_separation() {
-    local mount_field mount_path persistent_field persistent_path installer_field installer_path i j
-    local -a mount_fields=(workspace antares-mount-root)
-    local -a mount_paths=("$WORKSPACE" "$ANTARES_MOUNT_ROOT")
-    local -a persistent_fields=(store-path config-file antares-upper-root antares-cl-root antares-state-file)
-    local -a persistent_paths=("$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_STATE_FILE")
-    local -a installer_fields=(scorpio-binary antares-binary main-config)
-    local -a installer_paths=(
-        "$(realpath -m -- "${PREFIX}/bin/scorpio")"
-        "$(realpath -m -- "${PREFIX}/bin/antares")"
-        "$(realpath -m -- "${CONFDIR}/scorpio.toml")"
-    )
-    for ((i = 0; i < ${#mount_fields[@]}; i++)); do
-        mount_field="${mount_fields[$i]}"
-        mount_path="${mount_paths[$i]}"
-        for ((j = 0; j < ${#persistent_fields[@]}; j++)); do
-            persistent_field="${persistent_fields[$j]}"
-            persistent_path="${persistent_paths[$j]}"
-            if paths_overlap "$mount_path" "$persistent_path"; then
-                die "$mount_field must not overlap $persistent_field: $mount_path and $persistent_path"
-            fi
-        done
-        for ((j = 0; j < ${#installer_fields[@]}; j++)); do
-            installer_field="${installer_fields[$j]}"
-            installer_path="${installer_paths[$j]}"
-            if path_is_at_or_below "$installer_path" "$mount_path"; then
-                die "$mount_field must not contain $installer_field: $installer_path"
-            fi
-        done
+    local installer_path
+    for installer_path in "${PREFIX}/bin/scorpio" "${PREFIX}/bin/antares" "${CONFDIR}/scorpio.toml"; do
+        installer_path="$(realpath -m -- "$installer_path")"
+        if paths_overlap "$STORE_PATH" "$installer_path"; then
+            die "store-path must not overlap an installer artifact: $installer_path"
+        fi
     done
-    if paths_overlap "$WORKSPACE" "$ANTARES_MOUNT_ROOT"; then
-        die "workspace must not overlap antares-mount-root: $WORKSPACE and $ANTARES_MOUNT_ROOT"
-    fi
 }
 
 normalize_runtime_paths() {
-    local i
-    local -a fields=(workspace store-path config-file antares-upper-root antares-cl-root antares-mount-root antares-state-file)
-    local -a values=("$WORKSPACE" "$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" "$ANTARES_STATE_FILE")
-    for ((i = 0; i < ${#fields[@]}; i++)); do
-        validate_runtime_path_value "${fields[$i]}" "${values[$i]}"
-    done
+    validate_runtime_path_value store-path "$STORE_PATH"
+    validate_runtime_path_value workspace-root "$WORKSPACE_ROOT"
+    validate_runtime_path_value cache-root "$CACHE_ROOT"
+    [ "$WORKSPACE_ROOT" = "$STORE_PATH/workspaces-v3" ] && [ "$CACHE_ROOT" = "$STORE_PATH/mst2-cache" ] ||
+        die "installer received paths outside the v3 store layout"
 }
 
 validate_runtime_path_value() {
@@ -524,64 +472,27 @@ validate_runtime_path_value() {
     esac
 }
 
-common_path_ancestor() {
-    local candidate="$1" value
-    shift
-    for value in "$@"; do
-        while [ "$candidate" != "/" ]; do
-            case "$value" in
-                "$candidate"|"$candidate"/*) break ;;
-                *) candidate="${candidate%/*}"; [ -n "$candidate" ] || candidate="/" ;;
-            esac
-        done
-    done
-    printf '%s' "$candidate"
-}
-
 infer_data_root() {
     local failure_message="${1:-cannot infer data-root from an all-relative retained config; pass --data-root}"
     local root_label="${2:-data-root}"
-    local value
-    local -a anchors=()
-    for value in "$WORKSPACE" "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT"; do
-        if [[ "$value" == /* ]]; then anchors+=("$(dirname -- "$value")"); fi
-    done
-    for value in "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
-        if [[ "$value" == /* ]]; then anchors+=("$(dirname -- "$value")"); fi
-    done
-    [ "${#anchors[@]}" -gt 0 ] || die "$failure_message"
-    DATA_ROOT="$(realpath -m -- "$(common_path_ancestor "${anchors[@]}")")"
+    [[ "$STORE_PATH" == /* ]] || die "$failure_message"
+    DATA_ROOT="$(realpath -m -- "$(dirname -- "$STORE_PATH")")"
     note "using $root_label inferred from retained config: $DATA_ROOT"
 }
 
 retained_config_has_absolute_anchor() {
-    local value
-    for value in "$WORKSPACE" "$STORE_PATH" "$CONFIG_FILE" "$ANTARES_UPPER_ROOT" \
-        "$ANTARES_CL_ROOT" "$ANTARES_MOUNT_ROOT" "$ANTARES_STATE_FILE"; do
-        [[ "$value" == /* ]] && return 0
-    done
-    return 1
+    [[ "$STORE_PATH" == /* ]]
 }
 
 resolve_relative_runtime_paths() {
-    if [[ "$WORKSPACE" != /* ]]; then WORKSPACE="$DATA_ROOT/$WORKSPACE"; fi
     if [[ "$STORE_PATH" != /* ]]; then STORE_PATH="$DATA_ROOT/$STORE_PATH"; fi
-    if [[ "$CONFIG_FILE" != /* ]]; then CONFIG_FILE="$DATA_ROOT/$CONFIG_FILE"; fi
-    if [[ "$ANTARES_UPPER_ROOT" != /* ]]; then ANTARES_UPPER_ROOT="$DATA_ROOT/$ANTARES_UPPER_ROOT"; fi
-    if [[ "$ANTARES_CL_ROOT" != /* ]]; then ANTARES_CL_ROOT="$DATA_ROOT/$ANTARES_CL_ROOT"; fi
-    if [[ "$ANTARES_MOUNT_ROOT" != /* ]]; then ANTARES_MOUNT_ROOT="$DATA_ROOT/$ANTARES_MOUNT_ROOT"; fi
-    if [[ "$ANTARES_STATE_FILE" != /* ]]; then ANTARES_STATE_FILE="$DATA_ROOT/$ANTARES_STATE_FILE"; fi
     canonicalize_runtime_paths
 }
 
 set_generated_runtime_paths() {
-    if [ "$WORKSPACE_SET" -eq 1 ]; then WORKSPACE="$REQUESTED_WORKSPACE"; else WORKSPACE="$DATA_ROOT/mount"; fi
     if [ "$STORE_PATH_SET" -eq 1 ]; then STORE_PATH="$REQUESTED_STORE_PATH"; else STORE_PATH="$DATA_ROOT/store"; fi
-    CONFIG_FILE="$DATA_ROOT/config.toml"
-    ANTARES_UPPER_ROOT="$DATA_ROOT/antares/upper"
-    ANTARES_CL_ROOT="$DATA_ROOT/antares/cl"
-    ANTARES_MOUNT_ROOT="$DATA_ROOT/antares/mnt"
-    ANTARES_STATE_FILE="$DATA_ROOT/antares/state.toml"
+    WORKSPACE_ROOT="$STORE_PATH/workspaces-v3"
+    CACHE_ROOT="$STORE_PATH/mst2-cache"
 }
 
 run_scorpio_config_without_overrides() {
@@ -646,15 +557,17 @@ load_configured_runtime_paths() {
     if ! run_scorpio_config_without_overrides "$binary" installer-paths >"$output_file"; then
         die "could not safely resolve runtime paths from retained config: ${CONFDIR}/scorpio.toml"
     fi
+    python3 - "$output_file" <<'PY'
+import pathlib, sys
+fields = pathlib.Path(sys.argv[1]).read_bytes().split(b"\0")
+if len(fields) != 4 or fields[-1] != b"" or any(not field for field in fields[:3]):
+    raise SystemExit("installer requires exactly three terminated runtime path records")
+PY
     mapfile -d '' -t paths <"$output_file"
-    [ "${#paths[@]}" -eq 7 ] || die "installer received an invalid runtime-path response from scorpio"
-    WORKSPACE="${paths[0]}"
-    STORE_PATH="${paths[1]}"
-    CONFIG_FILE="${paths[2]}"
-    ANTARES_UPPER_ROOT="${paths[3]}"
-    ANTARES_CL_ROOT="${paths[4]}"
-    ANTARES_MOUNT_ROOT="${paths[5]}"
-    ANTARES_STATE_FILE="${paths[6]}"
+    [ "${#paths[@]}" -eq 3 ] || die "installer received an invalid runtime-path response from scorpio"
+    STORE_PATH="${paths[0]}"
+    WORKSPACE_ROOT="${paths[1]}"
+    CACHE_ROOT="${paths[2]}"
 }
 
 prepare_effective_runtime_paths() {
@@ -683,26 +596,10 @@ prepare_effective_runtime_paths() {
         fi
         resolve_relative_runtime_paths
         validate_runtime_paths
-        PREVIOUS_WORKSPACE="$WORKSPACE"
-        PREVIOUS_ANTARES_MOUNT_ROOT="$ANTARES_MOUNT_ROOT"
-        PREVIOUS_DATA_ROOT="$(common_path_ancestor \
-            "$(dirname -- "$WORKSPACE")" "$(dirname -- "$STORE_PATH")" \
-            "$(dirname -- "$CONFIG_FILE")" "$(dirname -- "$ANTARES_UPPER_ROOT")" \
-            "$(dirname -- "$ANTARES_CL_ROOT")" "$(dirname -- "$ANTARES_STATE_FILE")")"
+        PREVIOUS_DATA_ROOT="$(dirname -- "$STORE_PATH")"
         PREVIOUS_STORE_PATH="$STORE_PATH"
-        PREVIOUS_ANTARES_UPPER_ROOT="$ANTARES_UPPER_ROOT"
-        PREVIOUS_ANTARES_CL_ROOT="$ANTARES_CL_ROOT"
-        PREVIOUS_CONFIG_FILE="$CONFIG_FILE"
-        PREVIOUS_ANTARES_STATE_FILE="$ANTARES_STATE_FILE"
-        PREVIOUS_RUNTIME_PARENT_DIRS=()
-        local previous_path previous_parent
-        for previous_path in "$PREVIOUS_CONFIG_FILE" "$PREVIOUS_ANTARES_STATE_FILE"; do
-            previous_parent="$(dirname -- "$previous_path")"
-            while [[ "$previous_parent" == "$PREVIOUS_DATA_ROOT"/* ]]; do
-                PREVIOUS_RUNTIME_PARENT_DIRS+=("$previous_parent")
-                previous_parent="$(dirname -- "$previous_parent")"
-            done
-        done
+        PREVIOUS_WORKSPACE_ROOT="$WORKSPACE_ROOT"
+        PREVIOUS_CACHE_ROOT="$CACHE_ROOT"
     fi
 
     if [ "$RETAIN_CONFIG" -eq 1 ]; then
@@ -740,6 +637,14 @@ stop_active_service_for_upgrade() {
     [ "$SETUP_SERVICE" -eq 1 ] || return 0
     [ -n "$EXISTING_SERVICE_USER" ] || return 0
     if run_root systemctl is-active --quiet scorpiofs.service; then
+        if [ -n "$OWNED_SERVICE_PID" ]; then
+            [ "$(run_readonly systemctl show --property=MainPID --value scorpiofs.service)" = "$OWNED_SERVICE_PID" ] ||
+                die "managed service MainPID changed before stopping it"
+            capture_service_process "$OWNED_SERVICE_PID" "${WORKDIR}/process-before-stop" ||
+                die "managed service disappeared before its planned stop"
+            verify_captured_service_process "${WORKDIR}/process-before" "${WORKDIR}/process-before-stop" ||
+                die "managed service process/socket authority changed before stopping it"
+        fi
         note "stopping the active service before replacing its binary, config, or unit"
         if ! run_root systemctl stop scorpiofs.service; then
             die "could not stop scorpiofs.service before upgrading it"
@@ -806,9 +711,7 @@ parse_args() {
             --prefix) [ "$#" -ge 2 ] || die "--prefix needs a value"; PREFIX="$2"; shift 2 ;;
             --config-dir) [ "$#" -ge 2 ] || die "--config-dir needs a value"; CONFDIR="$2"; shift 2 ;;
             --data-root) [ "$#" -ge 2 ] || die "--data-root needs a value"; DATA_ROOT="$2"; DATA_ROOT_SET=1; shift 2 ;;
-            --base-url) [ "$#" -ge 2 ] || die "--base-url needs a value"; BASE_URL="$2"; shift 2 ;;
-            --lfs-url) [ "$#" -ge 2 ] || die "--lfs-url needs a value"; LFS_URL="$2"; shift 2 ;;
-            --workspace) [ "$#" -ge 2 ] || die "--workspace needs a value"; WORKSPACE="$2"; WORKSPACE_SET=1; shift 2 ;;
+            --mst2-base-url) [ "$#" -ge 2 ] || die "--mst2-base-url needs a value"; MST2_BASE_URL="$2"; shift 2 ;;
             --store-path) [ "$#" -ge 2 ] || die "--store-path needs a value"; STORE_PATH="$2"; STORE_PATH_SET=1; shift 2 ;;
             --http-addr) [ "$#" -ge 2 ] || die "--http-addr needs a value"; HTTP_ADDR="$2"; shift 2 ;;
             --allow-public-api) ALLOW_PUBLIC_API=1; shift ;;
@@ -838,7 +741,7 @@ apply_environment_options() {
 open_interactive_tty() {
     [ "$INTERACTIVE" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] || return 0
     if ! { exec 3<>/dev/tty; } 2>/dev/null; then
-        die "interactive input requires a controlling terminal; use --non-interactive with --base-url and --lfs-url"
+        die "interactive input requires a controlling terminal; use --non-interactive with --mst2-base-url"
     fi
     TTY_FD=3
 }
@@ -906,13 +809,13 @@ pkg_install() {
     [ "$INSTALL_DEPS" -eq 1 ] || { note "skipping dependency installation (--no-deps)"; return 0; }
     if command -v apt-get >/dev/null 2>&1; then
         run_root apt-get update
-        run_root apt-get install -y --no-install-recommends fuse3 openssl ca-certificates util-linux
+        run_root apt-get install -y --no-install-recommends fuse3 openssl ca-certificates util-linux python3
     elif command -v dnf >/dev/null 2>&1; then
-        run_root dnf install -y fuse3 openssl ca-certificates util-linux
+        run_root dnf install -y fuse3 openssl ca-certificates util-linux python3
     elif command -v pacman >/dev/null 2>&1; then
-        run_root pacman -Sy --noconfirm fuse3 openssl ca-certificates util-linux
+        run_root pacman -Sy --noconfirm fuse3 openssl ca-certificates util-linux python
     else
-        warn "no supported package manager found; install fuse3, openssl, ca-certificates, and util-linux manually"
+        warn "no supported package manager found; install fuse3, openssl, ca-certificates, util-linux, and python3 manually"
     fi
 }
 
@@ -920,6 +823,7 @@ check_runtime_tools() {
     command -v findmnt >/dev/null 2>&1 || die "findmnt is required (install util-linux)"
     command -v runuser >/dev/null 2>&1 || die "runuser is required (install util-linux)"
     command -v timeout >/dev/null 2>&1 || die "timeout is required (install coreutils)"
+    command -v python3 >/dev/null 2>&1 || die "python3 is required to verify live workspace and mount identities"
 }
 
 check_fuse() {
@@ -934,21 +838,14 @@ configure_interactively() {
     [ "$INTERACTIVE" -eq 1 ] || return 0
     printf '\nScorpioFS interactive installer\n'
     printf 'The remote HTTP API is unauthenticated and will default to loopback.\n\n'
-    prompt_value BASE_URL "Mega/monorepo base URL" "${BASE_URL:-http://localhost:8000}"
-    prompt_value LFS_URL "Git LFS URL" "${LFS_URL:-$(normalize_url "$BASE_URL")/lfs}"
-    local previous_data_root="$DATA_ROOT" workspace_default="${WORKSPACE:-$DATA_ROOT/mount}"
-    local store_default="${STORE_PATH:-$DATA_ROOT/store}"
+    prompt_value MST2_BASE_URL "MST/2 service URL" "${MST2_BASE_URL:-http://localhost:8000}"
+    local previous_data_root="$DATA_ROOT" store_default
     prompt_value DATA_ROOT "Data root" "$DATA_ROOT"
     [ "$DATA_ROOT" = "$previous_data_root" ] || DATA_ROOT_SET=1
-    workspace_default="${WORKSPACE:-$DATA_ROOT/mount}"
     store_default="${STORE_PATH:-$DATA_ROOT/store}"
-    prompt_value WORKSPACE "FUSE workspace" "$workspace_default"
-    [ "$WORKSPACE" = "$workspace_default" ] || WORKSPACE_SET=1
-    prompt_value STORE_PATH "Local store/cache" "$store_default"
+    prompt_value STORE_PATH "Local v3 store" "$store_default"
     [ "$STORE_PATH" = "$store_default" ] || STORE_PATH_SET=1
     prompt_value HTTP_ADDR "HTTP listen address" "$HTTP_ADDR"
-    prompt_value GIT_AUTHOR "Default Git author" "$GIT_AUTHOR"
-    prompt_value GIT_EMAIL "Default Git email" "$GIT_EMAIL"
     if [ "$FUSE_CHOICE_SET" -eq 0 ]; then
         prompt_yes_no ENABLE_USER_ALLOW_OTHER "Enable user_allow_other in /etc/fuse.conf" "y"
     fi
@@ -961,7 +858,6 @@ configure_interactively() {
     if [ -f "${CONFDIR}/scorpio.toml" ] && [ "$CONFIG_CHOICE_SET" -eq 0 ]; then
         prompt_yes_no OVERWRITE_CONFIG "Overwrite existing ${CONFDIR}/scorpio.toml" "n"
     fi
-
     validate_bind "$HTTP_ADDR"
     if ! is_loopback_host "$BIND_HOST" && [ "$ALLOW_PUBLIC_API" -ne 1 ]; then
         warn "${HTTP_ADDR} is not loopback. ScorpioFS has no HTTP authentication."
@@ -1015,40 +911,31 @@ detect_existing_config() {
 }
 
 validate_inputs() {
-    BASE_URL="$(normalize_url "$BASE_URL")"
-    LFS_URL="$(normalize_url "$LFS_URL")"
+    MST2_BASE_URL="$(normalize_url "$MST2_BASE_URL")"
     PREFIX="$(normalize_path "$PREFIX")"
     CONFDIR="$(normalize_path "$CONFDIR")"
     DATA_ROOT="$(normalize_path "$DATA_ROOT")"
-    WORKSPACE="$(normalize_path "$WORKSPACE")"
     STORE_PATH="$(normalize_path "$STORE_PATH")"
-    validate_url base_url "$BASE_URL"
-    validate_url lfs_url "$LFS_URL"
+    validate_url mst2_base_url "$MST2_BASE_URL"
     validate_url release-base-url "$RELEASE_BASE_URL"
     validate_path prefix "$PREFIX"
     validate_path config-dir "$CONFDIR"
     validate_path data-root "$DATA_ROOT"
-    validate_path workspace "$WORKSPACE"
     validate_path store-path "$STORE_PATH"
     canonicalize_paths
-    canonicalize_runtime_paths
     validate_path prefix "$PREFIX"
     validate_path config-dir "$CONFDIR"
     validate_path data-root "$DATA_ROOT"
-    validate_path workspace "$WORKSPACE"
     validate_path store-path "$STORE_PATH"
+    canonicalize_runtime_paths
     detect_existing_config
     validate_service_manager
     detect_existing_service_user
     validate_data_paths
     validate_runtime_paths
     validate_bind "$HTTP_ADDR"
-    is_loopback_host "$BIND_HOST" || [ "$ALLOW_PUBLIC_API" -eq 1 ] || \
+    is_loopback_host "$BIND_HOST" || [ "$ALLOW_PUBLIC_API" -eq 1 ] ||
         die "refusing non-loopback HTTP bind without --allow-public-api"
-    validate_toml_text "git author" "$GIT_AUTHOR"
-    validate_toml_text "git email" "$GIT_EMAIL"
-    [ -n "$GIT_AUTHOR" ] || die "git author must not be empty"
-    [ -n "$GIT_EMAIL" ] || die "git email must not be empty"
     [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid service user: $SERVICE_USER"
 }
 
@@ -1185,41 +1072,20 @@ restore_upgrade_artifacts() {
 restore_runtime_ownership() {
     [ -n "$EXISTING_SERVICE_USER" ] || return 0
     [ "$EXISTING_SERVICE_USER" = "$SERVICE_USER" ] && return 0
-
-    local previous_group runtime_dir runtime_file restore_failed=0
+    local previous_group runtime_dir restore_failed=0
     previous_group="$(id -gn "$EXISTING_SERVICE_USER")" || return 1
-    if [ -n "$PREVIOUS_DATA_ROOT" ] && run_root test -d "$PREVIOUS_DATA_ROOT" && \
+    if ! validate_mount_targets "$PREVIOUS_DATA_ROOT" "$PREVIOUS_STORE_PATH"; then
+        warn "${MOUNT_VALIDATION_ERROR}; skipping ownership restore"
+        return 1
+    fi
+    if [ -n "$PREVIOUS_DATA_ROOT" ] && run_root test -d "$PREVIOUS_DATA_ROOT" &&
         ! run_root chown "$EXISTING_SERVICE_USER:$previous_group" -- "$PREVIOUS_DATA_ROOT"; then
         restore_failed=1
     fi
-    local -a previous_runtime_dirs=(
-        "$PREVIOUS_STORE_PATH" "$PREVIOUS_ANTARES_UPPER_ROOT" "$PREVIOUS_ANTARES_CL_ROOT"
-    )
-    if ! validate_mount_targets "${previous_runtime_dirs[@]}"; then
-        warn "${MOUNT_VALIDATION_ERROR}; skipping recursive ownership restore"
+    if [ -n "$PREVIOUS_STORE_PATH" ] && run_root test -d "$PREVIOUS_STORE_PATH" &&
+        ! run_root chown -R -h -P "$EXISTING_SERVICE_USER:$previous_group" -- "$PREVIOUS_STORE_PATH"; then
         restore_failed=1
-    else
-        for runtime_dir in "${previous_runtime_dirs[@]}"; do
-            [ -n "$runtime_dir" ] || continue
-            if run_root test -d "$runtime_dir" && ! run_root chown -R -h -P \
-                "$EXISTING_SERVICE_USER:$previous_group" -- "$runtime_dir"; then
-                restore_failed=1
-            fi
-        done
     fi
-    for runtime_file in "$PREVIOUS_CONFIG_FILE" "$PREVIOUS_ANTARES_STATE_FILE"; do
-        [ -n "$runtime_file" ] || continue
-        if run_root test -e "$runtime_file" && ! run_root chown \
-            "$EXISTING_SERVICE_USER:$previous_group" -- "$runtime_file"; then
-            restore_failed=1
-        fi
-    done
-    for runtime_dir in "${PREVIOUS_RUNTIME_PARENT_DIRS[@]}"; do
-        if run_root test -d "$runtime_dir" && ! run_root chown \
-            "$EXISTING_SERVICE_USER:$previous_group" -- "$runtime_dir"; then
-            restore_failed=1
-        fi
-    done
     [ "$restore_failed" -eq 0 ]
 }
 
@@ -1274,21 +1140,13 @@ prepare_directories() {
             TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || id -gn)"
         fi
     fi
-    directories=(
-        "$DATA_ROOT" "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"
-        "$(dirname -- "$CONFIG_FILE")" "$(dirname -- "$ANTARES_STATE_FILE")"
-    )
-    for path in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT" \
-        "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
-        parent="$(dirname -- "$path")"
-        while [[ "$parent" == "$DATA_ROOT"/* ]]; do
-            directories+=("$parent")
-            [ "$parent" = "$DATA_ROOT" ] && break
-            parent="$(dirname -- "$parent")"
-        done
+    directories=("$DATA_ROOT" "$STORE_PATH" "$WORKSPACE_ROOT" "$CACHE_ROOT")
+    parent="$(dirname -- "$STORE_PATH")"
+    while [[ "$parent" == "$DATA_ROOT"/* ]]; do
+        directories+=("$parent")
+        parent="$(dirname -- "$parent")"
     done
-    if ! path_is_mount_target "$WORKSPACE"; then directories+=("$WORKSPACE"); fi
-    if ! path_is_mount_target "$ANTARES_MOUNT_ROOT"; then directories+=("$ANTARES_MOUNT_ROOT"); fi
+    validate_runtime_migration_mounts
     # mkdir preserves modes on existing directories; install -d would reset
     # hardened data directories to its 0755 default during every upgrade.
     run_root mkdir -p -m 0755 -- "${directories[@]}"
@@ -1296,121 +1154,259 @@ prepare_directories() {
     run_root mkdir -p -m 0755 -- "$CONFDIR"
 }
 
-find_mount_fstype() {
-    local path="$1" mount_target mount_fstype mount_entries
-    MOUNT_FSTYPE=""
-    mount_entries="$(findmnt --noheadings --raw --output TARGET,FSTYPE)" || \
-        die "could not inspect FUSE mount roots"
-    while read -r mount_target mount_fstype; do
-        if [ "$mount_target" = "$path" ]; then
-            MOUNT_FSTYPE="$mount_fstype"
-            return 0
-        fi
-    done <<<"$mount_entries"
-    return 1
+capture_service_process() {
+    local pid="$1" output="$2"
+    mkdir -p "$output"
+    run_readonly cat "/proc/$pid/status" >"$output/status" &&
+    run_readonly cat "/proc/$pid/stat" >"$output/stat" &&
+    run_readonly cat "/proc/$pid/cmdline" >"$output/cmdline" &&
+    run_readonly stat -Lc '%d:%i' "/proc/$pid/exe" >"$output/exe" &&
+    run_readonly stat -Lc '%d:%i' "${PREFIX}/bin/scorpio" >"$output/installed-exe" &&
+    run_readonly find "/proc/$pid/fd" -mindepth 1 -maxdepth 1 -type l -printf '%l\n' >"$output/fds" &&
+    run_readonly cat /proc/net/tcp >"$output/tcp" &&
+    run_readonly cat /proc/net/tcp6 >"$output/tcp6"
 }
 
-path_is_mount_target() {
-    find_mount_fstype "$1"
+verify_captured_service_process() {
+    python3 - "$1" "$2" <<'PY'
+import json, pathlib, sys
+before, after = map(pathlib.Path, sys.argv[1:])
+for name in ("cmdline", "exe", "installed-exe"):
+    if before.joinpath(name).read_bytes() != after.joinpath(name).read_bytes():
+        raise SystemExit("managed process authority changed")
+def uids(root):
+    return [line.split()[1:] for line in root.joinpath("status").read_text().splitlines() if line.startswith("Uid:")]
+if uids(before) != uids(after):
+    raise SystemExit("managed process UID changed")
+def started(root):
+    return root.joinpath("stat").read_text().rsplit(")", 1)[1].split()[19]
+if started(before) != started(after):
+    raise SystemExit("managed process was replaced")
+inode = before.joinpath("http-inode").read_text()
+if "socket:[" + inode + "]" not in after.joinpath("fds").read_text().splitlines():
+    raise SystemExit("managed HTTP listener was replaced")
+name, address, uid, inode = json.loads(before.joinpath("http-listener").read_text())
+matches = []
+for line in after.joinpath(name).read_text().splitlines()[1:]:
+    fields = line.split()
+    if len(fields) >= 10 and fields[1] == address and fields[3] == "0A" and fields[7] == uid and fields[9] == inode:
+        matches.append(line)
+if len(matches) != 1:
+    raise SystemExit("managed HTTP socket no longer proves the captured LISTEN bind")
+PY
 }
 
-recover_stale_runtime_mounts() {
-    local detach_managed_mounts="${1:-0}" mount_field mount_root mount_target candidate_field
-    local mount_entries found i j duplicate
-    local -a candidate_fields=(previous-workspace previous-antares-mount-root workspace antares-mount-root)
-    local -a candidate_roots=("$PREVIOUS_WORKSPACE" "$PREVIOUS_ANTARES_MOUNT_ROOT" "$WORKSPACE" "$ANTARES_MOUNT_ROOT")
-    local -a mount_fields=() mount_roots=()
-    local -a probe
-    for ((i = 0; i < ${#candidate_fields[@]}; i++)); do
-        candidate_field="${candidate_fields[$i]}"
-        mount_root="${candidate_roots[$i]}"
-        [ -n "$mount_root" ] || continue
-        if [[ "$candidate_field" == *antares-mount-root ]]; then
-            mount_entries="$(findmnt --noheadings --raw --output TARGET)" || \
-                die "could not inspect Antares mounts"
-            found=0
-            while IFS= read -r mount_target; do
-                case "$mount_target" in
-                    "$mount_root"|"$mount_root"/*)
-                        found=1
-                        duplicate=0
-                        for ((j = 0; j < ${#mount_roots[@]}; j++)); do
-                            if [ "${mount_roots[$j]}" = "$mount_target" ]; then duplicate=1; break; fi
-                        done
-                        if [ "$duplicate" -eq 0 ]; then
-                            mount_fields+=("$candidate_field")
-                            mount_roots+=("$mount_target")
-                        fi
-                        ;;
-                esac
-            done <<<"$mount_entries"
-            [ "$found" -eq 1 ] || continue
+capture_managed_runtime_mounts() {
+    OWNED_MOUNTS_FILE="${WORKDIR}/owned-mounts.json"
+    local mountinfo="${WORKDIR}/mountinfo-before" candidates="${WORKDIR}/mount-candidates.json"
+    local uid="" pid endpoint status
+    if [ -n "$EXISTING_SERVICE_USER" ]; then uid="$(id -u "$EXISTING_SERVICE_USER")"; fi
+    run_readonly cat /proc/self/mountinfo >"$mountinfo" || die "could not inspect kernel mount identities"
+    python3 - "$mountinfo" "$candidates" "$uid" "$DATA_ROOT" "$PREVIOUS_DATA_ROOT" "$STORE_PATH" "$PREVIOUS_STORE_PATH" <<'PY'
+import json, pathlib, sys
+mountinfo, output, uid, data_root, old_data_root, *stores = sys.argv[1:]
+stores = [root for root in stores if root]
+roots = [root for root in (data_root, old_data_root, *stores) if root]
+records = []
+for line in pathlib.Path(mountinfo).read_text().splitlines():
+    left, separator, right = line.partition(" - ")
+    if not separator:
+        raise SystemExit("invalid kernel mountinfo")
+    fields, tail = left.split(), right.split()
+    if len(fields) < 6 or len(tail) < 3:
+        raise SystemExit("invalid kernel mountinfo fields")
+    target = fields[4]
+    if not any(target == root or target.startswith(root + "/") for root in roots):
+        continue
+    workspace_roots = [root + "/workspaces-v3" for root in stores if target.startswith(root + "/workspaces-v3/")]
+    allowed = bool(workspace_roots) and target.endswith("/mount")
+    options = (fields[5] + "," + tail[2]).split(",")
+    if not allowed or tail[0] not in ("fuse", "fuse.scorpiofs-v3") or tail[1] != "scorpiofs-v3" or options.count("user_id=" + uid) != 1:
+        raise SystemExit("refusing unknown or foreign runtime mount before any ownership change: " + target)
+    if any(item["target"] == target for item in records):
+        raise SystemExit("refusing stacked runtime mounts: " + target)
+    for parent in pathlib.Path(target).parents:
+        if any(str(parent) == root or str(parent).startswith(root + "/") for root in stores) and parent.is_symlink():
+            raise SystemExit("workspace mount ancestor is a symbolic link: " + str(parent))
+    records.append({"target": target, "line": line, "workspace_root": workspace_roots[0]})
+pathlib.Path(output).write_text(json.dumps(records))
+PY
+    [ "$?" -eq 0 ] || die "runtime mounts have no trusted v3 ownership"
+    if [ "$(cat "$candidates")" = "[]" ]; then
+        cp "$candidates" "$OWNED_MOUNTS_FILE"
+        return 0
+    fi
+    [ "$SETUP_SERVICE" -eq 1 ] && [ "$EXISTING_SERVICE_ACTIVE" -eq 1 ] && [ -n "$EXISTING_SERVICE_USER" ] ||
+        die "runtime mounts require an active managed service; unmount unknown mounts manually and retry"
+    command -v curl >/dev/null 2>&1 || die "curl is required to verify managed workspace ownership"
+    if [ "$DRY_RUN" -eq 1 ] && [ "$(id -u)" -ne 0 ] && [ -z "$SUDO_BIN" ]; then
+        command -v sudo >/dev/null 2>&1 || die "sudo is required to inspect the managed service during dry-run"
+        sudo -n -v || die "could not obtain read access to the managed service during dry-run"
+        SUDO_BIN="sudo"
+    fi
+    pid="$(run_readonly systemctl show --property=MainPID --value scorpiofs.service)" ||
+        die "could not identify the running managed service"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "managed service has no live MainPID"
+    capture_service_process "$pid" "${WORKDIR}/process-before" ||
+        die "could not inspect the managed service process"
+    endpoint="$(python3 - "${WORKDIR}/process-before" "$uid" <<'PY'
+import ipaddress, json, pathlib, sys
+directory, uid = pathlib.Path(sys.argv[1]), sys.argv[2]
+status = directory.joinpath("status").read_text().splitlines()
+ids = [line.split()[1:] for line in status if line.startswith("Uid:")]
+if len(ids) != 1 or ids[0] != [uid] * 4:
+    raise SystemExit("managed service process UID does not match its unit")
+exe = directory.joinpath("exe").read_text().split()
+if len(exe) != 1 or exe[0] != directory.joinpath("installed-exe").read_text().strip():
+    raise SystemExit("managed service executable is not the installed Scorpio binary")
+args = directory.joinpath("cmdline").read_bytes().split(b"\0")
+args = [arg.decode("utf-8") for arg in args if arg]
+if "serve" not in args:
+    raise SystemExit("managed process is not the workspace daemon")
+binds = []
+for i, arg in enumerate(args):
+    if arg == "--http-addr" and i + 1 < len(args):
+        binds.append(args[i + 1])
+    elif arg.startswith("--http-addr="):
+        binds.append(arg.split("=", 1)[1])
+if len(binds) != 1:
+    raise SystemExit("managed process has no unique explicit HTTP bind")
+bind = binds[0]
+if bind.startswith("["):
+    host, port = bind[1:].split("]:")
+else:
+    host, port = bind.rsplit(":", 1)
+address, port = ipaddress.ip_address(host), int(port)
+if not 1 <= port <= 65535:
+    raise SystemExit("invalid managed process port")
+fds = set()
+for line in directory.joinpath("fds").read_text().splitlines():
+    if line.startswith("socket:[") and line.endswith("]"):
+        fds.add(line[8:-1])
+listeners = []
+for name, version in (("tcp", 4), ("tcp6", 6)):
+    for line in directory.joinpath(name).read_text().splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 10 or fields[3] != "0A" or fields[9] not in fds or fields[7] != uid:
             continue
-        fi
-        duplicate=0
-        for ((j = 0; j < ${#mount_roots[@]}; j++)); do
-            if [ "${mount_roots[$j]}" = "$mount_root" ]; then duplicate=1; break; fi
-        done
-        [ "$duplicate" -eq 1 ] && continue
-        mount_fields+=("${candidate_fields[$i]}")
-        mount_roots+=("$mount_root")
-    done
-    for ((i = 0; i < ${#mount_roots[@]}; i++)); do
-        mount_field="${mount_fields[$i]}"
-        mount_root="${mount_roots[$i]}"
-        find_mount_fstype "$mount_root" || continue
-        case "$MOUNT_FSTYPE" in
-            fuse|fuse.*) ;;
-            *)
-                die "$mount_field is mounted with non-FUSE filesystem type ${MOUNT_FSTYPE:-unknown} at $mount_root; unmount it manually and retry"
-                ;;
-        esac
-        # $1 is intentionally expanded by the probe shell.
-        # shellcheck disable=SC2016
-        probe=(timeout 15 bash -c 'stat -L -- "$1" >/dev/null 2>&1' bash "$mount_root")
-        if [ -n "$EXISTING_SERVICE_USER" ]; then
-            probe=(runuser -u "$EXISTING_SERVICE_USER" -- "${probe[@]}")
-            if [ "$DRY_RUN" -eq 1 ] && [ "$(id -u)" -ne 0 ] && [ -z "$SUDO_BIN" ]; then
-                command -v sudo >/dev/null 2>&1 || \
-                    die "sudo is required to inspect managed FUSE mounts during dry-run"
-                sudo -n -v || \
-                    die "could not obtain non-interactive sudo privileges to inspect managed FUSE mounts"
-                probe=(sudo -n "${probe[@]}")
-            fi
-        fi
-        # Mount health is a read-only check, so dry-runs must execute it to
-        # preserve the same stale-versus-active decision as a real install.
-        local probe_succeeded=0
-        if run_readonly "${probe[@]}"; then
-            probe_succeeded=1
-        fi
-        if [ "$probe_succeeded" -eq 1 ] && [ "$detach_managed_mounts" -ne 1 ]; then
-            if [ "$SETUP_SERVICE" -eq 1 ] && \
-                { [ -z "$EXISTING_SERVICE_USER" ] || [ "$EXISTING_SERVICE_ACTIVE" -ne 1 ]; }; then
-                die "$mount_field is actively mounted at $mount_root by an unmanaged process; stop the ScorpioFS daemon, unmount this path, and retry"
-            fi
-            note "$mount_field is actively mounted; leaving the mount root unchanged during directory preparation"
-            continue
-        fi
-        if [ "$detach_managed_mounts" -eq 1 ]; then
-            warn "detaching FUSE mount left by the stopped service at $mount_root"
-        else
-            warn "detaching inaccessible FUSE mount at $mount_root before installation"
-        fi
+        raw, candidate_port = fields[1].split(":")
+        encoded = bytes.fromhex(raw)
+        decoded = encoded[::-1] if version == 4 else b"".join(encoded[i:i+4][::-1] for i in range(0, 16, 4))
+        if ipaddress.ip_address(decoded) == address and int(candidate_port, 16) == port:
+            listeners.append((name, fields[1], fields[7], fields[9]))
+if len(listeners) != 1:
+    raise SystemExit("HTTP bind is not a unique LISTEN socket owned by the managed process")
+directory.joinpath("http-inode").write_text(listeners[0][3])
+directory.joinpath("http-listener").write_text(json.dumps(listeners[0]))
+host = str(address)
+if address.is_unspecified:
+    host = "127.0.0.1" if address.version == 4 else "::1"
+if address.version == 6:
+    host = "[" + host + "]"
+print("http://" + host + ":" + str(port))
+PY
+)" || die "managed service HTTP endpoint has no process/socket authority"
+    status="$(curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 --max-filesize 4194304 \
+        -o "${WORKDIR}/managed-workspaces.json" -w '%{http_code}' "$endpoint/v3/workspaces")" ||
+        die "could not obtain live managed workspace identities"
+    [ "$status" = 200 ] || die "managed workspace list did not return HTTP 200"
+    [ "$(run_readonly systemctl show --property=MainPID --value scorpiofs.service)" = "$pid" ] ||
+        die "managed service changed during mount ownership verification"
+    capture_service_process "$pid" "${WORKDIR}/process-after" ||
+        die "managed service disappeared during ownership verification"
+    verify_captured_service_process "${WORKDIR}/process-before" "${WORKDIR}/process-after" ||
+        die "managed service authority changed during the workspace request"
+    python3 - "$candidates" "${WORKDIR}/managed-workspaces.json" "$OWNED_MOUNTS_FILE" <<'PY'
+import json, pathlib, sys, uuid
+payload = pathlib.Path(sys.argv[2]).read_bytes()
+if len(payload) > 4194304:
+    raise SystemExit("managed workspace list exceeds its response cap")
+workspaces = json.loads(payload)
+if not isinstance(workspaces, list):
+    raise SystemExit("invalid managed workspace list")
+records = json.loads(pathlib.Path(sys.argv[1]).read_text())
+for record in records:
+    matches = [w for w in workspaces if isinstance(w, dict) and w.get("mountpoint") == record["target"]]
+    if len(matches) != 1:
+        raise SystemExit("kernel mount lacks one exact live workspace: " + record["target"])
+    workspace = matches[0]
+    for name in ("workspace_id", "generation"):
+        value = workspace.get(name)
+        if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+            raise SystemExit("invalid managed workspace identity")
+    if workspace.get("mount_state") != "mounted" or workspace.get("metadata_ready") is not True:
+        raise SystemExit("live daemon cannot prove its native mount identity")
+    if record["target"] != record["workspace_root"] + "/" + workspace["workspace_id"] + "/mount":
+        raise SystemExit("workspace UUID does not identify the exact mountpoint")
+    record.update(workspace_id=workspace["workspace_id"], generation=workspace["generation"])
+pathlib.Path(sys.argv[3]).write_text(json.dumps(records))
+PY
+    [ "$?" -eq 0 ] || die "runtime mounts lack live managed ownership"
+    OWNED_SERVICE_PID="$pid"
+}
+
+recover_managed_runtime_mounts() {
+    local mountinfo="${WORKDIR}/mountinfo-after" targets="${WORKDIR}/detach-targets"
+    local target
+    run_readonly cat /proc/self/mountinfo >"$mountinfo" || die "could not inspect mounts after stopping the service"
+    python3 - "$mountinfo" "$OWNED_MOUNTS_FILE" "$targets" "$DATA_ROOT" "$PREVIOUS_DATA_ROOT" "$STORE_PATH" "$PREVIOUS_STORE_PATH" <<'PY'
+import json, pathlib, sys
+mountinfo, owned, output, *roots = sys.argv[1:]
+roots = [root for root in roots if root]
+records = {item["target"]: item["line"] for item in json.loads(pathlib.Path(owned).read_text())}
+targets = []
+for line in pathlib.Path(mountinfo).read_text().splitlines():
+    fields = line.split()
+    if len(fields) < 6:
+        raise SystemExit("invalid kernel mountinfo")
+    target = fields[4]
+    if not any(target == root or target.startswith(root + "/") for root in roots):
+        continue
+    if records.get(target) != line:
+        raise SystemExit("runtime mount identity changed or became foreign: " + target)
+    if target in targets:
+        raise SystemExit("runtime mount became stacked: " + target)
+    targets.append(target)
+pathlib.Path(output).write_text("\n".join(sorted(targets, key=len, reverse=True)) + ("\n" if targets else ""))
+PY
+    [ "$?" -eq 0 ] || die "refusing changed runtime mounts after stopping service"
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] || die "refusing to detach a mount while its owned service is running"
+        run_readonly cat /proc/self/mountinfo >"${WORKDIR}/mountinfo-detach" ||
+            die "could not reinspect the exact residual mount"
+        python3 - "${WORKDIR}/mountinfo-detach" "$OWNED_MOUNTS_FILE" "$target" "$DATA_ROOT" "$PREVIOUS_DATA_ROOT" "$STORE_PATH" "$PREVIOUS_STORE_PATH" <<'PY'
+import json, pathlib, sys
+current, owned, target, *roots = sys.argv[1:]
+roots = [root for root in roots if root]
+frozen = {entry["target"]: entry["line"] for entry in json.loads(pathlib.Path(owned).read_text())}
+actual = {}
+for line in pathlib.Path(current).read_text().splitlines():
+    fields = line.split()
+    if len(fields) < 6 or " - " not in line:
+        raise SystemExit("invalid kernel mountinfo immediately before detach")
+    mounted = fields[4]
+    if not any(mounted == root or mounted.startswith(root + "/") for root in roots):
+        continue
+    if mounted in actual:
+        raise SystemExit("runtime mount became stacked immediately before detach: " + mounted)
+    if frozen.get(mounted) != line:
+        raise SystemExit("runtime mount identity changed or became foreign immediately before detach: " + mounted)
+    actual[mounted] = line
+if target not in frozen or actual.get(target) != frozen[target]:
+    raise SystemExit("residual mount identity changed immediately before detach: " + target)
+PY
+        [ "$?" -eq 0 ] || die "refusing a changed residual mount"
+        note "detaching verified v3 workspace mount left by the stopped service: $target"
         if command -v fusermount3 >/dev/null 2>&1; then
-            run_root fusermount3 -u -z "$mount_root" || \
-                run_root umount -l "$mount_root" || \
-                die "could not detach stale $mount_field at $mount_root; unmount it and retry"
+            run_root fusermount3 -u -z "$target" || die "could not detach verified v3 workspace mount: $target"
         else
-            run_root umount -l "$mount_root" || \
-                die "could not detach stale $mount_field at $mount_root; install fuse3 or unmount it manually"
+            die "fusermount3 is required to detach the verified v3 workspace mount"
         fi
-        [ "$DRY_RUN" -eq 1 ] && continue
-        if path_is_mount_target "$mount_root"; then
-            die "stale $mount_field is still mounted at $mount_root; unmount it and retry"
-        fi
-    done
-    return 0
+    done <"$targets"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        validate_mount_targets "$STORE_PATH" "$PREVIOUS_STORE_PATH" || die "$MOUNT_VALIDATION_ERROR"
+    fi
 }
 
 validate_mount_targets() {
@@ -1441,39 +1437,15 @@ validate_mount_targets() {
 }
 
 validate_runtime_migration_mounts() {
-    local path parent
-    local -a runtime_dirs=(
-        "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"
-    )
-    for path in "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
-        parent="$(dirname -- "$path")"
-        while [[ "$parent" == "$DATA_ROOT"/* ]]; do
-            runtime_dirs+=("$parent")
-            parent="$(dirname -- "$parent")"
-        done
-    done
-    validate_mount_targets "${runtime_dirs[@]}" || die "$MOUNT_VALIDATION_ERROR"
+    if [ "$DRY_RUN" -eq 1 ] && [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ]; then return 0; fi
+    validate_mount_targets "$DATA_ROOT" "$STORE_PATH" || die "$MOUNT_VALIDATION_ERROR"
 }
 
 reconcile_runtime_directories() {
-    local runtime_dir
-    # These are persistent local data trees. Workspace and mount roots are
-    # intentionally excluded because they may currently be FUSE mountpoints.
     validate_runtime_migration_mounts
-    for runtime_dir in "$STORE_PATH" "$ANTARES_UPPER_ROOT" "$ANTARES_CL_ROOT"; do
-        if run_readonly test -d "$runtime_dir"; then
-            run_root chown -R -h -P "$TARGET_USER:$TARGET_GROUP" -- "$runtime_dir"
-        fi
-    done
-}
-
-reconcile_runtime_files() {
-    local runtime_file
-    for runtime_file in "$CONFIG_FILE" "$ANTARES_STATE_FILE"; do
-        if run_readonly test -e "$runtime_file"; then
-            run_root chown "$TARGET_USER:$TARGET_GROUP" "$runtime_file"
-        fi
-    done
+    if run_readonly test -d "$STORE_PATH"; then
+        run_root chown -R -h -P "$TARGET_USER:$TARGET_GROUP" -- "$STORE_PATH"
+    fi
 }
 
 toml_escape() {
@@ -1482,14 +1454,6 @@ toml_escape() {
     value="${value//\"/\\\"}"
     value="${value//$'\t'/\\t}"
     printf '%s' "$value"
-}
-
-validate_toml_text() {
-    local field="$1" value_without_tabs="${2//$'\t'/}"
-    local LC_ALL=C
-    if [[ "$value_without_tabs" =~ [[:cntrl:]] ]]; then
-        die "$field must not contain control characters other than tab"
-    fi
 }
 
 write_config() {
@@ -1501,38 +1465,18 @@ write_config() {
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        note "would write ${CONFDIR}/scorpio.toml with the supplied URLs and paths"
+        note "would write ${CONFDIR}/scorpio.toml with the supplied endpoint and paths"
         return 0
     fi
-    local escaped_base_url escaped_lfs_url escaped_workspace escaped_store_path
-    local escaped_config_file escaped_author escaped_email
-    local escaped_antares_upper escaped_antares_cl escaped_antares_mount escaped_antares_state
-    escaped_base_url="$(toml_escape "$BASE_URL")"
-    escaped_lfs_url="$(toml_escape "$LFS_URL")"
-    escaped_workspace="$(toml_escape "$WORKSPACE")"
+    local escaped_mst2_base_url escaped_store_path
+    escaped_mst2_base_url="$(toml_escape "$MST2_BASE_URL")"
     escaped_store_path="$(toml_escape "$STORE_PATH")"
-    escaped_config_file="$(toml_escape "$CONFIG_FILE")"
-    escaped_author="$(toml_escape "$GIT_AUTHOR")"
-    escaped_email="$(toml_escape "$GIT_EMAIL")"
-    escaped_antares_upper="$(toml_escape "$ANTARES_UPPER_ROOT")"
-    escaped_antares_cl="$(toml_escape "$ANTARES_CL_ROOT")"
-    escaped_antares_mount="$(toml_escape "$ANTARES_MOUNT_ROOT")"
-    escaped_antares_state="$(toml_escape "$ANTARES_STATE_FILE")"
     umask 077
     cat > "$config_tmp" <<EOF
-# Generated by ScorpioFS install.sh. Edit base_url/lfs_url when the backend changes.
-base_url = "$escaped_base_url"
-lfs_url = "$escaped_lfs_url"
-workspace = "$escaped_workspace"
+# Generated by ScorpioFS install.sh.
+mst2_base_url = "$escaped_mst2_base_url"
 store_path = "$escaped_store_path"
-config_file = "$escaped_config_file"
-git_author = "$escaped_author"
-git_email = "$escaped_email"
 log_level = "info"
-antares_upper_root = "$escaped_antares_upper"
-antares_cl_root = "$escaped_antares_cl"
-antares_mount_root = "$escaped_antares_mount"
-antares_state_file = "$escaped_antares_state"
 EOF
     run_root install -m 0640 -o "$TARGET_USER" -g "$TARGET_GROUP" "$config_tmp" "${CONFDIR}/scorpio.toml"
     rm -f "$config_tmp"
@@ -1589,8 +1533,6 @@ install_systemd_service() {
     fi
     local unit_tmp="${WORKDIR}/scorpiofs.service"
     local fuse_group_line=""
-    local escaped_antares_mount
-    escaped_antares_mount="$(toml_escape "$ANTARES_MOUNT_ROOT")"
     if getent group fuse >/dev/null 2>&1; then fuse_group_line="SupplementaryGroups=fuse"; fi
     cat > "$unit_tmp" <<EOF
 [Unit]
@@ -1610,8 +1552,6 @@ AmbientCapabilities=CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_SYS_ADMIN
 WorkingDirectory=${DATA_ROOT}
 ExecStart=${PREFIX}/bin/scorpio --config-path ${CONFDIR}/scorpio.toml serve --http-addr ${HTTP_ADDR}
-ExecStopPost=-/bin/sh -c 'root="${escaped_antares_mount}"; findmnt -rno TARGET 2>/dev/null | sort -r | while IFS= read -r m; do case "\$m" in "\$root"|"\$root"/*) fusermount3 -u -z "\$m";; esac; done'
-ExecStopPost=-/usr/bin/fusermount3 -u -z ${WORKSPACE}
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=45
@@ -1706,11 +1646,8 @@ main() {
     resolve_version
     normalize_version
     configure_interactively
-    if [ -z "$BASE_URL" ]; then BASE_URL="http://localhost:8000"; fi
-    if [ -z "$LFS_URL" ]; then LFS_URL="$(normalize_url "$BASE_URL")/lfs"; fi
-    if [ -z "$WORKSPACE" ]; then WORKSPACE="$DATA_ROOT/mount"; fi
+    if [ -z "$MST2_BASE_URL" ]; then MST2_BASE_URL="http://localhost:8000"; fi
     if [ -z "$STORE_PATH" ]; then STORE_PATH="$DATA_ROOT/store"; fi
-    REQUESTED_WORKSPACE="$WORKSPACE"
     REQUESTED_STORE_PATH="$STORE_PATH"
     set_generated_runtime_paths
     require_privileges
@@ -1722,17 +1659,15 @@ main() {
     check_runtime_tools
     check_fuse
     prepare_release_binaries
-    recover_stale_runtime_mounts
-    validate_runtime_migration_mounts
+    capture_managed_runtime_mounts
     ensure_service_account
     validate_service_config_traversal
     stop_active_service_for_upgrade
-    recover_stale_runtime_mounts "$SERVICE_STOPPED_FOR_UPGRADE"
+    recover_managed_runtime_mounts
     backup_upgrade_artifacts
     install_release_binaries
     prepare_directories
     reconcile_runtime_directories
-    reconcile_runtime_files
     write_config
     validate_installed_config
     enable_user_allow_other

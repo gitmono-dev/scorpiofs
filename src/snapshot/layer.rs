@@ -1,10 +1,9 @@
-//! MST/2 snapshot view as an Antares overlay **lower layer** (spec 12 §1).
+//! Fixed MST/2 snapshot view as a workspace overlay lower layer (spec 12 §1).
 //!
 //! [`Mst2Fuse`] already implements the read-only FUSE semantics over a fixed
 //! snapshot view (lookup/getattr/read/readdir/readlink, T10-verified). This
-//! module adds the [`Layer`] impl so the Antares `OverlayFs` can stack it in
-//! the position `Dicfuse` occupies today — spec 12: "现有 user-space Layer
-//! 适配到 SnapshotReader".
+//! module adds the [`Layer`] implementation so a workspace OverlayFs stacks
+//! the fixed view beneath its private writable upper.
 //!
 //! The layer is read-only by construction: every mutation answers `EROFS`
 //! (see `fuse.rs`), so the overlay routes all writes to its upper layer and
@@ -322,7 +321,7 @@ mod tests {
     }
 
     /// Every mutation must answer EROFS — not the trait default ENOSYS — so the
-    /// overlay treats the layer as read-only exactly like Dicfuse (spec 12 §7).
+    /// overlay treats the fixed snapshot as read-only (spec 12 §7).
     #[tokio::test]
     async fn every_mutation_answers_erofs() {
         let fs = empty_view();
