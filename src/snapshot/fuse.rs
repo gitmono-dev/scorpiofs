@@ -30,7 +30,10 @@ use futures::stream::iter;
 
 use crate::{
     snapshot::{
-        closure::ValidatedSnapshotClosure, durable::DurableStore, SnapshotFile, SnapshotReader,
+        closure::ValidatedSnapshotClosure,
+        durable::DurableStore,
+        fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission},
+        FileMembershipError, OwnedChunkedFile, ProvenSnapshotFile, SnapshotFile, SnapshotReader,
     },
     util::file_attr::make_file_attr,
 };
@@ -76,8 +79,20 @@ struct State {
     contents: HashMap<u64, Arc<Vec<u8>>>,
     /// Large files opened through the verified chunk reader (range reads).
     chunked: HashMap<u64, Arc<crate::snapshot::range::ChunkedFile>>,
+    /// Modern online mounts retain paid payload/reply owners in fixed slots.
+    owned: Option<OwnedFuseCache>,
     /// Lazy mounts: directory pages are fetched on first readdir/lookup.
     lazy: bool,
+}
+
+fn owned_cache(
+    reader: Option<&SnapshotReader>,
+    store: Option<&Arc<DurableStore>>,
+) -> std::result::Result<Option<OwnedFuseCache>, crate::snapshot::SnapshotError> {
+    reader
+        .filter(|reader| store.is_none() && reader.capabilities().features.metadata_pages)
+        .map(OwnedFuseCache::new)
+        .transpose()
 }
 
 /// Kernel file type for one view entry. Symlinks are their own type, not
@@ -116,6 +131,11 @@ impl Mst2Fuse {
     pub async fn from_reader(
         reader: SnapshotReader,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        if reader.capabilities().features.metadata_pages {
+            let closure = reader.snapshot_closure().await?;
+            reader.seed_content_membership(&closure)?;
+            return Self::build_snapshot_closure(Some(reader), None, &closure);
+        }
         let manifest = reader.file_manifest().await?;
         Self::build(Some(reader), None, manifest)
     }
@@ -177,6 +197,7 @@ impl Mst2Fuse {
                 .authorized_context()
                 .validate_relative_path(&file.rel_path)?;
         }
+        reader.seed_content_membership(&closure)?;
         Self::build_snapshot_closure(Some(reader), Some(store), &closure)
     }
 
@@ -209,6 +230,7 @@ impl Mst2Fuse {
             nodes: HashMap::new(),
             contents: HashMap::new(),
             chunked: HashMap::new(),
+            owned: owned_cache(Some(&reader), store.as_ref())?,
             lazy: true,
         };
         state.nodes.insert(
@@ -443,6 +465,7 @@ impl Mst2Fuse {
             nodes: HashMap::new(),
             contents: HashMap::new(),
             chunked: HashMap::new(),
+            owned: owned_cache(reader.as_ref(), store.as_ref())?,
             lazy: false,
         };
         state.nodes.insert(
@@ -490,6 +513,7 @@ impl Mst2Fuse {
             nodes: HashMap::new(),
             contents: HashMap::new(),
             chunked: HashMap::new(),
+            owned: owned_cache(reader.as_ref(), store.as_ref())?,
             lazy: false,
         };
         let mut directories: Vec<_> = closure.directories().iter().collect();
@@ -645,6 +669,127 @@ impl Mst2Fuse {
         }
         let reader = self.reader.as_ref().ok_or_else(|| Errno::from(libc::EIO))?;
         reader.read_file(&f.path, &f.digest).await.map_err(io_err)
+    }
+
+    fn owned_reader(&self) -> Option<&SnapshotReader> {
+        self.reader
+            .as_ref()
+            .filter(|reader| self.store.is_none() && reader.capabilities().features.metadata_pages)
+    }
+
+    async fn proven_node(
+        reader: &SnapshotReader,
+        node: &FileNode,
+        cached: Option<Arc<ProvenSnapshotFile>>,
+    ) -> Result<Arc<ProvenSnapshotFile>> {
+        let proven = match cached {
+            Some(proven) => proven,
+            None => reader
+                .prove_file(&node.path)
+                .await
+                .map_err(membership_io_err)?,
+        };
+        proven.validate(reader).await.map_err(io_err)?;
+        let file = proven.file();
+        if file.rel_path != node.path
+            || file.fs_kind != node.fs_kind
+            || file.size != node.size
+            || file.content_digest != node.digest
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        Ok(proven)
+    }
+
+    /// The modern branch runs before legacy empty/EOF/cache paths. It cannot
+    /// fall back after a proof, authority, quota or body validation failure.
+    async fn read_owned(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        offset: u64,
+        size: u64,
+    ) -> Result<ReplyData> {
+        let (content, range) = {
+            let mut state = self.state.lock().unwrap();
+            let cache = state.owned.as_mut().ok_or_else(|| Errno::from(libc::EIO))?;
+            if node.size <= crate::snapshot::OBJECT_CAP {
+                (cache.contents.get(inode), None)
+            } else {
+                (None, cache.ranges.get(inode))
+            }
+        };
+        let cached = content
+            .as_ref()
+            .map(|entry| entry.proven.clone())
+            .or_else(|| range.as_ref().map(|entry| entry.proven.clone()));
+        let proven = Self::proven_node(reader, node, cached).await?;
+        if size == 0 || offset >= node.size {
+            return Ok(ReplyData { data: Bytes::new() });
+        }
+        let end = offset.saturating_add(size).min(node.size);
+        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        if node.size <= crate::snapshot::OBJECT_CAP {
+            let owner = match content {
+                Some(entry) => entry.content,
+                None => reader
+                    .read_proven_content(&proven, reader.capabilities().features.objects)
+                    .await
+                    .map_err(io_err)?,
+            };
+            if owner.len() as u64 != node.size {
+                return Err(Errno::from(libc::EIO));
+            }
+            proven.validate(reader).await.map_err(io_err)?;
+            let data = admission
+                .content(owner.clone(), offset as usize, end as usize)
+                .map_err(io_err)?;
+            self.state
+                .lock()
+                .unwrap()
+                .owned
+                .as_mut()
+                .unwrap()
+                .contents
+                .insert(ContentEntry {
+                    inode,
+                    proven,
+                    content: owner,
+                });
+            Ok(ReplyData { data })
+        } else {
+            let chunked = match range {
+                Some(entry) => entry.range,
+                None => Arc::new(
+                    OwnedChunkedFile::open_proven(reader, proven.clone())
+                        .await
+                        .map_err(io_err)?,
+                ),
+            };
+            let owner = chunked
+                .read_range_owned(offset, end - offset)
+                .await
+                .map_err(io_err)?;
+            if owner.len() as u64 != end - offset {
+                return Err(Errno::from(libc::EIO));
+            }
+            proven.validate(reader).await.map_err(io_err)?;
+            let data = admission.range(owner).map_err(io_err)?;
+            self.state
+                .lock()
+                .unwrap()
+                .owned
+                .as_mut()
+                .unwrap()
+                .ranges
+                .insert(RangeEntry {
+                    inode,
+                    proven,
+                    range: chunked,
+                });
+            Ok(ReplyData { data })
+        }
     }
 
     pub(crate) fn node(&self, inode: u64) -> Result<Node> {
@@ -1023,6 +1168,11 @@ impl Filesystem for Mst2Fuse {
             Node::File(f) => f,
             Node::Dir(_) => return Err(Errno::from(libc::EISDIR)),
         };
+        if let Some(reader) = self.owned_reader() {
+            return self
+                .read_owned(reader, inode, &f, offset, size as u64)
+                .await;
+        }
         if size == 0 || offset >= f.size {
             return Ok(ReplyData { data: Bytes::new() });
         }
@@ -1119,6 +1269,9 @@ impl Filesystem for Mst2Fuse {
             Node::File(_) => return Err(Errno::from(libc::EINVAL)),
             Node::Dir(_) => return Err(Errno::from(libc::EINVAL)),
         };
+        if let Some(reader) = self.owned_reader() {
+            return self.read_owned(reader, inode, &f, 0, f.size).await;
+        }
         let cached = self.state.lock().unwrap().contents.get(&inode).cloned();
         let target = match cached {
             Some(b) => b,
@@ -1353,6 +1506,17 @@ fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
     };
     Errno::from(code)
 }
+
+fn membership_io_err(error: FileMembershipError) -> Errno {
+    match error {
+        FileMembershipError::NotFile { .. } => Errno::from(libc::EIO),
+        FileMembershipError::Snapshot(error) => io_err(error),
+    }
+}
+
+#[cfg(test)]
+#[path = "fuse_owned_tests.rs"]
+mod owned_tests;
 
 #[cfg(test)]
 mod tests {
