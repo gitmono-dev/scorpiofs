@@ -1448,14 +1448,19 @@ impl AntaresServiceImpl {
     }
 
     async fn shared_dicfuse(&self) -> Arc<Dicfuse> {
-        self.dicfuse
+        let dic = self
+            .dicfuse
             .get_or_init(|| async {
                 let dic = DicfuseManager::global().await;
                 dic.start_import();
                 dic
             })
             .await
-            .clone()
+            .clone();
+        // An explicitly provided dictionary is also lazy in snapshot mode.
+        // Start its import only if an operation actually selects that base.
+        dic.start_import();
+        dic
     }
 
     /// Create a new service instance and recover previous mounts if available.
@@ -3892,13 +3897,15 @@ impl AntaresService for AntaresServiceImpl {
             )
         };
 
-        let dicfuse = self
-            .lower_dicfuse_for(&path, pinned_refs.as_deref())
-            .await?;
         let chain_dirs: Vec<PathBuf> = sealed_chain.iter().map(PathBuf::from).collect();
         let view: Arc<dyn crate::daemon::lower_view::LowerView> = match &mst2_lower {
             Some(view) => Arc::new(crate::daemon::lower_view::Mst2Lower(view.clone())),
-            None => Arc::new(DicfuseLower(dicfuse.store.clone())),
+            None => {
+                let dicfuse = self
+                    .lower_dicfuse_for(&path, pinned_refs.as_deref())
+                    .await?;
+                Arc::new(DicfuseLower(dicfuse.store.clone()))
+            }
         };
         let changes = effective_changes(view.as_ref(), &upper_dir, &chain_dirs)
             .await
