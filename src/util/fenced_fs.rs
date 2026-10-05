@@ -51,6 +51,21 @@ impl<FS> FencedFilesystem<FS> {
     }
 }
 
+struct WaitingCleanup {
+    fence: MutationFence,
+    admitted: bool,
+}
+
+impl Drop for WaitingCleanup {
+    fn drop(&mut self) {
+        if !self.admitted {
+            // RELEASE is not retried by the kernel. Cancellation before it
+            // obtains a permit is not evidence that its old handle closed.
+            self.fence.mark_uncertain();
+        }
+    }
+}
+
 type FinishOperation<T> = Box<dyn FnOnce(Option<Result<T>>) + Send>;
 
 // Normal operations run inline. Only cancellation transfers the remaining
@@ -99,6 +114,16 @@ impl<T: Send + 'static> Drop for NativeOperation<T> {
 }
 
 impl<FS: Filesystem + Send + Sync + 'static> FencedFilesystem<FS> {
+    async fn admit_cleanup(&self) -> Result<AdmittedMutation> {
+        let mut waiting = WaitingCleanup {
+            fence: self.fence.clone(),
+            admitted: false,
+        };
+        let admission = self.fence.admit(true).await.map_err(native_error)?;
+        waiting.admitted = true;
+        Ok(admission)
+    }
+
     async fn run<T, F, Fut>(&self, admission: AdmittedMutation, operation: F) -> Result<T>
     where
         T: Send + 'static,
@@ -162,7 +187,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
     async fn destroy(&self, req: Request) {
         match self.fence.pause().await {
             Ok(mut pause) => {
-                pause.seal();
+                if let Err(error) = pause.seal() {
+                    tracing::error!(%error, "native destroy refused a late unknown cleanup outcome");
+                    return;
+                }
                 self.inner().destroy(req).await;
             }
             Err(error) => {
@@ -367,7 +395,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
         lock_owner: u64,
         flush: bool,
     ) -> Result<()> {
-        let admission = self.fence.admit(true).await.map_err(native_error)?;
+        let admission = self.admit_cleanup().await?;
         let fence = self.fence.clone();
         self.run(admission, move |inner| async move {
             let result = inner
@@ -466,7 +494,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
     }
 
     async fn releasedir(&self, req: Request, inode: Inode, fh: u64, flags: u32) -> Result<()> {
-        let admission = self.fence.admit(true).await.map_err(native_error)?;
+        let admission = self.admit_cleanup().await?;
         let fence = self.fence.clone();
         self.run(admission, move |inner| async move {
             let result = inner.releasedir(req, inode, fh, flags).await;
@@ -982,7 +1010,7 @@ mod tests {
         let write = fs.write(Request::default(), 2, 99, 0, b"late", 0, 0);
         tokio::pin!(write);
         assert!(futures::poll!(write.as_mut()).is_pending());
-        pause.seal();
+        pause.seal().unwrap();
         drop(pause);
         assert_eq!(write.await.unwrap_err(), libc::EBUSY.into());
         assert_eq!(
@@ -1121,6 +1149,48 @@ mod tests {
                         .is_err()
                 );
                 assert_eq!(fs.inner.release_count.load(Ordering::Acquire), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_release_admission_cannot_hide_an_unclosed_old_handle() {
+        for directory in [false, true] {
+            for capacity_wait in [false, true] {
+                let fs = FencedFilesystem::new(ControlledFs::new());
+                let mut held = Vec::new();
+                let pause = if capacity_wait {
+                    for _ in 0..64 {
+                        held.push(fs.fence.admit(true).await.unwrap());
+                    }
+                    None
+                } else {
+                    Some(fs.fence.pause().await.unwrap())
+                };
+                let mut release = Box::pin(async {
+                    if directory {
+                        fs.releasedir(Request::default(), 2, 99, 0).await
+                    } else {
+                        fs.release(Request::default(), 2, 99, 0, 0, false).await
+                    }
+                });
+                assert!(futures::poll!(release.as_mut()).is_pending());
+                assert!(!fs.fence.is_uncertain());
+                drop(release);
+                assert!(
+                    fs.fence.is_uncertain(),
+                    "lost RELEASE admission must remain Unknown"
+                );
+                assert_eq!(fs.inner.release_count.load(Ordering::Acquire), 0);
+                if let Some(mut pause) = pause {
+                    assert!(pause.ensure_certain().is_err());
+                    assert!(pause.seal().is_err());
+                }
+                for admission in held {
+                    admission.complete();
+                }
+                assert!(fs.fence.pause().await.is_err());
+                assert!(fs.fence.seal().await.is_err());
             }
         }
     }

@@ -68,14 +68,16 @@ impl MutationFence {
                 "native mutation or handle cleanup has an unknown outcome",
             ));
         }
-        Ok(MutationPause { sealed })
+        Ok(MutationPause {
+            sealed,
+            uncertain: self.uncertain.clone(),
+        })
     }
 
     /// Permanently reject new content mutations, after draining existing ones.
     /// Closing handles remains permitted so unmount can finish its cleanup.
     pub async fn seal(&self) -> std::io::Result<()> {
-        self.pause().await?.seal();
-        Ok(())
+        self.pause().await?.seal()
     }
 
     pub fn is_uncertain(&self) -> bool {
@@ -89,11 +91,26 @@ impl MutationFence {
 
 pub struct MutationPause {
     sealed: OwnedRwLockWriteGuard<bool>,
+    uncertain: Arc<AtomicBool>,
 }
 
 impl MutationPause {
-    pub fn seal(&mut self) {
+    /// Recheck at a scan/commit boundary: canceling a waiting RELEASE can
+    /// latch Unknown even while this pause holds the writer lock.
+    pub fn ensure_certain(&self) -> std::io::Result<()> {
+        if self.uncertain.load(Ordering::Acquire) {
+            Err(std::io::Error::other(
+                "handle cleanup became unknown during the mutation pause",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn seal(&mut self) -> std::io::Result<()> {
+        self.ensure_certain()?;
         *self.sealed = true;
+        Ok(())
     }
 }
 
