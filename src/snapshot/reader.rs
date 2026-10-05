@@ -400,6 +400,8 @@ pub struct SnapshotReader {
     context: AuthorizedSnapshotContext,
     caps: Capabilities,
     lease: Arc<LeaseKeeper>,
+    pub(crate) content_scope: Arc<super::content::ContentBudget>,
+    pub(crate) content_membership: Arc<tokio::sync::OnceCell<HashMap<String, SnapshotFile>>>,
 }
 
 impl SnapshotReader {
@@ -455,6 +457,8 @@ impl SnapshotReader {
             lease_id: res.lease_id,
             caps,
             lease,
+            content_scope: super::content::ContentBudget::new(super::ContentBudgetLimits::default()),
+            content_membership: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -514,6 +518,8 @@ impl SnapshotReader {
 
     /// Fetch one file's verified bytes (digest checked on both server and
     /// client sides).
+    /// This compatibility Vec is caller-owned; use `read_content` for retained
+    /// capacity credits and fixed-root membership checks.
     pub async fn read_file(&self, rel_path: &str, digest: &str) -> Result<Vec<u8>, SnapshotError> {
         self.context.validate_relative_path(rel_path)?;
         let request_path = if rel_path.is_empty() || rel_path == "/" {
@@ -821,6 +827,8 @@ impl SnapshotReader {
     /// Every chunk is hash-checked against the map's leaf and the assembled
     /// file is re-hashed before it is returned — verified chunks alone never
     /// make a verified file (spec 07 §7).
+    /// This compatibility Vec is caller-owned; `read_content` uses the owned
+    /// fixed-size transport without whole-stream staging.
     pub async fn read_file_frames(
         &self,
         rel_path: &str,
