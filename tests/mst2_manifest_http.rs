@@ -338,7 +338,11 @@ async fn blob(
     bytes.clone().into_response()
 }
 
-async fn objects(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
+async fn objects(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    body: Bytes,
+) -> Response {
     let req: Value = serde_json::from_slice(&body).unwrap();
     let items = req["items"].as_array().unwrap();
     let mut seen = HashSet::new();
@@ -389,7 +393,12 @@ async fn objects(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
         }
         .encode(8, sequence),
     );
-    ([("content-type", "application/octet-stream")], wire).into_response()
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", snapshot_id)
+        .header("x-mega-request-digest", digest_of(&body))
+        .body(Body::from(wire))
+        .unwrap()
 }
 
 struct HttpFixture {
