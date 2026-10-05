@@ -234,6 +234,15 @@ pub struct ChunkUnit {
     pub bytes: Vec<u8>,
 }
 
+/// Canonical 204 acknowledges idempotent release without reporting whether
+/// the lease was active. Legacy 200 receipts preserve that distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseReleaseOutcome {
+    Acknowledged,
+    Removed,
+    AlreadyReleased,
+}
+
 impl Mst2Client {
     pub(crate) fn snap_url(&self, tail: &str) -> String {
         format!("{}/api/v2/snapshots{tail}", self.base())
@@ -269,17 +278,30 @@ impl Mst2Client {
             .await
     }
 
-    /// Idempotent lease release. Returns whether an active lease was
-    /// removed; this never deletes Git content.
+    /// Idempotent lease release. Canonical 204 returns true for acknowledgement;
+    /// legacy 200 returns its verified `released` flag. Use
+    /// [`Self::release_lease_outcome`] when the removal distinction matters.
     pub async fn release_lease(&self, lease_id: &str) -> Result<bool, SnapshotError> {
+        Ok(self.release_lease_outcome(lease_id).await? != LeaseReleaseOutcome::AlreadyReleased)
+    }
+
+    /// Release using the canonical 204 contract or the explicit legacy 200
+    /// receipt contract selected by HTTP status, without parser fallback.
+    pub async fn release_lease_outcome(
+        &self,
+        lease_id: &str,
+    ) -> Result<LeaseReleaseOutcome, SnapshotError> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ReleaseReceipt {
             lease_id: String,
             released: bool,
         }
 
         let url = format!("{}/api/v2/snapshots/leases/{lease_id}", self.base());
-        let v = self.delete_json(&url).await?;
+        let Some(v) = self.delete_release_json(&url).await? else {
+            return Ok(LeaseReleaseOutcome::Acknowledged);
+        };
         let invalid = || {
             SnapshotError::new(
                 SnapshotErrorCode::IntegrityError,
@@ -290,7 +312,11 @@ impl Mst2Client {
         if receipt.lease_id != lease_id {
             return Err(invalid());
         }
-        Ok(receipt.released)
+        Ok(if receipt.released {
+            LeaseReleaseOutcome::Removed
+        } else {
+            LeaseReleaseOutcome::AlreadyReleased
+        })
     }
 
     /// HEAD blob: exact size and strong ETag without downloading content.
