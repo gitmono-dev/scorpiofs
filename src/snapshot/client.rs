@@ -389,6 +389,13 @@ impl Mst2Client {
         lease_seconds: u64,
         receipt: Option<&mut super::ResolveTraceReceipt>,
     ) -> Result<ResolveResponse, SnapshotError> {
+        super::auth::validate_scope(scope)?;
+        if !(60..=3600).contains(&lease_seconds) {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                "resolve lease suggestion must be between 60 and 3600 seconds",
+            ));
+        }
         let body = serde_json::json!({
             "target": {"kind": "latest"},
             "scope": scope,
@@ -402,7 +409,8 @@ impl Mst2Client {
                 receipt,
             )
             .await?;
-        read_json(ok_or_error(resp).await?).await
+        let value = read_json(ok_or_error(resp).await?).await?;
+        super::resolve_wire::parse(value, scope)
     }
 
     /// One directory page; `cursor` continues pagination (spec 04 §5).
@@ -544,17 +552,6 @@ fn lookup_binding_error() -> SnapshotError {
     )
 }
 
-#[derive(Deserialize)]
-struct ErrorEnvelope {
-    error: ServerError,
-}
-
-#[derive(Deserialize)]
-struct ServerError {
-    code: String,
-    message: String,
-}
-
 async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, SnapshotError> {
     let status = resp.status();
     if status.is_success() {
@@ -568,18 +565,18 @@ async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, Snaps
 }
 
 pub(crate) fn server_error(bytes: &[u8], status: StatusCode) -> SnapshotError {
-    let Ok(env) = parse_json::<ErrorEnvelope>(bytes) else {
+    let Ok(value) = parse_json::<serde_json::Value>(bytes) else {
         return SnapshotError {
             code: SnapshotErrorCode::Internal,
             message: format!("HTTP {status} without valid error envelope"),
             http_status: status.as_u16(),
         };
     };
-    SnapshotError {
-        code: SnapshotErrorCode::from_server(&env.error.code),
-        message: env.error.message,
+    super::error_wire::parse(value, status.as_u16()).unwrap_or_else(|()| SnapshotError {
+        code: SnapshotErrorCode::IntegrityError,
+        message: "HTTP error envelope violates its selected contract or status binding".into(),
         http_status: status.as_u16(),
-    }
+    })
 }
 
 fn json_limit(direction: &str) -> SnapshotError {
@@ -625,7 +622,7 @@ async fn read_json_bytes(mut resp: reqwest::Response) -> Result<Vec<u8>, Snapsho
     Ok(bytes)
 }
 
-fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SnapshotError> {
+pub(crate) fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SnapshotError> {
     let invalid = |error| {
         SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
