@@ -14,8 +14,8 @@ use std::{
 
 use asyncfuse::raw::prelude::{Filesystem, Request};
 use axum::{
-    body::Bytes,
-    extract::{Query, State},
+    body::{Body, Bytes},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -258,7 +258,11 @@ async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
     }))
 }
 
-async fn metadata(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
+async fn metadata(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    body: Bytes,
+) -> Response {
     let req: Value = serde_json::from_slice(&body).unwrap();
     let items = req["items"].as_array().unwrap();
     let mut pages = Vec::new();

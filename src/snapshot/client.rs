@@ -604,6 +604,11 @@ fn validate_treeframe_headers(
             format!("unexpected TreeFrame Content-Type: {content_type}"),
         ));
     }
+    // TreeFrame bytes are already framed and authenticated by the codec.
+    // Letting reqwest transparently decode an HTTP content encoding before
+    // parsing would make the response representation ambiguous and could
+    // turn a proxy transformation into an integrity failure much later.
+    // Spec 06 therefore requires this header to be absent.
     if headers.contains_key(reqwest::header::CONTENT_ENCODING) {
         return Err(SnapshotError::new(
             SnapshotErrorCode::DigestMismatch,
