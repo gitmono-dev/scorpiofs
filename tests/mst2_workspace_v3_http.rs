@@ -13,8 +13,8 @@ use std::{
 use axum::{
     body::{Body, Bytes},
     extract::{Path, State},
-    http::StatusCode,
-    response::Response,
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -24,8 +24,11 @@ use mst2_codec::{
     treeframe::{EndPayload, MetaPayload},
 };
 use scorpiofs::{
-    snapshot::{durable::digest_of, frames::parse_digest, Mst2Client},
-    workspace::{http, CreateWorkspace, WorkspaceConfig, WorkspaceService},
+    snapshot::{durable::digest_of, frames::parse_digest, DurableStore, Mst2Client},
+    workspace::{
+        http, CreateWorkspace, WorkspaceConfig, WorkspaceObservationError, WorkspaceObserver,
+        WorkspaceResolveBinding, WorkspaceService,
+    },
 };
 use serde_json::{json, Value};
 use tokio::{sync::Semaphore, task::JoinHandle};
@@ -53,6 +56,7 @@ struct Fixture {
     resolves: AtomicUsize,
     metadata: AtomicUsize,
     requests: Mutex<Vec<String>>,
+    resolve_ids: Mutex<Vec<Option<String>>>,
 }
 
 impl Fixture {
@@ -79,6 +83,7 @@ impl Fixture {
             resolves: AtomicUsize::new(0),
             metadata: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
+            resolve_ids: Mutex::new(Vec::new()),
         })
     }
 
@@ -122,15 +127,23 @@ async fn capabilities() -> Json<Value> {
     Json(serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap())
 }
 
-async fn resolve(State(f): State<Arc<Fixture>>, Json(request): Json<Value>) -> Json<Value> {
+async fn resolve(
+    State(f): State<Arc<Fixture>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
     assert_eq!(request["target"], json!({"kind": "latest"}));
     assert_eq!(request["scope"], SCOPE);
     f.resolves.fetch_add(1, Ordering::SeqCst);
+    let request_id = headers
+        .get("x-request-id")
+        .map(|value| value.to_str().unwrap().to_owned());
+    f.resolve_ids.lock().unwrap().push(request_id.clone());
     f.entered.add_permits(1);
     if let Some(gate) = &f.gate {
         gate.acquire().await.unwrap().forget();
     }
-    Json(json!({
+    let mut response = Json(json!({
         "descriptor": {
             "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE,
             "namespace_view_id": digest(&[0x22; 32]), "scope": SCOPE,
@@ -141,6 +154,13 @@ async fn resolve(State(f): State<Arc<Fixture>>, Json(request): Json<Value>) -> J
         "publication_sequence": "1", "writer_epoch": "1", "authorization_epoch": "1",
         "resolved_at": "2026-01-01T00:00:00Z", "delivery": request["delivery"]
     }))
+    .into_response();
+    if let Some(id) = request_id {
+        response
+            .headers_mut()
+            .insert("x-request-id", HeaderValue::from_str(&id).unwrap());
+    }
+    response
 }
 
 async fn metadata(State(f): State<Arc<Fixture>>, Path(sid): Path<String>, body: Bytes) -> Response {
@@ -221,6 +241,16 @@ struct Harness {
 
 impl Harness {
     async fn new(failure: RootFailure, gated: bool, workspaces: usize, operations: usize) -> Self {
+        Self::new_with_observer(failure, gated, workspaces, operations, None).await
+    }
+
+    async fn new_with_observer(
+        failure: RootFailure,
+        gated: bool,
+        workspaces: usize,
+        operations: usize,
+        observer: Option<Arc<WorkspaceObserver>>,
+    ) -> Self {
         let fixture = Fixture::new(failure, gated);
         let upstream = Server::start(
             Router::new()
@@ -240,7 +270,12 @@ impl Harness {
             WorkspaceConfig::new(temp.path().join("workspaces"), temp.path().join("cache"));
         config.max_workspaces = workspaces;
         config.max_operations = operations;
-        let service = WorkspaceService::new(Mst2Client::new(&upstream.url), config).unwrap();
+        let client = Mst2Client::new(&upstream.url);
+        let service = match observer {
+            Some(observer) => WorkspaceService::new_with_observer(client, config, observer),
+            None => WorkspaceService::new(client, config),
+        }
+        .unwrap();
         let api = Server::start(http::router(service.clone())).await;
         Self {
             fixture,
@@ -339,6 +374,276 @@ fn assert_failed(status: &Value, fixture: &Fixture) {
     assert_ne!(status["hydration_state"], "complete");
     assert_ne!(status["local_pin_state"], "complete_snapshot");
     assert!(status["last_error"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+fn assert_observed_binding(
+    record: &WorkspaceResolveBinding,
+    status: &Value,
+    harness: &Harness,
+    run: &str,
+) {
+    assert_failed(status, &harness.fixture);
+    assert_eq!(record.revision, 1);
+    assert_eq!(record.run_id, run);
+    assert_eq!(
+        record.workspace_id,
+        status["workspace_id"].as_str().unwrap()
+    );
+    assert_eq!(record.generation, status["generation"].as_str().unwrap());
+    for id in [&record.workspace_id, &record.generation] {
+        let uuid = uuid::Uuid::parse_str(id).unwrap();
+        assert!(!uuid.is_nil());
+        assert_eq!(uuid.to_string(), *id);
+    }
+    let logical_id = format!("ws:{run}:{}", record.workspace_id);
+    assert!(logical_id.len() <= 125);
+    assert_eq!(record.logical_request_id, logical_id);
+    assert_eq!(record.resolve_trace_receipt.logical_request_id, logical_id);
+    assert_eq!(
+        record.resolve_trace_receipt.attempt_ids,
+        [format!("{logical_id}:a1")]
+    );
+    assert_eq!(
+        record.resolve_trace_receipt.final_attempt_id,
+        format!("{logical_id}:a1")
+    );
+    assert_eq!(record.resolve_trace_receipt.retry_count, 0);
+    assert_eq!(record.instance_id, INSTANCE);
+    assert_eq!(record.namespace_view_id, digest(&[0x22; 32]));
+    assert_eq!(record.snapshot_id, harness.fixture.sid);
+    assert_eq!(record.scope, SCOPE);
+    assert_eq!(record.publication_sequence, 1);
+    let descriptor = ServingDescriptor {
+        instance_uuid: *uuid::Uuid::parse_str(INSTANCE).unwrap().as_bytes(),
+        namespace_view_id: [0x22; 32],
+        scope: SCOPE.into(),
+        metadata_root: harness.fixture.root,
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(record.descriptor_bytes_hex, hex::encode(&descriptor));
+    assert_eq!(digest_of(&descriptor), record.snapshot_id);
+    assert!(record
+        .store
+        .starts_with(harness.temp.path().join("cache").canonicalize().unwrap()));
+    assert_eq!(
+        record.store.file_name().unwrap(),
+        record.workspace_id.as_str()
+    );
+    let owners = record.store.parent().unwrap();
+    assert_eq!(owners.file_name().unwrap(), "owners");
+    let view = owners.parent().unwrap();
+    assert_eq!(
+        view.file_name().unwrap(),
+        record.snapshot_id.strip_prefix("sha256:").unwrap()
+    );
+    assert_eq!(record.content_store, view.parent().unwrap().join("blobs"));
+    let store = DurableStore::open_with_content(&record.store, &record.content_store).unwrap();
+    let binding = store.workspace_binding().unwrap().unwrap();
+    assert_eq!(binding.workspace_id(), record.workspace_id);
+    assert_eq!(binding.snapshot_id(), record.snapshot_id);
+    let value = serde_json::to_value(record).unwrap();
+    assert_eq!(value["record"], "workspace_resolve_binding");
+    for absent in [
+        "lease_id",
+        "token",
+        "last_error",
+        "mount_state",
+        "metadata_ready",
+        "full_snapshot_complete",
+    ] {
+        assert!(value.get(absent).is_none());
+    }
+    let mut unknown = value.clone();
+    unknown["metadata_ready"] = true.into();
+    assert!(serde_json::from_value::<WorkspaceResolveBinding>(unknown).is_err());
+    let mut unknown_receipt = value;
+    unknown_receipt["resolve_trace_receipt"]["lease_id"] = "not-authority".into();
+    assert!(serde_json::from_value::<WorkspaceResolveBinding>(unknown_receipt).is_err());
+}
+
+#[tokio::test]
+async fn observed_creation_records_its_only_actual_resolve_and_independent_owners_without_claiming_mount_success(
+) {
+    let run = "11111111-2222-4333-8444-666666666666";
+    let (observer, mut observations) = WorkspaceObserver::channel(run, 2).unwrap();
+    let h =
+        Harness::new_with_observer(RootFailure::Denied, false, 2, 2, Some(observer.clone())).await;
+    for _ in 0..2 {
+        assert_eq!(
+            h.create(request("lazy")).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+    let statuses = h.list().await;
+    let first = observations.try_recv().unwrap();
+    let second = observations.try_recv().unwrap();
+    assert_ne!(first.workspace_id, second.workspace_id);
+    assert_ne!(first.generation, second.generation);
+    assert_ne!(first.store, second.store);
+    assert_eq!(first.content_store, second.content_store);
+    for record in [&first, &second] {
+        let status = statuses
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["workspace_id"] == record.workspace_id)
+            .unwrap();
+        assert_observed_binding(record, status, &h, run);
+    }
+    assert_eq!(
+        h.fixture.resolves.load(Ordering::SeqCst),
+        2,
+        "observer must not resolve again for labels"
+    );
+    assert_eq!(
+        *h.fixture.resolve_ids.lock().unwrap(),
+        [
+            Some(first.resolve_trace_receipt.final_attempt_id),
+            Some(second.resolve_trace_receipt.final_attempt_id)
+        ]
+    );
+    assert!(matches!(
+        observations.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(observer.status().first_error, None);
+    assert_eq!(observer.status().accepted_records, 2);
+    for status in statuses.as_array().unwrap() {
+        h.destroy(status["workspace_id"].as_str().unwrap()).await;
+    }
+    h.assert_no_mount_directory();
+    h.fixture.assert_only_canonical_requests();
+    drop(h);
+    drop(observer);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), observations.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let final_status = observations.finish().unwrap();
+    assert_eq!(final_status.accepted_records, 2);
+    assert_eq!(final_status.received_records, 2);
+}
+
+#[tokio::test]
+async fn ordinary_creation_has_no_observation_header_or_record() {
+    let (observer, observations) =
+        WorkspaceObserver::channel("11111111-2222-4333-8444-666666666666", 1).unwrap();
+    let h = Harness::new(RootFailure::Denied, false, 1, 2).await;
+    assert_eq!(
+        h.create(request("lazy")).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(*h.fixture.resolve_ids.lock().unwrap(), [None]);
+    assert_eq!(h.fixture.resolves.load(Ordering::SeqCst), 1);
+    assert_eq!(observer.status().accepted_records, 0);
+    let statuses = h.list().await;
+    h.destroy(statuses[0]["workspace_id"].as_str().unwrap())
+        .await;
+    h.assert_no_mount_directory();
+    drop(observer);
+    assert_eq!(observations.finish().unwrap().received_records, 0);
+}
+
+#[tokio::test]
+async fn full_observation_queue_is_sticky_but_preserves_failed_owners_and_cleanup_capacity() {
+    let (observer, mut observations) =
+        WorkspaceObserver::channel("11111111-2222-4333-8444-666666666666", 1).unwrap();
+    let h =
+        Harness::new_with_observer(RootFailure::Denied, false, 2, 2, Some(observer.clone())).await;
+    for _ in 0..2 {
+        assert_eq!(
+            h.create(request("lazy")).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+    let statuses = h.list().await;
+    assert_eq!(statuses.as_array().unwrap().len(), 2);
+    assert_eq!(h.fixture.resolves.load(Ordering::SeqCst), 2);
+    assert_eq!(observer.status().accepted_records, 1);
+    assert_eq!(
+        observer.status().first_error,
+        Some(WorkspaceObservationError::QueueFull)
+    );
+    let recorded = observations.try_recv().unwrap();
+    for status in statuses.as_array().unwrap() {
+        assert_failed(status, &h.fixture);
+        let owner_root = recorded
+            .store
+            .parent()
+            .unwrap()
+            .join(status["workspace_id"].as_str().unwrap());
+        let store = DurableStore::open_with_content(owner_root, &recorded.content_store).unwrap();
+        assert_eq!(
+            store.workspace_binding().unwrap().unwrap().workspace_id(),
+            status["workspace_id"].as_str().unwrap()
+        );
+        h.destroy(status["workspace_id"].as_str().unwrap()).await;
+    }
+    assert_eq!(h.list().await, json!([]));
+    assert_eq!(
+        h.create(request("lazy")).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        h.fixture.resolves.load(Ordering::SeqCst),
+        3,
+        "queue loss must not leak workspace capacity"
+    );
+    let last = h.list().await;
+    assert_failed(&last[0], &h.fixture);
+    h.destroy(last[0]["workspace_id"].as_str().unwrap()).await;
+    assert_eq!(
+        observations.try_recv().unwrap().workspace_id,
+        last[0]["workspace_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        observer.status().first_error,
+        Some(WorkspaceObservationError::QueueFull)
+    );
+    h.assert_no_mount_directory();
+    drop(h);
+    drop(observer);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), observations.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        observations.finish(),
+        Err(WorkspaceObservationError::QueueFull)
+    );
+}
+
+#[tokio::test]
+async fn dropped_observation_receiver_does_not_abandon_the_real_failed_workspace() {
+    let (observer, observations) =
+        WorkspaceObserver::channel("11111111-2222-4333-8444-666666666666", 1).unwrap();
+    drop(observations);
+    let h =
+        Harness::new_with_observer(RootFailure::Denied, false, 1, 2, Some(observer.clone())).await;
+    assert_eq!(
+        h.create(request("lazy")).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let statuses = h.list().await;
+    assert_eq!(statuses.as_array().unwrap().len(), 1);
+    assert_failed(&statuses[0], &h.fixture);
+    assert_eq!(h.fixture.resolves.load(Ordering::SeqCst), 1);
+    assert!(h.fixture.resolve_ids.lock().unwrap()[0].is_some());
+    assert_eq!(observer.status().accepted_records, 0);
+    assert_eq!(
+        observer.status().first_error,
+        Some(WorkspaceObservationError::ReceiverDropped)
+    );
+    h.destroy(statuses[0]["workspace_id"].as_str().unwrap())
+        .await;
+    assert_eq!(h.list().await, json!([]));
+    h.assert_no_mount_directory();
+    h.fixture.assert_only_canonical_requests();
 }
 
 #[tokio::test]
