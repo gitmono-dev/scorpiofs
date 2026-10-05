@@ -65,6 +65,10 @@ struct BoundCredentials {
 const MAX_ATTEMPTS: u32 = 4;
 const BASE_BACKOFF_MS: u64 = 40;
 
+/// Local limit for APIs returning a whole file in memory. Larger files use
+/// bounded range reads; this is independent of the protocol's file-size cap.
+pub const MAX_BUFFERED_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 impl Mst2Client {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_token(base_url, None)
@@ -310,10 +314,30 @@ impl Mst2Client {
             urlencode(expected_digest)
         ));
         let resp = self.send_retrying(self.http.get(url)).await?;
-        let resp = ok_or_error(resp).await?;
-        let bytes = resp.bytes().await.map_err(net_err)?;
-        self.recv_bytes
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let mut resp = ok_or_error(resp).await?;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_BUFFERED_FILE_BYTES)
+        {
+            return Err(buffered_limit());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(net_err)? {
+            self.recv_bytes
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            if chunk.len() as u64 > MAX_BUFFERED_FILE_BYTES - bytes.len() as u64 {
+                return Err(buffered_limit());
+            }
+            if chunk.len() > bytes.capacity() - bytes.len() {
+                let target = (bytes.len() + chunk.len())
+                    .max(bytes.capacity().saturating_mul(2))
+                    .min(MAX_BUFFERED_FILE_BYTES as usize);
+                bytes
+                    .try_reserve_exact(target - bytes.len())
+                    .map_err(|_| buffered_limit())?;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         // Defense in depth: verify locally even though the server enforces
         // expected_digest too. ring is already a dependency.
         use ring::digest::{Context, SHA256};
@@ -326,8 +350,15 @@ impl Mst2Client {
                 format!("blob {path}: expected {expected_digest}, got {got}"),
             ));
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
+}
+
+fn buffered_limit() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::LimitExceeded,
+        "whole-file buffered read exceeds the local 64 MiB budget; use range reads",
+    )
 }
 
 #[derive(Deserialize)]
