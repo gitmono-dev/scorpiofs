@@ -18,6 +18,13 @@ on:
         description: Repetitions (3 to 10)
         required: true
         default: '5'
+      session_deadline_utc:
+        description: Original shared UTC deadline when recovering a failed session
+        required: false
+      job_timeout_minutes:
+        description: Hard job bound; recovery must fit before the original deadline
+        required: true
+        default: '240'
 
 permissions:
   contents: read
@@ -29,9 +36,10 @@ jobs:
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
        github.event.pull_request.head.ref == 'test/mst2-real-commit-update-runner' &&
-       github.event.label.name == 'run-mst2-real-update-medium')
+       (github.event.label.name == 'run-mst2-real-update-medium' ||
+        startsWith(github.event.label.name, 'resume-mst2-update:')))
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && fromJSON(inputs.job_timeout_minutes) || startsWith(github.event.label.name, 'resume-mst2-update:') && fromJSON(github.event.label.description).timeout_minutes || 240 }}
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
@@ -41,15 +49,32 @@ jobs:
       SCORPIO_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       PROFILE: ${{ github.event_name == 'pull_request' && 'medium' || inputs.profile }}
       ROUNDS: ${{ github.event_name == 'pull_request' && '5' || inputs.rounds }}
+      DEADLINE_INPUT: ${{ inputs.session_deadline_utc }}
+      TIMEOUT_INPUT: ${{ inputs.job_timeout_minutes }}
+      RESUME_SPEC: ${{ startsWith(github.event.label.name, 'resume-mst2-update:') && github.event.label.description || '' }}
     steps:
       - name: Set shared session deadline
         shell: bash
         run: |
           python3 - <<'PY'
-          import os
+          import json, os
           from datetime import datetime, timedelta, timezone
+          now = datetime.now(timezone.utc)
+          spec = json.loads(os.environ['RESUME_SPEC']) if os.environ['RESUME_SPEC'] else {}
+          requested = spec.get('session_deadline_utc', os.environ['DEADLINE_INPUT'])
+          timeout = spec.get('timeout_minutes', int(os.environ['TIMEOUT_INPUT'] or '240'))
+          if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 240:
+              raise ValueError('invalid hard job timeout')
+          deadline = datetime.fromisoformat(requested.replace('Z', '+00:00')) if requested else now + timedelta(minutes=235)
+          if deadline.tzinfo is None or deadline.utcoffset().total_seconds() != 0:
+              raise ValueError('shared deadline must be explicit UTC')
+          remaining = (deadline - now).total_seconds()
+          if not 0 < remaining <= 235 * 60 or (requested and timeout * 60 > remaining):
+              raise ValueError('recovery timeout must fit the unextended shared deadline')
+          if spec and not requested:
+              raise ValueError('resume label must carry the original shared deadline')
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
-              stream.write('MST2_SESSION_DEADLINE=' + (datetime.now(timezone.utc) + timedelta(minutes=235)).isoformat() + '\n')
+              stream.write('MST2_SESSION_DEADLINE=' + deadline.isoformat() + '\n')
               stream.write('MST2_OWNED_ROOT=' + os.environ['RUNNER_TEMP'] + '/mst2-real-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '\n')
           PY
 
@@ -80,8 +105,15 @@ jobs:
           [[ "$MEGA_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -C scorpiofs rev-parse HEAD)" = "$SCORPIO_SHA"
           test "$(git -C mega2 rev-parse HEAD)" = "$MEGA_SHA"
-          cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
-          cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --example mst2_update_measure
+          for target in server client; do
+            REMAINING=$(python3 -c 'import os; from datetime import datetime, timezone; print(int((datetime.fromisoformat(os.environ["MST2_SESSION_DEADLINE"]) - datetime.now(timezone.utc)).total_seconds()) - 120)')
+            test "$REMAINING" -gt 0
+            if test "$target" = server; then
+              timeout --signal=TERM --kill-after=10 "$REMAINING" cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
+            else
+              timeout --signal=TERM --kill-after=10 "$REMAINING" cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --example mst2_update_measure
+            fi
+          done
 
       - name: Check benchmark fences and Git oracle
         run: python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_bench.py -v

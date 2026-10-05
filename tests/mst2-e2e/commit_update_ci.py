@@ -73,6 +73,73 @@ def free_port():
         return listener.getsockname()[1]
 
 
+def initialize_owned_native(database, instance, env, deadline):
+    """Maintenance bootstrap for this job's fresh DB, before starting writers.
+
+    service init does not invoke Mega2's maintenance-only native initializer.
+    Match its root/epoch/sequence contract, with a stricter empty-fixture gate.
+    This does not create a READY certificate; the first real push must do that.
+    """
+    if (not re.fullmatch(r"mst2_bench_[0-9a-f]{32}", database)
+            or env.get("PGDATABASE") != database
+            or env.get("PGHOST") != "127.0.0.1"):
+        raise ValueError("native bootstrap requires the exact newly owned loopback database")
+    if str(uuid.UUID(instance)) != instance:
+        raise ValueError("native bootstrap requires a canonical instance UUID")
+    sql = f"""BEGIN;
+SET LOCAL search_path = public;
+SELECT pg_advisory_xact_lock(1297043024, 1229867349);
+DO $owned_native$
+DECLARE root mega_refs%ROWTYPE;
+BEGIN
+ IF current_database() <> '{database}' THEN
+  RAISE EXCEPTION 'owned database differs';
+ END IF;
+ IF (SELECT count(*) FROM queue_control WHERE id=1) <> 1 THEN
+  RAISE EXCEPTION 'fresh queue control is missing';
+ END IF;
+ PERFORM id FROM queue_control WHERE id=1 FOR UPDATE;
+ IF EXISTS (SELECT 1 FROM push_queue)
+    OR EXISTS (SELECT 1 FROM mst2_native_head)
+    OR EXISTS (SELECT 1 FROM mst2_native_publication)
+    OR EXISTS (SELECT 1 FROM mst2_namespace_seq)
+    OR EXISTS (SELECT 1 FROM mst2_publication)
+    OR EXISTS (SELECT 1 FROM mst2_publication_outbox)
+    OR EXISTS (SELECT 1 FROM mst2_queue_noop_receipt) THEN
+  RAISE EXCEPTION 'native bootstrap requires an unused publication fixture';
+ END IF;
+ SELECT * INTO STRICT root FROM mega_refs
+  WHERE path='/' AND ref_name='refs/heads/main' AND NOT is_cl FOR UPDATE;
+ IF root.ref_commit_hash !~ '^[0-9a-f]{{40}}$'
+    OR root.ref_tree_hash !~ '^[0-9a-f]{{40}}$'
+    OR (SELECT count(*) FROM mega_commit
+        WHERE commit_id=root.ref_commit_hash AND tree=root.ref_tree_hash) <> 1
+    OR (SELECT count(*) FROM mega_tree WHERE tree_id=root.ref_tree_hash) <> 1 THEN
+  RAISE EXCEPTION 'fresh native root is missing or mismatched';
+ END IF;
+ INSERT INTO mst2_native_head
+  (namespace,instance_id,sequence,writer_epoch,root_commit,root_tree,state)
+ VALUES ('/','{instance}',0,1,root.ref_commit_hash,root.ref_tree_hash,'INITIALIZING');
+END $owned_native$;
+COMMIT;"""
+    bench.command(["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1"],
+                  deadline, env=env, data=sql.encode())
+    # Independently read back the actual stored root and initial head before
+    # any writer is started. No verified object or publication is fabricated.
+    rows = bench.query(bench.IDENTITY_SQL, deadline, env=env)
+    project = next(row for row in rows if row["path"] == "/project")
+    identity = bench.validate_identity(rows, project["commit"], project["tree"], database)
+    native = bench.query(bench.NATIVE_SQL, deadline, env=env)
+    bench.validate_native(native, identity, instance, False)
+    if native["sequence"] != 0 or native["state"] != "INITIALIZING":
+        raise AssertionError("fresh native head is not the initial epoch/sequence")
+    return {"record": "owned_native_initialization", "instance_id": instance,
+            "sequence": 0, "writer_epoch": 1, "state": "INITIALIZING",
+            "global_commit": identity["global_commit"],
+            "global_tree": identity["global_tree"], "correctness": "PASS",
+            "production_service_init_wired": False}
+
+
 def dependencies(source, project, ports, deadline):
     raw = bench.command(["docker", "compose", "-f", str(source / "docker/docker-compose.test.yml"),
                          "config", "--format", "json"], deadline)
@@ -206,6 +273,7 @@ def execute(options):
         prefix = [str(binary), "--config", str(config_path)]
         bench.command(prefix + ["config", "validate"], deadline, env=service_env)
         bench.command(prefix + ["service", "init", "--yes"], deadline, env=service_env)
+        print(json.dumps(initialize_owned_native(db, instance, env, deadline)), flush=True)
         log = (root / "service-private.log").open("wb")
         process = subprocess.Popen(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,

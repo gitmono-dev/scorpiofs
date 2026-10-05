@@ -1,12 +1,14 @@
 """Acceptance checks for the real runner's fences, Git oracle and durability."""
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import textwrap
 import time
 import unittest
 from unittest.mock import patch
@@ -21,6 +23,79 @@ CI_SPEC.loader.exec_module(CI)
 
 
 class CommitUpdateBenchTests(unittest.TestCase):
+    def test_owned_native_bootstrap_rejects_other_database_host_and_noncanonical_instance(self):
+        database = "mst2_bench_" + "a" * 32
+        instance = "6ab219b0-4275-45ba-9d7b-7b0b633018cd"
+        env = {"PGHOST": "127.0.0.1", "PGDATABASE": database}
+        cases = [("existing_database", instance, env),
+                 (database, instance, dict(env, PGDATABASE="other")),
+                 (database, instance, dict(env, PGHOST="remote.example")),
+                 (database, instance.upper(), env),
+                 (database, "' OR 1=1 --", env)]
+        with patch.object(CI.bench, "command") as command:
+            for db, uuid, connection in cases:
+                with self.assertRaises(ValueError):
+                    CI.initialize_owned_native(db, uuid, connection, time.monotonic() + 30)
+            command.assert_not_called()
+
+    def test_owned_native_bootstrap_independent_readback_rejects_stale_root_or_epoch(self):
+        database = "mst2_bench_" + "a" * 32
+        instance = "6ab219b0-4275-45ba-9d7b-7b0b633018cd"
+        commit, tree = "1" * 40, "2" * 40
+        raw = b"40000 project\0" + bytes.fromhex(tree)
+        root_tree = hashlib.sha1(b"tree " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+        rows = [{"path": "/", "commit": "3" * 40, "tree": root_tree, "commit_tree": root_tree,
+                 "database": database, "raw_tree": raw.hex()},
+                {"path": "/project", "commit": commit, "tree": tree, "commit_tree": tree,
+                 "database": database, "raw_tree": None}]
+        native = {"instance_id": instance, "root_commit": "3" * 40, "root_tree": root_tree,
+                  "writer_epoch": 1, "sequence": 0, "state": "INITIALIZING", "certificate_receipt_id": None}
+        env = {"PGHOST": "127.0.0.1", "PGDATABASE": database}
+        with patch.object(CI.bench, "command"), patch.object(CI.bench, "query", side_effect=[rows, native]):
+            CI.initialize_owned_native(database, instance, env, time.monotonic() + 30)
+        for wrong in [None, dict(native, root_commit="4" * 40), dict(native, writer_epoch=2),
+                      dict(native, instance_id="different"), dict(native, sequence=1)]:
+            with patch.object(CI.bench, "command"), patch.object(CI.bench, "query", side_effect=[rows, wrong]):
+                with self.assertRaises(AssertionError):
+                    CI.initialize_owned_native(database, instance, env, time.monotonic() + 30)
+
+    def test_query_reports_safe_phase_without_echoing_invalid_output(self):
+        for sql, phase in [(BENCH.IDENTITY_SQL, "Git identity"), (BENCH.NATIVE_SQL, "native publication")]:
+            with patch.object(BENCH, "command", return_value=b"private-token-do-not-log"):
+                with self.assertRaises(AssertionError) as error:
+                    BENCH.query(sql, time.monotonic() + 30)
+                self.assertIn(phase, str(error.exception))
+                self.assertNotIn("private-token", str(error.exception))
+        with patch.object(BENCH, "command", return_value=b"null\n"):
+            self.assertIsNone(BENCH.query(BENCH.NATIVE_SQL, time.monotonic() + 30))
+
+    def test_workflow_recovery_preserves_deadline_and_rejects_extension_before_setup(self):
+        workflow = SOURCE.parents[2] / ".github/workflows/mst2-real-update.yml"
+        script = textwrap.dedent(workflow.read_text().split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+        deadline = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "github-env"
+            env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
+                       GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2", RESUME_SPEC="",
+                       DEADLINE_INPUT=deadline, TIMEOUT_INPUT="19")
+            subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
+            self.assertIn("MST2_SESSION_DEADLINE=" + deadline, output.read_text())
+            output.unlink()
+            spec = json.dumps({"session_deadline_utc": deadline, "timeout_minutes": 19})
+            subprocess.run([os.sys.executable, "-c", script], check=True,
+                           env=dict(env, DEADLINE_INPUT="", TIMEOUT_INPUT="", RESUME_SPEC=spec), capture_output=True)
+            self.assertIn("MST2_SESSION_DEADLINE=" + deadline, output.read_text())
+            output.unlink()
+            for bad in [dict(env, TIMEOUT_INPUT="21"),
+                        dict(env, DEADLINE_INPUT="2000-01-01T00:00:00Z"),
+                        dict(env, DEADLINE_INPUT="2099-01-01T00:00:00Z"),
+                        dict(env, DEADLINE_INPUT=deadline[:-6]),
+                        dict(env, DEADLINE_INPUT=deadline[:-6] + "+08:00"),
+                        dict(env, DEADLINE_INPUT="", RESUME_SPEC='{"timeout_minutes":19}')]:
+                result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
     def test_ci_setup_plan_cannot_create_local_resources(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "nonexistent-owned-root"

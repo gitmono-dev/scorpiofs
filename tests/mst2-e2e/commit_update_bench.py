@@ -44,7 +44,7 @@ COMMIT;"""
 
 NATIVE_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL search_path = public;
-SELECT row_to_json(x) FROM (
+SELECT COALESCE((SELECT row_to_json(x) FROM (
  SELECT h.instance_id, h.sequence, h.writer_epoch, h.root_commit, h.root_tree,
         h.state, h.certificate_receipt_id, n.root_commit AS certificate_commit,
         n.root_tree AS certificate_tree, n.sequence AS certificate_sequence,
@@ -62,7 +62,7 @@ SELECT row_to_json(x) FROM (
  LEFT JOIN mst2_publication p ON p.id=n.receipt_id
  LEFT JOIN mst2_publication_outbox o ON o.operation_id=p.operation_id
  WHERE h.namespace='/'
-) x;
+) x), 'null'::json);
 COMMIT;"""
 
 
@@ -208,10 +208,17 @@ def service_binding(options):
             "config_sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def query(sql, deadline):
-    env = clean_env({k: v for k, v in os.environ.items() if k.startswith("PG")})
-    return json.loads(command(["psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
-                              deadline, env=env, data=sql.encode()))
+def query(sql, deadline, env=None):
+    if env is None:
+        env = clean_env({k: v for k, v in os.environ.items() if k.startswith("PG")})
+    raw = command(["psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
+                  deadline, env=env, data=sql.encode())
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Never echo SQL results, connection strings or credentials in CI.
+        phase = "native publication" if sql == NATIVE_SQL else "Git identity"
+        raise AssertionError(f"{phase} fence returned invalid JSON") from None
 
 
 def validate_identity(rows, commit, tree, database):
