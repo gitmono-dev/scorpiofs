@@ -1,6 +1,8 @@
 name: MST2 real commit update benchmark
 
 on:
+  pull_request:
+    types: [labeled]
   workflow_dispatch:
     inputs:
       mega_sha:
@@ -22,6 +24,12 @@ permissions:
 
 jobs:
   benchmark:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.head.ref == 'test/mst2-real-commit-update-runner' &&
+       github.event.label.name == 'run-mst2-real-update-medium')
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
@@ -29,6 +37,10 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       NO_PROXY: localhost,127.0.0.1
+      MEGA_SHA: ${{ github.event_name == 'pull_request' && '37b61086288b80c10b413472e262a1bf281779eb' || inputs.mega_sha }}
+      SCORPIO_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      PROFILE: ${{ github.event_name == 'pull_request' && 'medium' || inputs.profile }}
+      ROUNDS: ${{ github.event_name == 'pull_request' && '5' || inputs.rounds }}
     steps:
       - name: Set shared session deadline
         shell: bash
@@ -43,13 +55,14 @@ jobs:
 
       - uses: actions/checkout@v7
         with:
+          ref: ${{ env.SCORPIO_SHA }}
           path: scorpiofs
           persist-credentials: false
 
       - uses: actions/checkout@v7
         with:
           repository: gitmono-dev/mega2
-          ref: ${{ inputs.mega_sha }}
+          ref: ${{ env.MEGA_SHA }}
           path: mega2
           persist-credentials: false
 
@@ -61,12 +74,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build immutable server and measurement client
-        env:
-          MEGA_SHA: ${{ inputs.mega_sha }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$MEGA_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C scorpiofs rev-parse HEAD)" = "$SCORPIO_SHA"
           test "$(git -C mega2 rev-parse HEAD)" = "$MEGA_SHA"
           cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
           cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --example mst2_update_measure
@@ -75,10 +87,6 @@ jobs:
         run: python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_bench.py -v
 
       - name: Run real commit update benchmark on owned deployment
-        env:
-          MEGA_SHA: ${{ inputs.mega_sha }}
-          PROFILE: ${{ inputs.profile }}
-          ROUNDS: ${{ inputs.rounds }}
         shell: bash
         run: |
           set -euo pipefail
