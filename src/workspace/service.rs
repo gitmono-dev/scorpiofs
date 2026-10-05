@@ -412,7 +412,12 @@ impl WorkspaceService {
                 });
             }
         }
-        let local_pin_state = if let Some(store) = &runtime.store {
+        let local_pin_state = if runtime.hydrate.is_some() {
+            // The admitted task may still be acquiring its publication lock.
+            // An observation must not take that lock first and fail hydration.
+            // Audit the durable guarantee only after joining the owned task.
+            PinState::Unknown
+        } else if let Some(store) = &runtime.store {
             let store = store.clone();
             match tokio::task::spawn_blocking(move || store.local_pin_state()).await {
                 Ok(Ok(LocalPinState::Complete(CompletionKind::FullSnapshot))) => {
