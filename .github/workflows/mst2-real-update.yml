@@ -17,7 +17,7 @@ on:
       rounds:
         description: Repetitions (3 to 10)
         required: true
-        default: '5'
+        default: '3'
       session_deadline_utc:
         description: Original shared UTC deadline when recovering a failed session
         required: false
@@ -48,7 +48,7 @@ jobs:
       MEGA_SHA: ${{ github.event_name == 'pull_request' && '37b61086288b80c10b413472e262a1bf281779eb' || inputs.mega_sha }}
       SCORPIO_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       PROFILE: ${{ github.event_name == 'pull_request' && 'medium' || inputs.profile }}
-      ROUNDS: ${{ github.event_name == 'pull_request' && '5' || inputs.rounds }}
+      ROUNDS: ${{ github.event_name == 'pull_request' && '3' || inputs.rounds }}
       DEADLINE_INPUT: ${{ inputs.session_deadline_utc }}
       TIMEOUT_INPUT: ${{ inputs.job_timeout_minutes }}
       RESUME_SPEC: ${{ startsWith(github.event.label.name, 'resume-mst2-update:') && github.event.label.description || '' }}
@@ -57,7 +57,7 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
-          import json, os
+          import json, os, time
           from datetime import datetime, timedelta, timezone
           now = datetime.now(timezone.utc)
           spec = json.loads(os.environ['RESUME_SPEC']) if os.environ['RESUME_SPEC'] else {}
@@ -75,6 +75,7 @@ jobs:
               raise ValueError('resume label must carry the original shared deadline')
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
               stream.write('MST2_SESSION_DEADLINE=' + deadline.isoformat() + '\n')
+              stream.write('MST2_WORK_CLEANUP_DEADLINE_MONOTONIC=' + repr(time.monotonic() + remaining - 15 * 60) + '\n')
               stream.write('MST2_OWNED_ROOT=' + os.environ['RUNNER_TEMP'] + '/mst2-real-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '\n')
           PY
 
@@ -97,6 +98,7 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('scorpiofs/Cargo.lock') }}
 
       - name: Install system dependencies
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libfuse3-dev protobuf-compiler postgresql-client
@@ -111,20 +113,24 @@ jobs:
           test "$(git -C scorpiofs rev-parse HEAD)" = "$SCORPIO_SHA"
           test "$(git -C mega2 rev-parse HEAD)" = "$MEGA_SHA"
           for target in server client; do
-            REMAINING=$(python3 -c 'import os; from datetime import datetime, timezone; print(int((datetime.fromisoformat(os.environ["MST2_SESSION_DEADLINE"]) - datetime.now(timezone.utc)).total_seconds()) - 120)')
-            test "$REMAINING" -gt 0
             if test "$target" = server; then
-              timeout --signal=TERM --kill-after=10 "$REMAINING" cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
+              python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage server-build -- \
+                cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
             else
-              timeout --signal=TERM --kill-after=10 "$REMAINING" cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --example mst2_update_measure
+              python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage client-build -- \
+                cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --example mst2_update_measure
             fi
           done
 
       - name: Check benchmark fences and Git oracle
+        shell: bash
         run: |
-          python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_bench.py -v
-          MST2_MEASURE_DRIVER="$GITHUB_WORKSPACE/scorpiofs/target/release/examples/mst2_update_measure" \
-            cargo test --manifest-path scorpiofs/Cargo.toml --locked --release --example mst2_update_measure
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage fences -- bash -euo pipefail -c '
+            python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_bench.py -v
+            python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_budget.py -v
+            MST2_MEASURE_DRIVER="$GITHUB_WORKSPACE/scorpiofs/target/release/examples/mst2_update_measure" \
+              cargo test --manifest-path scorpiofs/Cargo.toml --locked --release --example mst2_update_measure
+          '
 
       - name: Run real commit update benchmark on owned deployment
         shell: bash
@@ -143,5 +149,6 @@ jobs:
         shell: bash
         run: |
           if test -f scorpiofs/tests/mst2-e2e/commit_update_ci.py; then
-            python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --cleanup --run-root "$MST2_OWNED_ROOT"
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --cleanup --run-root "$MST2_OWNED_ROOT" \
+              --session-deadline-utc "$MST2_SESSION_DEADLINE" --rounds "$ROUNDS"
           fi

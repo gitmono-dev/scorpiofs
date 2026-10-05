@@ -210,7 +210,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 "--run-root", str(root)])
             plan = json.loads(output)
             self.assertFalse(plan["execute"])
-            self.assertEqual(plan["rounds"], 5)
+            self.assertEqual(plan["rounds"], 3)
             self.assertEqual(plan["max_wall_seconds"], 14400)
             self.assertFalse(root.exists())
 
@@ -313,6 +313,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
     def test_timeout_terminates_whole_child_group_then_kills_if_term_is_ignored(self):
         class Hung:
             pid = 12345
+            returncode = None
             calls = 0
             def communicate(self, data=None, timeout=None):
                 self.calls += 1
@@ -320,15 +321,21 @@ class CommitUpdateBenchTests(unittest.TestCase):
                     raise subprocess.TimeoutExpired("ignored", timeout)
                 return b"", b""
         child = Hung()
-        with patch.object(BENCH.subprocess, "Popen", return_value=child), \
+        with patch.object(BENCH.budget_module.subprocess, "Popen", return_value=child), \
+                patch.object(BENCH.budget_module, "PinnedProcess", return_value=child), \
+                patch.object(BENCH.budget_module, "process_start", return_value="1"), \
+                patch.object(BENCH.budget_module, "group_members", return_value=[12345]), \
+                patch.object(BENCH.budget_module, "stop_group") as stop_group, \
                 patch.object(BENCH.os, "killpg", create=True) as killpg, \
-                patch.object(BENCH.signal, "SIGKILL", 9, create=True):
+                patch.object(BENCH.budget_module.signal, "SIGKILL", 9, create=True):
             with self.assertRaises(TimeoutError):
                 BENCH.command(["driver"], time.monotonic() + 30)
             self.assertEqual([call.args[1] for call in killpg.call_args_list],
-                             [BENCH.signal.SIGTERM, BENCH.signal.SIGKILL])
+                             [BENCH.budget_module.signal.SIGTERM, BENCH.budget_module.signal.SIGKILL])
             self.assertTrue(all(call.args[0] == 12345 for call in killpg.call_args_list))
             self.assertEqual(child.calls, 3)
+            self.assertEqual(stop_group.call_args.args[:2], (12345, "1"))
+            self.assertIs(stop_group.call_args.args[3], child)
 
     @unittest.skipUnless(hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"), "Linux durability primitive")
     def test_durable_flush_includes_regular_files_and_directories_without_following_symlinks(self):

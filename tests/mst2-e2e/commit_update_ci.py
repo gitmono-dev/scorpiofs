@@ -6,7 +6,6 @@ No existing server, cloud resource or persistent deployment is accepted.
 """
 
 import argparse
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -22,6 +21,7 @@ from urllib.request import urlopen
 import uuid
 
 import commit_update_bench as bench
+import commit_update_budget as budget_module
 
 
 def hosted_root(root):
@@ -183,34 +183,33 @@ def stop_owned(root, project, deadline, process=None):
     if hashlib.sha256(compose.read_bytes()).hexdigest() != state["compose_sha256"]:
         raise AssertionError("cleanup Compose configuration differs from owned startup")
     service = state.get("service")
-    if service and Path(f"/proc/{service['pid']}").exists():
+    if service:
         pid = service["pid"]
+        if service.get("pgid") != pid or service.get("sid") != pid:
+            raise AssertionError("owned new-session group binding is missing")
         proc = Path(f"/proc/{pid}")
-        started = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[19]
-        argv = [x.decode() for x in proc.joinpath("cmdline").read_bytes().split(b"\0") if x]
-        if (started != service["starttime"] or argv[:3] != [state["binary"], "--config", str(root / "service.toml")]
-                or os.getpgid(pid) != pid):
-            raise AssertionError("refusing cleanup of a replaced or unrelated service")
-        os.killpg(pid, signal.SIGTERM)
-        if process:
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(pid, signal.SIGKILL)
-                process.wait(timeout=5)
-        else:
-            for _ in range(50):
-                if not proc.exists():
-                    break
-                time.sleep(0.1)
-            if proc.exists():
-                # Recheck its start identity before escalation after waiting.
-                if proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[19] != service["starttime"]:
-                    raise AssertionError("service PID was replaced during cleanup")
-                os.killpg(pid, signal.SIGKILL)
+        reaped = process is not None and process.poll() is not None
+        if not reaped and proc.exists():
+            started = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[19]
+            argv = [x.decode() for x in proc.joinpath("cmdline").read_bytes().split(b"\0") if x]
+            if (started != service["starttime"]
+                    or argv[:3] != [state["binary"], "--config", str(root / "service.toml")]
+                    or os.getpgid(pid) != pid or os.getsid(pid) != pid):
+                raise AssertionError("refusing cleanup of a replaced or unrelated service")
+        budget_module.stop_group(pid, service["starttime"], deadline, process)
     bench.command(["docker", "compose", "-p", project, "-f", str(compose), "down", "--volumes"], deadline)
+    containers = bench.command(["docker", "ps", "-aq", "--filter",
+                                "label=com.docker.compose.project=" + project], deadline)
+    network = bench.command(["docker", "network", "ls", "-q", "--filter",
+                             "name=^" + project + "-network$"], deadline)
+    if containers.strip() or network.strip():
+        raise AssertionError("owned cleanup left project containers or network")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("owned cleanup inventory exceeded original deadline")
     state.pop("service", None)
     state_path.write_text(json.dumps(state))
+    if time.monotonic() >= deadline:
+        raise TimeoutError("owned cleanup metadata exceeded original deadline")
     print(json.dumps({"record": "owned_cleanup", "project": project, "correctness": "PASS"}), flush=True)
 
 
@@ -220,10 +219,8 @@ def execute(options):
         raise ValueError("disposable job directory must not already exist")
     if not re.fullmatch(r"[0-9a-f]{40}", options.mega_sha):
         raise ValueError("server source must be an immutable full SHA-1")
-    absolute = datetime.fromisoformat(options.session_deadline_utc.replace("Z", "+00:00"))
-    if absolute.tzinfo is None or absolute.utcoffset().total_seconds() != 0:
-        raise ValueError("shared deadline must be explicit UTC")
-    deadline = time.monotonic() + min(14400, absolute.timestamp() - time.time()) - 120
+    budget = budget_module.from_options(options)
+    deadline = budget.stage_deadline("setup")
     source = options.mega_source.resolve(strict=True)
     source_sha = bench.git(source, deadline, "rev-parse", "HEAD").decode().strip()
     if source_sha != options.mega_sha or bench.git(source, deadline, "status", "--porcelain").strip():
@@ -294,45 +291,61 @@ def execute(options):
         process = subprocess.Popen(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                    env=service_env, start_new_session=True)
-        state["service"] = {"pid": process.pid, "starttime": Path(f"/proc/{process.pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]}
-        state_path.write_text(json.dumps(state))
+        started = None
+        try:
+            started = budget_module.process_start(process.pid)
+            state["service"] = {"pid": process.pid, "pgid": process.pid, "sid": process.pid,
+                                "starttime": started}
+            state_path.write_text(json.dumps(state))
+        except BaseException:
+            # Startup identity/state failures must not bypass owned finally.
+            # The direct Popen child is still unreaped and pins its group ID.
+            if started is None:
+                budget_module.abort_startup(process, budget.cleanup_deadline)
+            else:
+                budget_module.stop_group(process.pid, started, budget.cleanup_deadline, process)
+            raise
         base = f"http://127.0.0.1:{ports['http']}"
         ready_until = min(deadline, time.monotonic() + 180)
         while True:
             if process.poll() is not None or time.monotonic() >= ready_until:
                 raise RuntimeError("owned service failed readiness")
             try:
-                with urlopen(base + "/api/v2/snapshots/capabilities", timeout=2) as response:
+                with urlopen(base + "/api/v2/snapshots/capabilities",
+                             timeout=min(2, max(.001, ready_until - time.monotonic()))) as response:
                     if response.status == 200:
                         break
             except OSError:
                 pass
-            time.sleep(0.2)
+            time.sleep(min(.2, max(0, ready_until - time.monotonic())))
         initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"], deadline).decode().split()
         if len(initial) != 2 or initial[1] != "refs/heads/main":
             raise AssertionError("owned service did not initialize exactly one project main")
         env.update(M2_TOKEN=token, M2_GIT_TOKEN=git_token)
-        remaining = deadline - time.monotonic()
-        actual_rounds = min(options.rounds, 3) if remaining < 3600 else options.rounds
-        actual_profile = "smoke" if options.profile == "medium" and remaining < 1200 else options.profile
+        budget.require(options.rounds * budget_module.ROUND_SECONDS
+                       + budget_module.REPORT_RESERVE + budget_module.CLEANUP_RESERVE
+                       + budget_module.MARGIN)
         print(json.dumps({"record": "owned_server_build", "source_sha": source_sha,
                           "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "project": project,
-                          "requested_profile": options.profile, "actual_profile": actual_profile,
-                          "requested_rounds": options.rounds, "actual_rounds": actual_rounds,
-                          "remaining_session_seconds": remaining}), flush=True)
+                          "requested_profile": options.profile, "actual_profile": options.profile,
+                          "requested_rounds": options.rounds, "actual_rounds": options.rounds,
+                          "remaining_session_seconds": budget.cleanup_deadline - time.monotonic()}), flush=True)
         os.environ.update(env)
         args = bench.parser().parse_args([
             "--execute", "--isolated-deployment", "--base-url", base, "--git-url", base + "/project",
             "--database", db, "--instance-id", instance, "--expect-initial-commit", initial[0],
             "--service-pid", str(process.pid), "--driver", str(options.driver.resolve()),
             "--driver-sha256", options.driver_sha256, "--run-root", str(root / "measurements"),
-            "--profile", actual_profile, "--rounds", str(actual_rounds),
+            "--profile", options.profile, "--rounds", str(options.rounds),
             "--session-deadline-utc", options.session_deadline_utc])
+        args.budget = budget
+        if time.monotonic() >= deadline:
+            raise TimeoutError("owned setup exceeded its fixed stage budget")
         with bench.phase("commit_update_benchmark"):
             bench.execute(args)
     finally:
         try:
-            stop_owned(root, project, time.monotonic() + 90, process)
+            stop_owned(root, project, budget.cleanup_deadline, process)
         finally:
             if log:
                 log.close()
@@ -349,15 +362,18 @@ if __name__ == "__main__":
     parser.add_argument("--driver", type=Path)
     parser.add_argument("--driver-sha256")
     parser.add_argument("--session-deadline-utc")
+    parser.add_argument("--work-cleanup-deadline-monotonic", type=float,
+                        default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     parser.add_argument("--profile", choices=("smoke", "medium"), default="medium")
-    parser.add_argument("--rounds", type=int, choices=range(3, 11), default=5)
+    parser.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     opts = parser.parse_args()
     try:
         if opts.execute and opts.cleanup:
             raise ValueError("execute and cleanup are separate operations")
         if opts.cleanup:
             owned, compose_project = hosted_root(opts.run_root)
-            stop_owned(owned, compose_project, time.monotonic() + 90)
+            if (owned / "owned.json").exists():
+                stop_owned(owned, compose_project, budget_module.from_options(opts).cleanup_deadline)
         elif not opts.execute:
             print(json.dumps({"execute": False, "profile": opts.profile, "rounds": opts.rounds,
                               "resources": "one unique disposable hosted-runner Compose project; no cloud resources",
