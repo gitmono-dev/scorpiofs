@@ -30,6 +30,7 @@ pub use closure::{SnapshotClosureMeters, SnapshotDirectory, ValidatedSnapshotClo
 pub use content::{ContentBudgetLimits, ContentBudgetUsage, VerifiedContent};
 pub use coordinator::{FetchCoordinator, FetchCoordinatorCounts, FetchCoordinatorLimits};
 pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMeters, ViewMeta};
+pub use frames::LeaseReleaseOutcome;
 pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
