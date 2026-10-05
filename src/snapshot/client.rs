@@ -560,7 +560,7 @@ async fn read_json_bytes(mut resp: reqwest::Response) -> Result<Vec<u8>, Snapsho
     Ok(bytes)
 }
 
-fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SnapshotError> {
+pub(crate) fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SnapshotError> {
     let invalid = |error| {
         SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
