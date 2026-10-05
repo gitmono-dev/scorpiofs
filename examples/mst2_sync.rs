@@ -131,9 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             concurrency,
         )?;
         store
-            .hydrate_snapshot_concurrent(&reader, &closure, concurrency, move |f| {
+            .hydrate_snapshot_concurrent_with_body(&reader, &closure, concurrency, move |f| {
                 let coordinator = coordinator.clone();
-                Box::pin(async move { coordinator.fetch(f, use_frames).await })
+                Box::pin(async move { coordinator.fetch_owned(f, use_frames).await })
             })
             .await?
     };

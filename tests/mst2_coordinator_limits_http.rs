@@ -466,9 +466,7 @@ fn coordinator(
 fn start(
     c: &Arc<FetchCoordinator>,
     path: &str,
-) -> tokio::task::JoinHandle<
-    Result<Arc<scorpiofs::snapshot::VerifiedContent>, scorpiofs::snapshot::SnapshotError>,
-> {
+) -> tokio::task::JoinHandle<Result<Arc<Vec<u8>>, scorpiofs::snapshot::SnapshotError>> {
     let c = c.clone();
     let file = file(path);
     tokio::spawn(async move { c.fetch(file, false).await })
@@ -893,14 +891,25 @@ async fn small_budget_coordinator(s: &Server) -> Arc<FetchCoordinator> {
     .unwrap()
 }
 
+fn start_owned(
+    c: &Arc<FetchCoordinator>,
+    path: &str,
+) -> tokio::task::JoinHandle<
+    Result<Arc<scorpiofs::snapshot::VerifiedContent>, scorpiofs::snapshot::SnapshotError>,
+> {
+    let c = c.clone();
+    let file = file(path);
+    tokio::spawn(async move { c.fetch_owned(file, false).await })
+}
+
 #[tokio::test]
 async fn returned_aliases_and_unreceived_task_results_keep_capacity_until_last_arc() {
     let _serial = TEST_LOCK.lock().await;
     let s = Server::start(true).await;
     let c = small_budget_coordinator(&s).await;
-    let first = start(&c, "a");
+    let first = start_owned(&c, "a");
     until(|| s.fixture.request_count() == 1).await;
-    let waiter = start(&c, "b");
+    let waiter = start_owned(&c, "b");
     until(|| c.counts().active_callers == 2).await;
     s.fixture.blob_release.add_permits(1);
     let owner = first.await.unwrap().unwrap();
@@ -910,7 +919,7 @@ async fn returned_aliases_and_unreceived_task_results_keep_capacity_until_last_a
     let clone = owner.clone();
     assert_eq!(c.content_usage().output_bytes, 1024);
     assert_eq!(
-        c.fetch(file("f00"), false).await.unwrap_err().code,
+        c.fetch_owned(file("f00"), false).await.unwrap_err().code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(
@@ -931,7 +940,7 @@ async fn returned_aliases_and_unreceived_task_results_keep_capacity_until_last_a
     drop(alias);
     assert_eq!(c.content_usage().output_bytes, 0);
     s.fixture.blob_release.add_permits(1);
-    let next = c.fetch(file("f00"), false).await.unwrap();
+    let next = c.fetch_owned(file("f00"), false).await.unwrap();
     assert_eq!(next.as_slice(), content("f00"));
     drop(next);
     idle(&c).await;
@@ -947,7 +956,7 @@ async fn sized_raw_rejects_length_digest_and_stream_overflow_without_publishing(
         s.fixture.body_mode.store(mode, Ordering::SeqCst);
         s.fixture.blob_release.add_permits(1);
         assert_eq!(
-            c.fetch(file("a"), false).await.unwrap_err().code,
+            c.fetch_owned(file("a"), false).await.unwrap_err().code,
             SnapshotErrorCode::DigestMismatch
         );
         idle(&c).await;
@@ -958,7 +967,7 @@ async fn sized_raw_rejects_length_digest_and_stream_overflow_without_publishing(
     s.fixture.corrupt_blob.store(true, Ordering::SeqCst);
     s.fixture.blob_release.add_permits(1);
     assert_eq!(
-        c.fetch(file("a"), false).await.unwrap_err().code,
+        c.fetch_owned(file("a"), false).await.unwrap_err().code,
         SnapshotErrorCode::DigestMismatch
     );
     idle(&c).await;
@@ -966,7 +975,7 @@ async fn sized_raw_rejects_length_digest_and_stream_overflow_without_publishing(
     s.fixture.corrupt_blob.store(false, Ordering::SeqCst);
     s.fixture.blob_release.add_permits(1);
     assert_eq!(
-        c.fetch(file("a"), false).await.unwrap().as_slice(),
+        c.fetch_owned(file("a"), false).await.unwrap().as_slice(),
         content("a")
     );
     idle(&c).await;
@@ -978,10 +987,10 @@ async fn queued_and_running_cancellation_drop_actual_fixed_output_owners() {
     let _serial = TEST_LOCK.lock().await;
     let s = Server::start(true).await;
     let c = small_budget_coordinator(&s).await;
-    let first = start(&c, "a");
+    let first = start_owned(&c, "a");
     until(|| s.fixture.request_count() == 1).await;
     assert_eq!(c.content_usage().output_bytes, 1024);
-    let queued = start(&c, "f00");
+    let queued = start_owned(&c, "f00");
     until(|| c.counts().pending_jobs == 2).await;
     assert_eq!(
         c.content_usage().output_bytes,
@@ -1230,4 +1239,27 @@ async fn owned_batch_end_without_eof_and_actual_cancellation_keep_then_release_a
             .len(),
         2
     );
+}
+
+#[tokio::test]
+async fn legacy_and_owned_aliases_keep_distinct_result_types_and_shared_count_admission() {
+    let _serial = TEST_LOCK.lock().await;
+    let s = Server::start(true).await;
+    let c = small_budget_coordinator(&s).await;
+    let legacy = start(&c, "a");
+    until(|| s.fixture.request_count() == 1).await;
+    let owned = start_owned(&c, "b");
+    until(|| c.counts().pending_jobs == 2).await;
+    assert_eq!(c.counts().active_callers, 2);
+    s.fixture.blob_release.add_permits(2);
+    let legacy: Arc<Vec<u8>> = legacy.await.unwrap().unwrap();
+    let owned = owned.await.unwrap().unwrap();
+    assert_eq!(legacy.as_slice(), content("a"));
+    assert_eq!(owned.as_slice(), content("b"));
+    idle(&c).await;
+    assert_eq!(s.fixture.request_count(), 2);
+    assert_eq!(c.content_usage().output_bytes, 1024);
+    drop(owned);
+    assert_eq!(c.content_usage().output_bytes, 0);
+    assert_eq!(legacy.as_slice(), content("a"));
 }

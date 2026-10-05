@@ -487,13 +487,13 @@ impl DurableStore {
                         stored.snapshot_id,
                         view.snapshot_id
                     ),
-                ))
+                ));
             }
             None => {
                 return Err(SnapshotError::new(
                     SnapshotErrorCode::SnapshotNotReady,
                     format!("{}: nothing hydrated here to pin", self.root.display()),
-                ))
+                ));
             }
         }
         // Hydration publishes its pin before its commit record. Repeating
@@ -564,7 +564,7 @@ impl DurableStore {
                     if reader.capabilities().features.metadata_pages {
                         reader.read_content(&file, false).await
                     } else {
-                        legacy.fetch(file, false).await
+                        legacy.fetch_owned(file, false).await
                     }
                 }
             },
@@ -778,7 +778,33 @@ impl DurableStore {
     /// identical content itself (single-flight); here we merge the durable
     /// side as well so the same content id is written and journaled once
     /// while every logical path is still recorded.
-    pub async fn hydrate_concurrent<F, B>(
+    pub async fn hydrate_concurrent<F>(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        concurrency: usize,
+        fetch: F,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        F: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        self.hydrate_concurrent_with_body(view, manifest, concurrency, fetch)
+            .await
+    }
+
+    /// Hydrate from borrowed callback body bytes without a compatibility copy.
+    /// This method adds no capacity accounting: reservations, if any, follow
+    /// the body's origin and remain owned by that body. Caller-created bodies
+    /// are outside coordinator output budgets.
+    pub async fn hydrate_concurrent_with_body<F, B>(
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
@@ -805,7 +831,33 @@ impl DurableStore {
     /// With chunk reads available, files above OBJECT_CAP stream through the
     /// reader into verified durable CAS; their aliases share one fetch unit.
     /// Other files retain the supplied buffered fetch callback.
-    pub async fn hydrate_snapshot_concurrent<F, B>(
+    pub async fn hydrate_snapshot_concurrent<F>(
+        &self,
+        reader: &SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+        concurrency: usize,
+        fetch: F,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        F: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        self.hydrate_snapshot_concurrent_with_body(reader, closure, concurrency, fetch)
+            .await
+    }
+
+    /// Hydrate from borrowed callback body bytes without a compatibility copy.
+    /// This method adds no capacity accounting: reservations, if any, follow
+    /// the body's origin and remain owned by that body. Caller-created bodies
+    /// are outside coordinator output budgets.
+    pub async fn hydrate_snapshot_concurrent_with_body<F, B>(
         &self,
         reader: &SnapshotReader,
         closure: &ValidatedSnapshotClosure,
@@ -975,7 +1027,51 @@ impl DurableStore {
     /// `fetch_batch` receives the batch's files (deduplicated by digest) and
     /// must return every requested digest; missing digests are an error, and
     /// every returned byte is re-verified here regardless of transport claims.
-    pub async fn hydrate_batches<FBatch, FLarge, BSmall, BLarge>(
+    pub async fn hydrate_batches<FBatch, FLarge>(
+        &self,
+        view: &ViewMeta,
+        manifest: &[SnapshotFile],
+        batch_concurrency: usize,
+        large_concurrency: usize,
+        fetch_batch: FBatch,
+        fetch_large: FLarge,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        FBatch: Fn(
+                Vec<SnapshotFile>,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+        FLarge: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        self.hydrate_batches_with_body(
+            view,
+            manifest,
+            batch_concurrency,
+            large_concurrency,
+            fetch_batch,
+            fetch_large,
+        )
+        .await
+    }
+
+    /// Hydrate from borrowed callback body bytes without a compatibility copy.
+    /// This method adds no capacity accounting: reservations, if any, follow
+    /// the body's origin and remain owned by that body. Caller-created bodies
+    /// are outside coordinator output budgets.
+    pub async fn hydrate_batches_with_body<FBatch, FLarge, BSmall, BLarge>(
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
@@ -1021,7 +1117,51 @@ impl DurableStore {
     /// descriptor/page/content dependencies before one FullSnapshot marker.
     /// With chunk reads available, large files use the fixed reader's bounded
     /// verified stream; fetch_large remains the bounded compatibility fallback.
-    pub async fn hydrate_snapshot_batches<FBatch, FLarge, BSmall, BLarge>(
+    pub async fn hydrate_snapshot_batches<FBatch, FLarge>(
+        &self,
+        reader: &SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+        batch_concurrency: usize,
+        large_concurrency: usize,
+        fetch_batch: FBatch,
+        fetch_large: FLarge,
+    ) -> Result<HydrateReport, SnapshotError>
+    where
+        FBatch: Fn(
+                Vec<SnapshotFile>,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+        FLarge: Fn(
+                SnapshotFile,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
+            > + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        self.hydrate_snapshot_batches_with_body(
+            reader,
+            closure,
+            batch_concurrency,
+            large_concurrency,
+            fetch_batch,
+            fetch_large,
+        )
+        .await
+    }
+
+    /// Hydrate from borrowed callback body bytes without a compatibility copy.
+    /// This method adds no capacity accounting: reservations, if any, follow
+    /// the body's origin and remain owned by that body. Caller-created bodies
+    /// are outside coordinator output budgets.
+    pub async fn hydrate_snapshot_batches_with_body<FBatch, FLarge, BSmall, BLarge>(
         &self,
         reader: &SnapshotReader,
         closure: &ValidatedSnapshotClosure,
@@ -2384,7 +2524,7 @@ fn create_dirs_durable(path: &Path) -> Result<(), SnapshotError> {
                 return Err(io_err(io::Error::new(
                     io::ErrorKind::NotADirectory,
                     "store path is not a directory",
-                )))
+                )));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 missing.push(cursor.clone());
@@ -2418,14 +2558,14 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SnapshotError> {
 fn required_dependency(path: &Path) -> Result<Vec<u8>, SnapshotError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if !meta.is_file() => {
-            return Err(integrity_err("completion metadata is not a regular file"))
+            return Err(integrity_err("completion metadata is not a regular file"));
         }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(integrity_err(format!(
                 "completion dependency missing: {}",
                 path.display()
-            )))
+            )));
         }
         Err(e) => return Err(io_err(e)),
     }
