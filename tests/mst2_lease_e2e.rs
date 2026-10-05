@@ -61,7 +61,7 @@ async fn short_lease_is_renewed_proactively_and_revocation_is_typed() {
         .expect("second resolve");
     assert!(
         client
-            .release_lease(&victim.lease_id)
+            .release_lease(victim.lease_id())
             .await
             .expect("release victim lease"),
         "the victim lease must be removable"
@@ -104,7 +104,7 @@ async fn hydrated_content_survives_lease_revocation() {
     assert!(store.is_complete().unwrap());
 
     // Revoke the lease, then drop the reader so no renewal can happen.
-    let lease = reader.lease_id.clone();
+    let lease = reader.lease_id().to_string();
     assert!(client.release_lease(&lease).await.expect("release"));
     drop(reader);
 

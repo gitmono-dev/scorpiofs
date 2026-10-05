@@ -31,8 +31,8 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
     );
     assert!(caps.features.metadata_pages);
     assert!(
-        caps.frame_encodings.iter().any(|e| e == "zstd"),
-        "zstd must be advertised alongside identity: {:?}",
+        caps.frame_encodings.iter().any(|e| e == "identity"),
+        "identity must be advertised for mixed-version rollout: {:?}",
         caps.frame_encodings
     );
 
@@ -40,7 +40,7 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
         .await
         .expect("resolve");
     let sid = reader.snapshot_id().to_string();
-    let lease = reader.lease_id.clone();
+    let lease = reader.lease_id().to_string();
 
     // descriptor round-trip without touching latest
     let d = client.descriptor(&sid).await.expect("descriptor");
@@ -62,8 +62,8 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
     assert_eq!(bytes, b"t08 alpha\n");
     assert_eq!(bytes.len() as u64, small.size);
 
-    // The same object over an explicitly zstd-negotiated stream: the
-    // codec transparently decompresses and re-verifies content identity.
+    // An older client can still request zstd; the upgraded HTTP service
+    // may fall back to byte-compatible identity during the rollout.
     let zstd_map = client
         .objects(
             &sid,

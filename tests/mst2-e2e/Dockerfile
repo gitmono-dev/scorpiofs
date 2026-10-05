@@ -3,7 +3,7 @@
 #
 # Build context is the scorpiofs checkout alone: the shared codec is a pinned
 # git dependency (see Cargo.toml), so `git` in the builder fetches it.
-FROM rust:1.97-bookworm AS build
+FROM rust:1.98-bookworm AS build
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

@@ -8,17 +8,163 @@
 //! chunk is still not a verified file — callers assembling chunks must
 //! recompute the whole-file digest (spec 07 §7).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mst2_codec::{
     chunkmap::{merkle_root, verify_leaf, ChunkLeaf, ChunkMap, ProofSide, CHUNK_SIZE},
-    treeframe::Frame,
+    treeframe::{self, Frame},
 };
 
 use crate::snapshot::{client::Mst2Client, SnapshotError, SnapshotErrorCode};
 
 const MAX_CHUNK_BATCH: usize = 128;
 const MAX_OBJECT_BATCH: usize = 128;
+const MAX_METADATA_BATCH: usize = 64;
+const MAX_OBJECT_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+// Account for JSON escaping and the complete envelope before sending any batch.
+fn request_batches<'a, T>(
+    items: &'a [T],
+    encoding: Option<&str>,
+    item_value: impl Fn(&T) -> serde_json::Value,
+) -> Result<Vec<&'a [T]>, SnapshotError> {
+    let mut envelope = serde_json::json!({"items": []});
+    if let Some(encoding) = encoding {
+        envelope["encoding"] = encoding.into();
+    }
+    let overhead = serde_json::to_vec(&envelope).unwrap().len();
+    let limit = crate::snapshot::client::TREEFRAME_REQUEST_MAX_BYTES;
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = overhead;
+    for (index, item) in items.iter().enumerate() {
+        let item_bytes = serde_json::to_vec(&item_value(item)).unwrap().len();
+        if overhead + item_bytes > limit {
+            return Err(limit_err(
+                "one TreeFrame item exceeds the JSON request byte limit",
+            ));
+        }
+        let comma = usize::from(index > start);
+        if bytes + comma + item_bytes > limit {
+            batches.push(&items[start..index]);
+            start = index;
+            bytes = overhead;
+        }
+        bytes += usize::from(index > start) + item_bytes;
+    }
+    if start < items.len() {
+        batches.push(&items[start..]);
+    }
+    Ok(batches)
+}
+
+fn chunk_request_value(item: &ChunkRequest) -> serde_json::Value {
+    serde_json::json!({
+        "path": item.path,
+        "expected_digest": item.expected_digest,
+        "map_id": item.map_id,
+        "chunk_index": item.chunk_index.to_string(),
+    })
+}
+
+struct ResponseBudget {
+    units: usize,
+    raw_bytes: usize,
+    wire_bytes: usize,
+}
+
+impl ResponseBudget {
+    fn new(
+        units: usize,
+        logical_bytes: usize,
+        unit_overhead: usize,
+    ) -> Result<Self, SnapshotError> {
+        let raw_bytes = units
+            .checked_mul(unit_overhead)
+            .and_then(|overhead| overhead.checked_add(logical_bytes))
+            .and_then(|bytes| bytes.checked_add(treeframe::ERROR_MAX_BYTES))
+            .ok_or_else(|| limit_err("TreeFrame response byte budget overflow"))?;
+        // This client quota allows normal zstd overhead while bounding the
+        // complete response by its request, even without Content-Length.
+        let wire_bytes = units
+            .checked_add(1)
+            .and_then(|frames| frames.checked_mul(treeframe::HEADER_LEN))
+            .and_then(|headers| raw_bytes.checked_mul(2)?.checked_add(headers))
+            .ok_or_else(|| limit_err("TreeFrame response byte budget overflow"))?;
+        Ok(Self {
+            units,
+            raw_bytes,
+            wire_bytes,
+        })
+    }
+}
+
+fn limit_err(message: &str) -> SnapshotError {
+    SnapshotError::new(SnapshotErrorCode::LimitExceeded, message)
+}
+
+fn response_frames(
+    raw: &[u8],
+    context: &str,
+    data_kind: u8,
+    data_name: &str,
+    budget: &ResponseBudget,
+) -> Result<Vec<Frame>, SnapshotError> {
+    let mut offset = 0usize;
+    let mut frames = 0usize;
+    let mut raw_total = 0usize;
+    while offset < raw.len() {
+        let header = raw
+            .get(offset..)
+            .and_then(|remaining| remaining.get(..treeframe::HEADER_LEN))
+            .ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "truncated TreeFrame header",
+                )
+            })?;
+        let kind = header[6];
+        if !matches!(kind, treeframe::KIND_END | treeframe::KIND_ERROR) && kind != data_kind {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!("{context} contains a non-{data_name} data frame"),
+            ));
+        }
+        let wire_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        let raw_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let max_raw = match kind {
+            treeframe::KIND_META => treeframe::META_MAX_RAW,
+            treeframe::KIND_OBJECT => treeframe::OBJECT_MAX_RAW,
+            treeframe::KIND_CHUNK => 76 + treeframe::CHUNK_MAX_LEN as usize,
+            treeframe::KIND_END => 48,
+            treeframe::KIND_ERROR => treeframe::ERROR_MAX_BYTES,
+            _ => unreachable!("endpoint frame kind checked above"),
+        };
+        if raw_len > max_raw || wire_len > 2 * 1024 * 1024 {
+            return Err(limit_err("TreeFrame payload exceeds its frame byte limit"));
+        }
+        frames += 1;
+        raw_total = raw_total
+            .checked_add(raw_len)
+            .ok_or_else(|| limit_err("TreeFrame raw response byte count overflow"))?;
+        if frames > budget.units + 2 || raw_total > budget.raw_bytes {
+            return Err(limit_err(
+                "TreeFrame response exceeds its request's frame or raw byte budget",
+            ));
+        }
+        offset = offset
+            .checked_add(treeframe::HEADER_LEN)
+            .and_then(|start| start.checked_add(wire_len))
+            .filter(|end| *end <= raw.len())
+            .ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "truncated TreeFrame payload",
+                )
+            })?;
+    }
+    treeframe::parse_stream(raw).map_err(|error| frame_err(context, error))
+}
 
 fn b64_decode(s: &str) -> Result<Vec<u8>, SnapshotError> {
     // Standard alphabet, padded. No external base64 dependency.
@@ -132,7 +278,7 @@ impl Mst2Client {
     }
 
     /// POST `/{sid}/metadata/pages`; returns `(page_id hex, page bytes)` in
-    /// frame order with duplicates removed by the server. `encoding`
+    /// frame order, rejecting duplicate pages and invalid END bindings. `encoding`
     /// negotiates `identity` (default) or `zstd` frame compression.
     pub async fn metadata_pages(
         &self,
@@ -140,35 +286,146 @@ impl Mst2Client {
         items: &[MetadataPageItem],
         encoding: Option<&str>,
     ) -> Result<Vec<([u8; 32], Vec<u8>)>, SnapshotError> {
+        if items.is_empty() || items.len() > MAX_METADATA_BATCH {
+            return Err(limit_err("metadata batch must hold 1..64 items"));
+        }
+        let batches = request_batches(items, encoding, |item| serde_json::to_value(item).unwrap())?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for batch in batches {
+            for page in self.metadata_pages_batch(sid, batch, encoding).await? {
+                if seen.insert(page.0) {
+                    out.push(page);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn metadata_pages_batch(
+        &self,
+        sid: &str,
+        items: &[MetadataPageItem],
+        encoding: Option<&str>,
+    ) -> Result<Vec<([u8; 32], Vec<u8>)>, SnapshotError> {
+        if items.is_empty() || items.len() > MAX_METADATA_BATCH {
+            return Err(limit_err("metadata batch must hold 1..64 items"));
+        }
+        let mut max_units = 0usize;
+        for item in items {
+            if item.route.len() > mst2_codec::metapage::MAX_DEPTH {
+                return Err(limit_err("metadata radix depth exceeds 255"));
+            }
+            if let Some(expected) = &item.expected_digest {
+                parse_digest(expected)?;
+            }
+            max_units += item.route.len() + 1;
+        }
+        let budget = ResponseBudget::new(
+            max_units,
+            max_units * mst2_codec::metapage::PAGE_MAX_BYTES,
+            36 + 4,
+        )?;
         let mut req = serde_json::json!({ "items": items });
         if let Some(enc) = encoding {
             req["encoding"] = serde_json::Value::String(enc.to_string());
         }
         let body = serde_json::to_vec(&req)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
+        let request_items = u32::try_from(items.len()).map_err(|_| {
+            SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "metadata request item count overflow",
+            )
+        })?;
         let raw = self
-            .post_treeframe(self.snap_url(&format!("/{sid}/metadata/pages")), body, sid)
+            .post_treeframe(
+                self.snap_url(&format!("/{sid}/metadata/pages")),
+                body.clone(),
+                sid,
+                budget.wire_bytes,
+            )
             .await?;
-        let frames = mst2_codec::treeframe::parse_stream(&raw)
-            .map_err(|e| frame_err("metadata/pages stream", e))?;
+        let frames = response_frames(
+            &raw,
+            "metadata/pages stream",
+            treeframe::KIND_META,
+            "META",
+            &budget,
+        )?;
         // A terminated-with-ERROR stream is a failure, not an empty page set
         // (spec 04 §5: a failed directory load must never read as "no entries").
+        let (expected_units, expected_bytes) = match frames.last() {
+            Some(Frame::End(end)) => {
+                check_end(&frames, &body, request_items)?;
+                (end.unique_unit_count, end.logical_bytes)
+            }
+            Some(Frame::Error(e)) => {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::Internal,
+                    format!(
+                        "server rejected metadata/pages: {} (request_id {})",
+                        e.code, e.request_id
+                    ),
+                ));
+            }
+            _ => {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "metadata/pages stream missing END frame",
+                ));
+            }
+        };
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut unique_units = 0u32;
+        let mut logical_bytes = 0u64;
         for f in frames {
             match f {
-                Frame::Meta(m) => out.extend(m.pages),
-                Frame::Error(e) => {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::Internal,
-                        format!(
-                            "server rejected metadata/pages: {} (request_id {})",
-                            e.code, e.request_id
-                        ),
-                    ))
+                Frame::Meta(m) => {
+                    for (page_id, bytes) in m.pages {
+                        if !seen.insert(page_id) {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                "metadata/pages repeated a page across frames",
+                            ));
+                        }
+                        unique_units = unique_units.checked_add(1).ok_or_else(|| {
+                            SnapshotError::new(
+                                SnapshotErrorCode::LimitExceeded,
+                                "metadata page count overflow",
+                            )
+                        })?;
+                        logical_bytes =
+                            logical_bytes
+                                .checked_add(bytes.len() as u64)
+                                .ok_or_else(|| {
+                                    SnapshotError::new(
+                                        SnapshotErrorCode::LimitExceeded,
+                                        "metadata page byte count overflow",
+                                    )
+                                })?;
+                        out.push((page_id, bytes));
+                    }
                 }
-                _ => {}
+                Frame::End(_) => {}
+                _ => {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        "metadata/pages stream contains a non-META data frame",
+                    ));
+                }
             }
         }
+        // A route may return ancestor witness pages, and aliased routes can
+        // share pages. Compare END with the actual unique pages, not items.
+        if unique_units != expected_units || logical_bytes != expected_bytes {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "metadata/pages END page count or logical bytes do not match the stream",
+            ));
+        }
+        check_metadata_members(items, &out)?;
         Ok(out)
     }
 
@@ -186,6 +443,51 @@ impl Mst2Client {
                 "objects batch must hold 1..128 items",
             ));
         }
+        let batches = request_batches(
+            items,
+            encoding,
+            |(path, digest)| serde_json::json!({"path": path, "expected_digest": digest}),
+        )?;
+        let mut out = HashMap::new();
+        let mut bytes = 0usize;
+        for batch in batches {
+            let objects = self.objects_batch(sid, batch, encoding).await?;
+            bytes += objects
+                .iter()
+                .filter(|(id, _)| !out.contains_key(*id))
+                .map(|(_, data)| data.len())
+                .sum::<usize>();
+            if bytes > MAX_OBJECT_BATCH_BYTES {
+                return Err(limit_err(
+                    "objects response exceeds the unique raw byte limit",
+                ));
+            }
+            out.extend(objects);
+        }
+        Ok(out)
+    }
+
+    async fn objects_batch(
+        &self,
+        sid: &str,
+        items: &[(String, String)],
+        encoding: Option<&str>,
+    ) -> Result<HashMap<[u8; 32], Vec<u8>>, SnapshotError> {
+        if items.is_empty() || items.len() > MAX_OBJECT_BATCH {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                "objects batch must hold 1..128 items",
+            ));
+        }
+        let requested: HashSet<_> = items
+            .iter()
+            .map(|(_, digest)| parse_digest(digest))
+            .collect::<Result<_, _>>()?;
+        let budget = ResponseBudget::new(
+            requested.len(),
+            (requested.len() * treeframe::OBJECT_MAX_LEN as usize).min(MAX_OBJECT_BATCH_BYTES),
+            40 + 4,
+        )?;
         let mut req = serde_json::json!({
             "items": items
                 .iter()
@@ -198,19 +500,55 @@ impl Mst2Client {
         let body = serde_json::to_vec(&req)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         let raw = self
-            .post_treeframe(self.snap_url(&format!("/{sid}/objects")), body.clone(), sid)
+            .post_treeframe(
+                self.snap_url(&format!("/{sid}/objects")),
+                body.clone(),
+                sid,
+                budget.wire_bytes,
+            )
             .await?;
-        let frames = mst2_codec::treeframe::parse_stream(&raw)
-            .map_err(|e| frame_err("objects stream", e))?;
-        check_end(&frames, &body, items.len() as u32)?;
+        let frames = response_frames(
+            &raw,
+            "objects stream",
+            treeframe::KIND_OBJECT,
+            "OBJECT",
+            &budget,
+        )?;
+        let (expected_units, expected_bytes) = check_end(&frames, &body, items.len() as u32)?;
 
         let mut out = HashMap::new();
+        let mut logical_bytes = 0u64;
         for f in frames {
-            if let Frame::Object(o) = f {
-                for (cid, data) in o.objects {
-                    out.insert(cid, data);
+            match f {
+                Frame::Object(o) => {
+                    for (cid, data) in o.objects {
+                        if !requested.contains(&cid) || out.contains_key(&cid) {
+                            return Err(SnapshotError::new(
+                                SnapshotErrorCode::DigestMismatch,
+                                "objects response contains an unrequested or duplicate content_id",
+                            ));
+                        }
+                        logical_bytes += data.len() as u64;
+                        if logical_bytes > MAX_OBJECT_BATCH_BYTES as u64 {
+                            return Err(limit_err(
+                                "objects response exceeds the unique raw byte limit",
+                            ));
+                        }
+                        out.insert(cid, data);
+                    }
                 }
+                Frame::End(_) => {}
+                _ => unreachable!("endpoint frame kinds and successful END were checked"),
             }
+        }
+        if out.len() != requested.len()
+            || out.len() as u32 != expected_units
+            || logical_bytes != expected_bytes
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "objects response unit set or END counts do not match the request",
+            ));
         }
         Ok(out)
     }
@@ -361,15 +699,68 @@ impl Mst2Client {
                 "chunks batch must hold 1..128 items",
             ));
         }
+        let mut requested = HashMap::new();
+        for item in items {
+            let key = (parse_digest(&item.map_id)?, item.chunk_index);
+            let file_id = parse_digest(&item.expected_digest)?;
+            if requested
+                .insert(key, file_id)
+                .is_some_and(|previous| previous != file_id)
+            {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::ScopeInvalid,
+                    "a chunk unit cannot name different file content ids",
+                ));
+            }
+        }
+        let batches = request_batches(items, encoding, chunk_request_value)?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for batch in batches {
+            for chunk in self.chunks_batch(sid, batch, encoding).await? {
+                if seen.insert((chunk.map_id, chunk.chunk_index)) {
+                    out.push(chunk);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn chunks_batch(
+        &self,
+        sid: &str,
+        items: &[ChunkRequest],
+        encoding: Option<&str>,
+    ) -> Result<Vec<ChunkUnit>, SnapshotError> {
+        if items.is_empty() || items.len() > MAX_CHUNK_BATCH {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                "chunks batch must hold 1..128 items",
+            ));
+        }
+        let mut requested = HashMap::new();
+        for item in items {
+            let key = (parse_digest(&item.map_id)?, item.chunk_index);
+            let file_id = parse_digest(&item.expected_digest)?;
+            if requested
+                .insert(key, file_id)
+                .is_some_and(|previous| previous != file_id)
+            {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::ScopeInvalid,
+                    "a chunk unit cannot name different file content ids",
+                ));
+            }
+        }
+        let budget = ResponseBudget::new(
+            requested.len(),
+            requested.len() * treeframe::CHUNK_MAX_LEN as usize,
+            76,
+        )?;
         let mut req = serde_json::json!({
             "items": items
                 .iter()
-                .map(|i| serde_json::json!({
-                    "path": i.path,
-                    "expected_digest": i.expected_digest,
-                    "map_id": i.map_id,
-                    "chunk_index": i.chunk_index.to_string(),
-                }))
+                .map(chunk_request_value)
                 .collect::<Vec<_>>(),
         });
         if let Some(enc) = encoding {
@@ -378,21 +769,54 @@ impl Mst2Client {
         let body = serde_json::to_vec(&req)
             .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
         let raw = self
-            .post_treeframe(self.snap_url(&format!("/{sid}/chunks")), body.clone(), sid)
+            .post_treeframe(
+                self.snap_url(&format!("/{sid}/chunks")),
+                body.clone(),
+                sid,
+                budget.wire_bytes,
+            )
             .await?;
-        let frames =
-            mst2_codec::treeframe::parse_stream(&raw).map_err(|e| frame_err("chunks stream", e))?;
-        check_end(&frames, &body, items.len() as u32)?;
+        let frames = response_frames(
+            &raw,
+            "chunks stream",
+            treeframe::KIND_CHUNK,
+            "CHUNK",
+            &budget,
+        )?;
+        let (expected_units, expected_bytes) = check_end(&frames, &body, items.len() as u32)?;
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut logical_bytes = 0u64;
         for f in frames {
-            if let Frame::Chunk(c) = f {
-                out.push(ChunkUnit {
-                    map_id: c.map_id,
-                    file_content_id: c.file_content_id,
-                    chunk_index: c.chunk_index,
-                    bytes: c.chunk_bytes,
-                });
+            match f {
+                Frame::Chunk(c) => {
+                    let key = (c.map_id, c.chunk_index);
+                    if requested.get(&key) != Some(&c.file_content_id) || !seen.insert(key) {
+                        return Err(SnapshotError::new(
+                            SnapshotErrorCode::DigestMismatch,
+                            "chunks response contains an unrequested or duplicate chunk unit",
+                        ));
+                    }
+                    logical_bytes += c.chunk_bytes.len() as u64;
+                    out.push(ChunkUnit {
+                        map_id: c.map_id,
+                        file_content_id: c.file_content_id,
+                        chunk_index: c.chunk_index,
+                        bytes: c.chunk_bytes,
+                    });
+                }
+                Frame::End(_) => {}
+                _ => unreachable!("endpoint frame kinds and successful END were checked"),
             }
+        }
+        if seen.len() != requested.len()
+            || seen.len() as u32 != expected_units
+            || logical_bytes != expected_bytes
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "chunks response unit set or END counts do not match the request",
+            ));
         }
         self.count_units(out.len() as u64);
         Ok(out)
@@ -421,10 +845,19 @@ fn check_end(
     frames: &[Frame],
     request_body: &[u8],
     expect_items: u32,
-) -> Result<(), SnapshotError> {
+) -> Result<(u32, u64), SnapshotError> {
+    if let Some(Frame::Error(error)) = frames.last() {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::Internal,
+            format!(
+                "server rejected TreeFrame request: {} (request_id {})",
+                error.code, error.request_id
+            ),
+        ));
+    }
     let end = frames
-        .iter()
-        .find_map(|f| match f {
+        .last()
+        .and_then(|f| match f {
             Frame::End(e) => Some(e),
             _ => None,
         })
@@ -450,6 +883,70 @@ fn check_end(
             "END request_body_sha256 does not match the body sent",
         ));
     }
+    Ok((end.unique_unit_count, end.logical_bytes))
+}
+
+fn check_metadata_members(
+    items: &[MetadataPageItem],
+    pages: &[([u8; 32], Vec<u8>)],
+) -> Result<(), SnapshotError> {
+    let page_ids: HashSet<_> = pages.iter().map(|(id, _)| *id).collect();
+    for item in items {
+        if let Some(expected) = &item.expected_digest {
+            if !page_ids.contains(&parse_digest(expected)?) {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::DigestMismatch,
+                    "metadata/pages response is missing a requested terminal page",
+                ));
+            }
+        }
+    }
+    if items.iter().all(|item| item.expected_digest.is_some()) {
+        let mut parents: HashMap<_, Vec<_>> = HashMap::new();
+        for (id, bytes) in pages {
+            let (page, _) = mst2_codec::metapage::Page::decode(bytes)
+                .map_err(|error| frame_err("metadata witness page", error))?;
+            if let mst2_codec::metapage::Page::Branch { children, .. } = page {
+                for child in children {
+                    parents
+                        .entry((child.label, child.child_page_id))
+                        .or_default()
+                        .push(*id);
+                }
+            }
+        }
+        let mut expected = HashSet::new();
+        for item in items {
+            let terminal = parse_digest(item.expected_digest.as_ref().unwrap())?;
+            expected.insert(terminal);
+            let mut frontier = HashSet::from([terminal]);
+            for label in item.route.iter().rev() {
+                let mut ancestors = HashSet::new();
+                for child in frontier {
+                    if let Some(ids) = parents.get(&(*label, child)) {
+                        ancestors.extend(ids.iter().copied());
+                    }
+                }
+                if ancestors.is_empty() {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        "metadata/pages response is missing a requested route witness",
+                    ));
+                }
+                expected.extend(ancestors.iter().copied());
+                frontier = ancestors;
+            }
+        }
+        if expected != page_ids {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "metadata/pages response contains an unrequested page",
+            ));
+        }
+    }
+    // A routed terminal can share a physical page across directories. The
+    // caller additionally binds these witnesses to its descriptor/known
+    // root ids; structural reachability alone is not publisher authority.
     Ok(())
 }
 

@@ -1,11 +1,11 @@
 //! Mount a fixed MST/2 snapshot read-only.
 //!
-//! Online (default): resolve `latest`, hydrate the whole view into a verified
-//! local store, pin it, then serve FUSE from that store.
+//! Online: resolve `latest` and load lazily by default. `M2_LAZY=0` proves and
+//! hydrates the full metadata/content closure, pins it, then serves the store.
 //!
-//! Offline reopen: `M2_STORE_DIR=<dir>` reopens a completed hydration with no
-//! server contact, so a mount keeps serving the view it was pinned to even
-//! after the branch moves (spec SYS-01).
+//! Local reopen: `M2_STORE_DIR=<dir>` reopens a completed full snapshot with
+//! no server contact. The caller must establish its local access policy;
+//! verified cached bytes do not grant offline authority.
 //!
 //! Usage:
 //!   M2_BASE=http://127.0.0.1:19700 M2_SCOPE=/project \
@@ -41,13 +41,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(content) => DurableStore::open_with_content(&view, content)?,
                 None => DurableStore::open(&view)?,
             });
-            let manifest = store.manifest()?;
-            let verified = store.verify_all(&manifest)?;
+            let closure = store.snapshot_manifest()?;
+            let verified = store.verify_all(closure.files())?;
             eprintln!(
                 "reopened {dir} (content {}): {verified} files re-verified, no server contact",
                 store.content_dir().display()
             );
-            Mst2Fuse::from_store(store)?
+            Mst2Fuse::from_snapshot_store(store)?
         }
         _ => {
             let base = std::env::var("M2_BASE").unwrap_or_else(|_| "http://127.0.0.1:19700".into());
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::env::var("M2_STORE_ROOT").unwrap_or_else(|_| "/var/lib/scorpio/mst2".into());
             // Lazy by default: mount as soon as the root page arrives; content
             // materializes on open. M2_LAZY=0 restores full hydration before
-            // the mount (offline-export semantics).
+            // the mount, including descriptor/pages/empty directories.
             let lazy = std::env::var("M2_LAZY").map(|v| v != "0").unwrap_or(true);
 
             let client = Mst2Client::with_token(
@@ -74,14 +74,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let snapshot_id = reader.snapshot_id().to_string();
             eprintln!("snapshot {snapshot_id}");
 
-            let dir =
-                DurableStore::path_for(std::path::Path::new(&store_root), &scope, &snapshot_id);
+            let context = reader.authorized_context();
+            let dir = context.view_cache_dir(std::path::Path::new(&store_root))?;
             // Content is shared by every view of the scope (spec 11 §3), and
             // verified subtrees are reused across versions (spec 11 §10).
             let scope_dir = dir.parent().expect("snapshot dir has a scope parent");
+            context.bind_scope_cache(scope_dir)?;
             let content_dir = scope_dir.join("blobs");
-            let store = Arc::new(DurableStore::open_with_content(&dir, &content_dir)?);
-            let was_complete = store.is_complete()?;
+            let store = Arc::new(DurableStore::open_for_reader(&dir, &content_dir, &reader)?);
+            let was_complete = store.is_snapshot_complete()?;
 
             if lazy {
                 eprintln!("lazy mount: tree loads per directory on access");
@@ -89,7 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let cache = scorpiofs::snapshot::ScopeCache::open(scope_dir)?;
                 let mut sync = scorpiofs::snapshot::IncrementalSync::new(&reader, &cache);
-                let manifest = sync.sync().await?;
+                let closure = sync.sync_snapshot().await?;
+                let manifest = closure.files();
                 let meters = sync.meters();
                 eprintln!(
                 "sync: traversal_nodes={} fetched_pages={} reused_pages={} reused_subtrees={} files={}",
@@ -99,11 +101,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 meters.reused_subtrees,
                 manifest.len()
             );
+                eprintln!("full_proof={:?}", sync.closure_meters());
                 let view = scorpiofs::snapshot::ViewMeta {
                     snapshot_id: snapshot_id.clone(),
-                    namespace_view_id: reader.descriptor.namespace_view_id.clone(),
-                    scope: reader.descriptor.scope.clone(),
-                    lease_id: reader.lease_id.clone(),
+                    namespace_view_id: reader.descriptor().namespace_view_id.clone(),
+                    scope: reader.descriptor().scope.clone(),
+                    lease_id: reader.lease_id().to_string(),
                 };
                 // Frame transport when advertised (OBJECT for small files,
                 // chunk-map/CHUNK for >256 KiB); raw blob otherwise.
@@ -116,14 +119,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let report = if use_frames {
                     // Batched: small files ride OBJECT batches (128/request),
                     // large files use chunk-map + CHUNK frames per file.
-                    let client = reader.client.clone();
+                    let client = reader.client().clone();
                     let encoding = reader.encoding_hint().map(str::to_string);
                     let sid = reader.snapshot_id().to_string();
                     let reader_large = reader.clone();
                     store
-                        .hydrate_batches(
-                            &view,
-                            &manifest,
+                        .hydrate_snapshot_batches(
+                            &reader,
+                            &closure,
                             concurrency,
                             concurrency,
                             move |batch| {
@@ -173,16 +176,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let coordinator =
                         scorpiofs::snapshot::FetchCoordinator::new(reader.clone(), concurrency);
                     store
-                        .hydrate_concurrent(&view, &manifest, concurrency, move |f| {
+                        .hydrate_snapshot_concurrent(&reader, &closure, concurrency, move |f| {
                             let coordinator = coordinator.clone();
                             Box::pin(async move { coordinator.fetch(f, use_frames).await })
                         })
                         .await?
                 };
                 store.pin(&view)?;
-                let verified = store.verify_all(&store.manifest()?)?;
-                if !store.is_complete()? {
-                    return Err("hydration finished without a completeness marker".into());
+                let verified = store.verify_all(store.snapshot_manifest()?.files())?;
+                if !store.is_snapshot_complete()? {
+                    return Err("hydration finished without a full snapshot marker".into());
                 }
                 eprintln!(
                 "store={} reopened={was_complete} files={} fetched={} resumed={} repaired={} bytes={} verified={verified}",
@@ -193,7 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.repaired,
                 report.bytes_total,
             );
-                Mst2Fuse::from_manifest(reader, store, manifest)?
+                Mst2Fuse::from_snapshot_manifest(reader, store, closure)?
             }
         }
     };

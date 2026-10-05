@@ -132,6 +132,10 @@ pub struct ResolveResponse {
     #[serde(default)]
     pub lease_expires_at: String,
     pub publication_sequence: String,
+    /// Policy generation returned by resolve. Missing generations cannot
+    /// establish an authorized cache domain.
+    #[serde(default)]
+    pub authorization_epoch: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

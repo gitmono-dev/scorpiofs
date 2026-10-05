@@ -51,12 +51,14 @@ impl ChunkedFile {
         digest: &str,
         size: u64,
     ) -> Result<Self, SnapshotError> {
+        reader.authorized_context().validate_relative_path(path)?;
         if size <= OBJECT_CAP {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::Internal,
                 "small files are read whole, not through the chunk map",
             ));
         }
+        reader.ensure_lease().await?;
         let map = reader
             .client
             .chunk_map(reader.snapshot_id(), path, digest)
@@ -161,6 +163,10 @@ impl ChunkedFile {
             )
         })?;
 
+        self.reader
+            .authorized_context()
+            .validate_relative_path(&self.path)?;
+        self.reader.ensure_lease().await?;
         let units = self
             .reader
             .client
@@ -212,6 +218,10 @@ impl ChunkedFile {
         if self.leaves.lock().await.contains_key(&page) {
             return Ok(());
         }
+        self.reader
+            .authorized_context()
+            .validate_relative_path(&self.path)?;
+        self.reader.ensure_lease().await?;
         let leaf = self
             .reader
             .client

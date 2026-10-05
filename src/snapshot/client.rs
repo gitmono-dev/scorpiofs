@@ -19,6 +19,8 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const TREEFRAME_REQUEST_MAX_BYTES: usize = 131_072;
+
 use reqwest::StatusCode;
 use serde::Deserialize;
 
@@ -483,7 +485,14 @@ impl Mst2Client {
         url: impl AsRef<str>,
         body: Vec<u8>,
         snapshot_id: &str,
+        max_response_bytes: usize,
     ) -> Result<Vec<u8>, SnapshotError> {
+        if body.len() > TREEFRAME_REQUEST_MAX_BYTES {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "TreeFrame request exceeds the JSON request byte limit",
+            ));
+        }
         let url = url.as_ref();
         let expected_request_digest = {
             use ring::digest::{Context, SHA256};
@@ -491,21 +500,60 @@ impl Mst2Client {
             cx.update(&body);
             format!("sha256:{}", hex_lower(cx.finish().as_ref()))
         };
-        let resp = ok_or_error(
-            self.send_retrying(
+        let mut resp = self
+            .send_retrying(
                 self.http
                     .post(url)
+                    .timeout(Duration::from_secs(60))
                     .header("content-type", "application/json")
                     .body(body),
             )
-            .await?,
-        )
-        .await?;
-        validate_treeframe_headers(resp.headers(), snapshot_id, &expected_request_digest)?;
-        let bytes = resp.bytes().await.map_err(de_err)?;
-        self.recv_bytes
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        Ok(bytes.to_vec())
+            .await?;
+        let status = resp.status();
+        let max_response_bytes = if status.is_success() {
+            validate_treeframe_headers(resp.headers(), snapshot_id, &expected_request_digest)?;
+            max_response_bytes
+        } else {
+            // Typed HTTP errors are JSON, not TreeFrames, but their bodies
+            // need the same bounded read before attempting envelope parsing.
+            max_response_bytes.min(1_048_576)
+        };
+        if resp
+            .content_length()
+            .is_some_and(|length| length > max_response_bytes as u64)
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "TreeFrame response exceeds the request's byte budget",
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(de_err)? {
+            self.recv_bytes
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            if chunk.len() > max_response_bytes.saturating_sub(bytes.len()) {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::LimitExceeded,
+                    "TreeFrame response exceeds the request's byte budget",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&bytes) {
+                return Err(SnapshotError {
+                    code: SnapshotErrorCode::from_server(&env.error.code),
+                    message: env.error.message,
+                    http_status: status.as_u16(),
+                });
+            }
+            return Err(SnapshotError {
+                code: SnapshotErrorCode::Internal,
+                message: format!("HTTP {status} without error envelope"),
+                http_status: status.as_u16(),
+            });
+        }
+        Ok(bytes)
     }
 
     pub(crate) async fn head_blob(
