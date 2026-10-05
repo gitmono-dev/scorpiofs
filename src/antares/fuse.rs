@@ -7,7 +7,10 @@ use libfuse_fs::{
     util::whiteout::WhiteoutFormat,
 };
 
-use crate::{server::mount_filesystem_with_antares_cache, util::fuse_platform};
+use crate::{
+    server::mount_filesystem_with_antares_cache,
+    util::{fenced_fs::FencedFilesystem, fuse_platform, mutation_fence::MutationFence},
+};
 
 /// Antares records deletions with the OCI whiteout form (`.wh.<name>`) instead of the
 /// Linux kernel-overlayfs character-device form.
@@ -310,6 +313,8 @@ pub struct FixedLayerFuse {
     pub frozen_dirs: Vec<PathBuf>,
     /// Live FUSE session. Drop / [`MountHandle::unmount`] tears the mount down.
     mount_handle: Option<MountHandle>,
+    /// The native session and lifecycle owner use the same operation fence.
+    overlay: Option<FencedFilesystem<OverlayFs>>,
     /// A failed helper fallback still needs an explicit unmount retry even
     /// after the native session handle has been consumed.
     unmount_failed: bool,
@@ -340,6 +345,7 @@ impl FixedLayerFuse {
             cl_dir,
             frozen_dirs: Vec::new(),
             mount_handle: None,
+            overlay: None,
             unmount_failed: false,
         })
     }
@@ -347,6 +353,10 @@ impl FixedLayerFuse {
     /// Keep the same fixed base when rebuilding only the writable layers.
     pub fn base_layer(&self) -> Arc<dyn Layer> {
         self.base_layer.clone()
+    }
+
+    pub fn mutation_fence(&self) -> Option<&MutationFence> {
+        self.overlay.as_ref().map(FencedFilesystem::fence)
     }
 
     /// Attach sealed chain layers (chain forks). Each path must be an existing
@@ -392,7 +402,8 @@ impl FixedLayerFuse {
         // transiently while Dicfuse is still loading.
         std::fs::metadata(&self.mountpoint)?;
 
-        let overlay = self.build_overlay().await?;
+        let overlay = FencedFilesystem::new(self.build_overlay().await?);
+        self.overlay = Some(overlay.clone());
         let logfs = LoggingFileSystem::new(overlay);
         // Keep Antares mounts on the safer non-writeback path for now.
         // With writeback cache enabled, reopening an existing file in append mode
@@ -446,9 +457,18 @@ impl FixedLayerFuse {
     /// Prefers [`MountHandle::unmount`] (asyncfuse native path). Falls back to
     /// the platform helper (`fusermount3` on Linux, `umount` on macOS).
     pub async fn unmount(&mut self) -> std::io::Result<()> {
+        // Do not consume the native handle while a write or orphan-handle
+        // cleanup is still running, or when its outcome is unknown.
+        if let Some(fence) = self.mutation_fence() {
+            fence.seal().await?;
+        }
         let Some(handle) = self.mount_handle.take() else {
             if self.unmount_failed {
                 let result = fuse_platform::unmount_path(&self.mountpoint, true).await;
+                let result = match result {
+                    Ok(()) => self.drain_mutations().await,
+                    Err(error) => Err(error),
+                };
                 self.unmount_failed = result.is_err();
                 return result;
             }
@@ -479,8 +499,21 @@ impl FixedLayerFuse {
                     fuse_platform::unmount_path(&mount_path, true).await
                 }
             };
+        let result = match result {
+            Ok(()) => self.drain_mutations().await,
+            Err(error) => Err(error),
+        };
         self.unmount_failed = result.is_err();
         result
+    }
+
+    /// Native teardown can process additional handle retirement. Re-audit
+    /// it before reporting success; keep the same owner on failure/cancel.
+    async fn drain_mutations(&self) -> std::io::Result<()> {
+        match self.mutation_fence() {
+            Some(fence) => fence.seal().await,
+            None => Ok(()),
+        }
     }
 }
 
