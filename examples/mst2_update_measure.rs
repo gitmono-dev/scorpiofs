@@ -11,10 +11,65 @@ use scorpiofs::snapshot::{
     SnapshotReader, ViewMeta,
 };
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct Expected {
     files: Vec<SnapshotFile>,
     directories: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditAuthority {
+    revision: u8,
+    domain: String,
+    scope: String,
+    snapshot_id: Option<String>,
+}
+
+fn audit_old_view(
+    expected: &Expected,
+    root: &std::path::Path,
+    content: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Check the explicit shared CAS binding before opening can recover markers.
+    let view: AuditAuthority =
+        serde_json::from_slice(&std::fs::read(root.join("authority.json"))?)?;
+    let cas: AuditAuthority =
+        serde_json::from_slice(&std::fs::read(content.join("authority.json"))?)?;
+    let snapshot = view
+        .snapshot_id
+        .as_deref()
+        .ok_or("view binding missing snapshot")?;
+    if view.revision != 1
+        || cas.revision != 1
+        || view.domain.len() != 64
+        || !view
+            .domain
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || view.domain != cas.domain
+        || view.scope != cas.scope
+        || cas.snapshot_id.is_some()
+        || !snapshot.starts_with("sha256:")
+        || snapshot.len() != 71
+        || !snapshot[7..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err("old view and shared content authority differ".into());
+    }
+    mst2_codec::descriptor::validate_scope(&view.scope)?;
+    let store = DurableStore::open_with_content(root, content)?;
+    let closure = store.snapshot_manifest()?;
+    if !store.is_snapshot_complete()?
+        || closure.snapshot_id() != snapshot
+        || closure.descriptor().scope != view.scope
+        || index(closure.files()) != index(&expected.files)
+        || !same_directories(closure.directories(), &expected.directories)
+    {
+        return Err("old fixed view no longer matches its complete Git oracle".into());
+    }
+    Ok(())
 }
 
 fn same_directories(
@@ -75,22 +130,20 @@ async fn measure(stage: &mut &'static str) -> Result<(), Box<dyn std::error::Err
     if mode == "audit" {
         *stage = "old_complete_view_audit";
         let root = PathBuf::from(args.next().ok_or("old store required")?);
+        let content = PathBuf::from(args.next().ok_or("old shared content store required")?);
         if args.next().is_some() {
-            return Err("audit accepts exactly one expected manifest and store".into());
+            return Err(
+                "audit accepts exactly one expected manifest, view store and content store".into(),
+            );
         }
-        let store = DurableStore::open(root)?;
-        let closure = store.snapshot_manifest()?;
-        if !store.is_snapshot_complete()?
-            || index(closure.files()) != index(&expected.files)
-            || !same_directories(closure.directories(), &expected.directories)
-        {
-            return Err("old fixed view no longer matches its complete Git oracle".into());
-        }
+        audit_old_view(&expected, &root, &content)?;
         println!("{}", serde_json::json!({"old_view_integrity": "PASS"}));
         return Ok(());
     }
     if mode != "sync" || args.next().is_some() {
-        return Err("usage: mst2_update_measure sync EXPECTED | audit EXPECTED STORE".into());
+        return Err(
+            "usage: mst2_update_measure sync EXPECTED | audit EXPECTED STORE CONTENT".into(),
+        );
     }
 
     let base = std::env::var("M2_BASE")?;
@@ -239,7 +292,7 @@ async fn measure(stage: &mut &'static str) -> Result<(), Box<dyn std::error::Err
             "driver_source_digest": scorpiofs::snapshot::durable::digest_of(include_bytes!("mst2_update_measure.rs")),
             "namespace_view_id": reader.descriptor().namespace_view_id,
             "publication_sequence": context.publication_sequence(),
-            "store": view_dir, "resolve_ms": resolve_ms,
+            "store": view_dir, "content_store": store.content_dir(), "resolve_ms": resolve_ms,
             "cache_setup_ms": cache_setup_ms, "metadata_ms": metadata_ms,
             "metadata_ready_ms": metadata_ready_ms, "metadata_bytes": metadata_bytes,
             "metadata_oracle_ms": metadata_oracle_ms,
@@ -266,4 +319,154 @@ async fn measure(stage: &mut &'static str) -> Result<(), Box<dyn std::error::Err
         })
     );
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use mst2_codec::{
+        descriptor::ServingDescriptor,
+        metapage::{page_id, Entry, EntryKind, Page},
+    };
+    use scorpiofs::snapshot::{durable::digest_of, ValidatedSnapshotClosure};
+    use std::{path::Path, process::Command};
+
+    async fn fixture(root: &Path, content: &Path, version: u8, body: &[u8]) -> Expected {
+        let digest = digest_of(body);
+        let raw = Page::Leaf {
+            entries: vec![Entry::file(
+                EntryKind::Regular,
+                b"old.txt",
+                body.len() as u64,
+                scorpiofs::snapshot::frames::parse_digest(&digest).unwrap(),
+            )],
+        }
+        .encode()
+        .unwrap();
+        let pid = page_id(&raw);
+        let descriptor = ServingDescriptor {
+            instance_uuid: *uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555")
+                .unwrap()
+                .as_bytes(),
+            namespace_view_id: [version; 32],
+            scope: "/project".into(),
+            metadata_root: pid,
+        };
+        let pages = BTreeMap::from([(format!("sha256:{}", hex::encode(pid)), raw)]);
+        let closure =
+            ValidatedSnapshotClosure::from_canonical_pages(&descriptor.encode().unwrap(), pages)
+                .unwrap();
+        let store = DurableStore::open_with_content(root, content).unwrap();
+        let view = ViewMeta {
+            snapshot_id: closure.snapshot_id().into(),
+            namespace_view_id: closure.descriptor().namespace_view_id.clone(),
+            scope: "/project".into(),
+            lease_id: "local-integrity-fixture".into(),
+        };
+        store
+            .hydrate_snapshot_with(&view, &closure, |_| std::future::ready(Ok(body.to_vec())))
+            .await
+            .unwrap();
+        assert!(store.is_snapshot_complete().unwrap());
+        for (dir, snapshot) in [(root, Some(closure.snapshot_id())), (content, None)] {
+            std::fs::write(
+                dir.join("authority.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "revision": 1, "domain": "a".repeat(64),
+                    "scope": "/project", "snapshot_id": snapshot,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        Expected {
+            files: vec![SnapshotFile {
+                rel_path: "old.txt".into(),
+                fs_kind: "regular".into(),
+                size: body.len() as u64,
+                content_digest: digest,
+            }],
+            directories: vec![String::new()],
+        }
+    }
+
+    #[tokio::test]
+    async fn real_audit_process_preserves_old_shared_cas_and_rejects_wrong_or_corrupt_content() {
+        let driver = std::env::var_os("MST2_MEASURE_DRIVER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join(format!(
+                        "mst2_update_measure{}",
+                        std::env::consts::EXE_SUFFIX
+                    ))
+            });
+        assert!(
+            driver.is_file(),
+            "build the driver or set MST2_MEASURE_DRIVER before example tests"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("old-view");
+        let content = temp.path().join("scope-blobs");
+        let original = b"original fixed snapshot bytes";
+        let expected = fixture(&root, &content, 0x22, original).await;
+        fixture(
+            &temp.path().join("new-view"),
+            &content,
+            0x23,
+            b"new commit bytes",
+        )
+        .await;
+        let manifest = temp.path().join("old-expected.json");
+        std::fs::write(&manifest, serde_json::to_vec(&expected).unwrap()).unwrap();
+        let audit = |cas: &Path| {
+            Command::new(&driver)
+                .args(["audit"])
+                .arg(&manifest)
+                .arg(&root)
+                .arg(cas)
+                .output()
+                .unwrap()
+        };
+        let good = audit(&content);
+        assert!(good.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&good.stdout).unwrap(),
+            serde_json::json!({"old_view_integrity": "PASS"})
+        );
+        let wrong = temp.path().join("other-domain");
+        std::fs::create_dir(&wrong).unwrap();
+        std::fs::write(
+            wrong.join("authority.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "revision": 1, "domain": "b".repeat(64),
+                "scope": "/project", "snapshot_id": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!audit(&wrong).status.success());
+        assert!(
+            audit(&content).status.success(),
+            "wrong CAS must not recover the real view"
+        );
+        std::fs::write(
+            content.join(
+                expected.files[0]
+                    .content_digest
+                    .strip_prefix("sha256:")
+                    .unwrap(),
+            ),
+            vec![0u8; original.len()],
+        )
+        .unwrap();
+        let corrupt = audit(&content);
+        assert!(!corrupt.status.success());
+        let failure: serde_json::Value = serde_json::from_slice(&corrupt.stderr).unwrap();
+        assert_eq!(failure["record"], "measurement_failure");
+        assert_eq!(failure["stage"], "old_complete_view_audit");
+    }
 }

@@ -647,8 +647,8 @@ def execute(options):
             # Full local bytes against independent Git after both timers end.
             verify_worktree(git_worktree, expected)
             with phase("old_complete_view_audit"):
-                for old_path, old_store in old:
-                    command([str(options.driver), "audit", str(old_path), old_store], deadline)
+                for old_path, old_store, old_content in old:
+                    command([str(options.driver), "audit", str(old_path), old_store, old_content], deadline)
             if version == "v2" and measured["fetched_content_units"] != 1:
                 raise AssertionError("single-file update must fetch exactly one new content unit")
             if version == "v3" and measured["fetched_content_units"] != 0:
@@ -656,7 +656,7 @@ def execute(options):
             after = validate_identity(query(IDENTITY_SQL, deadline), commit, tree, options.database)
             if after != identity or tip() != commit or service_binding(options) != owner:
                 raise AssertionError("fixed service/commit changed across update timing")
-            old.append((expected_path, measured["store"]))
+            old.append((expected_path, measured["store"], measured["content_store"]))
             record = {"record": "round", "round": round_number, "version": version,
                       "fixed_commit": commit, "identity": identity, "git_push_ms": push_ms,
                       "git_ref_visible_ms": visible_ms,
