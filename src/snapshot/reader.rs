@@ -21,6 +21,22 @@ use crate::snapshot::{
 /// Batch cap for one `metadata/pages` request: the server accepts 1..64.
 const PAGES_BATCH: usize = 64;
 
+/// Internal cache source. Bytes remain hints until the complete root proof.
+pub(crate) trait SnapshotPageSource {
+    fn cached_page(&mut self, id: &str) -> Result<Option<Vec<u8>>, SnapshotError>;
+    fn received_page(&mut self, id: &str, bytes: &[u8]) -> Result<(), SnapshotError>;
+}
+
+struct NetworkPages;
+impl SnapshotPageSource for NetworkPages {
+    fn cached_page(&mut self, _: &str) -> Result<Option<Vec<u8>>, SnapshotError> {
+        Ok(None)
+    }
+    fn received_page(&mut self, _: &str, _: &[u8]) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+}
+
 /// One pending page fetch: a directory plus the label route from that
 /// directory's MTP2 root, and the page id the parent page committed to (the
 /// descriptor's `metadata_root` for the scope root).
@@ -560,6 +576,16 @@ impl SnapshotReader {
     /// complete logical namespace, including empty directories and aliases.
     /// A deployment without the page surface cannot provide a full closure.
     pub async fn snapshot_closure(&self) -> Result<ValidatedSnapshotClosure, SnapshotError> {
+        let (pages, _, _) = self.snapshot_pages_with(&mut NetworkPages).await?;
+        ValidatedSnapshotClosure::from_pages(self.descriptor(), pages)
+    }
+
+    /// Collect only dependencies reached from this reader's fixed root.
+    /// Both cached and wire bytes pass the same safe decoder and final proof.
+    pub(crate) async fn snapshot_pages_with(
+        &self,
+        source: &mut impl SnapshotPageSource,
+    ) -> Result<(BTreeMap<String, Vec<u8>>, u64, u64), SnapshotError> {
         if !self.caps.features.metadata_pages {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
@@ -579,6 +605,8 @@ impl SnapshotReader {
         let mut page_bytes = BTreeMap::new();
         let mut route_ids = HashMap::new();
         let mut expanded = HashSet::new();
+        let mut route_visits = 0;
+        let mut page_decodes = 0;
         while !frontier.is_empty() {
             let take = frontier.len().min(PAGES_BATCH);
             let batch: Vec<PageFrontier> = frontier.drain(..take).collect();
@@ -593,6 +621,13 @@ impl SnapshotReader {
                     ));
                 }
                 route_ids.insert((f.dir.clone(), f.route.clone()), f.expected.clone());
+                if !decoded.contains_key(&f.expected) {
+                    if let Some(bytes) = source.cached_page(&f.expected)? {
+                        decoded.insert(f.expected.clone(), decode_page(&bytes)?);
+                        page_decodes += 1;
+                        page_bytes.insert(f.expected.clone(), bytes);
+                    }
+                }
                 if !decoded.contains_key(&f.expected) && requested.insert(f.expected.clone()) {
                     items.push(MetadataPageItem {
                         directory_path: f.dir.clone(),
@@ -639,6 +674,8 @@ impl SnapshotReader {
                     ));
                 }
                 let page = decode_page(&bytes)?;
+                page_decodes += 1;
+                source.received_page(&id, &bytes)?;
                 decoded.insert(id.clone(), page);
                 page_bytes.insert(id, bytes);
             }
@@ -656,6 +693,7 @@ impl SnapshotReader {
                 }
             }
             for f in batch {
+                route_visits += 1;
                 if !expanded.insert((f.dir.clone(), f.route.clone())) {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::IntegrityError,
@@ -691,7 +729,7 @@ impl SnapshotReader {
                 }
             }
         }
-        ValidatedSnapshotClosure::from_pages(self.descriptor(), page_bytes)
+        Ok((page_bytes, route_visits, page_decodes))
     }
 
     /// Manifest through the JSON `directory` transport only — the equivalence
