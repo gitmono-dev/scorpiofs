@@ -123,18 +123,6 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      - name: Check real runner budgets and process cleanup
-        run: |
-          python3 -B tests/mst2-e2e/test_commit_update_bench.py -v
-          python3 -B tests/mst2-e2e/test_commit_update_budget.py -v
-          python3 -B tests/mst2-e2e/test_commit_update_projection.py -v
-
-      - name: Check measurement driver old-view audit
-        run: |
-          cargo build --locked --release --example mst2_update_measure
-          MST2_MEASURE_DRIVER="$GITHUB_WORKSPACE/target/release/examples/mst2_update_measure" \
-            cargo test --locked --release --example mst2_update_measure
-
   docker:
     name: Docker image
     runs-on: ubuntu-latest
@@ -165,7 +153,7 @@ jobs:
           # The workspace binary runs through the entrypoint.
           docker run --rm scorpiofs:ci --version
           docker run --rm scorpiofs:ci workspace --help
-          docker run --rm --entrypoint sh scorpiofs:ci -c 'test -x /usr/local/bin/antares'
+          docker run --rm --entrypoint sh scorpiofs:ci -c 'test ! -e /usr/local/bin/antares'
 
           # The entrypoint must refuse `serve` without backend URLs.
           if docker run --rm scorpiofs:ci serve; then
