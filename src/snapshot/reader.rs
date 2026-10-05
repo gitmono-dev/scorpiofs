@@ -517,11 +517,13 @@ impl SnapshotReader {
         self.ensure_lease().await?;
         let mut cursor: Option<String> = None;
         let mut merged: Option<crate::snapshot::types::DirectoryResponse> = None;
+        let mut progress = super::directory::Progress::default();
         loop {
             let page = self
                 .client
                 .directory(self.snapshot_id(), dir, limit, cursor.as_deref())
                 .await?;
+            progress.accept(&page, &self.descriptor().metadata_root)?;
             match &mut merged {
                 None => merged = Some(page.clone()),
                 Some(acc) => {
@@ -556,7 +558,8 @@ impl SnapshotReader {
         }
         self.ensure_lease().await?;
         let mut out = Vec::new();
-        self.walk_dir("/", &mut out).await?;
+        self.walk_dir("/", &self.descriptor().metadata_root, &mut out)
+            .await?;
         Ok(out)
     }
 
@@ -734,18 +737,26 @@ impl SnapshotReader {
     pub async fn file_manifest_directory(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
         self.ensure_lease().await?;
         let mut out = Vec::new();
-        self.walk_dir("/", &mut out).await?;
+        self.walk_dir("/", &self.descriptor().metadata_root, &mut out)
+            .await?;
         Ok(out)
     }
 
-    async fn walk_dir(&self, dir: &str, out: &mut Vec<SnapshotFile>) -> Result<(), SnapshotError> {
+    async fn walk_dir(
+        &self,
+        dir: &str,
+        expected_root: &str,
+        out: &mut Vec<SnapshotFile>,
+    ) -> Result<(), SnapshotError> {
         self.context.validate_relative_path(dir)?;
         let mut cursor: Option<String> = None;
+        let mut progress = super::directory::Progress::for_root(expected_root);
         loop {
             let page = self
                 .client
                 .directory(self.snapshot_id(), dir, 256, cursor.as_deref())
                 .await?;
+            progress.accept(&page, &self.descriptor().metadata_root)?;
             for e in page.entries {
                 let rel = if dir == "/" {
                     e.name.clone()
@@ -753,15 +764,13 @@ impl SnapshotReader {
                     format!("{}/{}", dir.trim_start_matches('/'), e.name)
                 };
                 self.context.validate_relative_path(&rel)?;
-                if e.directory_root.is_some() {
-                    Box::pin(self.walk_dir(&format!("/{rel}"), out)).await?;
+                if let Some(child_root) = e.directory_root {
+                    Box::pin(self.walk_dir(&format!("/{rel}"), &child_root, out)).await?;
                 } else if let Some(digest) = e.content_digest {
-                    let size = e.size.as_deref().unwrap_or("0").parse().map_err(|_| {
-                        SnapshotError::new(
-                            SnapshotErrorCode::Internal,
-                            format!("non-numeric size for {rel}"),
-                        )
-                    })?;
+                    let size = crate::snapshot::frames::parse_count(
+                        e.size.as_deref().ok_or_else(super::directory::integrity)?,
+                        "file size",
+                    )?;
                     out.push(SnapshotFile {
                         rel_path: rel,
                         fs_kind: e.fs_kind,
