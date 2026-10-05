@@ -110,7 +110,10 @@ async fn hydrate_full_core(
                 .hydrate_batches_closure(
                     view,
                     closure.files(),
-                    Some(closure),
+                    Some(SnapshotHydration {
+                        closure,
+                        reader: None,
+                    }),
                     (2, 2),
                     {
                         let raw = raw.clone();
@@ -139,12 +142,21 @@ async fn hydrate_full_core(
         }
         "concurrent" => {
             store
-                .hydrate_concurrent_closure(view, closure.files(), Some(closure), 2, move |file| {
-                    let raw = raw.clone();
-                    Box::pin(
-                        async move { Ok(std::sync::Arc::new(raw[&file.content_digest].clone())) },
-                    )
-                })
+                .hydrate_concurrent_closure(
+                    view,
+                    closure.files(),
+                    Some(SnapshotHydration {
+                        closure,
+                        reader: None,
+                    }),
+                    2,
+                    move |file| {
+                        let raw = raw.clone();
+                        Box::pin(async move {
+                            Ok(std::sync::Arc::new(raw[&file.content_digest].clone()))
+                        })
+                    },
+                )
                 .await
         }
         _ => panic!("unknown full hydration core"),
@@ -187,7 +199,10 @@ async fn full_batch_merges_small_and_large_aliases_and_resumes_all_logical_paths
         .hydrate_batches_closure(
             &view,
             closure.files(),
-            Some(&closure),
+            Some(SnapshotHydration {
+                closure: &closure,
+                reader: None,
+            }),
             (2, 2),
             |_| Box::pin(async { panic!("cached small aliases must not fetch") }),
             |_| Box::pin(async { panic!("cached large aliases must not fetch") }),

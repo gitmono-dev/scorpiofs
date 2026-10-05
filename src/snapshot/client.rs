@@ -331,7 +331,22 @@ impl Mst2Client {
                     .json(&body),
             )
             .await?;
-        read_json(ok_or_error(resp).await?).await
+        let response: LookupResponse = read_json(ok_or_error(resp).await?).await?;
+        if response.snapshot_id != snapshot_id || response.results.len() != paths.len() {
+            return Err(lookup_binding_error());
+        }
+        for (result, path) in response.results.iter().zip(paths) {
+            if result.path != *path
+                || match result.status.as_str() {
+                    "found" => result.node.is_none(),
+                    "absent" | "not_directory" | "symlink_traversal" => result.node.is_some(),
+                    _ => true,
+                }
+            {
+                return Err(lookup_binding_error());
+            }
+        }
+        Ok(response)
     }
 
     /// Fetch a whole file, verifying SHA-256 against `expected_digest`.
@@ -394,6 +409,13 @@ fn buffered_limit() -> SnapshotError {
     SnapshotError::new(
         SnapshotErrorCode::LimitExceeded,
         "whole-file buffered read exceeds the local 64 MiB budget; use range reads",
+    )
+}
+
+fn lookup_binding_error() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::IntegrityError,
+        "lookup response does not bind every ordered result to its requested snapshot and path",
     )
 }
 
