@@ -464,6 +464,27 @@ mod tests {
         missing.remove("x-mega-request-digest");
         assert!(validate_treeframe_headers(&missing, expected_snapshot, expected_digest).is_err());
 
+        let mut wrong_digest = headers();
+        wrong_digest.insert(
+            "x-mega-request-digest",
+            HeaderValue::from_static(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+        );
+        assert!(
+            validate_treeframe_headers(&wrong_digest, expected_snapshot, expected_digest).is_err()
+        );
+
+        let mut wrong_media_type = headers();
+        wrong_media_type.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        assert!(
+            validate_treeframe_headers(&wrong_media_type, expected_snapshot, expected_digest)
+                .is_err()
+        );
+
         let mut wrong = headers();
         wrong.insert(
             "x-mega-snapshot-id",
@@ -606,6 +627,17 @@ fn validate_treeframe_headers(
             format!("unexpected TreeFrame Content-Type: {content_type}"),
         ));
     }
+        // TreeFrame bytes are already framed and authenticated by the codec.
+        // Letting reqwest transparently decode an HTTP content encoding before
+        // parsing would make the response representation ambiguous and could
+        // turn a proxy transformation into an integrity failure much later.
+        // Spec 06 therefore requires this header to be absent.
+        if headers.contains_key(reqwest::header::CONTENT_ENCODING) {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "TreeFrame response must not use Content-Encoding",
+            ));
+        }
     let returned_snapshot = headers
         .get("x-mega-snapshot-id")
         .and_then(|v| v.to_str().ok())
