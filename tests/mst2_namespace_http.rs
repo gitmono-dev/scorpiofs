@@ -893,3 +893,72 @@ async fn root_chmod_and_xattr_only_edits_cannot_be_destroyed_as_clean() {
         SnapshotErrorCode::UnsupportedEntry
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_and_root_owner_only_group_changes_are_dirty_when_the_host_permits_them() {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits, UpperChangeKind},
+        util::mutation_fence::MutationFence,
+    };
+    let owner = scorpiofs::util::mount_owner::mount_owner();
+    let mut groups = [0; 64];
+    let group_count = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+    let different_gid = if unsafe { libc::geteuid() } == 0 {
+        Some(owner.gid.wrapping_add(1))
+    } else if group_count >= 0 {
+        groups[..group_count as usize]
+            .iter()
+            .copied()
+            .find(|gid| *gid != owner.gid)
+    } else {
+        None
+    };
+    let Some(different_gid) = different_gid else {
+        eprintln!("OWNER_ONLY_NOT_RUN: no permitted distinct group on this host");
+        return;
+    };
+    let server = Server::start(Fixture::new()).await;
+    let view = Arc::new(
+        Mst2Fuse::from_reader_lazy(server.reader().await, None)
+            .await
+            .unwrap(),
+    );
+    let fence = MutationFence::new(4);
+    let pause = fence.pause().await.unwrap();
+    for root in [false, true] {
+        let temp = upper_tempdir();
+        let directory = temp.path().canonicalize().unwrap();
+        let path = if root {
+            directory.clone()
+        } else {
+            directory.join("plain")
+        };
+        if !root {
+            upper_file(&path, b"plain", 0o644);
+        }
+        assert!(scan_upper(&view, &directory, &pause, DiffLimits::default())
+            .await
+            .unwrap()
+            .is_clean());
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(name.as_ptr(), !0, different_gid) },
+            0,
+            "host advertised a group but rejected the fixture chown"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().gid(),
+            different_gid
+        );
+        let diff = scan_upper(&view, &directory, &pause, DiffLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].rel_path, if root { "" } else { "plain" });
+        assert_eq!(diff.changes[0].kind, UpperChangeKind::Modified);
+    }
+    eprintln!("OWNER_ONLY_GROUP_CHANGE_RUN: actual file and root chown to gid {different_gid}");
+}
