@@ -329,3 +329,81 @@ async fn editor_temp_fsync_rename_and_directory_fsync_replace_upper_without_muta
     idle(&server.reader).await;
     assert_eq!(server.reader.content_usage().output_bytes, 0);
 }
+
+#[tokio::test]
+async fn actual_large_chunked_copy_up_writes_only_upper_and_leaves_lower_ranges_verified() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true).with_large(), 8 * 1024 * 1024).await;
+    let (lower, overlay, _temp, upper) = overlay(&server).await;
+    let req = Request::default();
+    let name = OsStr::new("range000");
+    let file = overlay
+        .lookup(req, ROOT_INODE, name)
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let flags = libc::O_RDWR as u32;
+    let opened = overlay.open(req, file, flags).await.unwrap();
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 3);
+    let boundary = CHUNK_SIZE as usize;
+    let mut original = vec![0; boundary];
+    original.extend(vec![1; boundary]);
+    original.extend([2; 7]);
+    assert_eq!(std::fs::read(upper.join(name)).unwrap(), original);
+    assert_eq!(
+        overlay
+            .write(
+                req,
+                file,
+                opened.fh,
+                CHUNK_SIZE as u64 - 2,
+                b"HELLO",
+                0,
+                flags
+            )
+            .await
+            .unwrap()
+            .written,
+        5
+    );
+    overlay.fsync(req, file, opened.fh, false).await.unwrap();
+    assert_eq!(
+        overlay
+            .read(req, file, opened.fh, CHUNK_SIZE as u64 - 2, 5)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        b"HELLO"
+    );
+    let mut edited = original;
+    edited[boundary - 2..boundary + 3].copy_from_slice(b"HELLO");
+    assert_eq!(std::fs::read(upper.join(name)).unwrap(), edited);
+    assert_eq!(
+        read(&lower, "range000", CHUNK_SIZE as u64 - 2, 5)
+            .await
+            .data
+            .as_ref(),
+        [0, 0, 1, 1, 1]
+    );
+    assert_eq!(
+        read(&lower, "range000", 2 * CHUNK_SIZE as u64 + 3, 64)
+            .await
+            .data
+            .as_ref(),
+        [2; 4]
+    );
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+    overlay
+        .release(req, file, opened.fh, flags, 0, false)
+        .await
+        .unwrap();
+    drop(overlay);
+    drop(lower);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
