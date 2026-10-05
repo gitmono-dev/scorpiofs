@@ -79,6 +79,17 @@ pub struct ChunkedFile {
 }
 
 impl ChunkedFile {
+    /// Open a range reader with retained chunk/output credits and fixed-root
+    /// membership checks. The legacy `open` path is outside owned byte quotas.
+    pub async fn open_owned(
+        reader: &SnapshotReader,
+        path: &str,
+        digest: &str,
+        size: u64,
+    ) -> Result<super::OwnedChunkedFile, SnapshotError> {
+        super::OwnedChunkedFile::open(reader, path, digest, size).await
+    }
+
     /// Fetch and verify the chunk map for one path in the fixed view.
     pub async fn open(
         reader: &SnapshotReader,
@@ -127,6 +138,7 @@ impl ChunkedFile {
 
     /// Bytes `[offset, offset+length)` of the file, clamped to EOF, with
     /// every covering chunk verified before it is sliced.
+    /// This legacy Vec/cache path is caller-owned and outside owned byte quotas.
     pub async fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, SnapshotError> {
         if length == 0 || offset >= self.size {
             return Ok(Vec::new());
