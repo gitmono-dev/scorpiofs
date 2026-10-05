@@ -26,6 +26,8 @@ const MAX_OBJECT_BATCH_BYTES: usize = 8 * 1024 * 1024;
 fn request_batches<'a, T>(
     items: &'a [T],
     encoding: Option<&str>,
+    limit: usize,
+    max_items: usize,
     item_value: impl Fn(&T) -> serde_json::Value,
 ) -> Result<Vec<&'a [T]>, SnapshotError> {
     let mut envelope = serde_json::json!({"items": []});
@@ -33,7 +35,6 @@ fn request_batches<'a, T>(
         envelope["encoding"] = encoding.into();
     }
     let overhead = serde_json::to_vec(&envelope).unwrap().len();
-    let limit = crate::snapshot::client::TREEFRAME_REQUEST_MAX_BYTES;
     let mut batches = Vec::new();
     let mut start = 0;
     let mut bytes = overhead;
@@ -45,7 +46,7 @@ fn request_batches<'a, T>(
             ));
         }
         let comma = usize::from(index > start);
-        if bytes + comma + item_bytes > limit {
+        if bytes + comma + item_bytes > limit || index - start >= max_items {
             batches.push(&items[start..index]);
             start = index;
             bytes = overhead;
@@ -104,6 +105,7 @@ fn limit_err(message: &str) -> SnapshotError {
 }
 
 fn response_frames(
+    client: &Mst2Client,
     raw: &[u8],
     context: &str,
     data_kind: u8,
@@ -140,8 +142,11 @@ fn response_frames(
             treeframe::KIND_ERROR => treeframe::ERROR_MAX_BYTES,
             _ => unreachable!("endpoint frame kind checked above"),
         };
-        if raw_len > max_raw || wire_len > 2 * 1024 * 1024 {
+        if raw_len > max_raw || wire_len > client.frame_wire_limit() {
             return Err(limit_err("TreeFrame payload exceeds its frame byte limit"));
+        }
+        if client.is_canonical() && header[7] != 0 {
+            return Err(limit_err("reader selected identity TreeFrames"));
         }
         frames += 1;
         raw_total = raw_total
@@ -265,6 +270,9 @@ impl Mst2Client {
             .get_json(&self.snap_url(&format!("/{sid}/descriptor")))
             .await?;
         super::descriptor_wire::validate(&value, sid)?;
+        if self.is_canonical() && value.get("descriptor").is_some() {
+            return Err(chunk_binding_error());
+        }
         Ok(value)
     }
 
@@ -274,6 +282,9 @@ impl Mst2Client {
         let value = self
             .get_json(&self.snap_url(&format!("/{sid}/descriptor")))
             .await?;
+        if self.is_canonical() && value.get("descriptor").is_some() {
+            return Err(chunk_binding_error());
+        }
         super::descriptor_wire::validate(&value, sid)
     }
 
@@ -293,6 +304,9 @@ impl Mst2Client {
             .post_json(&url, serde_json::json!({ "lease_seconds": lease_seconds }))
             .await?;
         super::lease_wire::validate(&value, lease_id)?;
+        if self.is_canonical() && value.get("authorization_epoch").is_none() {
+            return Err(chunk_binding_error());
+        }
         Ok(value)
     }
 
@@ -344,6 +358,8 @@ impl Mst2Client {
         path: &str,
         expected_digest: Option<&str>,
     ) -> Result<(u64, String, String), SnapshotError> {
+        self.require_feature("blob")?;
+        self.validate_path(path)?;
         let mut url = self.snap_url(&format!("/{sid}/blob?path={}", urlencode(path)));
         if let Some(d) = expected_digest {
             url.push_str(&format!("&expected_digest={}", urlencode(d)));
@@ -360,10 +376,21 @@ impl Mst2Client {
         items: &[MetadataPageItem],
         encoding: Option<&str>,
     ) -> Result<Vec<([u8; 32], Vec<u8>)>, SnapshotError> {
+        self.require_feature("metadata/pages")?;
+        self.validate_encoding(encoding)?;
+        for item in items {
+            self.validate_path(&item.directory_path)?;
+        }
         if items.is_empty() || items.len() > MAX_METADATA_BATCH {
             return Err(limit_err("metadata batch must hold 1..64 items"));
         }
-        let batches = request_batches(items, encoding, |item| serde_json::to_value(item).unwrap())?;
+        let batches = request_batches(
+            items,
+            encoding,
+            self.request_byte_limit(),
+            self.metadata_item_limit(),
+            |item| serde_json::to_value(item).unwrap(),
+        )?;
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for batch in batches {
@@ -421,6 +448,7 @@ impl Mst2Client {
             )
             .await?;
         let frames = response_frames(
+            self,
             &raw,
             "metadata/pages stream",
             treeframe::KIND_META,
@@ -511,6 +539,11 @@ impl Mst2Client {
         items: &[(String, String)],
         encoding: Option<&str>,
     ) -> Result<HashMap<[u8; 32], Vec<u8>>, SnapshotError> {
+        self.require_feature("objects")?;
+        self.validate_encoding(encoding)?;
+        for (path, _) in items {
+            self.validate_path(path)?;
+        }
         if items.is_empty() || items.len() > MAX_OBJECT_BATCH {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::ScopeInvalid,
@@ -520,6 +553,9 @@ impl Mst2Client {
         let batches = request_batches(
             items,
             encoding,
+            self.request_byte_limit(),
+            self.request_item_limit()
+                .min((self.object_byte_limit() / treeframe::OBJECT_MAX_LEN as usize).max(1)),
             |(path, digest)| serde_json::json!({"path": path, "expected_digest": digest}),
         )?;
         let mut out = HashMap::new();
@@ -559,7 +595,7 @@ impl Mst2Client {
             .collect::<Result<_, _>>()?;
         let budget = ResponseBudget::new(
             requested.len(),
-            (requested.len() * treeframe::OBJECT_MAX_LEN as usize).min(MAX_OBJECT_BATCH_BYTES),
+            (requested.len() * treeframe::OBJECT_MAX_LEN as usize).min(self.object_byte_limit()),
             40 + 4,
         )?;
         let mut req = serde_json::json!({
@@ -582,6 +618,7 @@ impl Mst2Client {
             )
             .await?;
         let frames = response_frames(
+            self,
             &raw,
             "objects stream",
             treeframe::KIND_OBJECT,
@@ -603,7 +640,7 @@ impl Mst2Client {
                             ));
                         }
                         logical_bytes += data.len() as u64;
-                        if logical_bytes > MAX_OBJECT_BATCH_BYTES as u64 {
+                        if logical_bytes > self.object_byte_limit() as u64 {
                             return Err(limit_err(
                                 "objects response exceeds the unique raw byte limit",
                             ));
@@ -635,6 +672,8 @@ impl Mst2Client {
         path: &str,
         expected_digest: &str,
     ) -> Result<VerifiedChunkMap, SnapshotError> {
+        self.require_feature("chunk-map")?;
+        self.validate_path(path)?;
         let want = parse_digest(expected_digest)?;
         let url = self.snap_url(&format!(
             "/{sid}/chunk-map?path={}&expected_digest={}",
@@ -642,6 +681,9 @@ impl Mst2Client {
             urlencode(expected_digest)
         ));
         let response: serde_json::Value = self.get_json(&url).await?;
+        if self.is_canonical() && response.get("map").is_some() {
+            return Err(chunk_binding_error());
+        }
         let v = super::chunk_wire::map_descriptor(&response, sid, path)?;
         if v["schema_version"].as_u64() != Some(2) {
             return Err(chunk_binding_error());
@@ -663,6 +705,7 @@ impl Mst2Client {
         let pages_root = parse_digest(v["pages_root"].as_str().unwrap_or(""))?;
         let map_id_want = parse_digest(v["map_id"].as_str().unwrap_or(""))?;
         let file_size = parse_count(v["file_size"].as_str().unwrap_or(""), "file_size")?;
+        self.validate_file_size(file_size)?;
         // SPEC 07 limits content to 8 TiB independently of the wider JSON
         // counter domain and the codec's structural descriptor checks.
         const MAX_CHUNK_MAP_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
@@ -712,8 +755,15 @@ impl Mst2Client {
         map: &VerifiedChunkMap,
         page_index: u64,
     ) -> Result<ChunkLeaf, SnapshotError> {
-        self.chunk_map_page_contract(sid, path, expected_digest, map, page_index, false)
-            .await
+        self.chunk_map_page_contract(
+            sid,
+            path,
+            expected_digest,
+            map,
+            page_index,
+            self.is_canonical(),
+        )
+        .await
     }
 
     /// Request the canonical map_id/page_index query contract. This explicit
@@ -739,6 +789,9 @@ impl Mst2Client {
         page_index: u64,
         canonical_query: bool,
     ) -> Result<ChunkLeaf, SnapshotError> {
+        self.require_feature("chunk-map")?;
+        self.validate_path(path)?;
+        self.validate_file_size(map.file_size)?;
         let content_id = parse_digest(expected_digest)?;
         let canonical = ChunkMap::new(content_id, map.file_size, map.pages_root)
             .map_err(|error| frame_err("chunk-map descriptor", error))?;
@@ -842,6 +895,11 @@ impl Mst2Client {
         items: &[ChunkRequest],
         encoding: Option<&str>,
     ) -> Result<Vec<ChunkUnit>, SnapshotError> {
+        self.require_feature("chunks")?;
+        self.validate_encoding(encoding)?;
+        for item in items {
+            self.validate_path(&item.path)?;
+        }
         if items.is_empty() || items.len() > MAX_CHUNK_BATCH {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::ScopeInvalid,
@@ -862,7 +920,14 @@ impl Mst2Client {
                 ));
             }
         }
-        let batches = request_batches(items, encoding, chunk_request_value)?;
+        let batches = request_batches(
+            items,
+            encoding,
+            self.request_byte_limit(),
+            self.request_item_limit()
+                .min((self.chunk_byte_limit() / treeframe::CHUNK_MAX_LEN as usize).max(1)),
+            chunk_request_value,
+        )?;
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for batch in batches {
@@ -903,7 +968,7 @@ impl Mst2Client {
         }
         let budget = ResponseBudget::new(
             requested.len(),
-            requested.len() * treeframe::CHUNK_MAX_LEN as usize,
+            (requested.len() * treeframe::CHUNK_MAX_LEN as usize).min(self.chunk_byte_limit()),
             76,
         )?;
         let mut req = serde_json::json!({
@@ -926,6 +991,7 @@ impl Mst2Client {
             )
             .await?;
         let frames = response_frames(
+            self,
             &raw,
             "chunks stream",
             treeframe::KIND_CHUNK,

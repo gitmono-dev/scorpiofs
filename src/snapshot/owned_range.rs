@@ -193,6 +193,7 @@ impl OwnedChunkedFile {
         size: u64,
     ) -> Result<Self, SnapshotError> {
         reader.authorized_context().validate_relative_path(path)?;
+        reader.client().validate_file_size(size)?;
         if !(OBJECT_CAP + 1..=super::range::MAX_FILE_SIZE).contains(&size) {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
@@ -356,6 +357,7 @@ impl OwnedChunkedFile {
             encoding: Option<&'static str>,
         }
         let body = request_body(
+            self.reader.client(),
             &self.reader.content_scope,
             &Request {
                 items: [Item {
