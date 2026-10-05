@@ -78,3 +78,31 @@ fn git_blob_hash_and_store_remain_sha1_on_other_hash_workers() {
         );
     }
 }
+
+#[test]
+fn explicit_commit_constructor_preserves_legacy_object_bytes() {
+    let _guard = set_hash_kind_for_test(HashKind::Blake3);
+    let legacy: Commit = serde_json::from_str(LEGACY_COMMIT).unwrap();
+    let commit = Commit::new_with_kind(
+        HashKind::Sha1,
+        legacy.author.clone(),
+        legacy.committer.clone(),
+        legacy.tree_id,
+        legacy.parent_commit_ids.clone(),
+        &legacy.message,
+    )
+    .unwrap();
+    assert_eq!(commit.id.to_string(), COMMIT_OID);
+    assert_eq!(commit.to_data().unwrap(), legacy.to_data().unwrap());
+    // The new API must reject a mismatched repository reference instead of
+    // producing an object with an incompatible hash algorithm.
+    assert!(Commit::new_with_kind(
+        HashKind::Sha1,
+        legacy.author,
+        legacy.committer,
+        ObjectHash::zero_for_kind(HashKind::Blake3),
+        vec![],
+        "invalid tree kind",
+    )
+    .is_err());
+}
