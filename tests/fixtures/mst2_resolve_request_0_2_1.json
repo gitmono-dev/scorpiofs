@@ -1,0 +1,11 @@
+{
+  "target": {
+    "kind": "latest"
+  },
+  "scope": "/project/app",
+  "delivery": "full",
+  "lease_seconds": 600,
+  "supported_metadata_codecs": [
+    1
+  ]
+}

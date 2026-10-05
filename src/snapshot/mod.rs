@@ -27,6 +27,7 @@ mod owned_reader;
 mod owned_transport;
 pub mod range;
 pub mod reader;
+mod resolve_wire;
 pub mod types;
 
 pub use auth::{AuthorizedSnapshotContext, CacheDomain};
