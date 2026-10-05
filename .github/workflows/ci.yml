@@ -123,6 +123,12 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Check measurement driver old-view audit
+        run: |
+          cargo build --locked --release --example mst2_update_measure
+          MST2_MEASURE_DRIVER="$GITHUB_WORKSPACE/target/release/examples/mst2_update_measure" \
+            cargo test --locked --release --example mst2_update_measure
+
   docker:
     name: Docker image
     runs-on: ubuntu-latest
