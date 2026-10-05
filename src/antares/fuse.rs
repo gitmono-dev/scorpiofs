@@ -272,6 +272,34 @@ impl AntaresFuse {
         Ok(())
     }
 
+    async fn finish_overlay_retirement(&self) -> std::io::Result<()> {
+        if let Some(overlay) = &self.overlay {
+            // Session completion does not join asyncfuse's worker requests.
+            // Every mounted wrapper and retained native future owns this exact
+            // private Arc; no Weak capability to it is exposed. Once only the
+            // control owner remains, no old request can enter the fence later.
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                while Arc::strong_count(overlay.inner()) != 1 {
+                    if overlay.fence().is_uncertain() {
+                        return Err(std::io::Error::other(
+                            "native handle retirement has an unknown outcome",
+                        ));
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "native filesystem owners are still retiring",
+                )
+            })??;
+        }
+        self.recover_copy_up_ownership().await
+    }
+
     /// Unmount the FUSE session if mounted.
     ///
     /// Prefers [`MountHandle::unmount`] (asyncfuse native path). Falls back to
@@ -284,7 +312,7 @@ impl AntaresFuse {
             if self.unmount_failed {
                 let result = fuse_platform::unmount_path(&self.mountpoint, true).await;
                 let result = if result.is_ok() {
-                    self.recover_copy_up_ownership().await
+                    self.finish_overlay_retirement().await
                 } else {
                     result
                 };
@@ -294,7 +322,15 @@ impl AntaresFuse {
                 }
                 return result;
             }
-            self.overlay = None;
+            if self.overlay.is_some() {
+                self.unmount_failed = true;
+                let result = self.finish_overlay_retirement().await;
+                self.unmount_failed = result.is_err();
+                if result.is_ok() {
+                    self.overlay = None;
+                }
+                return result;
+            }
             return Ok(());
         };
         let mount_path = self.mountpoint.clone();
@@ -326,7 +362,7 @@ impl AntaresFuse {
         // RELEASE calls. Drain again before discarding the control owner; a
         // failed/unknown cleanup keeps the owner and explicit retry state.
         let result = if result.is_ok() {
-            self.recover_copy_up_ownership().await
+            self.finish_overlay_retirement().await
         } else {
             result
         };
