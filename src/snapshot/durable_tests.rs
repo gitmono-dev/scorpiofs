@@ -38,10 +38,10 @@ thread_local! {
     static FAULT: RefCell<Option<Fault>> = const { RefCell::new(None) };
 }
 
-struct FaultGuard;
+pub(super) struct FaultGuard;
 
 impl FaultGuard {
-    fn install(path: &Path, phase: &'static str, after_complete_rename: bool) -> Self {
+    pub(super) fn install(path: &Path, phase: &'static str, after_complete_rename: bool) -> Self {
         FAULT.with(|slot| {
             assert!(slot.borrow().is_none());
             *slot.borrow_mut() = Some(Fault {
