@@ -59,8 +59,11 @@ EXISTING_SERVICE_USER=""
 EXISTING_SERVICE_ACTIVE=0
 SERVICE_STOPPED_FOR_UPGRADE=0
 SERVICE_HEALTH_CONFIRMED=0
+SERVICE_REPLACEMENT_STARTED=0
 ARTIFACT_BACKUP_DIR=""
 ARTIFACT_BACKUP_READY=0
+RETIRED_ALIAS_BACKUP_READY=0
+RETIRED_ALIAS_REMOVED=0
 HAD_OLD_SCORPIO=0
 HAD_OLD_ANTARES=0
 HAD_OLD_CONFIG=0
@@ -110,6 +113,19 @@ cleanup() {
         warn "installation failed after stopping scorpiofs.service; attempting to restore the managed service"
         if ! run_root systemctl start scorpiofs.service; then
             warn "could not restore scorpiofs.service; inspect: systemctl status scorpiofs"
+        fi
+    elif [ "$exit_status" -ne 0 ] && [ "$RETIRED_ALIAS_REMOVED" -eq 1 ] && \
+        [ "$RETIRED_ALIAS_BACKUP_READY" -eq 1 ] && [ "$SERVICE_HEALTH_CONFIRMED" -ne 1 ]; then
+        # An inactive installation has no old service to restart. Stop only a
+        # replacement this invocation started and restore the retired artifact.
+        if [ "$SERVICE_REPLACEMENT_STARTED" -eq 1 ]; then
+            if ! run_root systemctl stop scorpiofs.service; then
+                warn "could not stop the failed replacement service"
+            fi
+        fi
+        if ! restore_upgrade_artifact "$HAD_OLD_ANTARES" \
+            "${ARTIFACT_BACKUP_DIR}/antares" "${PREFIX}/bin/antares"; then
+            warn "could not restore the previous retired entry point"
         fi
     fi
     if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ]; then
@@ -1107,20 +1123,23 @@ install_release_binaries() {
     # Retire the old entry point only after the replacement binary is installed.
     # A failed managed upgrade restores it from the artifact backup below.
     run_root rm -f -- "${PREFIX}/bin/antares"
+    RETIRED_ALIAS_REMOVED=1
 }
 
 backup_upgrade_artifacts() {
-    [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] || return 0
+    [ "$DRY_RUN" -eq 0 ] || return 0
     [ -n "$WORKDIR" ] || die "internal error: upgrade backup requires a working directory"
     ARTIFACT_BACKUP_DIR="${WORKDIR}/previous-install"
     mkdir -m 0700 -- "$ARTIFACT_BACKUP_DIR"
-    if run_root test -e "${PREFIX}/bin/scorpio"; then
-        HAD_OLD_SCORPIO=1
-        run_root cp -a -- "${PREFIX}/bin/scorpio" "${ARTIFACT_BACKUP_DIR}/scorpio"
-    fi
     if run_root test -e "${PREFIX}/bin/antares"; then
         HAD_OLD_ANTARES=1
         run_root cp -a -- "${PREFIX}/bin/antares" "${ARTIFACT_BACKUP_DIR}/antares"
+    fi
+    RETIRED_ALIAS_BACKUP_READY=1
+    [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] || return 0
+    if run_root test -e "${PREFIX}/bin/scorpio"; then
+        HAD_OLD_SCORPIO=1
+        run_root cp -a -- "${PREFIX}/bin/scorpio" "${ARTIFACT_BACKUP_DIR}/scorpio"
     fi
     if run_root test -e "${CONFDIR}/scorpio.toml"; then
         HAD_OLD_CONFIG=1
@@ -1619,6 +1638,7 @@ EOF
     if ! run_root systemctl "$service_action" scorpiofs.service; then
         die "systemd unit could not ${service_action}; inspect: systemctl status scorpiofs"
     fi
+    SERVICE_REPLACEMENT_STARTED=1
     wait_for_service_health
 }
 

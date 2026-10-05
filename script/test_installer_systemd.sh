@@ -364,6 +364,41 @@ grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
 test "$(grep -Fc 'start scorpiofs.service' "$systemctl_log")" -ge 2
 : >"$systemctl_log"
 
+mock_service_active=0
+printf '#!/usr/bin/env bash\nexit 66\n# inactive alias bytes\n' >"${test_root}/prefix/bin/antares"
+chmod 0755 "${test_root}/prefix/bin/antares"
+inactive_alias_digest="$(sha256sum "${test_root}/prefix/bin/antares" | awk '{print $1}')"
+if MOCK_HEALTH_FAIL=1 MOCK_RETIRED_ALIAS_PATH="${test_root}/prefix/bin/antares" \
+    SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
+    --version "$version" \
+    --release-base-url "$release_base_url" \
+    --non-interactive \
+    --no-deps \
+    --no-user-allow-other \
+    --base-url https://ignored.example.com \
+    --lfs-url https://ignored.example.com/lfs \
+    --prefix "${test_root}/prefix" \
+    --config-dir "${test_root}/etc" \
+    --data-root "${test_root}/data" \
+    --workspace "${test_root}/data/mount" \
+    --store-path "${test_root}/data/store" \
+    --http-addr 127.0.0.1:2925 >"${test_root}/inactive-health-failure.log" 2>&1; then
+    printf 'installer accepted an unhealthy replacement for an inactive service\n' >&2
+    exit 1
+fi
+grep -Fq 'did not become healthy' "${test_root}/inactive-health-failure.log"
+assert_systemctl_log_line 'retired alias absent at health check'
+test -x "${test_root}/prefix/bin/antares"
+test "$(sha256sum "${test_root}/prefix/bin/antares" | awk '{print $1}')" = "$inactive_alias_digest"
+test "$(grep -Fc 'start scorpiofs.service' "$systemctl_log")" -eq 1
+test "$(grep -Fc 'stop scorpiofs.service' "$systemctl_log")" -eq 1
+if grep -Fxq 'restart scorpiofs.service' "$systemctl_log"; then
+    printf 'installer restarted the previously inactive service after failure\n' >&2
+    exit 1
+fi
+mock_service_active=1
+: >"$systemctl_log"
+
 sed -i 's/^User=.*/User=root/' "$unit_capture"
 chmod 0750 "${test_root}/etc"
 if SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
