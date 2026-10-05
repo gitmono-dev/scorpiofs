@@ -24,7 +24,7 @@ pub mod types;
 pub use auth::{AuthorizedSnapshotContext, CacheDomain};
 pub use client::Mst2Client;
 pub use closure::{SnapshotClosureMeters, SnapshotDirectory, ValidatedSnapshotClosure};
-pub use coordinator::FetchCoordinator;
+pub use coordinator::{FetchCoordinator, FetchCoordinatorCounts, FetchCoordinatorLimits};
 pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMeters, ViewMeta};
 pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
 pub use range::{ChunkedFile, OBJECT_CAP};
