@@ -10,6 +10,31 @@ use libfuse_fs::{
 
 use super::*;
 
+fn request() -> Request {
+    let owner = crate::util::mount_owner::mount_owner();
+    Request {
+        uid: owner.uid,
+        gid: owner.gid,
+        pid: std::process::id(),
+        ..Request::default()
+    }
+}
+
+async fn close_overlay(overlay: OverlayFs, lower: Arc<Mst2Fuse>) {
+    let gone = Arc::downgrade(&lower);
+    drop(overlay);
+    drop(lower);
+    // libfuse-fs RealInode::Drop schedules actual lower.forget futures which
+    // retain a Layer Arc. Wait for those real owners, not an assumed drop time.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gone.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 async fn overlay(server: &Server) -> (Arc<Mst2Fuse>, OverlayFs, tempfile::TempDir, PathBuf) {
     let lower = Arc::new(server.view(false).await);
     let temp = tempfile::tempdir().unwrap();
@@ -34,7 +59,7 @@ async fn overlay(server: &Server) -> (Arc<Mst2Fuse>, OverlayFs, tempfile::TempDi
         1,
     )
     .unwrap();
-    overlay.init(Request::default()).await.unwrap();
+    overlay.init(request()).await.unwrap();
     (lower, overlay, temp, upper_path)
 }
 
@@ -43,7 +68,7 @@ async fn modern_copy_up_append_truncate_and_upper_fsync_preserve_the_open_fixed_
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
     let (lower, overlay, _temp, upper) = overlay(&server).await;
-    let req = Request::default();
+    let req = request();
     let file = overlay
         .lookup(req, ROOT_INODE, OsStr::new("file001"))
         .await
@@ -136,8 +161,7 @@ async fn modern_copy_up_append_truncate_and_upper_fsync_preserve_the_open_fixed_
     assert_eq!(read(&lower, "file001", 0, 4).await.data.as_ref(), [1; 4]);
     assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
     assert_eq!(server.fixture.metadata.lock().unwrap().len(), 1);
-    drop(overlay);
-    drop(lower);
+    close_overlay(overlay, lower).await;
     idle(&server.reader).await;
     assert_eq!(server.reader.content_usage().output_bytes, paid);
     assert_eq!(retained.data.as_ref(), [1; 31]);
@@ -150,7 +174,7 @@ async fn copied_up_modern_file_keeps_its_live_upper_handle_after_unlink_and_whit
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
     let (lower, overlay, _temp, upper) = overlay(&server).await;
-    let req = Request::default();
+    let req = request();
     let name = OsStr::new("file002");
     let file = overlay
         .lookup(req, ROOT_INODE, name)
@@ -213,8 +237,7 @@ async fn copied_up_modern_file_keeps_its_live_upper_handle_after_unlink_and_whit
     );
     assert_eq!(read(&lower, "file002", 0, 9).await.data.as_ref(), [2; 9]);
     assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
-    drop(overlay);
-    drop(lower);
+    close_overlay(overlay, lower).await;
     idle(&server.reader).await;
     assert_eq!(server.reader.content_usage().output_bytes, 0);
 }
@@ -224,7 +247,7 @@ async fn editor_temp_fsync_rename_and_directory_fsync_replace_upper_without_muta
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
     let (lower, overlay, _temp, upper) = overlay(&server).await;
-    let req = Request::default();
+    let req = request();
     let original_name = OsStr::new("file003");
     let original = overlay
         .lookup(req, ROOT_INODE, original_name)
@@ -324,8 +347,7 @@ async fn editor_temp_fsync_rename_and_directory_fsync_replace_upper_without_muta
     assert_eq!(prior.data.as_ref(), [3; 4]);
     assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
     drop(prior);
-    drop(overlay);
-    drop(lower);
+    close_overlay(overlay, lower).await;
     idle(&server.reader).await;
     assert_eq!(server.reader.content_usage().output_bytes, 0);
 }
@@ -335,7 +357,7 @@ async fn actual_large_chunked_copy_up_writes_only_upper_and_leaves_lower_ranges_
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::new(false, true).with_large(), 8 * 1024 * 1024).await;
     let (lower, overlay, _temp, upper) = overlay(&server).await;
-    let req = Request::default();
+    let req = request();
     let name = OsStr::new("range000");
     let file = overlay
         .lookup(req, ROOT_INODE, name)
@@ -402,8 +424,7 @@ async fn actual_large_chunked_copy_up_writes_only_upper_and_leaves_lower_ranges_
         .release(req, file, opened.fh, flags, 0, false)
         .await
         .unwrap();
-    drop(overlay);
-    drop(lower);
+    close_overlay(overlay, lower).await;
     idle(&server.reader).await;
     assert_eq!(server.reader.content_usage().output_bytes, 0);
 }
