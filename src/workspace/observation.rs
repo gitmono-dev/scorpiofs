@@ -13,9 +13,7 @@ use mst2_codec::descriptor::ServingDescriptor;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::snapshot::{
-    durable::digest_of, frames::parse_digest, DurableStore, ResolveTraceReceipt, SnapshotReader,
-};
+use crate::snapshot::{frames::parse_digest, DurableStore, ResolveTraceReceipt, SnapshotReader};
 
 pub const MAX_WORKSPACE_OBSERVATIONS: usize = 64;
 const MAX_RECORD_BYTES: usize = 32 * 1024;
@@ -215,17 +213,18 @@ impl WorkspaceObserver {
                 return None;
             }
             let descriptor = reader.descriptor();
-            let encoded = ServingDescriptor {
+            let canonical = ServingDescriptor {
                 instance_uuid: *uuid::Uuid::parse_str(&descriptor.instance_id)
                     .ok()?
                     .as_bytes(),
                 namespace_view_id: parse_digest(&descriptor.namespace_view_id).ok()?,
                 scope: descriptor.scope.clone(),
                 metadata_root: parse_digest(&descriptor.metadata_root).ok()?,
-            }
-            .encode()
-            .ok()?;
-            if digest_of(&encoded) != reader.snapshot_id() {
+            };
+            let encoded = canonical.encode().ok()?;
+            // MST/2 snapshot identities include the descriptor domain prefix;
+            // a digest of the raw descriptor bytes is a different identity.
+            if canonical.snapshot_id().ok()? != parse_digest(reader.snapshot_id()).ok()? {
                 return None;
             }
             let record = WorkspaceResolveBinding {

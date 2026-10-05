@@ -413,16 +413,19 @@ fn assert_observed_binding(
     assert_eq!(record.snapshot_id, harness.fixture.sid);
     assert_eq!(record.scope, SCOPE);
     assert_eq!(record.publication_sequence, 1);
-    let descriptor = ServingDescriptor {
+    let canonical = ServingDescriptor {
         instance_uuid: *uuid::Uuid::parse_str(INSTANCE).unwrap().as_bytes(),
         namespace_view_id: [0x22; 32],
         scope: SCOPE.into(),
         metadata_root: harness.fixture.root,
-    }
-    .encode()
-    .unwrap();
+    };
+    let descriptor = canonical.encode().unwrap();
     assert_eq!(record.descriptor_bytes_hex, hex::encode(&descriptor));
-    assert_eq!(digest_of(&descriptor), record.snapshot_id);
+    assert_eq!(
+        digest(&canonical.snapshot_id().unwrap()),
+        record.snapshot_id
+    );
+    assert_ne!(digest_of(&descriptor), record.snapshot_id);
     assert!(record
         .store
         .starts_with(harness.temp.path().join("cache").canonicalize().unwrap()));
@@ -476,6 +479,7 @@ async fn observed_creation_records_its_only_actual_resolve_and_independent_owner
         );
     }
     let statuses = h.list().await;
+    assert_eq!(observer.status().first_error, None);
     let first = observations.try_recv().unwrap();
     let second = observations.try_recv().unwrap();
     assert_ne!(first.workspace_id, second.workspace_id);
