@@ -16,13 +16,13 @@ import math
 import os
 from pathlib import Path
 import re
-import signal
 import stat
-import subprocess
 import sys
 import time
 from urllib.parse import urlsplit
 import uuid
+
+import commit_update_budget as budget_module
 
 try:
     import tomllib
@@ -148,37 +148,12 @@ def clean_env(extra=None):
 def command(args, deadline, env=None, data=None):
     # Each child owns a process group; a stalled Git/HTTP child cannot survive
     # the shared wall-clock deadline. Captured errors never echo bearer headers.
-    remaining = min(deadline - time.monotonic(), 1800)
-    if remaining <= 0:
-        raise TimeoutError("shared four-hour deadline reached")
-    process = subprocess.Popen(args, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               env=env or clean_env(), start_new_session=True)
-    def terminate():
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.communicate(timeout=5)
-    try:
-        out, error_output = process.communicate(data, timeout=remaining)
-    except subprocess.TimeoutExpired:
-        terminate()
-        raise TimeoutError(f"{Path(str(args[0])).name} exceeded its operation budget") from None
-    except BaseException:
-        terminate()
-        raise
-    if process.returncode:
+    status, out, error_output = budget_module.run_process(
+        args, min(deadline, time.monotonic() + 1800), env=env or clean_env(), data=data)
+    if status:
         name = Path(str(args[0])).name.removesuffix(".exe")
         program = name if name in {"git", "psql", "docker", "mst2_update_measure"} else "external_command"
-        raise CommandFailure(program, process.returncode, error_output)
+        raise CommandFailure(program, status, error_output)
     return out
 
 
@@ -392,12 +367,14 @@ def expected_manifest(repo, commit, deadline):
             "directories": directories}
 
 
-def verify_worktree(worktree, expected):
+def verify_worktree(worktree, expected, deadline=None):
     wanted = {f["rel_path"]: f for f in expected["files"]}
     found = set()
     def fail(error):
         raise error
     for base, directories, names in os.walk(worktree, followlinks=False, onerror=fail):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Git byte oracle exceeded its operation budget")
         if Path(base) == worktree:
             directories[:] = [d for d in directories if d != ".git"]
             names = [n for n in names if n != ".git"]
@@ -405,6 +382,8 @@ def verify_worktree(worktree, expected):
         directories[:] = [d for d in directories if d not in links]
         names.extend(links)
         for name in names:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Git byte oracle exceeded its operation budget")
             path = Path(base) / name
             rel = path.relative_to(worktree).as_posix()
             if rel not in wanted:
@@ -478,6 +457,17 @@ def percentile(values, percentage):
     return sorted(values)[math.ceil(len(values) * percentage / 100) - 1]
 
 
+def durable_verified(operation, oracle):
+    """The common end point includes each side's immediate full-byte oracle."""
+    started = time.monotonic()
+    measured = operation()
+    oracle_started = time.monotonic()
+    oracle(measured)
+    measured["durable_byte_oracle_ms"] = (time.monotonic() - oracle_started) * 1000
+    measured["durable_verified_ms"] = (time.monotonic() - started) * 1000
+    return measured
+
+
 def driver_binding(options):
     if not re.fullmatch(r"[0-9a-f]{64}", options.driver_sha256):
         raise ValueError("a fixed measurement binary SHA-256 is required")
@@ -498,15 +488,15 @@ def execute(options):
     if not re.fullmatch(r"[0-9a-f]{40}", options.expect_initial_commit):
         raise ValueError("expected initial project commit must be a fixed SHA-1")
     endpoint_pair(options.base_url, options.git_url)
+    budget = budget_module.from_options(options)
+    budget.require(options.rounds * budget_module.ROUND_SECONDS
+                   + budget_module.REPORT_RESERVE + budget_module.CLEANUP_RESERVE
+                   + budget_module.MARGIN)
     started = time.monotonic()
     # This one deadline includes all preflight, fixture, publish, client, Git,
     # audit and repeated-round work. Never grant a fresh four hours per round.
-    deadline = started + min(options.deadline_seconds, 14400) - 30
-    if options.session_deadline_utc:
-        absolute = datetime.fromisoformat(options.session_deadline_utc.replace("Z", "+00:00"))
-        if absolute.tzinfo is None or absolute.utcoffset().total_seconds() != 0:
-            raise ValueError("session deadline must be explicit UTC")
-        deadline = min(deadline, started + absolute.timestamp() - time.time() - 30)
+    measurement_limit = min(budget.measurement_deadline, started + options.deadline_seconds)
+    deadline = measurement_limit
     owner = service_binding(options)
     driver_binding(options)
     root = options.run_root.parent.resolve(strict=True) / options.run_root.name
@@ -559,7 +549,7 @@ def execute(options):
           "git_baseline": "cold V1 depth=1 fetch, ordinary incremental V2/V3 in the same worktree; core.fsync=all + fsync of Git store and worktree files/directories",
           "started_utc": datetime.now(timezone.utc).isoformat(), "max_wall_seconds": min(options.deadline_seconds, 14400)})
     for round_number in range(1, options.rounds + 1):
-        round_started = time.monotonic()
+        deadline = min(budget.round_deadline(round_number), measurement_limit)
         group = root / f"round-{round_number:02}"
         group.mkdir()
         git_store, git_worktree = group / "git.git", group / "git-worktree"
@@ -595,7 +585,7 @@ def execute(options):
                                    "M2_TOKEN": os.environ.get("M2_TOKEN", "")})
             if native:
                 driver_env["M2_EXPECTED_SEQUENCE"] = str(native["sequence"])
-            def scorpio():
+            def scorpio_sync():
                 with phase("scorpio_sync"):
                     got = json.loads(command([str(options.driver), "sync", str(expected_path)],
                                              deadline, env=driver_env))
@@ -603,7 +593,13 @@ def execute(options):
                 if got.get("driver_source_digest") != source_digest:
                     raise AssertionError("measurement binary was compiled from different driver source")
                 return got
-            def baseline():
+            def scorpio_oracle(got):
+                with phase("new_complete_view_audit"):
+                    command([str(options.driver), "audit", str(expected_path),
+                             got["store"], got["content_store"]], deadline)
+            def scorpio():
+                return durable_verified(scorpio_sync, scorpio_oracle)
+            def git_sync():
                 start = time.monotonic()
                 durable_git = ["git", "-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync",
                                "--git-dir", str(git_store)]
@@ -637,6 +633,11 @@ def execute(options):
                 return {"fetch_ms": fetch_ms, "worktree_ready_ms": ready_ms,
                         "durable_complete_ms": (time.monotonic() - start) * 1000,
                         "git_store_flush": flushed_store, "worktree_flush": flushed_worktree}
+            def git_oracle(_):
+                with phase("git_byte_oracle"):
+                    verify_worktree(git_worktree, expected, deadline)
+            def baseline():
+                return durable_verified(git_sync, git_oracle)
             # Alternate side order across repeat/scenario to limit systematic
             # advantage from HTTP/object/page-cache warming on the server.
             side_order = "scorpio-first" if (round_number + int(version[1])) % 2 == 0 else "git-first"
@@ -644,8 +645,8 @@ def execute(options):
                 measured, git_measured = scorpio(), baseline()
             else:
                 git_measured, measured = baseline(), scorpio()
-            # Full local bytes against independent Git after both timers end.
-            verify_worktree(git_worktree, expected)
+            # Each side's new-view byte oracle ran immediately within that
+            # side's verified timer. Old-view checks are separate wall time.
             with phase("old_complete_view_audit"):
                 for old_path, old_store, old_content in old:
                     command([str(options.driver), "audit", str(old_path), old_store, old_content], deadline)
@@ -668,21 +669,21 @@ def execute(options):
                       "native_publication": native, "publication_mode": options.publication_mode,
                       "server_projection_rebuilt_pages": None, "server_projection_reused_pages": None,
                       "server_projection_stats": "NOT_EXPOSED: native certificates bind Git roots; metadata projection work is not instrumented",
+                      "durable_verified_scope": "each side operation through its immediate independent full-byte oracle; old-view audits excluded",
                       "side_order": side_order, "scorpio": measured, "git": git_measured,
                       "correctness": "PASS", "old_local_complete_views_equal": True,
                       "old_live_reader_or_fuse_lease": "NOT_RUN",
                       "fuse_mount": "NOT_RUN"}
             records.append(record)
             emit(record)
-        remaining = deadline - time.monotonic()
-        last_round_seconds = time.monotonic() - round_started
-        if (round_number >= 3 and round_number < options.rounds
-                and remaining < last_round_seconds * 1.5 + 60):
-            emit({"record": "bounded_scale", "requested_rounds": options.rounds,
-                  "actual_rounds": round_number, "profile": options.profile,
-                  "reason": "shared deadline has less than a conservative next-round budget"})
-            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError("complete round exceeded its fixed budget")
+    if len(records) != options.rounds * 3:
+        raise AssertionError("all requested complete V1/V2/V3 rounds are required")
+    deadline = budget.report_deadline()
     for version in ("v1", "v2", "v3"):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("summary exceeded its fixed report budget")
         samples = [r for r in records if r["version"] == version]
         summary = {"record": "summary", "version": version, "samples": len(samples)}
         for metric, select in {
@@ -692,6 +693,8 @@ def execute(options):
                 "resolve_ms": lambda r: r["scorpio"]["resolve_ms"],
                 "metadata_ready_ms": lambda r: r["scorpio"]["metadata_ready_ms"],
                 "durable_complete_ms": lambda r: r["scorpio"]["durable_complete_ms"],
+                "durable_verified_ms": lambda r: r["scorpio"]["durable_verified_ms"],
+                "git_durable_verified_ms": lambda r: r["git"]["durable_verified_ms"],
                 "git_durable_complete_ms": lambda r: r["git"]["durable_complete_ms"]}.items():
             values = [select(r) for r in samples if select(r) is not None]
             summary[metric] = {"p50": percentile(values, 50), "p95": percentile(values, 95)} if values else None
@@ -715,9 +718,11 @@ def parser():
     p.add_argument("--run-root", type=Path, required=True)
     p.add_argument("--publication-mode", choices=("native", "on-demand"), default="native")
     p.add_argument("--profile", choices=("medium", "smoke"), default="medium")
-    p.add_argument("--rounds", type=int, choices=range(3, 11), default=5)
+    p.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     p.add_argument("--deadline-seconds", type=int, choices=range(60, 14401), default=14400)
     p.add_argument("--session-deadline-utc")
+    p.add_argument("--work-cleanup-deadline-monotonic", type=float,
+                   default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     return p
 
 

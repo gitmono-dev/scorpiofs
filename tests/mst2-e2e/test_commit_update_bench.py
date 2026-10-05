@@ -210,7 +210,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 "--run-root", str(root)])
             plan = json.loads(output)
             self.assertFalse(plan["execute"])
-            self.assertEqual(plan["rounds"], 5)
+            self.assertEqual(plan["rounds"], 3)
             self.assertEqual(plan["max_wall_seconds"], 14400)
             self.assertFalse(root.exists())
 
@@ -320,13 +320,13 @@ class CommitUpdateBenchTests(unittest.TestCase):
                     raise subprocess.TimeoutExpired("ignored", timeout)
                 return b"", b""
         child = Hung()
-        with patch.object(BENCH.subprocess, "Popen", return_value=child), \
+        with patch.object(BENCH.budget_module.subprocess, "Popen", return_value=child), \
                 patch.object(BENCH.os, "killpg", create=True) as killpg, \
-                patch.object(BENCH.signal, "SIGKILL", 9, create=True):
+                patch.object(BENCH.budget_module.signal, "SIGKILL", 9, create=True):
             with self.assertRaises(TimeoutError):
                 BENCH.command(["driver"], time.monotonic() + 30)
             self.assertEqual([call.args[1] for call in killpg.call_args_list],
-                             [BENCH.signal.SIGTERM, BENCH.signal.SIGKILL])
+                             [BENCH.budget_module.signal.SIGTERM, BENCH.budget_module.signal.SIGKILL])
             self.assertTrue(all(call.args[0] == 12345 for call in killpg.call_args_list))
             self.assertEqual(child.calls, 3)
 
