@@ -469,14 +469,10 @@ impl SnapshotReader {
         self.content_encoding()
     }
 
-    /// Negotiated content encoding for frame responses: zstd when the
-    /// deployment advertises it, otherwise identity (`None`).
+    /// Identity is byte-compatible with both codec digest contracts. A
+    /// legacy `zstd` capability does not establish raw-payload digests.
     fn content_encoding(&self) -> Option<&'static str> {
-        if self.caps.frame_encodings.iter().any(|e| e == "zstd") {
-            Some("zstd")
-        } else {
-            None
-        }
+        None
     }
 
     pub fn snapshot_id(&self) -> &str {
@@ -988,6 +984,7 @@ mod tests {
     use super::*;
 
     struct ClosureHttpFixture {
+        frame_encodings: Vec<&'static str>,
         descriptor: mst2_codec::descriptor::ServingDescriptor,
         pages: BTreeMap<String, Vec<u8>>,
         routes: BTreeMap<(String, Vec<u8>), String>,
@@ -1028,6 +1025,7 @@ mod tests {
             root
         }
         let mut fixture = ClosureHttpFixture {
+            frame_encodings: vec!["identity"],
             descriptor: mst2_codec::descriptor::ServingDescriptor {
                 instance_uuid: *uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555")
                     .unwrap()
@@ -1078,9 +1076,9 @@ mod tests {
         };
         use mst2_codec::treeframe::{EndPayload, MetaPayload};
         use serde_json::{json, Value};
-        async fn capabilities() -> Json<Value> {
+        async fn capabilities(State(fixture): State<Arc<ClosureHttpFixture>>) -> Json<Value> {
             Json(json!({
-                "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
+                "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": fixture.frame_encodings,
                 "features": {"resolve": true, "directory": true, "leases": true, "metadata_pages": true}
             }))
         }
@@ -1099,8 +1097,12 @@ mod tests {
                 "publication_sequence": "1", "authorization_epoch": "1",
             }))
         }
-        async fn metadata(State(fixture): State<Arc<ClosureHttpFixture>>, body: Bytes) -> Vec<u8> {
+        async fn metadata(
+            State(fixture): State<Arc<ClosureHttpFixture>>,
+            body: Bytes,
+        ) -> axum::response::Response {
             let request: Value = serde_json::from_slice(&body).unwrap();
+            assert!(request.get("encoding").is_none_or(Value::is_null));
             let items: Vec<MetadataPageItem> = request["items"]
                 .as_array()
                 .unwrap()
@@ -1154,7 +1156,21 @@ mod tests {
                 }
                 .encode(7, 1),
             );
-            wire
+            axum::response::Response::builder()
+                .header("content-type", "application/vnd.mega.treeframe;version=2")
+                .header(
+                    "x-mega-snapshot-id",
+                    format!(
+                        "sha256:{}",
+                        hex::encode(fixture.descriptor.snapshot_id().unwrap())
+                    ),
+                )
+                .header(
+                    "x-mega-request-digest",
+                    crate::snapshot::durable::digest_of(&body),
+                )
+                .body(axum::body::Body::from(wire))
+                .unwrap()
         }
         let fixture = Arc::new(fixture);
         let app = Router::new()
@@ -1204,6 +1220,27 @@ mod tests {
         );
         drop(requests);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_zstd_capability_keeps_reader_on_identity_frames() {
+        let mut fixture = closure_http_fixture();
+        fixture.frame_encodings.push("zstd");
+        let (url, fixture, server) = serve_closure_fixture(fixture).await;
+        let reader = SnapshotReader::resolve(Mst2Client::new(url), "/project", 600)
+            .await
+            .unwrap();
+        assert!(reader
+            .capabilities()
+            .frame_encodings
+            .iter()
+            .any(|e| e == "zstd"));
+        assert_eq!(reader.encoding_hint(), None);
+        let closure = reader.snapshot_closure().await.unwrap();
+        assert_eq!(closure.pages(), &fixture.pages);
+        assert!(!fixture.requested.lock().unwrap().is_empty());
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
