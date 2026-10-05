@@ -21,6 +21,7 @@ fn request() -> Request {
 }
 
 async fn close_overlay(overlay: OverlayFs, lower: Arc<Mst2Fuse>) {
+    overlay.recover_all_copyups().await.unwrap();
     let gone = Arc::downgrade(&lower);
     drop(overlay);
     drop(lower);
@@ -33,6 +34,59 @@ async fn close_overlay(overlay: OverlayFs, lower: Arc<Mst2Fuse>) {
     })
     .await
     .unwrap();
+}
+
+fn original_large_file(full_chunks: u64) -> Vec<u8> {
+    let mut original = Vec::new();
+    for index in 0..=full_chunks {
+        original.extend(vec![
+            index as u8;
+            if index == full_chunks {
+                7
+            } else {
+                CHUNK_SIZE as usize
+            }
+        ]);
+    }
+    original
+}
+
+fn private_payload(root: &std::path::Path) -> PathBuf {
+    let stages: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".libfuse-copyup-")
+        })
+        .collect();
+    assert_eq!(stages.len(), 1, "expected one real private copy-up owner");
+    stages[0].path().join("payload")
+}
+
+fn assert_private_storage_released(root: &std::path::Path) {
+    assert_eq!(
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        [OsStr::new("upper")]
+    );
+    // Observe descriptors for this operation's actual private namespace,
+    // including deleted files. Unrelated concurrent test descriptors do not
+    // affect this witness.
+    for descriptor in std::fs::read_dir("/proc/self/fd").unwrap() {
+        let Ok(target) = std::fs::read_link(descriptor.unwrap().path()) else {
+            continue;
+        };
+        assert!(
+            !target.starts_with(root) || !target.to_string_lossy().contains(".libfuse-copyup-"),
+            "private descriptor still owned: {}",
+            target.display()
+        );
+    }
 }
 
 async fn overlay(server: &Server) -> (Arc<Mst2Fuse>, OverlayFs, tempfile::TempDir, PathBuf) {
@@ -424,6 +478,151 @@ async fn actual_large_chunked_copy_up_writes_only_upper_and_leaves_lower_ranges_
         .release(req, file, opened.fh, flags, 0, false)
         .await
         .unwrap();
+    close_overlay(overlay, lower).await;
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn late_modern_chunk_failures_leave_no_partial_upper_or_private_resources_and_retry() {
+    let _serial = TEST_LOCK.lock().await;
+    for mode in [8, 10] {
+        let fixture = Fixture::new(false, true).with_large_file(Large::with_full_chunks(5));
+        let server = Server::start(fixture, 32 * 1024 * 1024).await;
+        let (lower, overlay, temp, upper) = overlay(&server).await;
+        let req = request();
+        let name = OsStr::new("range000");
+        let file = overlay
+            .lookup(req, ROOT_INODE, name)
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        server.fixture.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            i32::from(
+                overlay
+                    .open(req, file, libc::O_RDWR as u32)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EIO
+        );
+        assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 5);
+        assert!(!upper.join(name).exists());
+        assert_eq!(std::fs::read_dir(&upper).unwrap().count(), 0);
+        assert_private_storage_released(temp.path());
+        assert!(overlay.take_copy_up_cleanup_failures().await.is_empty());
+        overlay.recover_all_copyups().await.unwrap();
+        idle(&server.reader).await;
+        assert!(server.reader.content_usage().output_bytes > 0);
+        let original = original_large_file(5);
+        server.fixture.mode.store(0, Ordering::SeqCst);
+        assert_eq!(
+            read(&lower, "range000", 0, original.len() as u32)
+                .await
+                .data
+                .as_ref(),
+            original
+        );
+        let opened = overlay.open(req, file, libc::O_RDWR as u32).await.unwrap();
+        assert_eq!(std::fs::read(upper.join(name)).unwrap(), original);
+        assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 7);
+        overlay
+            .release(req, file, opened.fh, 0, 0, false)
+            .await
+            .unwrap();
+        assert_private_storage_released(temp.path());
+        close_overlay(overlay, lower).await;
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage().output_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_modern_copy_up_recovers_the_written_private_block_and_keeps_other_inodes_live() {
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::new(false, true).with_large_file(Large::with_full_chunks(5));
+    let server = Server::start(fixture, 32 * 1024 * 1024).await;
+    let (lower, overlay, temp, upper) = overlay(&server).await;
+    let overlay = Arc::new(overlay);
+    let req = request();
+    let name = OsStr::new("range000");
+    let file = overlay
+        .lookup(req, ROOT_INODE, name)
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    server.fixture.mode.store(9, Ordering::SeqCst);
+    let task = tokio::spawn({
+        let overlay = overlay.clone();
+        async move { overlay.open(req, file, libc::O_RDWR as u32).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.fixture.emitted.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !task.is_finished(),
+        "pending CHUNK body published an upper handle"
+    );
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 5);
+    let original = original_large_file(5);
+    assert_eq!(
+        std::fs::read(private_payload(temp.path())).unwrap(),
+        original[..4 * CHUNK_SIZE as usize]
+    );
+    assert!(!upper.join(name).exists());
+    assert_eq!(std::fs::read_dir(&upper).unwrap().count(), 0);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // A retained cancelled job cannot block a real independent writable inode.
+    let other = overlay
+        .lookup(req, ROOT_INODE, OsStr::new("file001"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let opened = tokio::time::timeout(
+        Duration::from_secs(5),
+        overlay.open(req, other, libc::O_RDWR as u32),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    overlay
+        .release(req, other, opened.fh, 0, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(upper.join("file001")).unwrap(), [1; 8192]);
+    tokio::time::timeout(Duration::from_secs(5), overlay.recover_all_copyups())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!upper.join(name).exists());
+    assert_private_storage_released(temp.path());
+    assert!(overlay.take_copy_up_cleanup_failures().await.is_empty());
+    idle(&server.reader).await;
+    server.fixture.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        read(&lower, "range000", 0, original.len() as u32)
+            .await
+            .data
+            .as_ref(),
+        original
+    );
+    let opened = overlay.open(req, file, libc::O_RDWR as u32).await.unwrap();
+    assert_eq!(std::fs::read(upper.join(name)).unwrap(), original);
+    overlay
+        .release(req, file, opened.fh, 0, 0, false)
+        .await
+        .unwrap();
+    assert_private_storage_released(temp.path());
+    let overlay = Arc::try_unwrap(overlay).unwrap_or_else(|_| panic!("unexpected overlay owner"));
     close_overlay(overlay, lower).await;
     idle(&server.reader).await;
     assert_eq!(server.reader.content_usage().output_bytes, 0);

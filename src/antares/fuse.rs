@@ -298,7 +298,10 @@ mod tests {
         ffi::{OsStr, OsString},
         num::NonZeroU32,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
     };
 
     use async_trait::async_trait;
@@ -836,11 +839,13 @@ mod tests {
                 return;
             };
             let mut state = self.state.write().unwrap();
-            if let Some(children) = state.children.get_mut(&self.parent) {
-                if children.get(name) == Some(&self.inode) {
-                    children.remove(name);
-                    state.nodes.remove(&self.inode);
-                }
+            let owned = state
+                .children
+                .get(&self.parent)
+                .is_some_and(|children| children.get(name) == Some(&self.inode));
+            if owned {
+                state.children.get_mut(&self.parent).unwrap().remove(name);
+                state.nodes.remove(&self.inode);
             }
         }
     }
