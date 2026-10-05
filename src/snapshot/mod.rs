@@ -20,6 +20,7 @@ pub mod durable;
 mod error_wire;
 pub mod frames;
 pub mod fuse;
+mod fuse_owned;
 pub mod incremental;
 pub mod layer;
 mod lookup;
