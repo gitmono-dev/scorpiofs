@@ -1,6 +1,7 @@
 """One immutable session budget for builds, owned setup, rounds and cleanup."""
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import math
@@ -112,29 +113,58 @@ def reap_owned(process, deadline):
     process.wait(timeout=max(0, deadline - time.monotonic()))
 
 
+def reap_exited(process):
+    """No signals or added wait budget: only reap an already exited child."""
+    if process is None or process.returncode is not None or sys.platform != "linux":
+        return
+    observed = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    if observed is not None:
+        release = getattr(process, "release_reap", None)
+        if release is not None:
+            release()
+        process.wait(timeout=0)
+
+
+@contextmanager
+def cleanup_reap(process):
+    """The final reap runs after all owned-group signal paths have ended."""
+    try:
+        yield
+    finally:
+        failed = sys.exc_info()[0] is not None
+        try:
+            reap_exited(process)
+        except BaseException:
+            # Keep the original cleanup/timeout/interrupt failure. This final
+            # nonblocking reap cannot convert an incomplete cleanup to PASS.
+            if not failed:
+                raise
+
+
 def stop_group(pgid, started, deadline, process=None):
     """Reaped leaders do not prove that their owned descendants exited."""
-    if group_members(pgid, started):
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        term_until = min(deadline, time.monotonic() + 5)
-        while group_members(pgid, started) and time.monotonic() < term_until:
-            time.sleep(min(.05, max(0, term_until - time.monotonic())))
+    with cleanup_reap(process):
         if group_members(pgid, started):
             try:
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(pgid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            while group_members(pgid, started) and time.monotonic() < deadline:
-                time.sleep(min(.01, max(0, deadline - time.monotonic())))
-        if group_members(pgid, started):
-            raise TimeoutError("owned group remained active at its original deadline")
-    if process is not None:
-        reap_owned(process, deadline)
-    if time.monotonic() >= deadline:
-        raise TimeoutError("owned group verification exceeded original deadline")
+            term_until = min(deadline, time.monotonic() + 5)
+            while group_members(pgid, started) and time.monotonic() < term_until:
+                time.sleep(min(.05, max(0, term_until - time.monotonic())))
+            if group_members(pgid, started):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                while group_members(pgid, started) and time.monotonic() < deadline:
+                    time.sleep(min(.01, max(0, deadline - time.monotonic())))
+            if group_members(pgid, started):
+                raise TimeoutError("owned group remained active at its original deadline")
+        if process is not None:
+            reap_owned(process, deadline)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("owned group verification exceeded original deadline")
 
 
 def process_start(pid):
@@ -156,6 +186,12 @@ class PinnedProcess(subprocess.Popen):
 
     def release_reap(self):
         self.reap_pinned = False
+
+    def _wait(self, timeout=None):
+        # CPython communicate's KeyboardInterrupt handler calls _wait directly.
+        if self.reap_pinned:
+            return self.wait(timeout=timeout)
+        return super()._wait(timeout=timeout)
 
     def wait(self, timeout=None):
         if not self.reap_pinned:
@@ -253,29 +289,30 @@ def run_process(args, deadline, env=None, data=None, capture=True):
         if started is not None:
             stop_group(process.pid, started, deadline, process)
 
-    try:
-        started = process_start(process.pid)
-    except FileNotFoundError:
-        if abort_startup(process, deadline):
-            raise AssertionError("startup process identity could not be established") from None
-    except BaseException:
-        abort_startup(process, deadline)
-        raise
-    try:
-        output, error = process.communicate(data, timeout=max(0, run_until - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        terminate()
-        raise TimeoutError("owned child exceeded its operation budget") from None
-    except BaseException:
-        terminate()
-        raise
-    # A short-lived command owns its new-session group even when descendants
-    # close inherited pipes and its leader returns a successful exit status.
-    if started is not None:
-        stop_group(process.pid, started, deadline, process)
-    if time.monotonic() >= deadline:
-        raise TimeoutError("owned child verification exceeded original deadline")
-    return process.returncode, output, error
+    with cleanup_reap(process):
+        try:
+            started = process_start(process.pid)
+        except FileNotFoundError:
+            if abort_startup(process, deadline):
+                raise AssertionError("startup process identity could not be established") from None
+        except BaseException:
+            abort_startup(process, deadline)
+            raise
+        try:
+            output, error = process.communicate(data, timeout=max(0, run_until - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            terminate()
+            raise TimeoutError("owned child exceeded its operation budget") from None
+        except BaseException:
+            terminate()
+            raise
+        # A short-lived command owns its new-session group even when descendants
+        # close inherited pipes and its leader returns a successful exit status.
+        if started is not None:
+            stop_group(process.pid, started, deadline, process)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("owned child verification exceeded original deadline")
+        return process.returncode, output, error
 
 
 def main():

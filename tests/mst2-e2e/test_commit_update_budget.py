@@ -34,6 +34,7 @@ class SessionBudgetTests(unittest.TestCase):
                 patch.object(budget.os, "waitid", return_value=observation, create=True) as observe, \
                 patch.object(subprocess.Popen, "wait", return_value=0) as reap:
             self.assertEqual(process.wait(timeout=1), 0)
+            self.assertEqual(process._wait(timeout=1), 0)
             self.assertEqual(process.wait(timeout=1), 0)
             self.assertIsNone(process.returncode)
             reap.assert_not_called()
@@ -66,10 +67,140 @@ class SessionBudgetTests(unittest.TestCase):
                     patch.object(budget, "PinnedProcess", return_value=child), \
                     patch.object(budget, "process_start", return_value="1"), \
                     patch.object(budget, "group_members", side_effect=members), \
+                    patch.object(budget, "reap_exited"), \
                     patch.object(budget.os, "killpg", create=True) as send:
                 with self.assertRaises(AssertionError):
                     budget.run_process(["owned"], time.monotonic() + 30)
                 send.assert_called_once_with(123, budget.signal.SIGTERM)
+
+    def test_open_pipe_timeout_reaps_exited_leader_without_extending_wait_or_masking_failure(self):
+        class Child:
+            pid = 123
+            returncode = None
+            stdin = None
+            stdout = io.BytesIO()
+            stderr = io.BytesIO()
+            def communicate(self, *args, **kwargs):
+                raise subprocess.TimeoutExpired("owned", 1)
+            def release_reap(self):
+                self.released = True
+            def wait(self, timeout=None):
+                self.wait_timeout = timeout
+                self.returncode = 0
+        child = Child()
+        with patch.object(budget.sys, "platform", "linux"), \
+                patch.object(budget, "PinnedProcess", return_value=child), \
+                patch.object(budget, "process_start", return_value="1"), \
+                patch.object(budget, "group_members", return_value=[]), \
+                patch.object(budget.signal, "SIGKILL", 9, create=True), \
+                patch.multiple(budget.os, P_PID=1, WEXITED=2, WNOHANG=4, WNOWAIT=8, create=True), \
+                patch.object(budget.os, "waitid", return_value=SimpleNamespace(si_status=0), create=True), \
+                patch.object(budget.os, "killpg", create=True) as send:
+            with self.assertRaisesRegex(TimeoutError, "owned child did not reap"):
+                budget.run_process(["owned"], time.monotonic() + 30)
+            send.assert_not_called()
+        self.assertTrue(child.released)
+        self.assertEqual(child.wait_timeout, 0)
+        self.assertEqual(child.returncode, 0)
+
+    def test_group_timeout_reaps_exited_direct_leader_and_preserves_timeout(self):
+        child = SimpleNamespace(pid=123, returncode=None)
+        waits = []
+        def wait(timeout=None):
+            waits.append(timeout)
+            child.returncode = 0
+        child.wait = wait
+        with patch.object(budget.sys, "platform", "linux"), \
+                patch.object(budget, "group_members", return_value=[456]), \
+                patch.object(budget.signal, "SIGKILL", 9, create=True), \
+                patch.object(budget.os, "killpg", create=True), \
+                patch.multiple(budget.os, P_PID=1, WEXITED=2, WNOHANG=4, WNOWAIT=8, create=True), \
+                patch.object(budget.os, "waitid", return_value=SimpleNamespace(si_status=0), create=True):
+            with self.assertRaisesRegex(TimeoutError, "owned group remained active"):
+                budget.stop_group(123, "1", time.monotonic() - 1, child)
+        self.assertEqual(waits, [0])
+
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux escaped open-pipe timeout")
+    def test_exited_leader_with_escaped_pipe_holder_is_reaped_without_signalling_escape(self):
+        import signal
+        with tempfile.TemporaryDirectory() as temp:
+            pids = Path(temp) / "pids"
+            script = textwrap.dedent("""\
+                import os, signal, sys, time
+                leader = os.getpid()
+                child = os.fork()
+                if child == 0:
+                    os.setsid()
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    with open(sys.argv[1], 'w') as stream:
+                        stream.write(str(leader) + ' ' + str(os.getpid()))
+                    while True: time.sleep(.01)
+                while not os.path.exists(sys.argv[1]): time.sleep(.01)
+                """)
+            deadline = time.monotonic() + 2
+            try:
+                with patch.object(budget.os, "killpg", wraps=os.killpg) as send:
+                    with self.assertRaises(TimeoutError):
+                        budget.run_process([sys.executable, "-c", script, str(pids)], deadline)
+                leader, child = map(int, pids.read_text().split())
+                self.assertFalse(Path(f"/proc/{leader}").exists())
+                self.assertTrue(Path(f"/proc/{child}").exists())
+                self.assertTrue(all(call.args[0] != child for call in send.call_args_list))
+                self.assertLess(time.monotonic(), deadline + .15)
+            finally:
+                if pids.exists():
+                    _, child = map(int, pids.read_text().split())
+                    try:
+                        os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    @unittest.skipUnless(sys.platform == "linux", "actual Linux communicate KeyboardInterrupt")
+    def test_keyboard_interrupt_keeps_leader_pinned_until_same_group_descendant_cleanup(self):
+        import signal
+        import threading
+        with tempfile.TemporaryDirectory() as temp:
+            pids = Path(temp) / "pids"
+            script = textwrap.dedent("""\
+                import os, signal, sys, time
+                leader = os.getpid()
+                child = os.fork()
+                if child == 0:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    with open(sys.argv[1], 'w') as stream:
+                        stream.write(str(leader) + ' ' + str(os.getpid()))
+                    while True: time.sleep(.01)
+                while not os.path.exists(sys.argv[1]): time.sleep(.01)
+                """)
+            original = budget.stop_group
+            observed = []
+            def stop(pgid, started, deadline, process=None):
+                self.assertIsNone(process.returncode)
+                self.assertTrue(Path(f"/proc/{pgid}").exists())
+                observed.append(pgid)
+                return original(pgid, started, deadline, process)
+            timer = threading.Timer(.3, os.kill, args=(os.getpid(), signal.SIGINT))
+            deadline = time.monotonic() + 3
+            try:
+                timer.start()
+                with patch.object(budget, "stop_group", side_effect=stop):
+                    with self.assertRaises(KeyboardInterrupt):
+                        budget.run_process([sys.executable, "-c", script, str(pids)], deadline)
+                leader, child = map(int, pids.read_text().split())
+                self.assertEqual(observed, [leader])
+                self.assertFalse(Path(f"/proc/{leader}").exists())
+                proc = Path(f"/proc/{child}/stat")
+                self.assertTrue(not proc.exists() or proc.read_text().rsplit(") ", 1)[1].split()[0] == "Z")
+                self.assertLess(time.monotonic(), deadline)
+            finally:
+                timer.cancel()
+                timer.join()
+                if pids.exists():
+                    _, child = map(int, pids.read_text().split())
+                    try:
+                        os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_build_setup_round_admission_uses_one_anchor_and_never_grants_more_time(self):
         with patch.object(budget.time, "time", return_value=0), \
