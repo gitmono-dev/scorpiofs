@@ -1,0 +1,6 @@
+{
+  "lease_id": "fixture-lease-100",
+  "snapshot_id": "sha256:f94af7bddec0603b40dbf5c2b17952bbfef30093af9f5653734ac05983cbbfee",
+  "lease_expires_at": "2026-09-15T12:20:00Z",
+  "authorization_epoch": "7"
+}
