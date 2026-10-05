@@ -475,12 +475,22 @@ impl Mst2Client {
             .map_err(de_err)
     }
 
-    pub(crate) async fn post_octets(
+    /// POST a TreeFrame request and validate the protocol identity headers
+    /// before exposing any frame bytes to the decoder (MST/2 spec 06 §1).
+    /// The request digest covers the exact serialized bytes sent on the wire.
+    pub(crate) async fn post_treeframe(
         &self,
         url: impl AsRef<str>,
         body: Vec<u8>,
+        snapshot_id: &str,
     ) -> Result<Vec<u8>, SnapshotError> {
         let url = url.as_ref();
+        let expected_request_digest = {
+            use ring::digest::{Context, SHA256};
+            let mut cx = Context::new(&SHA256);
+            cx.update(&body);
+            format!("sha256:{}", hex_lower(cx.finish().as_ref()))
+        };
         let resp = ok_or_error(
             self.send_retrying(
                 self.http
@@ -491,6 +501,7 @@ impl Mst2Client {
             .await?,
         )
         .await?;
+        validate_treeframe_headers(resp.headers(), snapshot_id, &expected_request_digest)?;
         let bytes = resp.bytes().await.map_err(de_err)?;
         self.recv_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -522,5 +533,186 @@ impl Mst2Client {
             .unwrap_or("")
             .to_string();
         Ok((len, etag, kind))
+    }
+}
+
+fn validate_treeframe_headers(
+    headers: &reqwest::header::HeaderMap,
+    snapshot_id: &str,
+    expected_request_digest: &str,
+) -> Result<(), SnapshotError> {
+    let content_type = one_treeframe_header(headers, "content-type", "Content-Type")?;
+    let mut media_parts = content_type.split(';').map(str::trim);
+    let media_type = media_parts.next().unwrap_or_default();
+    let version = media_parts.next().unwrap_or_default();
+    if !media_type.eq_ignore_ascii_case("application/vnd.mega.treeframe")
+        || !version.split_once('=').is_some_and(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("version") && matches!(value.trim(), "2" | "\"2\"")
+        })
+        || media_parts.next().is_some()
+    {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("unexpected TreeFrame Content-Type: {content_type}"),
+        ));
+    }
+    // TreeFrame bytes are already framed and authenticated by the codec.
+    // Letting reqwest transparently decode an HTTP content encoding before
+    // parsing would make the response representation ambiguous and could
+    // turn a proxy transformation into an integrity failure much later.
+    // Spec 06 therefore requires this header to be absent.
+    if headers.contains_key(reqwest::header::CONTENT_ENCODING) {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            "TreeFrame response must not use Content-Encoding",
+        ));
+    }
+    let returned_snapshot =
+        one_treeframe_header(headers, "x-mega-snapshot-id", "X-Mega-Snapshot-Id")?;
+    if returned_snapshot != snapshot_id {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("TreeFrame response snapshot {returned_snapshot} does not match {snapshot_id}"),
+        ));
+    }
+    let returned_request_digest =
+        one_treeframe_header(headers, "x-mega-request-digest", "X-Mega-Request-Digest")?;
+    if returned_request_digest != expected_request_digest {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!(
+                "TreeFrame request digest {returned_request_digest} does not match {expected_request_digest}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn one_treeframe_header<'a>(
+    headers: &'a reqwest::header::HeaderMap,
+    name: &str,
+    display_name: &str,
+) -> Result<&'a str, SnapshotError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next().ok_or_else(|| {
+        SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("TreeFrame response is missing {display_name}"),
+        )
+    })?;
+    if values.next().is_some() {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("TreeFrame response has duplicate {display_name}"),
+        ));
+    }
+    value.to_str().map_err(|_| {
+        SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("TreeFrame response has invalid {display_name}"),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    use super::*;
+
+    fn headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.mega.treeframe;version=2"),
+        );
+        headers.insert(
+            "x-mega-snapshot-id",
+            HeaderValue::from_static(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        );
+        headers.insert(
+            "x-mega-request-digest",
+            HeaderValue::from_static(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        );
+        headers
+    }
+
+    #[test]
+    fn treeframe_identity_headers_are_required_and_bound() {
+        let expected_snapshot =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let expected_digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        validate_treeframe_headers(&headers(), expected_snapshot, expected_digest).unwrap();
+
+        let mut spaced = headers();
+        spaced.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("Application/Vnd.Mega.TreeFrame; version = 2"),
+        );
+        validate_treeframe_headers(&spaced, expected_snapshot, expected_digest).unwrap();
+
+        let mut quoted = headers();
+        quoted.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.mega.treeframe; version=\"2\""),
+        );
+        validate_treeframe_headers(&quoted, expected_snapshot, expected_digest).unwrap();
+
+        let mut missing = headers();
+        missing.remove("x-mega-request-digest");
+        assert!(validate_treeframe_headers(&missing, expected_snapshot, expected_digest).is_err());
+
+        let mut wrong_digest = headers();
+        wrong_digest.insert(
+            "x-mega-request-digest",
+            HeaderValue::from_static(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+        );
+        assert!(
+            validate_treeframe_headers(&wrong_digest, expected_snapshot, expected_digest).is_err()
+        );
+
+        let mut wrong_media_type = headers();
+        wrong_media_type.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        assert!(
+            validate_treeframe_headers(&wrong_media_type, expected_snapshot, expected_digest)
+                .is_err()
+        );
+
+        let mut encoded = headers();
+        encoded.insert(
+            reqwest::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        assert!(validate_treeframe_headers(&encoded, expected_snapshot, expected_digest).is_err());
+
+        let mut duplicate = headers();
+        duplicate.append(
+            "x-mega-snapshot-id",
+            HeaderValue::from_static(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            ),
+        );
+        assert!(
+            validate_treeframe_headers(&duplicate, expected_snapshot, expected_digest).is_err()
+        );
+
+        let mut wrong = headers();
+        wrong.insert(
+            "x-mega-snapshot-id",
+            HeaderValue::from_static(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+        );
+        assert!(validate_treeframe_headers(&wrong, expected_snapshot, expected_digest).is_err());
     }
 }

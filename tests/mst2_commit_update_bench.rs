@@ -21,7 +21,7 @@ use std::{
 };
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path as HttpPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -367,6 +367,20 @@ impl Fixture {
         });
         ([("content-type", "application/json")], bytes).into_response()
     }
+
+    fn treeframe_response(
+        &self,
+        snapshot_id: &str,
+        request_body: &[u8],
+        body: Vec<u8>,
+    ) -> Response {
+        Response::builder()
+            .header("content-type", "application/vnd.mega.treeframe;version=2")
+            .header("x-mega-snapshot-id", snapshot_id)
+            .header("x-mega-request-digest", digest_of(request_body))
+            .body(Body::from(body))
+            .unwrap()
+    }
 }
 
 async fn capabilities(State(f): State<Arc<Fixture>>) -> Response {
@@ -500,7 +514,7 @@ async fn metadata(
         response_pages: pages.iter().map(|(id, _)| *id).collect(),
         ..Event::default()
     });
-    ([("content-type", "application/octet-stream")], wire).into_response()
+    f.treeframe_response(&sid, &body, wire)
 }
 
 async fn objects(
@@ -551,7 +565,7 @@ async fn objects(
         content,
         ..Event::default()
     });
-    ([("content-type", "application/octet-stream")], wire).into_response()
+    f.treeframe_response(&sid, &body, wire)
 }
 
 async fn blob(
@@ -827,7 +841,21 @@ fn open_output(path: &Path) -> fs::File {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    options.open(path).unwrap()
+    let output = options.open(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = output
+            .metadata()
+            .expect("cannot inspect opened benchmark output");
+        assert_eq!(
+            metadata.nlink(),
+            1,
+            "benchmark output must not be a hard link"
+        );
+    }
+    output
 }
 
 #[cfg(unix)]
@@ -841,6 +869,13 @@ fn output_symlinks_cannot_append_to_checkout_files() {
     assert!(std::panic::catch_unwind(|| open_output(&output)).is_err());
     assert_eq!(fs::read(&tracked).unwrap(), original);
     fs::remove_file(&output).unwrap();
+
+    let hardlink = temp.path().join("hardlink.jsonl");
+    fs::hard_link(&tracked, &hardlink).unwrap();
+    assert!(std::panic::catch_unwind(|| open_output(&hardlink)).is_err());
+    assert_eq!(fs::read(&tracked).unwrap(), original);
+    fs::remove_file(&hardlink).unwrap();
+
     writeln!(open_output(&output), "private result").unwrap();
     assert_eq!(fs::read_to_string(&output).unwrap(), "private result\n");
 }

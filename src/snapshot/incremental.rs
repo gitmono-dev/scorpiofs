@@ -973,14 +973,21 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    {
+    let result = (|| {
         use std::io::Write as _;
         let mut f = fs::File::create(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
         f.sync_all().map_err(io_err)?;
+        #[cfg(test)]
+        tests::before_index_rename(dir, name)?;
+        fs::rename(&tmp, dir.join(name)).map_err(io_err)
+    })();
+    if result.is_err() {
+        // Leave the published index intact when preparation fails. A
+        // leftover temporary file is not a reusable closure record.
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, dir.join(name)).map_err(io_err)?;
-    Ok(())
+    result
 }
 
 /// Unused-import guard for the type used only in signatures above.
@@ -989,7 +996,50 @@ fn _client_marker(_: &Mst2Client) {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    thread_local! {
+        static FAIL_INDEX_RENAME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    struct RenameFailure;
+
+    impl RenameFailure {
+        fn install(dir: &Path) -> Self {
+            FAIL_INDEX_RENAME.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(dir.into());
+            });
+            Self
+        }
+    }
+
+    impl Drop for RenameFailure {
+        fn drop(&mut self) {
+            FAIL_INDEX_RENAME.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn before_index_rename(dir: &Path, name: &str) -> Result<(), SnapshotError> {
+        let fail = FAIL_INDEX_RENAME.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if name == "closures.json" && slot.as_deref() == Some(dir) {
+                *slot = None;
+                true
+            } else {
+                false
+            }
+        });
+        if fail {
+            Err(io_err(std::io::Error::other(
+                "injected closure-index publication failure",
+            )))
+        } else {
+            Ok(())
+        }
+    }
 
     fn rec(root: &str, pin: &str) -> ClosureRecord {
         ClosureRecord {
@@ -1234,6 +1284,85 @@ mod tests {
         assert!(transaction.records.contains_key("existing"));
         assert!(!transaction.records.contains_key("cancelled"));
         assert!(!transaction.dirty);
+    }
+
+    #[tokio::test]
+    async fn failed_index_publication_keeps_old_records_and_releases_its_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        cache.put_record(&rec("existing", "old")).unwrap();
+        let original = fs::read(cache.closures_path()).unwrap();
+        let mut meters = SyncMeters::default();
+        let mut transaction = cache.sync_transaction(&mut meters).await.unwrap();
+        transaction.put_record(rec("existing", "new"));
+        transaction.put_record(rec("fresh", "new"));
+        let fault = RenameFailure::install(tmp.path());
+        assert_eq!(
+            transaction.commit(&cache, &mut meters).unwrap_err().code,
+            SnapshotErrorCode::Internal
+        );
+        drop(fault);
+        drop(transaction);
+        assert_eq!(fs::read(cache.closures_path()).unwrap(), original);
+        assert_eq!(meters.closure_index_writes, 0);
+        assert_eq!(meters.closure_index_write_bytes, 0);
+        assert!(!fs::read_dir(tmp.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".closures.json.tmp.")));
+
+        let mut transaction = cache
+            .sync_transaction(&mut SyncMeters::default())
+            .await
+            .unwrap();
+        assert_eq!(transaction.records["existing"].pin_ref, "old");
+        assert!(!transaction.records.contains_key("fresh"));
+        transaction.put_record(rec("fresh", "retry"));
+        transaction
+            .commit(&cache, &mut SyncMeters::default())
+            .unwrap();
+        drop(transaction);
+        assert_eq!(cache.record_for("fresh").unwrap().pin_ref, "retry");
+    }
+
+    #[tokio::test]
+    async fn pin_release_orders_after_transfer_and_is_not_restored_by_later_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        cache.put_record(&rec("existing", "old")).unwrap();
+        cache.put_record(&rec("unrelated", "other")).unwrap();
+        let mut transaction = cache
+            .sync_transaction(&mut SyncMeters::default())
+            .await
+            .unwrap();
+        transaction.put_record(rec("existing", "new"));
+        transaction.put_record(rec("fresh", "new"));
+        assert_eq!(
+            cache.drop_records_for_pin("old").unwrap_err().code,
+            SnapshotErrorCode::SnapshotNotReady
+        );
+        transaction
+            .commit(&cache, &mut SyncMeters::default())
+            .unwrap();
+        drop(transaction);
+        assert_eq!(cache.drop_records_for_pin("old").unwrap(), 0);
+        assert_eq!(cache.record_for("existing").unwrap().pin_ref, "new");
+        assert_eq!(cache.drop_records_for_pin("new").unwrap(), 2);
+
+        let mut transaction = cache
+            .sync_transaction(&mut SyncMeters::default())
+            .await
+            .unwrap();
+        transaction.put_record(rec("later", "later"));
+        transaction
+            .commit(&cache, &mut SyncMeters::default())
+            .unwrap();
+        drop(transaction);
+        assert!(cache.record_for("existing").is_none());
+        assert!(cache.record_for("fresh").is_none());
+        assert_eq!(cache.record_for("unrelated").unwrap().pin_ref, "other");
+        assert_eq!(cache.record_for("later").unwrap().pin_ref, "later");
     }
 
     #[test]
