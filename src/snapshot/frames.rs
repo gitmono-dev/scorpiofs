@@ -583,11 +583,9 @@ impl Mst2Client {
             urlencode(path),
             urlencode(expected_digest)
         ));
-        let v: serde_json::Value = self.get_json(&url).await?;
-        if v["snapshot_id"].as_str() != Some(sid)
-            || v["path"].as_str() != Some(path)
-            || v["schema_version"].as_u64() != Some(2)
-        {
+        let response: serde_json::Value = self.get_json(&url).await?;
+        let v = super::chunk_wire::map_descriptor(&response, sid, path)?;
+        if v["schema_version"].as_u64() != Some(2) {
             return Err(chunk_binding_error());
         }
         let file_content_id = parse_digest(v["file_content_id"].as_str().unwrap_or(""))?;
@@ -648,6 +646,33 @@ impl Mst2Client {
         map: &VerifiedChunkMap,
         page_index: u64,
     ) -> Result<ChunkLeaf, SnapshotError> {
+        self.chunk_map_page_contract(sid, path, expected_digest, map, page_index, false)
+            .await
+    }
+
+    /// Request the canonical map_id/page_index query contract. This explicit
+    /// entry point does not retry a rejected request with legacy parameters.
+    pub async fn chunk_map_page_canonical(
+        &self,
+        sid: &str,
+        path: &str,
+        expected_digest: &str,
+        map: &VerifiedChunkMap,
+        page_index: u64,
+    ) -> Result<ChunkLeaf, SnapshotError> {
+        self.chunk_map_page_contract(sid, path, expected_digest, map, page_index, true)
+            .await
+    }
+
+    async fn chunk_map_page_contract(
+        &self,
+        sid: &str,
+        path: &str,
+        expected_digest: &str,
+        map: &VerifiedChunkMap,
+        page_index: u64,
+        canonical_query: bool,
+    ) -> Result<ChunkLeaf, SnapshotError> {
         let content_id = parse_digest(expected_digest)?;
         let canonical = ChunkMap::new(content_id, map.file_size, map.pages_root)
             .map_err(|error| frame_err("chunk-map descriptor", error))?;
@@ -664,24 +689,35 @@ impl Mst2Client {
                 "chunk-map page index is outside the fixed map",
             ));
         }
-        let url = self.snap_url(&format!(
-            "/{sid}/chunk-map/pages?path={}&expected_digest={}&page={page_index}",
-            urlencode(path),
-            urlencode(expected_digest)
-        ));
+        let query = if canonical_query {
+            format!(
+                "path={}&map_id={}&page_index={page_index}",
+                urlencode(path),
+                urlencode(&map.map_id)
+            )
+        } else {
+            format!(
+                "path={}&expected_digest={}&page={page_index}",
+                urlencode(path),
+                urlencode(expected_digest)
+            )
+        };
+        let url = self.snap_url(&format!("/{sid}/chunk-map/pages?{query}"));
         let v: serde_json::Value = self.get_json(&url).await?;
         let expect_count = ChunkLeaf::expected_count(map.chunk_count, page_index);
-        if v["snapshot_id"].as_str() != Some(sid)
-            || v["path"].as_str() != Some(path)
-            || v["map_id"].as_str() != Some(map.map_id.as_str())
-            || parse_count(v["page_count"].as_str().unwrap_or(""), "page_count")? != map.page_count
-            || parse_count(v["leaf"]["page_index"].as_str().unwrap_or(""), "page_index")?
-                != page_index
-            || parse_count(v["leaf"]["count"].as_str().unwrap_or(""), "leaf count")? != expect_count
-        {
+        if canonical_query && !(v.get("leaf_base64").is_some() || v.get("page_index").is_some()) {
             return Err(chunk_binding_error());
         }
-        let leaf_bytes = b64_decode(v["leaf"]["data_base64"].as_str().unwrap_or(""))?;
+        let (encoded_leaf, steps) = super::chunk_wire::map_leaf(
+            &v,
+            sid,
+            path,
+            &map.map_id,
+            map.page_count,
+            page_index,
+            expect_count,
+        )?;
+        let leaf_bytes = b64_decode(encoded_leaf)?;
         let leaf = ChunkLeaf::decode(&leaf_bytes).map_err(|e| frame_err("chunk-map leaf", e))?;
         if leaf.page_index != page_index {
             return Err(SnapshotError::new(
@@ -699,7 +735,6 @@ impl Mst2Client {
             ));
         }
         let mut proof = Vec::new();
-        let steps = v["proof"].as_array().ok_or_else(chunk_binding_error)?;
         for step in steps {
             let digest = parse_digest(step["digest"].as_str().unwrap_or(""))?;
             let sibling_pages = parse_count(

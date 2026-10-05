@@ -8,6 +8,7 @@
 
 pub mod auth;
 mod cas_index;
+mod chunk_wire;
 pub mod client;
 pub mod closure;
 pub mod coordinator;
