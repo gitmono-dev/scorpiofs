@@ -10,6 +10,7 @@ pub mod auth;
 pub mod client;
 pub mod closure;
 pub mod coordinator;
+mod directory;
 pub mod durable;
 pub mod frames;
 pub mod fuse;

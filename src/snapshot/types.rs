@@ -160,9 +160,11 @@ pub struct DirectoryResponse {
     pub directory_root: String,
     pub node_class: String,
     pub lifecycle: String,
+    #[serde(deserialize_with = "required_nullable_string")]
     pub range_start_exclusive: Option<String>,
     pub entries: Vec<DirEntry>,
     pub entry_count: String,
+    #[serde(deserialize_with = "required_nullable_string")]
     pub next_cursor: Option<String>,
     pub proof_pages: Vec<ProofPage>,
 }
@@ -171,12 +173,24 @@ pub struct DirectoryResponse {
 pub struct DirEntry {
     pub name: String,
     pub fs_kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub size: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub content_digest: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_nonnull_string")]
     pub directory_root: Option<String>,
+}
+
+fn required_nullable_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+
+fn optional_nonnull_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Deserialize)]

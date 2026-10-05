@@ -305,6 +305,12 @@ impl Mst2Client {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<DirectoryResponse, SnapshotError> {
+        if !(1..=256).contains(&limit) {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                "directory limit must be 1..256",
+            ));
+        }
         let mut url = self.snapshots_url(&format!(
             "/{snapshot_id}/directory?path={}&limit={limit}",
             urlencode(path)
@@ -314,7 +320,9 @@ impl Mst2Client {
             url.push_str(&urlencode(c));
         }
         let resp = self.send_retrying(self.http.get(url)).await?;
-        read_json(ok_or_error(resp).await?).await
+        let page: DirectoryResponse = read_json(ok_or_error(resp).await?).await?;
+        super::directory::validate_page(&page, snapshot_id, path, limit, cursor)?;
+        Ok(page)
     }
 
     /// Batch path resolution (spec 04 §7).

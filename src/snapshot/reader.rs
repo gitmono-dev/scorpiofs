@@ -517,11 +517,13 @@ impl SnapshotReader {
         self.ensure_lease().await?;
         let mut cursor: Option<String> = None;
         let mut merged: Option<crate::snapshot::types::DirectoryResponse> = None;
+        let mut progress = super::directory::Progress::default();
         loop {
             let page = self
                 .client
                 .directory(self.snapshot_id(), dir, limit, cursor.as_deref())
                 .await?;
+            progress.accept(&page, &self.descriptor().metadata_root)?;
             match &mut merged {
                 None => merged = Some(page.clone()),
                 Some(acc) => {
@@ -741,11 +743,13 @@ impl SnapshotReader {
     async fn walk_dir(&self, dir: &str, out: &mut Vec<SnapshotFile>) -> Result<(), SnapshotError> {
         self.context.validate_relative_path(dir)?;
         let mut cursor: Option<String> = None;
+        let mut progress = super::directory::Progress::default();
         loop {
             let page = self
                 .client
                 .directory(self.snapshot_id(), dir, 256, cursor.as_deref())
                 .await?;
+            progress.accept(&page, &self.descriptor().metadata_root)?;
             for e in page.entries {
                 let rel = if dir == "/" {
                     e.name.clone()
@@ -756,12 +760,10 @@ impl SnapshotReader {
                 if e.directory_root.is_some() {
                     Box::pin(self.walk_dir(&format!("/{rel}"), out)).await?;
                 } else if let Some(digest) = e.content_digest {
-                    let size = e.size.as_deref().unwrap_or("0").parse().map_err(|_| {
-                        SnapshotError::new(
-                            SnapshotErrorCode::Internal,
-                            format!("non-numeric size for {rel}"),
-                        )
-                    })?;
+                    let size = crate::snapshot::frames::parse_count(
+                        e.size.as_deref().ok_or_else(super::directory::integrity)?,
+                        "file size",
+                    )?;
                     out.push(SnapshotFile {
                         rel_path: rel,
                         fs_kind: e.fs_kind,
