@@ -16,7 +16,9 @@ use std::{
 
 use tokio::sync::{oneshot, OnceCell, Semaphore};
 
-use crate::snapshot::{SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader};
+use crate::snapshot::{
+    SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader, ValidatedSnapshotClosure,
+};
 
 type FetchResult = Result<Arc<Vec<u8>>, Arc<SnapshotError>>;
 
@@ -77,9 +79,33 @@ impl FetchCoordinator {
     /// `max_concurrent` bounds simultaneous leader downloads; waiters do
     /// not hold permits.
     pub fn new(reader: SnapshotReader, max_concurrent: usize) -> Arc<Self> {
+        Self::with_membership(reader, max_concurrent, None)
+    }
+
+    /// Reuse a complete root proof already acquired for this fixed reader.
+    /// Only file facts are retained; the closure cannot select a different
+    /// descriptor or replace any caller's current lease/credential checks.
+    pub fn with_verified_closure(
+        reader: SnapshotReader,
+        closure: &ValidatedSnapshotClosure,
+        max_concurrent: usize,
+    ) -> Result<Arc<Self>, SnapshotError> {
+        closure.matches_descriptor(reader.descriptor())?;
+        Ok(Self::with_membership(
+            reader,
+            max_concurrent,
+            Some(membership_index(closure)),
+        ))
+    }
+
+    fn with_membership(
+        reader: SnapshotReader,
+        max_concurrent: usize,
+        membership: Option<HashMap<String, SnapshotFile>>,
+    ) -> Arc<Self> {
         Arc::new(FetchCoordinator {
             reader,
-            membership: OnceCell::new(),
+            membership: OnceCell::new_with(membership),
             inflight: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
         })
@@ -152,14 +178,7 @@ impl FetchCoordinator {
                 let closure = self.reader.snapshot_closure().await?;
                 // Keep the fixed-root-derived path index, not duplicate page
                 // bytes. A failed/cancelled initialization can be retried.
-                Ok::<_, SnapshotError>(
-                    closure
-                        .files()
-                        .iter()
-                        .cloned()
-                        .map(|file| (file.rel_path.clone(), file))
-                        .collect::<HashMap<_, _>>(),
-                )
+                Ok::<_, SnapshotError>(membership_index(&closure))
             })
             .await?;
         let path = file.rel_path.strip_prefix('/').unwrap_or(&file.rel_path);
@@ -217,4 +236,13 @@ impl FetchCoordinator {
         }
         Ok(Arc::new(bytes))
     }
+}
+
+fn membership_index(closure: &ValidatedSnapshotClosure) -> HashMap<String, SnapshotFile> {
+    closure
+        .files()
+        .iter()
+        .cloned()
+        .map(|file| (file.rel_path.clone(), file))
+        .collect()
 }

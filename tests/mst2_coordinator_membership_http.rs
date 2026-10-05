@@ -329,10 +329,29 @@ impl Server {
 
 #[tokio::test]
 async fn each_alias_proves_its_metadata_before_content_can_merge() {
+    assert_alias_membership(false).await;
+}
+
+#[tokio::test]
+async fn seeded_aliases_keep_individual_checks_without_a_second_metadata_walk() {
+    assert_alias_membership(true).await;
+}
+
+async fn assert_alias_membership(seeded: bool) {
     let fixture = Fixture::new(true);
     fixture.pause_blob.store(true, Ordering::SeqCst);
     let server = Server::start(fixture).await;
-    let coordinator = FetchCoordinator::new(server.reader(None).await, 2);
+    let reader = server.reader(None).await;
+    let coordinator = if seeded {
+        let closure = reader.snapshot_closure().await.unwrap();
+        let coordinator = FetchCoordinator::with_verified_closure(reader, &closure, 2).unwrap();
+        // A new proof request would now fail. Seeded membership must use the
+        // already verified facts without retaining or refetching page bytes.
+        server.fixture.corrupt.store(true, Ordering::SeqCst);
+        coordinator
+    } else {
+        FetchCoordinator::new(reader, 2)
+    };
     let leader = tokio::spawn({
         let c = coordinator.clone();
         async move { c.fetch(file("a"), false).await }
@@ -402,12 +421,26 @@ async fn cancelling_first_caller_preserves_a_proven_alias_waiter() {
 
 #[tokio::test]
 async fn cached_membership_does_not_let_a_waiter_join_with_a_failed_lease() {
+    assert_current_lease(false).await;
+}
+
+#[tokio::test]
+async fn seeded_membership_does_not_bypass_a_failed_current_lease() {
+    assert_current_lease(true).await;
+}
+
+async fn assert_current_lease(seeded: bool) {
     let mut fixture = Fixture::new(true);
     fixture.expiry = expiry_in_three_seconds();
     fixture.pause_blob.store(true, Ordering::SeqCst);
     let server = Server::start(fixture).await;
     let reader = server.reader(None).await;
-    let coordinator = FetchCoordinator::new(reader.clone(), 2);
+    let coordinator = if seeded {
+        let closure = reader.snapshot_closure().await.unwrap();
+        FetchCoordinator::with_verified_closure(reader.clone(), &closure, 2).unwrap()
+    } else {
+        FetchCoordinator::new(reader.clone(), 2)
+    };
     let first = tokio::spawn({
         let c = coordinator.clone();
         async move { c.fetch(file("a"), false).await }
@@ -433,6 +466,30 @@ async fn cached_membership_does_not_let_a_waiter_join_with_a_failed_lease() {
     assert_eq!(server.fixture.blob_requests.lock().unwrap().len(), 1);
     server.fixture.blob_release.add_permits(1);
     let _ = first.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_valid_closure_cannot_seed_a_different_fixed_reader() {
+    let server = Server::start(Fixture::new(true)).await;
+    let closure = server.reader(None).await.snapshot_closure().await.unwrap();
+    for different_root in [false, true] {
+        let mut fixture = Fixture::new(true);
+        if different_root {
+            fixture.page =
+                Page::build(&[Entry::file(EntryKind::Regular, b"a", 1, hash(b"x"))]).unwrap();
+            fixture.descriptor.metadata_root = page_id(&fixture.page);
+        } else {
+            fixture.descriptor.namespace_view_id[0] ^= 1;
+        }
+        let other = Server::start(fixture).await;
+        let reader = other.reader(None).await;
+        let error = FetchCoordinator::with_verified_closure(reader, &closure, 2)
+            .err()
+            .expect("a valid closure was accepted for a different fixed reader");
+        assert_eq!(error.code, SnapshotErrorCode::ScopeForbidden);
+        assert_eq!(other.fixture.metadata_requests.load(Ordering::SeqCst), 0);
+        assert!(other.fixture.blob_requests.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -519,10 +576,31 @@ async fn credentials_cannot_share_another_coordinators_download_or_membership() 
 
 #[tokio::test]
 async fn legacy_callers_keep_separate_online_path_requests_without_merging() {
+    assert_legacy_requests(false).await;
+}
+
+#[tokio::test]
+async fn a_verified_seed_does_not_enable_single_flight_on_legacy_deployments() {
+    assert_legacy_requests(true).await;
+}
+
+async fn assert_legacy_requests(seeded: bool) {
     let fixture = Fixture::new(false);
     fixture.pause_blob.store(true, Ordering::SeqCst);
     let server = Server::start(fixture).await;
-    let coordinator = FetchCoordinator::new(server.reader(None).await, 2);
+    let reader = server.reader(None).await;
+    let coordinator = if seeded {
+        let proof_server = Server::start(Fixture::new(true)).await;
+        let closure = proof_server
+            .reader(None)
+            .await
+            .snapshot_closure()
+            .await
+            .unwrap();
+        FetchCoordinator::with_verified_closure(reader, &closure, 2).unwrap()
+    } else {
+        FetchCoordinator::new(reader, 2)
+    };
     let first = tokio::spawn({
         let c = coordinator.clone();
         async move { c.fetch(file("a"), false).await }
@@ -542,7 +620,10 @@ async fn legacy_callers_keep_separate_online_path_requests_without_merging() {
     });
     server.fixture.wait_blobs(3).await;
     server.fixture.blob_release.add_permits(2);
-    assert_eq!(first.await.unwrap().unwrap().as_slice(), CONTENT);
-    assert_eq!(second.await.unwrap().unwrap().as_slice(), CONTENT);
+    let a = first.await.unwrap().unwrap();
+    let b = second.await.unwrap().unwrap();
+    assert_eq!(a.as_slice(), CONTENT);
+    assert_eq!(b.as_slice(), CONTENT);
+    assert!(!Arc::ptr_eq(&a, &b));
     assert_eq!(server.fixture.metadata_requests.load(Ordering::SeqCst), 0);
 }

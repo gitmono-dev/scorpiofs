@@ -703,6 +703,15 @@ async fn full_snapshot_http_batch_failure_revokes_complete_and_can_resume() {
 
 #[tokio::test]
 async fn full_snapshot_http_raw_concurrent_fallback_preserves_metadata_and_resume() {
+    assert_raw_concurrent_hydration(false).await;
+}
+
+#[tokio::test]
+async fn full_snapshot_http_seeded_coordinator_preserves_zero_extra_metadata_rpc() {
+    assert_raw_concurrent_hydration(true).await;
+}
+
+async fn assert_raw_concurrent_hydration(seeded: bool) {
     let http = HttpFixture::start(nested_fixture("a", b"target-one")).await;
     let reader = http.reader().await;
     assert!(!reader.capabilities().features.objects);
@@ -720,7 +729,11 @@ async fn full_snapshot_http_raw_concurrent_fallback_preserves_metadata_and_resum
     )
     .unwrap();
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
-    let coordinator = FetchCoordinator::new(reader.clone(), 3);
+    let coordinator = if seeded {
+        FetchCoordinator::with_verified_closure(reader.clone(), &closure, 3).unwrap()
+    } else {
+        FetchCoordinator::new(reader.clone(), 3)
+    };
     let report = tokio::time::timeout(
         Duration::from_secs(5),
         store.hydrate_snapshot_concurrent(&reader, &closure, 3, move |file| {
@@ -742,13 +755,18 @@ async fn full_snapshot_http_raw_concurrent_fallback_preserves_metadata_and_resum
     );
     let after_metadata = http.fixture.requested_ids();
     assert_eq!(&after_metadata[..before_metadata.len()], &before_metadata);
-    // The coordinator proves each waiter's membership against the fixed
-    // root. Its OnceCell shares one proof walk across all three callers.
-    let mut membership_pages = after_metadata[before_metadata.len()..].to_vec();
-    membership_pages.sort();
-    let mut expected_pages = closure.pages().keys().cloned().collect::<Vec<_>>();
-    expected_pages.sort();
-    assert_eq!(membership_pages, expected_pages);
+    if seeded {
+        // The already proved incremental closure supplies membership facts;
+        // hydration must not issue a second metadata RPC.
+        assert_eq!(after_metadata, before_metadata);
+    } else {
+        // Without a seed, OnceCell shares one fixed-root proof across callers.
+        let mut membership_pages = after_metadata[before_metadata.len()..].to_vec();
+        membership_pages.sort();
+        let mut expected_pages = closure.pages().keys().cloned().collect::<Vec<_>>();
+        expected_pages.sort();
+        assert_eq!(membership_pages, expected_pages);
+    }
     assert!(http.fixture.object_requests.lock().unwrap().is_empty());
     assert_eq!(store.snapshot_manifest().unwrap().pages(), closure.pages());
     let resumed = store
