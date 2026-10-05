@@ -106,6 +106,7 @@ struct Fixture {
     objects: bool,
     expiry: String,
     large: Option<Large>,
+    nested_page: Option<Vec<u8>>,
 }
 impl Fixture {
     fn new(unavailable: bool, objects: bool) -> Self {
@@ -157,6 +158,7 @@ impl Fixture {
             objects,
             expiry: "2099-01-01T00:00:00Z".into(),
             large: None,
+            nested_page: None,
         }
     }
     fn with_large(mut self) -> Self {
@@ -189,6 +191,42 @@ impl Fixture {
         self.page = Page::build(&entries).unwrap();
         self.descriptor.metadata_root = page_id(&self.page);
         self.large = Some(large);
+        self
+    }
+    fn with_nested(mut self) -> Self {
+        let bytes = vec![0x7b; 8192];
+        let nested = Page::build(&[Entry::file(
+            EntryKind::Regular,
+            b"target",
+            bytes.len() as u64,
+            hash(&bytes),
+        )])
+        .unwrap();
+        let mut entries: Vec<_> = self
+            .bodies
+            .iter()
+            .map(|(name, body)| {
+                Entry::file(
+                    match name.as_str() {
+                        "exec" => EntryKind::Executable,
+                        "link" => EntryKind::Symlink,
+                        _ => EntryKind::Regular,
+                    },
+                    name.as_bytes(),
+                    body.len() as u64,
+                    hash(body),
+                )
+            })
+            .collect();
+        entries.extend([
+            Entry::dir(b"nested", page_id(&nested)),
+            Entry::dir(b"unavailable", [0x88; 32]),
+        ]);
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self.page = Page::build(&entries).unwrap();
+        self.descriptor.metadata_root = page_id(&self.page);
+        self.bodies.insert("nested/target".into(), bytes);
+        self.nested_page = Some(nested);
         self
     }
     fn response(&self, request: &[u8], wire: Vec<u8>, pending: bool) -> Response {
@@ -240,10 +278,14 @@ async fn metadata(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Resp
     assert_eq!(items.len(), 1);
     let directory = items[0]["directory_path"].as_str().unwrap();
     f.metadata.lock().unwrap().push(directory.into());
-    assert_eq!(directory, "/", "unrelated snapshot closure walk");
+    let page = match directory {
+        "/" => &f.page,
+        "/nested" => f.nested_page.as_ref().unwrap(),
+        _ => panic!("unrelated snapshot closure walk: {directory}"),
+    };
     assert_eq!(items[0]["route"], json!([]));
     let mut wire = MetaPayload {
-        pages: vec![(page_id(&f.page), f.page.clone())],
+        pages: vec![(page_id(page), page.clone())],
     }
     .encode(51, 0)
     .unwrap();
@@ -251,7 +293,7 @@ async fn metadata(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Resp
         EndPayload {
             request_item_count: 1,
             unique_unit_count: 1,
-            logical_bytes: f.page.len() as u64,
+            logical_bytes: page.len() as u64,
             request_body_sha256: hash(&request),
         }
         .encode(51, 1),
@@ -1063,4 +1105,42 @@ async fn fixed_cache_construction_admission_failure_leaks_no_slots_or_reply_owne
     assert_eq!(server.reader.content_usage().output_bytes, 0);
     drop(server.view(false).await);
     assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn actual_lazy_nested_read_uses_selected_ancestors_without_unrelated_closure() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true).with_nested(), 1024 * 1024).await;
+    let fs = server.view(true).await;
+    let nested = inode(&fs, "nested").await;
+    let file = fs
+        .lookup(Request::default(), nested, OsStr::new("target"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    assert_eq!(
+        fs.read(Request::default(), file, file, 7, 4)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        [0x7b; 4]
+    );
+    assert!(server.reader.content_membership.get().is_none());
+    assert_eq!(
+        server.fixture.metadata.lock().unwrap().as_slice(),
+        ["/", "/nested", "/", "/nested"]
+    );
+    let before = server.fixture.metadata.lock().unwrap().len();
+    assert_eq!(
+        fs.read(Request::default(), file, file, 0, 1)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        [0x7b]
+    );
+    assert_eq!(server.fixture.metadata.lock().unwrap().len(), before);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
 }
