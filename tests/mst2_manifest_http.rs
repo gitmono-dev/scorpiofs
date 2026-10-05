@@ -325,9 +325,9 @@ async fn metadata(
     );
     Response::builder()
         .header("content-type", "application/vnd.mega.treeframe;version=2")
-        .header("x-mega-snapshot-id", f.snapshot_id())
+        .header("x-mega-snapshot-id", snapshot_id)
         .header("x-mega-request-digest", digest_of(&body))
-        .body(axum::body::Body::from(wire))
+        .body(Body::from(wire))
         .unwrap()
 }
 
