@@ -320,6 +320,18 @@ impl Mst2Client {
         read_json(ok_or_error(resp).await?).await
     }
 
+    /// Discover the canonical profile or explicit legacy capabilities. This
+    /// does not configure the existing legacy reader or grant authorization.
+    /// Callers must select compatible APIs and enforce the advertised maxima.
+    pub async fn capability_advertisement(
+        &self,
+    ) -> Result<super::capabilities::CapabilityAdvertisement, SnapshotError> {
+        let resp = self
+            .send_retrying(self.http.get(self.snapshots_url("/capabilities")))
+            .await?;
+        super::capabilities::parse(read_json(ok_or_error(resp).await?).await?)
+    }
+
     /// Fix a view on `target` for `scope`; returns the descriptor + lease.
     pub async fn resolve(
         &self,

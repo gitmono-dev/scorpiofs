@@ -7,6 +7,7 @@
 //!   resume, a completeness marker and a pin.
 
 pub mod auth;
+pub mod capabilities;
 mod cas_index;
 mod chunk_wire;
 pub mod client;
