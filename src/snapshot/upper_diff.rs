@@ -31,22 +31,37 @@ impl Default for DiffLimits {
 pub enum UpperNodeIdentity {
     Directory {
         mode: u32,
+        uid: u32,
+        gid: u32,
     },
     Regular {
         mode: u32,
+        uid: u32,
+        gid: u32,
         size: u64,
         content_digest: String,
     },
     Symlink {
         mode: u32,
+        uid: u32,
+        gid: u32,
         size: u64,
         content_digest: String,
     },
 }
 impl UpperNodeIdentity {
     fn matches(&self, base: &SnapshotNodeIdentity) -> bool {
+        let owner = crate::util::mount_owner::mount_owner();
+        let (uid, gid) = match self {
+            Self::Directory { uid, gid, .. }
+            | Self::Regular { uid, gid, .. }
+            | Self::Symlink { uid, gid, .. } => (*uid, *gid),
+        };
+        if uid != owner.uid || gid != owner.gid {
+            return false;
+        }
         match (self, base) {
-            (Self::Directory { mode }, SnapshotNodeIdentity::Directory { .. }) => {
+            (Self::Directory { mode, .. }, SnapshotNodeIdentity::Directory { .. }) => {
                 *mode == base.mode()
             }
             (
@@ -54,6 +69,7 @@ impl UpperNodeIdentity {
                     mode,
                     size,
                     content_digest,
+                    ..
                 },
                 SnapshotNodeIdentity::Regular { .. } | SnapshotNodeIdentity::Executable { .. },
             )
@@ -62,6 +78,7 @@ impl UpperNodeIdentity {
                     mode,
                     size,
                     content_digest,
+                    ..
                 },
                 SnapshotNodeIdentity::Symlink { .. },
             ) => *mode == base.mode() && base.content() == Some((*size, content_digest.as_str())),
@@ -92,6 +109,7 @@ pub struct DiffMeters {
     pub hash_bytes: u64,
     pub lower_queries: u64,
     pub lower_directory_entries: u64,
+    pub xattr_checks: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,13 +158,22 @@ pub async fn scan_upper(
         .map_err(|error| unknown(format!("upper scan task failed: {error}")))??;
     let mut meters = scanned.meters;
     meters.lower_queries += 1;
-    if !matches!(
-        lower.path_state("").await?,
-        SnapshotPathState::Present(SnapshotNodeIdentity::Directory { .. })
-    ) {
-        return Err(unknown("fixed lower scope root is not a proved directory"));
-    }
+    let root_base = match lower.path_state("").await? {
+        SnapshotPathState::Present(identity @ SnapshotNodeIdentity::Directory { .. }) => identity,
+        _ => return Err(unknown("fixed lower scope root is not a proved directory")),
+    };
     let mut changes = BTreeMap::new();
+    if !scanned.facts[""].identity.matches(&root_base) {
+        changes.insert(
+            String::new(),
+            UpperChange {
+                rel_path: String::new(),
+                kind: UpperChangeKind::Modified,
+                base: Some(root_base),
+                upper: Some(scanned.facts[""].identity.clone()),
+            },
+        );
+    }
     // lower_directory=false is derived from a proved absent/non-directory
     // parent, never from swallowing a lookup error.
     let mut pending = vec![(String::new(), false, true)];
@@ -492,6 +519,70 @@ mod unix {
             .ok_or_else(|| budget("upper streaming byte budget exceeded"))?;
         Ok(())
     }
+    fn xattr_result(count: libc::ssize_t, meters: &mut DiffMeters) -> Result<(), SnapshotError> {
+        meters.xattr_checks += 1;
+        if count < 0 {
+            return Err(io(std::io::Error::last_os_error()));
+        }
+        if count > 65_536 {
+            return Err(budget("upper xattr name budget exceeded"));
+        }
+        if count != 0 {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::UnsupportedEntry,
+                "upper xattrs cannot be represented by the fixed snapshot profile",
+            ));
+        }
+        Ok(())
+    }
+    fn no_xattrs(file: &File, meters: &mut DiffMeters) -> Result<(), SnapshotError> {
+        // A size query proves an empty list without allocating or reading
+        // arbitrary attribute values. Nonempty or unsupported is Unknown.
+        #[cfg(target_os = "linux")]
+        let count = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
+        #[cfg(target_os = "macos")]
+        let count = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+        xattr_result(count, meters)
+    }
+    fn no_symlink_xattrs(
+        parent: &File,
+        name: &str,
+        before: Fingerprint,
+        meters: &mut DiffMeters,
+    ) -> Result<(), SnapshotError> {
+        #[cfg(target_os = "linux")]
+        {
+            // llistxattr applies to the final link itself. The parent fd path
+            // stays anchored even if a host-side ancestor is renamed.
+            let path = CString::new(format!("/proc/self/fd/{}/{name}", parent.as_raw_fd()))
+                .map_err(|_| unknown("NUL in anchored symlink path"))?;
+            let count = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+            xattr_result(count, meters)?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let name = c_name(OsStr::new(name))?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_SYMLINK,
+                )
+            };
+            if fd < 0 {
+                return Err(io(std::io::Error::last_os_error()));
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            if stat_fd(&file)? != before {
+                return Err(unknown("upper symlink replaced before xattr check"));
+            }
+            no_xattrs(&file, meters)?;
+        }
+        if stat_at(parent, name)? != before {
+            return Err(unknown("upper symlink changed during xattr check"));
+        }
+        Ok(())
+    }
     fn regular(
         parent: &File,
         name: &str,
@@ -505,6 +596,7 @@ mod unix {
         if stat_fd(&file)? != before {
             return Err(unknown("upper file replaced before hashing"));
         }
+        no_xattrs(&file, meters)?;
         let mut context = Context::new(&SHA256);
         let mut buffer = [0u8; BUFFER_BYTES];
         let mut read = 0u64;
@@ -524,6 +616,8 @@ mod unix {
         }
         Ok(UpperNodeIdentity::Regular {
             mode: before.mode & 0o7777,
+            uid: before.uid,
+            gid: before.gid,
             size,
             content_digest: format!("sha256:{}", hex::encode(context.finish().as_ref())),
         })
@@ -539,6 +633,7 @@ mod unix {
             return Err(budget("upper symlink exceeds serving profile"));
         }
         consume_bytes(meters, before.size as u64, limits)?;
+        no_symlink_xattrs(parent, name, before, meters)?;
         let name_c = c_name(OsStr::new(name))?;
         let mut bytes = [0u8; 4096];
         // SAFETY: buffer has the requested capacity; readlinkat never follows
@@ -563,6 +658,8 @@ mod unix {
         );
         Ok(UpperNodeIdentity::Symlink {
             mode: before.mode & 0o7777,
+            uid: before.uid,
+            gid: before.gid,
             size: before.size as u64,
             content_digest,
         })
@@ -579,6 +676,7 @@ mod unix {
             return Err(budget("upper directory depth budget exceeded"));
         }
         let before = stat_fd(directory)?;
+        no_xattrs(directory, &mut scanned.meters)?;
         let children = names(
             directory,
             limits.max_nodes.saturating_sub(scanned.facts.len()),
@@ -601,6 +699,8 @@ mod unix {
                 child_directory = Some(child);
                 UpperNodeIdentity::Directory {
                     mode: fingerprint.mode & 0o7777,
+                    uid: fingerprint.uid,
+                    gid: fingerprint.gid,
                 }
             } else if kind == libc::S_IFREG as u32 {
                 regular(directory, &name, fingerprint, &mut scanned.meters, limits)?
@@ -640,6 +740,8 @@ mod unix {
             Fact {
                 identity: UpperNodeIdentity::Directory {
                     mode: fingerprint.mode & 0o7777,
+                    uid: fingerprint.uid,
+                    gid: fingerprint.gid,
                 },
                 children: Vec::new(),
                 fingerprint,
@@ -733,6 +835,20 @@ mod unix {
             let link = temp.path().join("alias");
             std::os::unix::fs::symlink(temp.path(), &link).unwrap();
             assert!(collect(&link, DiffLimits::default()).is_err());
+        }
+
+        #[test]
+        fn symlink_attribute_check_reads_the_link_without_following_its_target() {
+            let temp = tempfile::tempdir().unwrap();
+            let target = "/missing-scorpiofs-outside-target";
+            std::os::unix::fs::symlink(target, temp.path().join("link")).unwrap();
+            let scanned =
+                collect(&temp.path().canonicalize().unwrap(), DiffLimits::default()).unwrap();
+            assert!(
+                matches!(scanned.facts["link"].identity, UpperNodeIdentity::Symlink { size, .. } if size == target.len() as u64)
+            );
+            assert_eq!(scanned.meters.xattr_checks, 2);
+            verify(&scanned).unwrap();
         }
     }
 }
