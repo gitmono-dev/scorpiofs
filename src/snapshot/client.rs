@@ -48,6 +48,8 @@ pub struct Mst2Client {
     /// An immutable credential snapshot used by a resolved reader. Pool and
     /// counters remain shared; configuration changes affect future resolves.
     bound_credentials: Option<Arc<BoundCredentials>>,
+    /// Discovery is frozen independently for each resolved reader.
+    profile: Option<Arc<super::capabilities::CanonicalCapabilities>>,
     /// Transport-level retries performed (metrics, spec 13 §6).
     retries: Arc<AtomicU64>,
     /// Payload bytes received (frame/blob bodies), for the "transfer is
@@ -98,6 +100,7 @@ impl Mst2Client {
             token: Arc::new(StdMutex::new(token)),
             lease: Arc::new(StdMutex::new(None)),
             bound_credentials: None,
+            profile: None,
             retries: Arc::new(AtomicU64::new(0)),
             recv_bytes: Arc::new(AtomicU64::new(0)),
             units_fetched: Arc::new(AtomicU64::new(0)),
@@ -142,7 +145,179 @@ impl Mst2Client {
         client.token = Arc::new(StdMutex::new(token.clone()));
         client.lease = Arc::new(StdMutex::new(None));
         client.bound_credentials = Some(Arc::new(BoundCredentials { token, lease: None }));
+        client.profile = None;
         client
+    }
+
+    pub(crate) fn with_advertisement(
+        mut self,
+        advertisement: &super::capabilities::CapabilityAdvertisement,
+    ) -> Self {
+        self.profile = match advertisement {
+            super::capabilities::CapabilityAdvertisement::Canonical(caps) => {
+                Some(Arc::new(caps.clone()))
+            }
+            super::capabilities::CapabilityAdvertisement::Legacy(_) => None,
+        };
+        self
+    }
+
+    pub(crate) fn is_canonical(&self) -> bool {
+        self.profile.is_some()
+    }
+
+    pub(crate) fn request_byte_limit(&self) -> usize {
+        self.profile
+            .as_ref()
+            .map_or(MAX_JSON_REQUEST_BYTES, |caps| {
+                caps.limits().max_json_request_bytes as usize
+            })
+    }
+
+    pub(crate) fn response_byte_limit(&self) -> usize {
+        self.profile
+            .as_ref()
+            .map_or(MAX_JSON_RESPONSE_BYTES, |caps| {
+                caps.limits().max_json_response_bytes as usize
+            })
+    }
+
+    pub(crate) fn request_item_limit(&self) -> usize {
+        self.profile
+            .as_ref()
+            .map_or(128, |caps| caps.limits().max_request_items as usize)
+    }
+
+    pub(crate) fn metadata_item_limit(&self) -> usize {
+        self.profile
+            .as_ref()
+            .map_or(64, |caps| caps.limits().max_metadata_items as usize)
+    }
+
+    pub(crate) fn directory_limit(&self) -> u32 {
+        self.profile
+            .as_ref()
+            .map_or(256, |caps| caps.limits().max_directory_entries)
+    }
+
+    pub(crate) fn object_byte_limit(&self) -> usize {
+        self.profile.as_ref().map_or(8 * 1024 * 1024, |caps| {
+            caps.limits().small_batch_bytes as usize
+        })
+    }
+
+    pub(crate) fn chunk_byte_limit(&self) -> usize {
+        self.profile.as_ref().map_or(128 * 1024 * 1024, |caps| {
+            caps.limits().chunk_batch_bytes as usize
+        })
+    }
+
+    pub(crate) fn frame_wire_limit(&self) -> usize {
+        self.profile.as_ref().map_or(2 * 1024 * 1024, |caps| {
+            caps.limits().frame_wire_bytes as usize
+        })
+    }
+
+    pub(crate) fn validate_file_size(&self, size: u64) -> Result<(), SnapshotError> {
+        let limit = self
+            .profile
+            .as_ref()
+            .map_or(super::range::MAX_FILE_SIZE, |caps| {
+                caps.limits().max_file_bytes
+            });
+        if size > limit {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "file exceeds the discovered serving limit",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_path(&self, path: &str) -> Result<(), SnapshotError> {
+        if let Some(profile) = &self.profile {
+            let limits = profile.limits();
+            let path = path.strip_prefix('/').unwrap_or(path);
+            if path.len() + 1 > limits.max_path_bytes as usize
+                || (!path.is_empty()
+                    && path.split('/').count() > limits.max_path_components as usize)
+            {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::LimitExceeded,
+                    "path exceeds the discovered serving limit",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_feature(&self, endpoint: &str) -> Result<(), SnapshotError> {
+        if let Some(profile) = &self.profile {
+            let features = profile.features();
+            let enabled = match endpoint {
+                "resolve" => features.strict_publication,
+                "directory" => features.directory,
+                "lookup" => features.lookup,
+                "metadata/pages" => features.metadata_pages,
+                "blob" => features.raw_blob,
+                "objects" => features.small_objects,
+                "chunks" | "chunk-map" => features.chunk_reads,
+                _ => false,
+            };
+            if !enabled {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::SnapshotNotReady,
+                    "endpoint is disabled by discovery",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_encoding(&self, encoding: Option<&str>) -> Result<(), SnapshotError> {
+        if self.is_canonical() && encoding.is_some_and(|encoding| encoding != "identity") {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                "canonical reader selects identity frames",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn json_response<T: DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<T, SnapshotError> {
+        let response = self.checked_response(response).await?;
+        parse_json(&read_json_bytes(response, self.response_byte_limit()).await?)
+    }
+
+    async fn checked_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response, SnapshotError> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let bytes = read_json_bytes(response, self.response_byte_limit())
+            .await
+            .map_err(|mut error| {
+                error.http_status = status.as_u16();
+                error
+            })?;
+        Err(self.response_error(&bytes, status))
+    }
+
+    pub(crate) fn response_error(&self, bytes: &[u8], status: StatusCode) -> SnapshotError {
+        if self.is_canonical() {
+            if let Err(error) =
+                super::error_wire::CanonicalSnapshotError::parse_response(bytes, status.as_u16())
+            {
+                return error;
+            }
+        }
+        server_error(bytes, status)
     }
 
     /// Conservative cache partition for the frozen actor credential. Token
@@ -198,6 +373,8 @@ impl Mst2Client {
         path: &str,
         expected_digest: &str,
     ) -> Result<reqwest::Response, SnapshotError> {
+        self.require_feature("blob")?;
+        self.validate_path(path)?;
         let url = self.snapshots_url(&format!(
             "/{snapshot_id}/blob?path={}&expected_digest={}",
             urlencode(path),
@@ -212,6 +389,7 @@ impl Mst2Client {
         endpoint: &str,
         body: bytes::Bytes,
     ) -> Result<reqwest::Response, SnapshotError> {
+        self.require_feature(endpoint)?;
         let request_digest = format!(
             "sha256:{}",
             hex::encode(ring::digest::digest(&ring::digest::SHA256, &body))
@@ -268,7 +446,7 @@ impl Mst2Client {
         if req
             .body()
             .and_then(reqwest::Body::as_bytes)
-            .is_some_and(|body| body.len() > MAX_JSON_REQUEST_BYTES)
+            .is_some_and(|body| body.len() > self.request_byte_limit())
         {
             return Err(json_limit("request"));
         }
@@ -344,19 +522,18 @@ impl Mst2Client {
         let resp = self
             .send_retrying(self.http.get(self.snapshots_url("/capabilities")))
             .await?;
-        read_json(ok_or_error(resp).await?).await
+        self.json_response(resp).await
     }
 
     /// Discover the canonical profile or explicit legacy capabilities. This
-    /// does not configure the existing legacy reader or grant authorization.
-    /// Callers must select compatible APIs and enforce the advertised maxima.
+    /// does not grant authorization. Readers freeze its limits in their client.
     pub async fn capability_advertisement(
         &self,
     ) -> Result<super::capabilities::CapabilityAdvertisement, SnapshotError> {
         let resp = self
             .send_retrying(self.http.get(self.snapshots_url("/capabilities")))
             .await?;
-        super::capabilities::parse(read_json(ok_or_error(resp).await?).await?)
+        super::capabilities::parse(self.json_response(resp).await?)
     }
 
     /// Fix a view on `target` for `scope`; returns the descriptor + lease.
@@ -389,28 +566,69 @@ impl Mst2Client {
         lease_seconds: u64,
         receipt: Option<&mut super::ResolveTraceReceipt>,
     ) -> Result<ResolveResponse, SnapshotError> {
-        super::auth::validate_scope(scope)?;
-        if !(60..=3600).contains(&lease_seconds) {
+        self.resolve_request_internal(
+            &super::ResolveRequest::latest(scope, lease_seconds),
+            receipt,
+            false,
+        )
+        .await
+    }
+
+    /// Typed canonical resolve. Discovery is required by SnapshotReader before
+    /// this call; no legacy envelope can satisfy this explicit contract.
+    pub async fn resolve_request(
+        &self,
+        request: &super::ResolveRequest,
+    ) -> Result<ResolveResponse, SnapshotError> {
+        self.resolve_request_internal(request, None, true).await
+    }
+
+    pub(crate) async fn resolve_request_observed(
+        &self,
+        request: &super::ResolveRequest,
+        logical_request_id: &str,
+    ) -> Result<(ResolveResponse, super::ResolveTraceReceipt), SnapshotError> {
+        let mut receipt = super::ResolveTraceReceipt::new(logical_request_id)?;
+        let response = self
+            .resolve_request_internal(request, Some(&mut receipt), true)
+            .await?;
+        Ok((response, receipt.finish()?))
+    }
+
+    async fn resolve_request_internal(
+        &self,
+        request: &super::ResolveRequest,
+        receipt: Option<&mut super::ResolveTraceReceipt>,
+        require_canonical: bool,
+    ) -> Result<ResolveResponse, SnapshotError> {
+        super::auth::validate_scope(&request.scope)?;
+        self.validate_path(&request.scope)?;
+        self.require_feature("resolve")?;
+        if let super::ResolveTarget::View { view_id } = &request.target {
+            super::frames::parse_digest(view_id).map_err(|_| {
+                SnapshotError::new(
+                    SnapshotErrorCode::InvalidRequest,
+                    "resolve view ID is not canonical",
+                )
+            })?;
+        }
+        if !(60..=3600).contains(&request.lease_seconds) {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::InvalidRequest,
                 "resolve lease suggestion must be between 60 and 3600 seconds",
             ));
         }
-        let body = serde_json::json!({
-            "target": {"kind": "latest"},
-            "scope": scope,
-            "delivery": "full",
-            "lease_seconds": lease_seconds,
-            "supported_metadata_codecs": [1],
-        });
+        let mut body = serde_json::to_value(request)
+            .map_err(|e| SnapshotError::new(SnapshotErrorCode::InvalidRequest, e.to_string()))?;
+        body["supported_metadata_codecs"] = serde_json::json!([1]);
         let resp = self
             .send_retrying_with_receipt(
                 self.http.post(self.snapshots_url("/resolve")).json(&body),
                 receipt,
             )
             .await?;
-        let value = read_json(ok_or_error(resp).await?).await?;
-        super::resolve_wire::parse(value, scope)
+        let value = self.json_response(resp).await?;
+        super::resolve_wire::parse_request(value, request, require_canonical || self.is_canonical())
     }
 
     /// One directory page; `cursor` continues pagination (spec 04 §5).
@@ -421,12 +639,15 @@ impl Mst2Client {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<DirectoryResponse, SnapshotError> {
+        self.require_feature("directory")?;
+        self.validate_path(path)?;
         if !(1..=256).contains(&limit) {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::ScopeInvalid,
                 "directory limit must be 1..256",
             ));
         }
+        let limit = limit.min(self.directory_limit());
         let mut url = self.snapshots_url(&format!(
             "/{snapshot_id}/directory?path={}&limit={limit}",
             urlencode(path)
@@ -436,8 +657,13 @@ impl Mst2Client {
             url.push_str(&urlencode(c));
         }
         let resp = self.send_retrying(self.http.get(url)).await?;
-        let page: DirectoryResponse = read_json(ok_or_error(resp).await?).await?;
+        let page: DirectoryResponse = self.json_response(resp).await?;
         super::directory::validate_page(&page, snapshot_id, path, limit, cursor)?;
+        for entry in &page.entries {
+            if let Some(size) = &entry.size {
+                self.validate_file_size(super::frames::parse_count(size, "directory size")?)?;
+            }
+        }
         Ok(page)
     }
 
@@ -447,6 +673,16 @@ impl Mst2Client {
         snapshot_id: &str,
         paths: &[String],
     ) -> Result<LookupResponse, SnapshotError> {
+        self.require_feature("lookup")?;
+        for path in paths {
+            self.validate_path(path)?;
+        }
+        if paths.len() > self.request_item_limit() && self.is_canonical() {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "lookup exceeds the discovered item limit",
+            ));
+        }
         if paths.len() > 128 {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
@@ -461,7 +697,7 @@ impl Mst2Client {
                     .json(&body),
             )
             .await?;
-        let response: LookupResponse = read_json(ok_or_error(resp).await?).await?;
+        let response: LookupResponse = self.json_response(resp).await?;
         if response.snapshot_id != snapshot_id || response.results.len() != paths.len() {
             return Err(lookup_binding_error());
         }
@@ -477,6 +713,9 @@ impl Mst2Client {
             }
             if let Some(node) = &result.node {
                 super::lookup::validate_node(node, path)?;
+                if let Some(size) = &node.size {
+                    self.validate_file_size(super::frames::parse_count(size, "lookup size")?)?;
+                }
             }
         }
         Ok(response)
@@ -492,16 +731,24 @@ impl Mst2Client {
         path: &str,
         expected_digest: &str,
     ) -> Result<Vec<u8>, SnapshotError> {
+        self.require_feature("blob")?;
+        self.validate_path(path)?;
         let url = self.snapshots_url(&format!(
             "/{snapshot_id}/blob?path={}&expected_digest={}",
             urlencode(path),
             urlencode(expected_digest)
         ));
         let resp = self.send_retrying(self.http.get(url)).await?;
-        let mut resp = ok_or_error(resp).await?;
+        let mut resp = self.checked_response(resp).await?;
+        let byte_limit = self
+            .profile
+            .as_ref()
+            .map_or(MAX_BUFFERED_FILE_BYTES, |caps| {
+                caps.limits().max_file_bytes.min(MAX_BUFFERED_FILE_BYTES)
+            });
         if resp
             .content_length()
-            .is_some_and(|length| length > MAX_BUFFERED_FILE_BYTES)
+            .is_some_and(|length| length > byte_limit)
         {
             return Err(buffered_limit());
         }
@@ -509,13 +756,13 @@ impl Mst2Client {
         while let Some(chunk) = resp.chunk().await.map_err(net_err)? {
             self.recv_bytes
                 .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-            if chunk.len() as u64 > MAX_BUFFERED_FILE_BYTES - bytes.len() as u64 {
+            if chunk.len() as u64 > byte_limit - bytes.len() as u64 {
                 return Err(buffered_limit());
             }
             if chunk.len() > bytes.capacity() - bytes.len() {
                 let target = (bytes.len() + chunk.len())
                     .max(bytes.capacity().saturating_mul(2))
-                    .min(MAX_BUFFERED_FILE_BYTES as usize);
+                    .min(byte_limit as usize);
                 bytes
                     .try_reserve_exact(target - bytes.len())
                     .map_err(|_| buffered_limit())?;
@@ -552,18 +799,6 @@ fn lookup_binding_error() -> SnapshotError {
     )
 }
 
-async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, SnapshotError> {
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp);
-    }
-    let bytes = read_json_bytes(resp).await.map_err(|mut error| {
-        error.http_status = status.as_u16();
-        error
-    })?;
-    Err(server_error(&bytes, status))
-}
-
 pub(crate) fn server_error(bytes: &[u8], status: StatusCode) -> SnapshotError {
     let Ok(value) = parse_json::<serde_json::Value>(bytes) else {
         return SnapshotError {
@@ -593,26 +828,25 @@ fn request_deadline() -> SnapshotError {
     )
 }
 
-async fn read_json<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, SnapshotError> {
-    parse_json(&read_json_bytes(resp).await?)
-}
-
-async fn read_json_bytes(mut resp: reqwest::Response) -> Result<Vec<u8>, SnapshotError> {
+async fn read_json_bytes(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, SnapshotError> {
     if resp
         .content_length()
-        .is_some_and(|length| length > MAX_JSON_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
         return Err(json_limit("response"));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(net_err)? {
-        if chunk.len() > MAX_JSON_RESPONSE_BYTES - bytes.len() {
+        if chunk.len() > limit - bytes.len() {
             return Err(json_limit("response"));
         }
         if chunk.len() > bytes.capacity() - bytes.len() {
             let target = (bytes.len() + chunk.len())
                 .max(bytes.capacity().saturating_mul(2))
-                .min(MAX_JSON_RESPONSE_BYTES);
+                .min(limit);
             bytes
                 .try_reserve_exact(target - bytes.len())
                 .map_err(|_| json_limit("response"))?;
@@ -772,7 +1006,8 @@ impl Mst2Client {
         url: impl AsRef<str>,
     ) -> Result<serde_json::Value, SnapshotError> {
         let url = url.as_ref();
-        read_json(ok_or_error(self.send_retrying(self.http.get(url)).await?).await?).await
+        self.json_response(self.send_retrying(self.http.get(url)).await?)
+            .await
     }
 
     pub(crate) async fn post_json(
@@ -781,7 +1016,7 @@ impl Mst2Client {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, SnapshotError> {
         let url = url.as_ref();
-        read_json(ok_or_error(self.send_retrying(self.http.post(url).json(&body)).await?).await?)
+        self.json_response(self.send_retrying(self.http.post(url).json(&body)).await?)
             .await
     }
 
@@ -792,7 +1027,9 @@ impl Mst2Client {
         url: impl AsRef<str>,
     ) -> Result<Option<serde_json::Value>, SnapshotError> {
         let url = url.as_ref();
-        let mut response = ok_or_error(self.send_retrying(self.http.delete(url)).await?).await?;
+        let mut response = self
+            .checked_response(self.send_retrying(self.http.delete(url)).await?)
+            .await?;
         let status = response.status();
         let invalid = || SnapshotError {
             code: SnapshotErrorCode::IntegrityError,
@@ -823,7 +1060,7 @@ impl Mst2Client {
                 }
                 Ok(None)
             }
-            StatusCode::OK => read_json(response).await.map(Some),
+            StatusCode::OK if !self.is_canonical() => self.json_response(response).await.map(Some),
             _ => Err(invalid()),
         }
     }
@@ -838,7 +1075,7 @@ impl Mst2Client {
         snapshot_id: &str,
         max_response_bytes: usize,
     ) -> Result<Vec<u8>, SnapshotError> {
-        if body.len() > TREEFRAME_REQUEST_MAX_BYTES {
+        if body.len() > self.request_byte_limit() {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
                 "TreeFrame request exceeds the JSON request byte limit",
@@ -866,7 +1103,7 @@ impl Mst2Client {
         } else {
             // Typed HTTP errors are JSON, not TreeFrames, but their bodies
             // need the same bounded read before attempting envelope parsing.
-            max_response_bytes.min(MAX_JSON_RESPONSE_BYTES)
+            max_response_bytes.min(self.response_byte_limit())
         };
         if resp
             .content_length()
@@ -890,7 +1127,7 @@ impl Mst2Client {
             bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            return Err(server_error(&bytes, status));
+            return Err(self.response_error(&bytes, status));
         }
         Ok(bytes)
     }
@@ -900,7 +1137,9 @@ impl Mst2Client {
         url: impl AsRef<str>,
     ) -> Result<(u64, String, String), SnapshotError> {
         let url = url.as_ref();
-        let resp = ok_or_error(self.send_retrying(self.http.head(url)).await?).await?;
+        let resp = self
+            .checked_response(self.send_retrying(self.http.head(url)).await?)
+            .await?;
         let headers = resp.headers();
         let len = headers
             .get("content-length")
@@ -919,6 +1158,7 @@ impl Mst2Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        self.validate_file_size(len)?;
         Ok((len, etag, kind))
     }
 }
