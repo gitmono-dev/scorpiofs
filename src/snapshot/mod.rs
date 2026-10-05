@@ -28,6 +28,7 @@ pub use client::Mst2Client;
 pub use closure::{SnapshotClosureMeters, SnapshotDirectory, ValidatedSnapshotClosure};
 pub use coordinator::{FetchCoordinator, FetchCoordinatorCounts, FetchCoordinatorLimits};
 pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMeters, ViewMeta};
+pub use frames::LeaseReleaseOutcome;
 pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
