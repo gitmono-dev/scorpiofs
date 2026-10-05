@@ -1,0 +1,99 @@
+name: MST2 real commit update benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      mega_sha:
+        description: Immutable reviewed Mega2 server SHA
+        required: true
+        default: c6c1d5c839f73a717192fec6e403c1ed320148f1
+      profile:
+        type: choice
+        description: Fixture size
+        options: [medium, smoke]
+        default: medium
+      rounds:
+        description: Repetitions (3 to 10)
+        required: true
+        default: '5'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      NO_PROXY: localhost,127.0.0.1
+    steps:
+      - name: Set shared session deadline
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from datetime import datetime, timedelta, timezone
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('MST2_SESSION_DEADLINE=' + (datetime.now(timezone.utc) + timedelta(minutes=235)).isoformat() + '\n')
+              stream.write('MST2_OWNED_ROOT=' + os.environ['RUNNER_TEMP'] + '/mst2-real-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '\n')
+          PY
+
+      - uses: actions/checkout@v7
+        with:
+          path: scorpiofs
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          repository: gitmono-dev/mega2
+          ref: ${{ inputs.mega_sha }}
+          path: mega2
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libfuse3-dev protobuf-compiler postgresql-client
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build immutable server and measurement client
+        env:
+          MEGA_SHA: ${{ inputs.mega_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$MEGA_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C mega2 rev-parse HEAD)" = "$MEGA_SHA"
+          cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
+          cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --example mst2_update_measure
+
+      - name: Check benchmark fences and Git oracle
+        run: python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_bench.py -v
+
+      - name: Run real commit update benchmark on owned deployment
+        env:
+          MEGA_SHA: ${{ inputs.mega_sha }}
+          PROFILE: ${{ inputs.profile }}
+          ROUNDS: ${{ inputs.rounds }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DRIVER="$GITHUB_WORKSPACE/scorpiofs/target/release/examples/mst2_update_measure"
+          DRIVER_SHA=$(sha256sum "$DRIVER" | cut -d ' ' -f 1)
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --execute \
+            --run-root "$MST2_OWNED_ROOT" --mega-source "$GITHUB_WORKSPACE/mega2" \
+            --mega-sha "$MEGA_SHA" --mega-binary "$GITHUB_WORKSPACE/mega2/target/release/mega2" \
+            --driver "$DRIVER" --driver-sha256 "$DRIVER_SHA" \
+            --profile "$PROFILE" --rounds "$ROUNDS" --session-deadline-utc "$MST2_SESSION_DEADLINE"
+
+      - name: Clean up owned deployment
+        if: always()
+        shell: bash
+        run: |
+          if test -f scorpiofs/tests/mst2-e2e/commit_update_ci.py; then
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --cleanup --run-root "$MST2_OWNED_ROOT"
+          fi
