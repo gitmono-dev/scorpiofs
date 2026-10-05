@@ -44,7 +44,7 @@ fn invalid() -> SnapshotError {
     )
 }
 
-fn counter(value: &str) -> Result<(), SnapshotError> {
+pub(crate) fn counter(value: &str) -> Result<(), SnapshotError> {
     if value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
         || !value.bytes().all(|byte| byte.is_ascii_digit())
@@ -58,11 +58,11 @@ fn counter(value: &str) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn opaque(value: &str) -> bool {
+pub(crate) fn opaque(value: &str) -> bool {
     (1..=512).contains(&value.chars().count())
 }
 
-fn timestamp(value: &str) -> Result<OffsetDateTime, SnapshotError> {
+pub(crate) fn timestamp(value: &str) -> Result<OffsetDateTime, SnapshotError> {
     // RFC3339 -00:00 explicitly means an unknown local offset; it cannot
     // identify an actual lease expiry instant.
     if value.ends_with("-00:00") {
