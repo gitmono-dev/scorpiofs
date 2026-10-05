@@ -478,17 +478,6 @@ fn lookup_binding_error() -> SnapshotError {
     )
 }
 
-#[derive(Deserialize)]
-struct ErrorEnvelope {
-    error: ServerError,
-}
-
-#[derive(Deserialize)]
-struct ServerError {
-    code: String,
-    message: String,
-}
-
 async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, SnapshotError> {
     let status = resp.status();
     if status.is_success() {
@@ -502,18 +491,18 @@ async fn ok_or_error(resp: reqwest::Response) -> Result<reqwest::Response, Snaps
 }
 
 pub(crate) fn server_error(bytes: &[u8], status: StatusCode) -> SnapshotError {
-    let Ok(env) = parse_json::<ErrorEnvelope>(bytes) else {
+    let Ok(value) = parse_json::<serde_json::Value>(bytes) else {
         return SnapshotError {
             code: SnapshotErrorCode::Internal,
             message: format!("HTTP {status} without valid error envelope"),
             http_status: status.as_u16(),
         };
     };
-    SnapshotError {
-        code: SnapshotErrorCode::from_server(&env.error.code),
-        message: env.error.message,
+    super::error_wire::parse(value, status.as_u16()).unwrap_or_else(|()| SnapshotError {
+        code: SnapshotErrorCode::IntegrityError,
+        message: "HTTP error envelope violates its selected contract or status binding".into(),
         http_status: status.as_u16(),
-    }
+    })
 }
 
 fn json_limit(direction: &str) -> SnapshotError {
