@@ -4,6 +4,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
+    net::TcpListener as StdTcpListener,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -22,6 +23,7 @@ use axum::{
 };
 use futures::StreamExt;
 use mst2_codec::{
+    descriptor::ServingDescriptor,
     metapage::{page_id, BranchChild, Entry, EntryKind, Page},
     treeframe::{EndPayload, MetaPayload, ObjectPayload},
 };
@@ -31,6 +33,9 @@ use scorpiofs::snapshot::{
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
+
+const INSTANCE_ID: &str = "11111111-2222-4333-8444-555555555555";
+const NAMESPACE_VIEW_ID: [u8; 32] = [0x22; 32];
 
 #[derive(Default)]
 struct Fixture {
@@ -91,7 +96,16 @@ impl Fixture {
     }
 
     fn snapshot_id(&self) -> String {
-        id_string(&self.root)
+        id_string(
+            &ServingDescriptor {
+                instance_uuid: *uuid::Uuid::parse_str(INSTANCE_ID).unwrap().as_bytes(),
+                namespace_view_id: NAMESPACE_VIEW_ID,
+                scope: "/project".into(),
+                metadata_root: self.root,
+            }
+            .snapshot_id()
+            .unwrap(),
+        )
     }
 
     fn requested_ids(&self) -> Vec<String> {
@@ -234,13 +248,13 @@ async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
 async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
     Json(json!({
         "descriptor": {
-            "schema_version": 2, "metadata_codec": 1, "instance_id": "fixture",
-            "namespace_view_id": "fixed-fixture-view", "scope": "/project",
-            "materialization_policy": 1, "fs_semantics": 1, "access_projection": 1,
+            "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE_ID,
+            "namespace_view_id": id_string(&NAMESPACE_VIEW_ID), "scope": "/project",
+            "materialization_policy": 1, "fs_semantics": 1, "access_projection": 0,
             "metadata_root": id_string(&f.root), "snapshot_id": f.snapshot_id()
         },
         "lease_id": "fixture-lease", "lease_expires_at": "2099-01-01T00:00:00Z",
-        "publication_sequence": "1"
+        "publication_sequence": "1", "authorization_epoch": "1"
     }))
 }
 
@@ -404,14 +418,30 @@ async fn objects(
 struct HttpFixture {
     fixture: Arc<Fixture>,
     base: String,
+    listener: StdTcpListener,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl HttpFixture {
     async fn start(fixture: Fixture) -> Self {
         let fixture = Arc::new(fixture);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .into_std()
+            .unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = Self::serve(&listener, fixture.clone());
+        Self {
+            fixture,
+            base,
+            listener,
+            task,
+        }
+    }
+
+    fn serve(listener: &StdTcpListener, fixture: Arc<Fixture>) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::TcpListener::from_std(listener.try_clone().unwrap()).unwrap();
         let app = Router::new()
             .route("/api/v2/snapshots/capabilities", get(capabilities))
             .route("/api/v2/snapshots/resolve", post(resolve))
@@ -419,12 +449,17 @@ impl HttpFixture {
             .route("/api/v2/snapshots/{sid}/blob", get(blob))
             .route("/api/v2/snapshots/{sid}/objects", post(objects))
             .with_state(fixture.clone());
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Self {
-            fixture,
-            base,
-            task,
-        }
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
+    }
+
+    async fn restart(mut self, fixture: Fixture) -> Self {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        // Keep the listening socket bound while replacing the server. V1 and
+        // V2 share the deployment URL, independently of ephemeral port reuse.
+        self.fixture = Arc::new(fixture);
+        self.task = Self::serve(&self.listener, self.fixture.clone());
+        self
     }
 
     async fn reader(&self) -> SnapshotReader {
@@ -460,8 +495,14 @@ fn assert_manifest(actual: &[SnapshotFile], expected: &[SnapshotFile]) {
     );
 }
 
-async fn pin(cache: &ScopeCache, snapshot_id: &str, fixture: &Fixture) {
+async fn pin(cache: &ScopeCache, reader: &SnapshotReader, fixture: &Fixture) {
+    let snapshot_id = reader.snapshot_id();
     let dir = cache.dir().join(snapshot_id.trim_start_matches("sha256:"));
+    reader.authorized_context().bind_view_cache(&dir).unwrap();
+    reader
+        .authorized_context()
+        .bind_scope_cache(&cache.dir().join("blobs"))
+        .unwrap();
     let store =
         scorpiofs::snapshot::DurableStore::open_with_content(&dir, cache.dir().join("blobs"))
             .unwrap();
@@ -1056,9 +1097,14 @@ async fn mixed_reused_and_new_children_preserve_both_manifests() {
         &IncrementalSync::new(&old, &cache).sync().await.unwrap(),
         &first.fixture.expected,
     );
-    pin(&cache, old.snapshot_id(), &first.fixture).await;
-    let next = HttpFixture::start(nested_fixture("a", b"target-two")).await;
+    pin(&cache, &old, &first.fixture).await;
+    let next = first.restart(nested_fixture("a", b"target-two")).await;
     let reader = next.reader().await;
+    assert_ne!(old.snapshot_id(), reader.snapshot_id());
+    assert_eq!(
+        old.authorized_context().cache_domain(),
+        reader.authorized_context().cache_domain()
+    );
     let mut sync = IncrementalSync::new(&reader, &cache);
     assert_manifest(&sync.sync().await.unwrap(), &next.fixture.expected);
     assert_eq!(sync.meters().reused_subtrees, 1);
@@ -1095,9 +1141,14 @@ async fn moved_subtree_rebases_once_and_keeps_its_descendant_pages() {
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path()).unwrap();
     IncrementalSync::new(&old, &cache).sync().await.unwrap();
-    pin(&cache, old.snapshot_id(), &first.fixture).await;
-    let next = HttpFixture::start(nested_fixture("moved", b"target-one")).await;
+    pin(&cache, &old, &first.fixture).await;
+    let next = first.restart(nested_fixture("moved", b"target-one")).await;
     let reader = next.reader().await;
+    assert_ne!(old.snapshot_id(), reader.snapshot_id());
+    assert_eq!(
+        old.authorized_context().cache_domain(),
+        reader.authorized_context().cache_domain()
+    );
     let mut sync = IncrementalSync::new(&reader, &cache);
     assert_manifest(&sync.sync().await.unwrap(), &next.fixture.expected);
     assert_eq!(
@@ -1110,6 +1161,45 @@ async fn moved_subtree_rebases_once_and_keeps_its_descendant_pages() {
     assert_manifest(
         &reader.file_manifest_pages().await.unwrap(),
         &next.fixture.expected,
+    );
+}
+
+#[tokio::test]
+async fn identical_pages_from_another_deployment_cannot_reuse_a_scope_cache() {
+    let first = HttpFixture::start(nested_fixture("a", b"target-one")).await;
+    let old = first.reader().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = ScopeCache::open(tmp.path()).unwrap();
+    assert_manifest(
+        &IncrementalSync::new(&old, &cache).sync().await.unwrap(),
+        &first.fixture.expected,
+    );
+    pin(&cache, &old, &first.fixture).await;
+    let previous_records = std::fs::read(cache.dir().join("closures.json")).unwrap();
+
+    // The first listener stays bound: this second port represents a genuinely
+    // different deployment even though it advertises identical snapshot bytes.
+    let other = HttpFixture::start(nested_fixture("a", b"target-one")).await;
+    let reader = other.reader().await;
+    assert_ne!(first.base, other.base);
+    assert_eq!(old.snapshot_id(), reader.snapshot_id());
+    assert_ne!(
+        old.authorized_context().cache_domain(),
+        reader.authorized_context().cache_domain()
+    );
+    let mut sync = IncrementalSync::new(&reader, &cache);
+    assert_eq!(
+        sync.sync().await.unwrap_err().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    assert_eq!(sync.meters().reused_subtrees, 0);
+    assert_eq!(sync.meters().reused_pages, 0);
+    assert_eq!(sync.meters().fetched_pages, 0);
+    assert_eq!(sync.meters().traversal_nodes, 0);
+    assert!(other.fixture.requested_ids().is_empty());
+    assert_eq!(
+        std::fs::read(cache.dir().join("closures.json")).unwrap(),
+        previous_records
     );
 }
 
@@ -1131,7 +1221,7 @@ async fn identical_page_ids_expand_under_every_logical_directory() {
         3,
         "three logical page visits"
     );
-    pin(&cache, reader.snapshot_id(), &http.fixture).await;
+    pin(&cache, &reader, &http.fixture).await;
     let mut warm = IncrementalSync::new(&reader, &cache);
     assert_manifest(&warm.sync().await.unwrap(), &http.fixture.expected);
     assert_eq!(warm.meters().fetched_pages, 0);
@@ -1154,7 +1244,7 @@ async fn missing_descendant_page_refetches_only_that_page_without_trusting_root_
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path()).unwrap();
     IncrementalSync::new(&reader, &cache).sync().await.unwrap();
-    pin(&cache, reader.snapshot_id(), &http.fixture).await;
+    pin(&cache, &reader, &http.fixture).await;
     let missing = http.fixture.routes[&("/a/nested".into(), vec![])];
     std::fs::remove_file(cache.dir().join("pages").join(hex::encode(missing))).unwrap();
     http.fixture.requests.lock().unwrap().clear();
@@ -1169,7 +1259,7 @@ async fn missing_descendant_page_refetches_only_that_page_without_trusting_root_
     );
     assert_eq!(
         cache
-            .record_for(reader.snapshot_id())
+            .record_for(&id_string(&http.fixture.root))
             .unwrap()
             .page_ids
             .len(),
@@ -1279,11 +1369,11 @@ async fn malformed_closure_page_id_cannot_read_write_or_remove_an_outside_file()
     let tmp = tempfile::tempdir().unwrap();
     let cache = ScopeCache::open(tmp.path().join("cache")).unwrap();
     IncrementalSync::new(&reader, &cache).sync().await.unwrap();
-    pin(&cache, reader.snapshot_id(), &http.fixture).await;
+    pin(&cache, &reader, &http.fixture).await;
     let sentinel = tmp.path().join("sentinel");
     std::fs::write(&sentinel, b"must remain untouched").unwrap();
     let invalid = "sha256:../../sentinel";
-    let mut record = cache.record_for(reader.snapshot_id()).unwrap();
+    let mut record = cache.record_for(&id_string(&http.fixture.root)).unwrap();
     record.page_ids.insert(0, invalid.into());
     // Use the current policy and a live pin so the corrupted record reaches
     // the id verifier; policy mismatch must not mask this regression.
@@ -1301,7 +1391,7 @@ async fn malformed_closure_page_id_cannot_read_write_or_remove_an_outside_file()
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"must remain untouched");
     assert!(!cache
-        .record_for(reader.snapshot_id())
+        .record_for(&id_string(&http.fixture.root))
         .unwrap()
         .page_ids
         .contains(&invalid.to_string()));
