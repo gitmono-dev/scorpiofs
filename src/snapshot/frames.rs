@@ -577,27 +577,32 @@ impl Mst2Client {
         path: &str,
         expected_digest: &str,
     ) -> Result<VerifiedChunkMap, SnapshotError> {
+        let want = parse_digest(expected_digest)?;
         let url = self.snap_url(&format!(
             "/{sid}/chunk-map?path={}&expected_digest={}",
             urlencode(path),
             urlencode(expected_digest)
         ));
         let v: serde_json::Value = self.get_json(&url).await?;
+        if v["snapshot_id"].as_str() != Some(sid)
+            || v["path"].as_str() != Some(path)
+            || v["schema_version"].as_u64() != Some(2)
+        {
+            return Err(chunk_binding_error());
+        }
         let file_content_id = parse_digest(v["file_content_id"].as_str().unwrap_or(""))?;
         // Bind the map to the file the view named (spec 07 §3, BODY-07): a
         // server returning a well-formed map for a *different* content id
         // must be rejected, never silently accepted.
-        if let Ok(want) = parse_digest(expected_digest) {
-            if file_content_id != want {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::DigestMismatch,
-                    format!(
-                        "chunk map binds content {}, the view named {}",
-                        hex32(&file_content_id),
-                        hex32(&want)
-                    ),
-                ));
-            }
+        if file_content_id != want {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!(
+                    "chunk map binds content {}, the view named {}",
+                    hex32(&file_content_id),
+                    hex32(&want)
+                ),
+            ));
         }
         let pages_root = parse_digest(v["pages_root"].as_str().unwrap_or(""))?;
         let map_id_want = parse_digest(v["map_id"].as_str().unwrap_or(""))?;
@@ -643,12 +648,39 @@ impl Mst2Client {
         map: &VerifiedChunkMap,
         page_index: u64,
     ) -> Result<ChunkLeaf, SnapshotError> {
+        let content_id = parse_digest(expected_digest)?;
+        let canonical = ChunkMap::new(content_id, map.file_size, map.pages_root)
+            .map_err(|error| frame_err("chunk-map descriptor", error))?;
+        if parse_digest(&map.file_content_id)? != content_id
+            || parse_digest(&map.map_id)? != canonical.map_id()
+            || map.chunk_count != canonical.chunk_count
+            || map.page_count != canonical.page_count
+        {
+            return Err(chunk_binding_error());
+        }
+        if page_index >= map.page_count {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                "chunk-map page index is outside the fixed map",
+            ));
+        }
         let url = self.snap_url(&format!(
             "/{sid}/chunk-map/pages?path={}&expected_digest={}&page={page_index}",
             urlencode(path),
             urlencode(expected_digest)
         ));
         let v: serde_json::Value = self.get_json(&url).await?;
+        let expect_count = ChunkLeaf::expected_count(map.chunk_count, page_index);
+        if v["snapshot_id"].as_str() != Some(sid)
+            || v["path"].as_str() != Some(path)
+            || v["map_id"].as_str() != Some(map.map_id.as_str())
+            || parse_count(v["page_count"].as_str().unwrap_or(""), "page_count")? != map.page_count
+            || parse_count(v["leaf"]["page_index"].as_str().unwrap_or(""), "page_index")?
+                != page_index
+            || parse_count(v["leaf"]["count"].as_str().unwrap_or(""), "leaf count")? != expect_count
+        {
+            return Err(chunk_binding_error());
+        }
         let leaf_bytes = b64_decode(v["leaf"]["data_base64"].as_str().unwrap_or(""))?;
         let leaf = ChunkLeaf::decode(&leaf_bytes).map_err(|e| frame_err("chunk-map leaf", e))?;
         if leaf.page_index != page_index {
@@ -657,7 +689,6 @@ impl Mst2Client {
                 "chunk leaf page_index mismatch",
             ));
         }
-        let expect_count = ChunkLeaf::expected_count(map.chunk_count, page_index);
         if leaf.chunk_sha256.len() as u64 != expect_count {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::DigestMismatch,
@@ -668,7 +699,8 @@ impl Mst2Client {
             ));
         }
         let mut proof = Vec::new();
-        for step in v["proof"].as_array().unwrap_or(&vec![]) {
+        let steps = v["proof"].as_array().ok_or_else(chunk_binding_error)?;
+        for step in steps {
             let digest = parse_digest(step["digest"].as_str().unwrap_or(""))?;
             let sibling_pages = parse_count(
                 step["sibling_pages"].as_str().unwrap_or(""),
@@ -997,9 +1029,26 @@ pub(crate) fn parse_count(s: &str, field: &str) -> Result<u64, SnapshotError> {
             format!("{field} must be a decimal string"),
         ));
     }
-    s.parse::<u64>().map_err(|_| {
-        SnapshotError::new(SnapshotErrorCode::ScopeInvalid, format!("{field} overflow"))
-    })
+    let value = s.parse::<u64>().map_err(|_| {
+        SnapshotError::new(
+            SnapshotErrorCode::LimitExceeded,
+            format!("{field} exceeds the protocol counter limit"),
+        )
+    })?;
+    if value > i64::MAX as u64 {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::LimitExceeded,
+            format!("{field} exceeds the protocol counter limit"),
+        ));
+    }
+    Ok(value)
+}
+
+fn chunk_binding_error() -> SnapshotError {
+    SnapshotError::new(
+        SnapshotErrorCode::IntegrityError,
+        "chunk-map response does not bind to the requested fixed snapshot, path and map",
+    )
 }
 
 pub fn hex32(b: &[u8; 32]) -> String {
