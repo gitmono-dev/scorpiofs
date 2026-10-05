@@ -13,8 +13,8 @@ use std::{
 
 use asyncfuse::raw::prelude::{Filesystem, Request};
 use axum::{
-    body::Bytes,
-    extract::{Query, State},
+    body::{Body, Bytes},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -199,7 +199,11 @@ async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
     }))
 }
 
-async fn metadata(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
+async fn metadata(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(snapshot_id): AxumPath<String>,
+    body: Bytes,
+) -> Response {
     let req: Value = serde_json::from_slice(&body).unwrap();
     let items = req["items"].as_array().unwrap();
     let mut pages = Vec::new();
@@ -260,7 +264,12 @@ async fn metadata(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
         }
         .encode(7, sequence),
     );
-    ([("content-type", "application/octet-stream")], wire).into_response()
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", snapshot_id)
+        .header("x-mega-request-digest", digest_of(&body))
+        .body(Body::from(wire))
+        .unwrap()
 }
 
 async fn blob(

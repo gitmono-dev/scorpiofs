@@ -425,6 +425,56 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    use super::*;
+
+    fn headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.mega.treeframe;version=2"),
+        );
+        headers.insert(
+            "x-mega-snapshot-id",
+            HeaderValue::from_static(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        );
+        headers.insert(
+            "x-mega-request-digest",
+            HeaderValue::from_static(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        );
+        headers
+    }
+
+    #[test]
+    fn treeframe_identity_headers_are_required_and_bound() {
+        let expected_snapshot =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let expected_digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        validate_treeframe_headers(&headers(), expected_snapshot, expected_digest).unwrap();
+
+        let mut missing = headers();
+        missing.remove("x-mega-request-digest");
+        assert!(validate_treeframe_headers(&missing, expected_snapshot, expected_digest).is_err());
+
+        let mut wrong = headers();
+        wrong.insert(
+            "x-mega-snapshot-id",
+            HeaderValue::from_static(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+        );
+        assert!(validate_treeframe_headers(&wrong, expected_snapshot, expected_digest).is_err());
+    }
+}
+
 #[allow(dead_code)]
 fn _statuscode_marker(_: StatusCode) {}
 
@@ -475,12 +525,22 @@ impl Mst2Client {
             .map_err(de_err)
     }
 
-    pub(crate) async fn post_octets(
+    /// POST a TreeFrame request and validate the protocol identity headers
+    /// before exposing any frame bytes to the decoder (MST/2 spec 06 §1).
+    /// The request digest covers the exact serialized bytes sent on the wire.
+    pub(crate) async fn post_treeframe(
         &self,
         url: impl AsRef<str>,
         body: Vec<u8>,
+        snapshot_id: &str,
     ) -> Result<Vec<u8>, SnapshotError> {
         let url = url.as_ref();
+        let expected_request_digest = {
+            use ring::digest::{Context, SHA256};
+            let mut cx = Context::new(&SHA256);
+            cx.update(&body);
+            format!("sha256:{}", hex_lower(cx.finish().as_ref()))
+        };
         let resp = ok_or_error(
             self.send_retrying(
                 self.http
@@ -491,6 +551,7 @@ impl Mst2Client {
             .await?,
         )
         .await?;
+        validate_treeframe_headers(resp.headers(), snapshot_id, &expected_request_digest)?;
         let bytes = resp.bytes().await.map_err(de_err)?;
         self.recv_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -523,4 +584,59 @@ impl Mst2Client {
             .to_string();
         Ok((len, etag, kind))
     }
+}
+
+fn validate_treeframe_headers(
+    headers: &reqwest::header::HeaderMap,
+    snapshot_id: &str,
+    expected_request_digest: &str,
+) -> Result<(), SnapshotError> {
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "TreeFrame response is missing Content-Type",
+            )
+        })?;
+    if !content_type.eq_ignore_ascii_case("application/vnd.mega.treeframe;version=2") {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("unexpected TreeFrame Content-Type: {content_type}"),
+        ));
+    }
+    let returned_snapshot = headers
+        .get("x-mega-snapshot-id")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "TreeFrame response is missing X-Mega-Snapshot-Id",
+            )
+        })?;
+    if returned_snapshot != snapshot_id {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!("TreeFrame response snapshot {returned_snapshot} does not match {snapshot_id}"),
+        ));
+    }
+    let returned_request_digest = headers
+        .get("x-mega-request-digest")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                "TreeFrame response is missing X-Mega-Request-Digest",
+            )
+        })?;
+    if returned_request_digest != expected_request_digest {
+        return Err(SnapshotError::new(
+            SnapshotErrorCode::DigestMismatch,
+            format!(
+                "TreeFrame request digest {returned_request_digest} does not match {expected_request_digest}"
+            ),
+        ));
+    }
+    Ok(())
 }

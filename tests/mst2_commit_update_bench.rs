@@ -21,7 +21,7 @@ use std::{
 };
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path as HttpPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -357,6 +357,20 @@ impl Fixture {
         });
         ([("content-type", "application/json")], bytes).into_response()
     }
+
+    fn treeframe_response(
+        &self,
+        snapshot_id: &str,
+        request_body: &[u8],
+        body: Vec<u8>,
+    ) -> Response {
+        Response::builder()
+            .header("content-type", "application/vnd.mega.treeframe;version=2")
+            .header("x-mega-snapshot-id", snapshot_id)
+            .header("x-mega-request-digest", digest_of(request_body))
+            .body(Body::from(body))
+            .unwrap()
+    }
 }
 
 async fn capabilities(State(f): State<Arc<Fixture>>) -> Response {
@@ -488,7 +502,7 @@ async fn metadata(
         response_pages: pages.iter().map(|(id, _)| *id).collect(),
         ..Event::default()
     });
-    ([("content-type", "application/octet-stream")], wire).into_response()
+    f.treeframe_response(&sid, &body, wire)
 }
 
 async fn objects(
@@ -539,7 +553,7 @@ async fn objects(
         content,
         ..Event::default()
     });
-    ([("content-type", "application/octet-stream")], wire).into_response()
+    f.treeframe_response(&sid, &body, wire)
 }
 
 async fn blob(
