@@ -89,6 +89,12 @@ impl FetchCoordinator {
         file: SnapshotFile,
         use_frames: bool,
     ) -> Result<Arc<Vec<u8>>, SnapshotError> {
+        // Every waiter owns its path contract. Content identity may merge
+        // network work only after this caller's canonical path and composed
+        // scope budget have been checked, including when a leader exists.
+        self.reader
+            .authorized_context()
+            .validate_relative_path(&file.rel_path)?;
         let key = format!("{}:{}", file.content_digest, file.size);
         let (tx, rx) = oneshot::channel();
         let leader = {

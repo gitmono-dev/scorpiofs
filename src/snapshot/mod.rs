@@ -6,6 +6,7 @@
 //! - [`durable::DurableStore`] hydrates a view into a local verified CAS with
 //!   resume, a completeness marker and a pin.
 
+pub mod auth;
 pub mod client;
 pub mod coordinator;
 pub mod durable;
@@ -17,6 +18,7 @@ pub mod range;
 pub mod reader;
 pub mod types;
 
+pub use auth::{AuthorizedSnapshotContext, CacheDomain};
 pub use client::Mst2Client;
 pub use coordinator::FetchCoordinator;
 pub use durable::{DurableStore, HydrateReport, ViewMeta};

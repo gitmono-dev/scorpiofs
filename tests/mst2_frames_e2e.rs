@@ -40,7 +40,7 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
         .await
         .expect("resolve");
     let sid = reader.snapshot_id().to_string();
-    let lease = reader.lease_id.clone();
+    let lease = reader.lease_id().to_string();
 
     // descriptor round-trip without touching latest
     let d = client.descriptor(&sid).await.expect("descriptor");

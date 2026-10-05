@@ -148,6 +148,22 @@ impl Drop for TransactionGuard {
 }
 
 impl DurableStore {
+    /// Check authority before the constructor can recover or alter a marker.
+    pub fn open_for_reader(
+        root: impl Into<PathBuf>,
+        content: impl Into<PathBuf>,
+        reader: &SnapshotReader,
+    ) -> Result<Self, SnapshotError> {
+        let root = root.into();
+        let content = content.into();
+        let context = reader.authorized_context();
+        context.bind_view_cache(&root)?;
+        context.bind_scope_cache(&content)?;
+        let store = Self::open_with_content(root, content)?;
+        store.bind_reader(reader)?;
+        Ok(store)
+    }
+
     /// Open (creating if needed) the store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
         let root = root.into();
@@ -194,6 +210,25 @@ impl DurableStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Establish the reader's immutable authority before accessing local data.
+    pub fn bind_reader(&self, reader: &SnapshotReader) -> Result<(), SnapshotError> {
+        let context = reader.authorized_context();
+        context.bind_view_cache(self.root())?;
+        context.bind_scope_cache(self.content_dir())?;
+        if let Some(view) = self.stored_view()? {
+            if view.snapshot_id != reader.snapshot_id()
+                || view.scope != reader.descriptor().scope
+                || view.namespace_view_id != reader.descriptor().namespace_view_id
+            {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::ScopeForbidden,
+                    "stored view differs from the reader's authorized snapshot",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Path of one CAS object. The digest is validated as `sha256:<64 hex>`
@@ -305,11 +340,12 @@ impl DurableStore {
     /// The manifest is walked in full first: an incomplete listing is an
     /// error, never a partial hydration presented as complete.
     pub async fn hydrate(&self, reader: &SnapshotReader) -> Result<HydrateReport, SnapshotError> {
+        self.bind_reader(reader)?;
         let view = ViewMeta {
             snapshot_id: reader.snapshot_id().to_string(),
-            namespace_view_id: reader.descriptor.namespace_view_id.clone(),
-            scope: reader.descriptor.scope.clone(),
-            lease_id: reader.lease_id.clone(),
+            namespace_view_id: reader.descriptor().namespace_view_id.clone(),
+            scope: reader.descriptor().scope.clone(),
+            lease_id: reader.lease_id().to_string(),
         };
         let manifest = reader.file_manifest().await?;
         self.hydrate_with(&view, &manifest, |f| {

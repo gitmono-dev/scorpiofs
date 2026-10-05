@@ -29,7 +29,7 @@ async fn resolve_walk_and_read_verified() {
         .await
         .expect("resolve");
     assert!(reader.snapshot_id().starts_with("sha256:"));
-    assert_eq!(reader.descriptor.scope, SCOPE);
+    assert_eq!(reader.descriptor().scope, SCOPE);
     let snapshot_id = reader.snapshot_id().to_string();
 
     // manifest walk
