@@ -22,6 +22,51 @@ const MAX_OBJECT_BATCH: usize = 128;
 const MAX_METADATA_BATCH: usize = 64;
 const MAX_OBJECT_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
+// Account for JSON escaping and the complete envelope before sending any batch.
+fn request_batches<'a, T>(
+    items: &'a [T],
+    encoding: Option<&str>,
+    item_value: impl Fn(&T) -> serde_json::Value,
+) -> Result<Vec<&'a [T]>, SnapshotError> {
+    let mut envelope = serde_json::json!({"items": []});
+    if let Some(encoding) = encoding {
+        envelope["encoding"] = encoding.into();
+    }
+    let overhead = serde_json::to_vec(&envelope).unwrap().len();
+    let limit = crate::snapshot::client::TREEFRAME_REQUEST_MAX_BYTES;
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = overhead;
+    for (index, item) in items.iter().enumerate() {
+        let item_bytes = serde_json::to_vec(&item_value(item)).unwrap().len();
+        if overhead + item_bytes > limit {
+            return Err(limit_err(
+                "one TreeFrame item exceeds the JSON request byte limit",
+            ));
+        }
+        let comma = usize::from(index > start);
+        if bytes + comma + item_bytes > limit {
+            batches.push(&items[start..index]);
+            start = index;
+            bytes = overhead;
+        }
+        bytes += usize::from(index > start) + item_bytes;
+    }
+    if start < items.len() {
+        batches.push(&items[start..]);
+    }
+    Ok(batches)
+}
+
+fn chunk_request_value(item: &ChunkRequest) -> serde_json::Value {
+    serde_json::json!({
+        "path": item.path,
+        "expected_digest": item.expected_digest,
+        "map_id": item.map_id,
+        "chunk_index": item.chunk_index.to_string(),
+    })
+}
+
 struct ResponseBudget {
     units: usize,
     raw_bytes: usize,
@@ -244,6 +289,28 @@ impl Mst2Client {
         if items.is_empty() || items.len() > MAX_METADATA_BATCH {
             return Err(limit_err("metadata batch must hold 1..64 items"));
         }
+        let batches = request_batches(items, encoding, |item| serde_json::to_value(item).unwrap())?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for batch in batches {
+            for page in self.metadata_pages_batch(sid, batch, encoding).await? {
+                if seen.insert(page.0) {
+                    out.push(page);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn metadata_pages_batch(
+        &self,
+        sid: &str,
+        items: &[MetadataPageItem],
+        encoding: Option<&str>,
+    ) -> Result<Vec<([u8; 32], Vec<u8>)>, SnapshotError> {
+        if items.is_empty() || items.len() > MAX_METADATA_BATCH {
+            return Err(limit_err("metadata batch must hold 1..64 items"));
+        }
         let mut max_units = 0usize;
         for item in items {
             if item.route.len() > mst2_codec::metapage::MAX_DEPTH {
@@ -365,6 +432,42 @@ impl Mst2Client {
     /// POST `/{sid}/objects` for a batch of small files. Returns
     /// `content_id -> bytes`; all requested digests must be present.
     pub async fn objects(
+        &self,
+        sid: &str,
+        items: &[(String, String)],
+        encoding: Option<&str>,
+    ) -> Result<HashMap<[u8; 32], Vec<u8>>, SnapshotError> {
+        if items.is_empty() || items.len() > MAX_OBJECT_BATCH {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                "objects batch must hold 1..128 items",
+            ));
+        }
+        let batches = request_batches(
+            items,
+            encoding,
+            |(path, digest)| serde_json::json!({"path": path, "expected_digest": digest}),
+        )?;
+        let mut out = HashMap::new();
+        let mut bytes = 0usize;
+        for batch in batches {
+            let objects = self.objects_batch(sid, batch, encoding).await?;
+            bytes += objects
+                .iter()
+                .filter(|(id, _)| !out.contains_key(*id))
+                .map(|(_, data)| data.len())
+                .sum::<usize>();
+            if bytes > MAX_OBJECT_BATCH_BYTES {
+                return Err(limit_err(
+                    "objects response exceeds the unique raw byte limit",
+                ));
+            }
+            out.extend(objects);
+        }
+        Ok(out)
+    }
+
+    async fn objects_batch(
         &self,
         sid: &str,
         items: &[(String, String)],
@@ -610,6 +713,45 @@ impl Mst2Client {
                 ));
             }
         }
+        let batches = request_batches(items, encoding, chunk_request_value)?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for batch in batches {
+            for chunk in self.chunks_batch(sid, batch, encoding).await? {
+                if seen.insert((chunk.map_id, chunk.chunk_index)) {
+                    out.push(chunk);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn chunks_batch(
+        &self,
+        sid: &str,
+        items: &[ChunkRequest],
+        encoding: Option<&str>,
+    ) -> Result<Vec<ChunkUnit>, SnapshotError> {
+        if items.is_empty() || items.len() > MAX_CHUNK_BATCH {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeInvalid,
+                "chunks batch must hold 1..128 items",
+            ));
+        }
+        let mut requested = HashMap::new();
+        for item in items {
+            let key = (parse_digest(&item.map_id)?, item.chunk_index);
+            let file_id = parse_digest(&item.expected_digest)?;
+            if requested
+                .insert(key, file_id)
+                .is_some_and(|previous| previous != file_id)
+            {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::ScopeInvalid,
+                    "a chunk unit cannot name different file content ids",
+                ));
+            }
+        }
         let budget = ResponseBudget::new(
             requested.len(),
             requested.len() * treeframe::CHUNK_MAX_LEN as usize,
@@ -618,12 +760,7 @@ impl Mst2Client {
         let mut req = serde_json::json!({
             "items": items
                 .iter()
-                .map(|i| serde_json::json!({
-                    "path": i.path,
-                    "expected_digest": i.expected_digest,
-                    "map_id": i.map_id,
-                    "chunk_index": i.chunk_index.to_string(),
-                }))
+                .map(chunk_request_value)
                 .collect::<Vec<_>>(),
         });
         if let Some(enc) = encoding {
