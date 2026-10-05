@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 if [ "$#" -ne 3 ]; then
     printf 'usage: %s <version> <release-base-url> <test-root>\n' "$0" >&2
     exit 2
@@ -151,7 +151,7 @@ systemctl() {
     esac
 }
 cat() {
-    local argument uid current
+    local argument="" uid current
     for argument; do :; done
     if [ "$argument" = /proc/self/mountinfo ]; then
         if [ "$(phase)" = stopped ]; then
@@ -311,7 +311,11 @@ assert_zero_mutations() {
     fi
 }
 # Exact release binary and the same 3-NUL layout consumed by the installer.
-invoke "$test_root" --overwrite-config >"$test_root/fresh.log" 2>&1
+invoke "$test_root" --overwrite-config >"$test_root/fresh.log" 2>&1 || {
+    status=$?
+    command cat "$test_root/fresh.log" >&2
+    exit "$status"
+}
 mock_service_active=1
 test -x "$test_root/prefix/bin/scorpio"
 test ! -e "$test_root/prefix/bin/antares"
