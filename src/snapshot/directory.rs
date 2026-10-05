@@ -58,9 +58,10 @@ pub(crate) fn validate_page(
             .range_start_exclusive
             .as_deref()
             .is_some_and(|name| !name_valid(name))
-        || page.next_cursor.as_deref().is_some_and(|next| {
-            next.is_empty() || next.len() > 8192 || Some(next) == cursor || page.entries.is_empty()
-        })
+        || page
+            .next_cursor
+            .as_deref()
+            .is_some_and(|next| next.is_empty() || Some(next) == cursor || page.entries.is_empty())
     {
         return Err(integrity());
     }

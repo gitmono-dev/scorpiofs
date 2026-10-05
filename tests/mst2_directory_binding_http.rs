@@ -43,6 +43,12 @@ struct Server {
 }
 impl Server {
     async fn start(pages: Vec<Value>) -> Self {
+        Self::start_checked(pages, None).await
+    }
+    async fn start_checked(
+        pages: Vec<Value>,
+        requests: Option<Vec<(String, u32, Option<String>)>>,
+    ) -> Self {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
         let app = Router::new()
@@ -57,8 +63,14 @@ impl Server {
                 "lease_id":"directory-test-lease","lease_expires_at":"2099-01-01T00:00:00Z",
                 "publication_sequence":"1","authorization_epoch":"1"
             })) }))
-            .route("/api/v2/snapshots/{sid}/directory", get(move || {
+            .route("/api/v2/snapshots/{sid}/directory", get(move |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
                 let index = observed.fetch_add(1, Ordering::SeqCst);
+                if let Some(requests) = &requests {
+                    let (path, limit, cursor) = &requests[index];
+                    assert_eq!(query.get("path"), Some(path));
+                    assert_eq!(query.get("limit"), Some(&limit.to_string()));
+                    assert_eq!(query.get("cursor"), cursor.as_ref());
+                }
                 let body = pages[index.min(pages.len()-1)].clone();
                 async move { Json(body) }
             }));
@@ -76,6 +88,63 @@ impl Server {
             .await
             .unwrap()
     }
+}
+
+// The backend cursor uses standard padded base64 over its JSON payload,
+// followed by a dot and a 64-hex authentication tag. Authentication belongs
+// to the server: this fixture accepts only its exact issued opaque token.
+fn standard_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::new();
+    for chunk in bytes.chunks(3) {
+        let word = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for (index, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            encoded.push(if index > chunk.len() {
+                '='
+            } else {
+                ALPHABET[((word >> shift) & 63) as usize] as char
+            });
+        }
+    }
+    encoded
+}
+
+#[tokio::test]
+async fn escaped_legal_paths_preserve_server_shaped_opaque_cursors_over_http() {
+    let dir = format!("/{}", vec!["\u{1}".repeat(255); 10].join("/"));
+    // These controls are valid UTF-8 basenames under the serving profile.
+    // JSON escaping expands the legal 2560-byte path before base64 encoding.
+    mst2_codec::descriptor::validate_scope(&format!("/project{dir}")).unwrap();
+    let payload = serde_json::to_vec(&json!({
+        "s": sid(), "p": format!("/project{dir}"), "l": 1, "a": "a",
+    }))
+    .unwrap();
+    let cursor = format!("{}.{}", standard_base64(&payload), hex::encode([0xa5; 32]));
+    let mut first = page(vec![file("a")], "2", None, Some(&cursor));
+    let mut second = page(vec![file("b")], "2", Some("a"), None);
+    first["path"] = json!(dir);
+    second["path"] = json!(dir);
+    let server = Server::start_checked(
+        vec![first, second],
+        Some(vec![(dir.clone(), 1, None), (dir.clone(), 1, Some(cursor))]),
+    )
+    .await;
+    let result = server.reader().await.directory_page(&dir, 1).await.unwrap();
+    assert_eq!(result.path, dir);
+    assert_eq!(
+        result
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(result.entry_count, "2");
+    assert!(result.next_cursor.is_none());
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(server.client.retry_count(), 0);
 }
 impl Drop for Server {
     fn drop(&mut self) {
