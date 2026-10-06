@@ -2210,34 +2210,41 @@ impl DurableStore {
         if let Some(closure) = closure {
             validate_snapshot_view(view, closure)
                 .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
-            self.verify_snapshot_links(closure)
+            super::stage::trace_sync("snapshot_links", || self.verify_snapshot_links(closure))
                 .map_err(|error| tag_hydration_error(error, HydrationSubstage::SnapshotLinks))?;
         }
         // Reuse is not a durability certificate. Sync every unique dependency
         // (including cache hits), then its directory, before metadata/pin.
-        for blob in &dependencies {
-            if !self
-                .verify_blob(
-                    &blob.digest,
-                    blob.size,
-                    CasVerificationReason::HydrationCommit,
-                )
-                .map_err(|error| tag_hydration_error(error, HydrationSubstage::DependencyAudit))?
-            {
-                return Err(tag_hydration_error(
-                    integrity_err(format!(
-                        "hydration dependency missing or corrupt: {}",
-                        blob.digest
-                    )),
-                    HydrationSubstage::DependencyAudit,
-                ));
+        super::stage::trace_sync("hydration_dependency_audit", || {
+            for blob in &dependencies {
+                if !self
+                    .verify_blob(
+                        &blob.digest,
+                        blob.size,
+                        CasVerificationReason::HydrationCommit,
+                    )
+                    .map_err(|error| {
+                        tag_hydration_error(error, HydrationSubstage::DependencyAudit)
+                    })?
+                {
+                    return Err(tag_hydration_error(
+                        integrity_err(format!(
+                            "hydration dependency missing or corrupt: {}",
+                            blob.digest
+                        )),
+                        HydrationSubstage::DependencyAudit,
+                    ));
+                }
+                let blob_path = self.blob_path(&blob.digest).map_err(|error| {
+                    tag_hydration_error(error, HydrationSubstage::DependencyAudit)
+                })?;
+                sync_file(&blob_path).map_err(|error| {
+                    tag_hydration_error(error, HydrationSubstage::DependencyAudit)
+                })?;
             }
-            let blob_path = self
-                .blob_path(&blob.digest)
-                .map_err(|error| tag_hydration_error(error, HydrationSubstage::DependencyAudit))?;
-            sync_file(&blob_path)
-                .map_err(|error| tag_hydration_error(error, HydrationSubstage::DependencyAudit))?;
-        }
+            Ok::<_, SnapshotError>(())
+        })
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::DependencyAudit))?;
         sync_dir(&self.content)
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         durability_checkpoint(&self.root, "content-durable")
