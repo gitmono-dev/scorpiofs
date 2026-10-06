@@ -171,7 +171,6 @@ if MOCK_STALE_MOUNT="${non_fuse_root}/data/store/workspaces-v3" MOCK_MOUNT_FSTYP
         --prefix "${non_fuse_root}/prefix" \
         --config-dir "${non_fuse_root}/etc" \
         --data-root "${non_fuse_root}/data" \
-        --workspace "${non_fuse_root}/data/store/workspaces-v3" \
         --store-path "${non_fuse_root}/data/store" \
         --http-addr 127.0.0.1:2925 >"${non_fuse_root}/install.log" 2>&1; then
     printf 'installer detached a non-FUSE mount\n' >&2
@@ -198,7 +197,6 @@ if MOCK_ACTIVE_MOUNT="${unmanaged_root}/data/store/workspaces-v3" \
         --prefix "${unmanaged_root}/prefix" \
         --config-dir "${unmanaged_root}/etc" \
         --data-root "${unmanaged_root}/data" \
-        --workspace "${unmanaged_root}/data/store/workspaces-v3" \
         --store-path "${unmanaged_root}/data/store" \
         --http-addr 127.0.0.1:2925 >"${unmanaged_root}/install.log" 2>&1; then
     printf 'installer accepted an unmanaged active FUSE mount\n' >&2
@@ -233,7 +231,6 @@ if [ "$service_user" != root ]; then
             --prefix "${inaccessible_root}/prefix" \
             --config-dir "${inaccessible_root}/etc" \
             --data-root "${inaccessible_root}/data" \
-            --workspace "${inaccessible_root}/data/store/workspaces-v3" \
             --store-path "${inaccessible_root}/data/store" \
             --http-addr 127.0.0.1:2925 \
             < "${repo_root}/install.sh" 2>&1)"; then
@@ -259,7 +256,6 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --prefix "${test_root}/prefix" \
     --config-dir "${test_root}/etc" \
     --data-root "${test_root}/data" \
-    --workspace "${test_root}/data/store/workspaces-v3" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925
 
@@ -306,7 +302,6 @@ if MOCK_HEALTH_FAIL=1 \
     --prefix "${test_root}/prefix" \
     --config-dir "${test_root}/etc" \
     --data-root "${test_root}/data" \
-    --workspace "${test_root}/data/store/workspaces-v3" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925 >"${test_root}/health-failure.log" 2>&1; then
     printf 'installer accepted a service that failed its health check\n' >&2
@@ -360,7 +355,6 @@ if MOCK_ACTIVE_MOUNT="${inactive_root}/data/store/workspaces-v3" \
         --prefix "${test_root}/prefix" \
         --config-dir "${test_root}/etc" \
         --data-root "${inactive_root}/data" \
-        --workspace "${inactive_root}/data/store/workspaces-v3" \
         --store-path "${inactive_root}/data/store" \
         --http-addr 127.0.0.1:2925 >"${inactive_root}/install.log" 2>&1; then
     printf 'installer accepted an active mount while the existing service was inactive\n' >&2
@@ -382,7 +376,6 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --prefix "${test_root}/prefix" \
     --config-dir "${test_root}/etc" \
     --data-root "${test_root}/data" \
-    --workspace "${test_root}/data/store/workspaces-v3" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925 >"${test_root}/mounted-dry-run.log"
 grep -Fq "[dry-run] fusermount3 -u -z ${test_root}/data/store/workspaces-v3" \
@@ -403,7 +396,6 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
     --prefix "${test_root}/prefix" \
     --config-dir "${test_root}/etc" \
     --data-root "${test_root}/data" \
-    --workspace "$new_workspace" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925
 grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
@@ -426,7 +418,6 @@ if [ "$service_user" != root ] && \
         --prefix "${protected_root}/prefix" \
         --config-dir "${protected_root}/etc" \
         --data-root "${protected_root}/data" \
-        --workspace "${protected_root}/data/store/workspaces-v3" \
         --store-path "${protected_root}/data/store" \
         --http-addr 127.0.0.1:2925
     chown root:root "${protected_root}/etc"
@@ -443,7 +434,6 @@ if [ "$service_user" != root ] && \
             --prefix "${protected_root}/prefix" \
             --config-dir "${protected_root}/etc" \
             --data-root "${protected_root}/data" \
-            --workspace "${protected_root}/data/store/workspaces-v3" \
             --store-path "${protected_root}/data/store" \
             --http-addr 127.0.0.1:2925)"
     grep -Fq "using runtime paths from retained ${protected_root}/etc/scorpio.toml" \
@@ -462,7 +452,6 @@ SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
     --prefix "${test_root}/prefix" \
     --config-dir "${test_root}/etc" \
     --data-root "${test_root}/data" \
-    --workspace "${test_root}/data/store/workspaces-v3" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925
 grep -Fxq 'stop scorpiofs.service' "$systemctl_log"
@@ -482,7 +471,6 @@ SUDO_USER=daemon bash "${repo_root}/install.sh" \
     --prefix "${test_root}/prefix" \
     --config-dir "${test_root}/etc" \
     --data-root "${test_root}/data" \
-    --workspace "${test_root}/data/store/workspaces-v3" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925
 test "$(stat -c '%U' "${test_root}/etc/scorpio.toml")" = nobody
@@ -500,7 +488,6 @@ if MOCK_NESTED_MOUNT="$nested_mount" bash "${repo_root}/install.sh" \
     --prefix "${test_root}/prefix" \
     --config-dir "${test_root}/etc" \
     --data-root "${test_root}/data" \
-    --workspace "${test_root}/data/store/workspaces-v3" \
     --store-path "${test_root}/data/store" \
     --http-addr 127.0.0.1:2925 >"${test_root}/nested-mount.log" 2>&1; then
     printf 'installer accepted a nested mount during ownership migration\n' >&2
@@ -522,7 +509,6 @@ if MOCK_NESTED_MOUNT="$runtime_mount" SCORPIO_SERVICE_USER=nobody \
         --prefix "${test_root}/prefix" \
         --config-dir "${test_root}/etc" \
         --data-root "${test_root}/data" \
-        --workspace "${test_root}/data/store/workspaces-v3" \
         --store-path "${test_root}/data/store" \
         --http-addr 127.0.0.1:2925 >"${test_root}/runtime-root-mount.log" 2>&1; then
     printf 'installer accepted a mount at a persistent runtime root\n' >&2
@@ -567,7 +553,6 @@ SCORPIO_SERVICE_USER=nobody bash "${repo_root}/install.sh" \
     --prefix "${nested_runtime_root}/prefix" \
     --config-dir "${nested_runtime_root}/etc" \
     --data-root "${nested_runtime_root}/data" \
-    --workspace "${nested_runtime_root}/data/store/workspaces-v3" \
     --store-path "${nested_runtime_root}/data/private/store" \
     --http-addr 127.0.0.1:2925
 test "$(stat -c '%U' "${nested_runtime_root}/data/private")" = nobody

@@ -2,7 +2,7 @@
 #
 # ScorpioFS interactive installer.
 #
-# With no arguments this script asks for the Mega/monorepo URLs, local paths,
+# With no arguments this script asks for the MST/2 v3 endpoint, local paths,
 # HTTP bind address, and whether to install a systemd service. It also keeps a
 # non-interactive mode for automation and the original release-install flags.
 #
@@ -26,7 +26,6 @@ CONFDIR="${SCORPIO_CONFDIR:-/etc/scorpiofs}"
 DATA_ROOT="${SCORPIO_DATA_ROOT:-/var/lib/scorpiofs}"
 MST2_BASE_URL="${SCORPIO_MST2_BASE_URL:-}"
 MST2_AUTH_TOKEN="${SCORPIO_MST2_AUTH_TOKEN:-}"
-WORKSPACE="${SCORPIO_WORKSPACE:-}"
 STORE_PATH="${SCORPIO_STORE_PATH:-}"
 HTTP_ADDR="${SCORPIO_HTTP_ADDR:-127.0.0.1:2725}"
 SERVICE_USER="${SCORPIO_SERVICE_USER:-scorpiofs}"
@@ -45,7 +44,6 @@ SERVICE_CHOICE_SET=0
 FUSE_CHOICE_SET=0
 CONFIG_CHOICE_SET=0
 DATA_ROOT_SET=0
-WORKSPACE_SET=0
 STORE_PATH_SET=0
 EXISTING_CONFIG=0
 RETAIN_CONFIG=0
@@ -58,13 +56,11 @@ ARTIFACT_BACKUP_READY=0
 HAD_OLD_SCORPIO=0
 HAD_OLD_CONFIG=0
 HAD_OLD_UNIT=0
-PREVIOUS_WORKSPACE=""
 PREVIOUS_DATA_ROOT=""
 PREVIOUS_STORE_PATH=""
 PREVIOUS_CACHE_ROOT=""
 PREVIOUS_RUNTIME_PARENT_DIRS=()
 EXTRACTED_RELEASE=""
-REQUESTED_WORKSPACE=""
 REQUESTED_STORE_PATH=""
 WORKDIR=""
 SUDO_BIN=""
@@ -75,7 +71,6 @@ BIND_HOST=""
 BIND_PORT=""
 
 [ -z "${SCORPIO_DATA_ROOT:-}" ] || DATA_ROOT_SET=1
-[ -z "${SCORPIO_WORKSPACE:-}" ] || WORKSPACE_SET=1
 [ -z "${SCORPIO_STORE_PATH:-}" ] || STORE_PATH_SET=1
 
 cleanup() {
@@ -123,7 +118,6 @@ Options:
   --data-root <dir>         Runtime/data root (default: /var/lib/scorpiofs).
   --mst2-base-url <url>     MST/2 v3 snapshot service URL.
   --mst2-auth-token <token> Optional MST/2 bearer token.
-  --workspace <dir>         FUSE workspace inside data-root.
   --store-path <dir>        Local cache/store inside data-root.
   --http-addr <socket>      IPv4:port or [IPv6]:port (default: 127.0.0.1:2725).
   --allow-public-api        Permit a non-loopback HTTP bind (use a firewall/auth proxy).
@@ -344,7 +338,6 @@ canonicalize_paths() {
     PREFIX="$(realpath -m -- "$PREFIX")"
     CONFDIR="$(realpath -m -- "$CONFDIR")"
     DATA_ROOT="$(realpath -m -- "$DATA_ROOT")"
-    WORKSPACE="$(realpath -m -- "$WORKSPACE")"
     STORE_PATH="$(realpath -m -- "$STORE_PATH")"
 }
 
@@ -385,7 +378,6 @@ require_path_in_data_root() {
 
 validate_data_paths() {
     validate_data_root
-    require_path_in_data_root workspace "$WORKSPACE"
     require_path_in_data_root store-path "$STORE_PATH"
     local runtime_file
     [ ! -L "$CONFDIR/scorpio.toml" ] || die "config file must not be a symbolic link: $CONFDIR/scorpio.toml"
@@ -395,20 +387,19 @@ validate_data_paths() {
 }
 
 canonicalize_runtime_paths() {
-    WORKSPACE="$(realpath -m -- "$WORKSPACE")"
     STORE_PATH="$(realpath -m -- "$STORE_PATH")"
     CACHE_ROOT="$(realpath -m -- "$CACHE_ROOT")"
 }
 
 validate_runtime_paths() {
     local field value i
-    local -a fields=(workspace store-path cache-root)
-    local -a values=("$WORKSPACE" "$STORE_PATH" "$CACHE_ROOT")
+    local -a fields=(store-path cache-root)
+    local -a values=("$STORE_PATH" "$CACHE_ROOT")
     for ((i = 0; i < ${#fields[@]}; i++)); do
         validate_path "${fields[$i]}" "${values[$i]}"
     done
     canonicalize_runtime_paths
-    values=("$WORKSPACE" "$STORE_PATH" "$CACHE_ROOT")
+    values=("$STORE_PATH" "$CACHE_ROOT")
     validate_data_root
     for ((i = 0; i < ${#fields[@]}; i++)); do
         field="${fields[$i]}"
@@ -419,13 +410,6 @@ validate_runtime_paths() {
     validate_runtime_path_separation
 }
 
-paths_overlap() {
-    local left="$1" right="$2"
-    case "$left" in "$right"|"$right"/*) return 0 ;; esac
-    case "$right" in "$left"|"$left"/*) return 0 ;; esac
-    return 1
-}
-
 path_is_at_or_below() {
     local path="$1" parent="$2"
     case "$path" in "$parent"|"$parent"/*) return 0 ;; esac
@@ -434,8 +418,8 @@ path_is_at_or_below() {
 
 validate_runtime_path_separation() {
     local managed_field managed_path installer_field installer_path i j
-    local -a managed_fields=(workspace store-path cache-root)
-    local -a managed_paths=("$WORKSPACE" "$STORE_PATH" "$CACHE_ROOT")
+    local -a managed_fields=(store-path cache-root)
+    local -a managed_paths=("$STORE_PATH" "$CACHE_ROOT")
     local -a installer_fields=(scorpio-binary main-config)
     local -a installer_paths=(
         "$(realpath -m -- "${PREFIX}/bin/scorpio")"
@@ -456,8 +440,8 @@ validate_runtime_path_separation() {
 
 normalize_runtime_paths() {
     local i
-    local -a fields=(workspace store-path cache-root)
-    local -a values=("$WORKSPACE" "$STORE_PATH" "$CACHE_ROOT")
+    local -a fields=(store-path cache-root)
+    local -a values=("$STORE_PATH" "$CACHE_ROOT")
     for ((i = 0; i < ${#fields[@]}; i++)); do
         validate_runtime_path_value "${fields[$i]}" "${values[$i]}"
     done
@@ -494,7 +478,7 @@ infer_data_root() {
     local root_label="${2:-data-root}"
     local value
     local -a anchors=()
-    for value in "$WORKSPACE" "$STORE_PATH" "$CACHE_ROOT"; do
+    for value in "$STORE_PATH" "$CACHE_ROOT"; do
         if [[ "$value" == /* ]]; then anchors+=("$(dirname -- "$value")"); fi
     done
     [ "${#anchors[@]}" -gt 0 ] || die "$failure_message"
@@ -511,7 +495,6 @@ retained_config_has_absolute_anchor() {
 }
 
 resolve_relative_runtime_paths() {
-    if [[ "$WORKSPACE" != /* ]]; then WORKSPACE="$DATA_ROOT/$WORKSPACE"; fi
     if [[ "$STORE_PATH" != /* ]]; then STORE_PATH="$DATA_ROOT/$STORE_PATH"; fi
     WORKSPACE="$STORE_PATH/workspaces-v3"
     CACHE_ROOT="$STORE_PATH/mst2-cache"
@@ -619,7 +602,6 @@ prepare_effective_runtime_paths() {
         fi
         resolve_relative_runtime_paths
         validate_runtime_paths
-        PREVIOUS_WORKSPACE="$WORKSPACE"
         PREVIOUS_DATA_ROOT="$(common_path_ancestor \
             "$(dirname -- "$WORKSPACE")" "$(dirname -- "$STORE_PATH")" \
             "$(dirname -- "$CACHE_ROOT")")"
@@ -731,7 +713,6 @@ parse_args() {
             --data-root) [ "$#" -ge 2 ] || die "--data-root needs a value"; DATA_ROOT="$2"; DATA_ROOT_SET=1; shift 2 ;;
             --mst2-base-url) [ "$#" -ge 2 ] || die "--mst2-base-url needs a value"; MST2_BASE_URL="$2"; shift 2 ;;
             --mst2-auth-token) [ "$#" -ge 2 ] || die "--mst2-auth-token needs a value"; MST2_AUTH_TOKEN="$2"; shift 2 ;;
-            --workspace) [ "$#" -ge 2 ] || die "--workspace needs a value"; WORKSPACE="$2"; WORKSPACE_SET=1; shift 2 ;;
             --store-path) [ "$#" -ge 2 ] || die "--store-path needs a value"; STORE_PATH="$2"; STORE_PATH_SET=1; shift 2 ;;
             --http-addr) [ "$#" -ge 2 ] || die "--http-addr needs a value"; HTTP_ADDR="$2"; shift 2 ;;
             --allow-public-api) ALLOW_PUBLIC_API=1; shift ;;
@@ -859,14 +840,11 @@ configure_interactively() {
     printf 'The remote HTTP API is unauthenticated and will default to loopback.\n\n'
     prompt_value MST2_BASE_URL "MST/2 v3 service URL" "${MST2_BASE_URL:-http://127.0.0.1:19700}"
     prompt_value MST2_AUTH_TOKEN "MST/2 bearer token (optional)" "${MST2_AUTH_TOKEN:-}"
-    local previous_data_root="$DATA_ROOT" workspace_default="${WORKSPACE:-$DATA_ROOT/mount}"
+    local previous_data_root="$DATA_ROOT"
     local store_default="${STORE_PATH:-$DATA_ROOT/store}"
     prompt_value DATA_ROOT "Data root" "$DATA_ROOT"
     [ "$DATA_ROOT" = "$previous_data_root" ] || DATA_ROOT_SET=1
-    workspace_default="${WORKSPACE:-$DATA_ROOT/mount}"
     store_default="${STORE_PATH:-$DATA_ROOT/store}"
-    prompt_value WORKSPACE "FUSE workspace" "$workspace_default"
-    [ "$WORKSPACE" = "$workspace_default" ] || WORKSPACE_SET=1
     prompt_value STORE_PATH "Local store/cache" "$store_default"
     [ "$STORE_PATH" = "$store_default" ] || STORE_PATH_SET=1
     prompt_value HTTP_ADDR "HTTP listen address" "$HTTP_ADDR"
@@ -940,34 +918,19 @@ validate_inputs() {
     PREFIX="$(normalize_path "$PREFIX")"
     CONFDIR="$(normalize_path "$CONFDIR")"
     DATA_ROOT="$(normalize_path "$DATA_ROOT")"
-    WORKSPACE="$(normalize_path "$WORKSPACE")"
     STORE_PATH="$(normalize_path "$STORE_PATH")"
     validate_url mst2-base-url "$MST2_BASE_URL"
     validate_url release-base-url "$RELEASE_BASE_URL"
     validate_path prefix "$PREFIX"
     validate_path config-dir "$CONFDIR"
     validate_path data-root "$DATA_ROOT"
-    validate_path workspace "$WORKSPACE"
     validate_path store-path "$STORE_PATH"
     canonicalize_paths
     canonicalize_runtime_paths
     validate_path prefix "$PREFIX"
     validate_path config-dir "$CONFDIR"
     validate_path data-root "$DATA_ROOT"
-    validate_path workspace "$WORKSPACE"
     validate_path store-path "$STORE_PATH"
-    if [ "$WORKSPACE_SET" -eq 1 ]; then
-        local requested_workspace
-        requested_workspace="$(realpath -m -- "$REQUESTED_WORKSPACE")"
-        validate_path workspace "$requested_workspace"
-        require_path_in_data_root workspace "$requested_workspace"
-        if paths_overlap "$requested_workspace" "$STORE_PATH"; then
-            die "workspace must not overlap store-path: $requested_workspace and $STORE_PATH"
-        fi
-        if path_is_at_or_below "$(realpath -m -- "${PREFIX}/bin/scorpio")" "$requested_workspace"; then
-            die "workspace must not contain scorpio-binary: $(realpath -m -- "${PREFIX}/bin/scorpio")"
-        fi
-    fi
     detect_existing_config
     validate_service_manager
     detect_existing_service_user
@@ -1528,7 +1491,6 @@ main() {
     configure_interactively
     if [ -z "$MST2_BASE_URL" ]; then MST2_BASE_URL="http://127.0.0.1:19700"; fi
     if [ -z "$STORE_PATH" ]; then STORE_PATH="$DATA_ROOT/store"; fi
-    REQUESTED_WORKSPACE="$WORKSPACE"
     REQUESTED_STORE_PATH="$STORE_PATH"
     set_generated_runtime_paths
     require_privileges

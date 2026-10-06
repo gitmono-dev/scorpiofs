@@ -17,7 +17,6 @@ common=(
     --prefix "$test_root/prefix"
     --config-dir "$test_root/etc"
     --data-root "$test_root/data"
-    --workspace "$test_root/data/mount"
     --store-path "$test_root/data/store"
     --http-addr 127.0.0.1:2725
 )
@@ -61,7 +60,6 @@ interactive_public=(
     --prefix "$test_root/interactive-prefix"
     --config-dir "$test_root/interactive-etc"
     --data-root "$test_root/interactive-data"
-    --workspace "$test_root/interactive-data/mount"
     --store-path "$test_root/interactive-data/store"
     --http-addr 192.168.1.10:2725
 )
@@ -80,21 +78,19 @@ expect_failure "unbracketed IPv6 bind" "IPv4:port or [IPv6]:port" "${common[@]}"
 expect_failure "unauthorized public bind" "without --allow-public-api" \
     "${common[@]}" --http-addr 192.168.1.10:2725
 expect_failure "filesystem root data path" "data-root is too broad" \
-    "${common[@]}" --data-root / --workspace /mount --store-path /store
+    "${common[@]}" --data-root / --store-path /store
 expect_failure "broad /var/lib data path" "data-root is too broad" \
-    "${common[@]}" --data-root /var/lib --workspace /var/lib/mount --store-path /var/lib/store
-expect_failure "workspace outside data root" "workspace must be inside data-root" \
-    "${common[@]}" --workspace /home
-expect_failure "workspace overlaps store" "workspace must not overlap store-path" \
-    "${common[@]}" --store-path "$test_root/data/mount"
-expect_failure "workspace contains installed binary" "workspace must not contain scorpio-binary" \
-    "${common[@]}" --prefix "$test_root/data/mount/tools"
+    "${common[@]}" --data-root /var/lib --store-path /var/lib/store
+expect_failure "store path outside data root" "store-path must be inside data-root" \
+    "${common[@]}" --store-path /home
+expect_failure "store path contains installed binary" "store-path must not contain scorpio-binary" \
+    "${common[@]}" --prefix "$test_root/data/store/tools"
 expect_failure "systemd path specifier" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio%Q" \
-    --workspace "$test_root/scorpio%Q/mount" --store-path "$test_root/scorpio%Q/store"
+    --store-path "$test_root/scorpio%Q/store"
 expect_failure "cleanup shell metacharacter" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio;false" \
-    --workspace "$test_root/scorpio;false/mount" --store-path "$test_root/scorpio;false/store"
+    --store-path "$test_root/scorpio;false/store"
 no_systemctl_bin="$test_root/no-systemctl-bin"
 mkdir -p "$no_systemctl_bin"
 for tool in curl tar realpath find findmnt; do
@@ -110,7 +106,6 @@ if output="$(PATH="$no_systemctl_bin" /bin/bash "$installer" \
     --prefix "$test_root/service-prefix" \
     --config-dir "$test_root/service-etc" \
     --data-root "$test_root/service-data" \
-    --workspace "$test_root/service-data/mount" \
     --store-path "$test_root/service-data/store" \
     --http-addr 127.0.0.1:2725 2>&1)"; then
     printf 'expected failure without systemctl\n' >&2
@@ -132,13 +127,13 @@ expect_failure "retained dry-run without target release" \
 ln -s / "$test_root/root-link"
 expect_failure "symlinked ancestor to broad root" "data-root is too broad" \
     "${common[@]}" --data-root "$test_root/root-link/home" \
-    --workspace "$test_root/root-link/home/mount" --store-path "$test_root/root-link/home/store"
+    --store-path "$test_root/root-link/home/store"
 
 mkdir -p "$test_root/existing-data"
 : >"$test_root/existing-data/unrelated-file"
 expect_failure "nonempty unowned data root" "refusing to change ownership of a nonempty data-root" \
     "${common[@]}" --data-root "$test_root/existing-data" \
-    --workspace "$test_root/existing-data/mount" --store-path "$test_root/existing-data/store"
+    --store-path "$test_root/existing-data/store"
 
 if command -v setsid >/dev/null 2>&1; then
     if output="$(setsid bash "$installer" --version v0.0.0-test --dry-run </dev/null 2>&1)"; then
