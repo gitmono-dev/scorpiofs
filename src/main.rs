@@ -12,14 +12,6 @@ struct Cli {
     #[arg(short, long, default_value = "scorpio.toml", global = true)]
     config_path: String,
 
-    /// MST/2 snapshot service base URL. Overrides SCORPIO_MST2_BASE_URL and config.
-    #[arg(long, global = true)]
-    mst2_base_url: Option<String>,
-
-    /// Persistent store root. Workspace and cache roots derive from this path.
-    #[arg(long, global = true)]
-    store_path: Option<String>,
-
     /// HTTP bind address for the v3 workspace daemon.
     #[arg(long, default_value = "0.0.0.0:2725", global = true)]
     http_addr: SocketAddr,
@@ -28,6 +20,14 @@ struct Cli {
     /// SCORPIO_LOG, RUST_LOG, and the config `log_level`.
     #[arg(long, global = true)]
     log_level: Option<String>,
+
+    /// Override the MST/2 service URL for this invocation.
+    #[arg(long, global = true)]
+    mst2_base_url: Option<String>,
+
+    /// Override the v3 workspace store path for this invocation.
+    #[arg(long, global = true)]
+    store_path: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -158,13 +158,11 @@ async fn main() {
         cli => cli,
     };
     let mut overrides = HashMap::new();
-    for (key, value) in [
-        ("mst2_base_url", &cli.mst2_base_url),
-        ("store_path", &cli.store_path),
-    ] {
-        if let Some(value) = value {
-            overrides.insert(key.into(), value.clone());
-        }
+    if let Some(value) = &cli.mst2_base_url {
+        overrides.insert("mst2_base_url".to_owned(), value.clone());
+    }
+    if let Some(value) = &cli.store_path {
+        overrides.insert("store_path".to_owned(), value.clone());
     }
     if let Some(value) = &cli.log_level {
         // Resolve the CLI value before parsing the persisted file so a stale

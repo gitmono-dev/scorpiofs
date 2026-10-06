@@ -68,14 +68,19 @@ jobs:
           mkdir -p "${asset_root}/${version}/${dist}"
           cp target/release/scorpio "${asset_root}/${version}/${dist}/"
           tar -C "${asset_root}/${version}" -czf "${asset_root}/${version}/${dist}.tar.gz" "${dist}"
-          (cd "${asset_root}/${version}" && sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256")
+          (
+            cd "${asset_root}/${version}"
+            sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256"
+          )
 
           python3 -m http.server 18080 --bind 127.0.0.1 --directory "${asset_root}" \
             >"${RUNNER_TEMP}/scorpiofs-installer-http.log" 2>&1 &
           server_pid=$!
           trap 'kill "${server_pid}" 2>/dev/null || true' EXIT
           for _ in {1..20}; do
-            curl -fsS "http://127.0.0.1:18080/${version}/${dist}.tar.gz.sha256" >/dev/null && break
+            if curl -fsS "http://127.0.0.1:18080/${version}/${dist}.tar.gz.sha256" >/dev/null; then
+              break
+            fi
             sleep 0.25
           done
 
@@ -120,5 +125,6 @@ jobs:
           grep -F 'mst2_base_url must start with http:// or https://' "${RUNNER_TEMP}/invalid-url.log"
 
           sudo bash script/test_installer_systemd.sh \
-            "${version}" http://127.0.0.1:18080 \
+            "${version}" \
+            http://127.0.0.1:18080 \
             "/tmp/scorpiofs-systemd-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
