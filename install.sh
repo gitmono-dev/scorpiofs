@@ -999,6 +999,11 @@ prepare_release_archive() {
     EXTRACTED_RELEASE="$extracted"
 }
 
+ensure_workdir() {
+    [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ] && return 0
+    WORKDIR="$(mktemp -d)" || die "could not create installer working directory"
+}
+
 install_release_binaries() {
     if [ "$DRY_RUN" -eq 1 ]; then
         return 0
@@ -1659,6 +1664,9 @@ main() {
     check_runtime_tools
     check_fuse
     prepare_release_binaries
+    # A dry-run without a retained config skips archive preparation, but the
+    # ownership audit still needs a private workspace for its evidence files.
+    ensure_workdir
     capture_managed_runtime_mounts
     ensure_service_account
     validate_service_config_traversal
