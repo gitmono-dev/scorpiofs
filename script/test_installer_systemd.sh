@@ -122,6 +122,6 @@ if bash "${repo_root}/install.sh" \
     printf 'installer accepted a non-HTTP MST/2 URL\n' >&2
     exit 1
 fi
-grep -Fq 'mst2-base-url must use HTTP(S)' "${test_root}/invalid.log"
+grep -Fq 'mst2_base_url must start with http:// or https://' "${test_root}/invalid.log"
 
 printf 'v3 installer systemd tests passed\n'
