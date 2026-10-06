@@ -8,8 +8,9 @@
 //!
 //! Every request is idempotent, so transport-level failures are retried
 //! with jittered backoff (spec 04 §10). Only connection/timeout errors and
-//! retryable statuses (429/5xx) are re-attempted; a typed server error is
-//! definitive and returned as-is.
+//! typed server errors whose canonical envelope says `retryable: true` are
+//! re-attempted. Deterministic projection/integrity failures finish one
+//! request and are surfaced without multiplying commit-update latency.
 
 use std::{
     collections::HashSet,
@@ -497,10 +498,32 @@ impl Mst2Client {
                 super::resolve_receipt::validate_echo(response.headers(), id)?;
             }
             match response {
-                Ok(resp) if attempt < MAX_ATTEMPTS && retryable_status(resp.status()) => {
-                    tokio::time::timeout_at(deadline, sleep_backoff(attempt))
+                Ok(resp) if !resp.status().is_success() => {
+                    // A canonical error owns its retry classification. Read
+                    // the bounded body once so deterministic projection or
+                    // integrity failures do not spend the full retry budget.
+                    // Legacy or malformed envelopes have no retry authority;
+                    // fail closed instead of repeating a deterministic 5xx.
+                    let status = resp.status();
+                    let bytes = read_json_bytes(resp, self.response_byte_limit())
                         .await
-                        .map_err(|_| request_deadline())?;
+                        .map_err(|mut error| {
+                            error.http_status = status.as_u16();
+                            error
+                        })?;
+                    let retryable = super::error_wire::CanonicalSnapshotError::parse_response(
+                        &bytes,
+                        status.as_u16(),
+                    )
+                    .map(|error| error.retryable)
+                    .unwrap_or(false);
+                    if attempt < MAX_ATTEMPTS && retryable {
+                        tokio::time::timeout_at(deadline, sleep_backoff(attempt))
+                            .await
+                            .map_err(|_| request_deadline())?;
+                    } else {
+                        return Err(self.response_error(&bytes, status));
+                    }
                 }
                 Ok(resp) => return Ok(resp),
                 Err(e) if attempt < MAX_ATTEMPTS && retryable_transport(&e) => {
@@ -924,12 +947,6 @@ impl<'de> Deserialize<'de> for UniqueJson {
     }
 }
 
-/// Statuses worth another attempt: throttling and transient server faults.
-/// A 4xx typed error is definitive and never retried.
-fn retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
-}
-
 /// Transport failures that a retry can plausibly fix. A malformed-URL or
 /// body-encoding error is not retryable.
 fn retryable_transport(e: &reqwest::Error) -> bool {
@@ -990,6 +1007,111 @@ fn urlencode(s: &str) -> String {
 
 #[allow(dead_code)]
 fn _statuscode_marker(_: StatusCode) {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::get,
+        Json, Router,
+    };
+
+    use super::Mst2Client;
+
+    async fn server(
+        requests: Arc<AtomicUsize>,
+        response: impl Fn(usize) -> Response + Send + Sync + 'static,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let response = Arc::new(response);
+        let app = Router::new().route(
+            "/probe",
+            get({
+                let requests = Arc::clone(&requests);
+                move || {
+                    let requests = Arc::clone(&requests);
+                    let response = Arc::clone(&response);
+                    async move {
+                        let number = requests.fetch_add(1, Ordering::SeqCst) + 1;
+                        response(number)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn canonical_non_retryable_integrity_error_is_not_retried() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base, task) = server(Arc::clone(&requests), |_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "INTEGRITY_ERROR",
+                        "message": "projection digest mismatch",
+                        "request_id": "test-request",
+                        "retryable": false
+                    }
+                })),
+            )
+                .into_response()
+        })
+        .await;
+        let client = Mst2Client::new(base.clone());
+        let request = client.http.get(format!("{base}/probe"));
+        let error = client.send_retrying(request).await.unwrap_err();
+        assert_eq!(error.code, super::SnapshotErrorCode::IntegrityError);
+        assert_eq!(error.http_status, 502);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(client.retry_count(), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn canonical_retryable_unavailable_error_retries() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base, task) = server(Arc::clone(&requests), |number| {
+            if number == 1 {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "SNAPSHOT_NOT_READY",
+                            "message": "publication still being indexed",
+                            "request_id": "test-request",
+                            "retryable": true
+                        }
+                    })),
+                )
+                    .into_response()
+            } else {
+                StatusCode::NO_CONTENT.into_response()
+            }
+        })
+        .await;
+        let client = Mst2Client::new(base.clone());
+        let request = client.http.get(format!("{base}/probe"));
+        let response = client.send_retrying(request).await.expect("retry succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(client.retry_count(), 1);
+        task.abort();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Generic verbs for the frame/navigation module (frames.rs). Kept here so the
