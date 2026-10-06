@@ -90,10 +90,13 @@ struct State {
 
 fn owned_cache(
     reader: Option<&SnapshotReader>,
-    store: Option<&Arc<DurableStore>>,
+    _store: Option<&Arc<DurableStore>>,
 ) -> std::result::Result<Option<OwnedFuseCache>, crate::snapshot::SnapshotError> {
     reader
-        .filter(|reader| store.is_none() && reader.capabilities().features.metadata_pages)
+        // The owned range path also covers a live CAS miss. Keeping it
+        // enabled for store-backed mounts avoids falling back to the legacy
+        // Vec/cache reader when a large object has not been hydrated yet.
+        .filter(|reader| reader.capabilities().features.metadata_pages)
         .map(OwnedFuseCache::new)
         .transpose()
 }
@@ -763,7 +766,7 @@ impl Mst2Fuse {
     fn owned_reader(&self) -> Option<&SnapshotReader> {
         self.reader
             .as_ref()
-            .filter(|reader| self.store.is_none() && reader.capabilities().features.metadata_pages)
+            .filter(|reader| reader.capabilities().features.metadata_pages)
     }
 
     async fn proven_node(
