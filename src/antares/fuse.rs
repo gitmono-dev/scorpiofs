@@ -7,7 +7,10 @@ use libfuse_fs::{
     util::whiteout::WhiteoutFormat,
 };
 
-use crate::{server::mount_filesystem_with_antares_cache, util::fuse_platform};
+use crate::{
+    server::mount_filesystem_with_antares_cache,
+    util::{fenced_fs::FencedFilesystem, fuse_platform, mutation_fence::MutationFence},
+};
 
 /// Antares records deletions with the OCI whiteout form (`.wh.<name>`) instead of the
 /// Linux kernel-overlayfs character-device form.
@@ -80,6 +83,44 @@ async fn new_antares_passthrough_layer(
     #[cfg(target_os = "linux")]
     fs.import().await?;
     Ok(fs)
+}
+
+async fn compose_overlay(
+    mountpoint: &std::path::Path,
+    upper_dir: &std::path::Path,
+    cl_dir: &Option<PathBuf>,
+    frozen_dirs: &[PathBuf],
+    base_layer: Arc<dyn Layer>,
+) -> std::io::Result<OverlayFs> {
+    // Build lower layers, nearest first:
+    // - Optional CL dir sits above everything to override base files for the CL view.
+    // - Sealed chain layers follow, most recent first (they shadow what is below).
+    // - The selected fixed base remains below every local delta.
+    let mut lower_layers: Vec<Arc<dyn Layer>> = Vec::new();
+
+    if let Some(cl_dir) = cl_dir {
+        let cl_layer = new_antares_passthrough_layer(cl_dir).await?;
+        lower_layers.push(Arc::new(cl_layer) as Arc<dyn Layer>);
+    }
+
+    // Sealed chain layers, nearest first — each shadows the layers below it.
+    for frozen in frozen_dirs {
+        let frozen_layer = new_antares_passthrough_layer(frozen).await?;
+        lower_layers.push(Arc::new(frozen_layer) as Arc<dyn Layer>);
+    }
+
+    lower_layers.push(base_layer);
+
+    // Upper layer mirrors upper_dir to keep writes separated from lower layers.
+    let upper_layer: Arc<dyn Layer> = Arc::new(new_antares_passthrough_layer(upper_dir).await?);
+
+    let cfg = Config {
+        mountpoint: mountpoint.to_path_buf(),
+        do_import: true,
+        ..Default::default()
+    };
+
+    OverlayFs::new(Some(upper_layer), lower_layers, cfg, 1)
 }
 
 /// Antares union-fs wrapper: dicfuse lower + passthrough upper/CL.
@@ -157,45 +198,16 @@ impl AntaresFuse {
 
     /// Compose the union filesystem instance.
     pub async fn build_overlay(&self) -> std::io::Result<OverlayFs> {
-        // Build lower layers, nearest first:
-        // - Optional CL dir sits above everything to override base files for the CL view.
-        // - Sealed chain layers follow, most recent first (they shadow what is below).
-        // - Dicfuse remains the base read-only monorepo projection.
-        let mut lower_layers: Vec<Arc<dyn Layer>> = Vec::new();
-
-        if let Some(cl_dir) = &self.cl_dir {
-            let cl_layer = new_antares_passthrough_layer(cl_dir).await?;
-            lower_layers.push(Arc::new(cl_layer) as Arc<dyn Layer>);
-        }
-
-        // Sealed chain layers, nearest first — each shadows the layers below it.
-        for frozen in &self.frozen_dirs {
-            let frozen_layer = new_antares_passthrough_layer(frozen).await?;
-            lower_layers.push(Arc::new(frozen_layer) as Arc<dyn Layer>);
-        }
-
-        // Base projection: an explicit override (MST/2 snapshot view) takes the
-        // Dicfuse slot when present (spec 12 §1).
-        match &self.lower_override {
-            Some(lower) => lower_layers.push(lower.clone()),
-            None => lower_layers.push(self.dic.clone() as Arc<dyn Layer>),
-        }
-
-        // Upper layer mirrors upper_dir to keep writes separated from lower layers.
-        let upper_layer: Arc<dyn Layer> =
-            Arc::new(new_antares_passthrough_layer(&self.upper_dir).await?);
-
-        // passthrough Upper  - readwrite file system over upper dir
-        // passthrough CL  - readwrite file system over upper dir
-        // dicfuse  - readonly file and dictionary from mega
-
-        let cfg = Config {
-            mountpoint: self.mountpoint.clone(),
-            do_import: true,
-            ..Default::default()
-        };
-
-        OverlayFs::new(Some(upper_layer), lower_layers, cfg, 1)
+        compose_overlay(
+            &self.mountpoint,
+            &self.upper_dir,
+            &self.cl_dir,
+            &self.frozen_dirs,
+            self.lower_override
+                .clone()
+                .unwrap_or_else(|| self.dic.clone() as Arc<dyn Layer>),
+        )
+        .await
     }
 
     /// Mount the composed unionfs into the provided mountpoint, spawning a background task to run the FUSE session.
@@ -284,6 +296,223 @@ impl AntaresFuse {
                 );
                 fuse_platform::unmount_path(&mount_path, true).await
             }
+        }
+    }
+}
+
+/// Compose a fixed lower layer with a private passthrough upper.
+pub struct FixedLayerFuse {
+    pub mountpoint: PathBuf,
+    pub upper_dir: PathBuf,
+    base_layer: Arc<dyn Layer>,
+    pub cl_dir: Option<PathBuf>,
+    /// Sealed read-only delta layers from `chain` forks, **nearest first** (they
+    /// shadow the Dicfuse projection below them). Plain host directories: they are
+    /// part of the overlay lookup order but are never mounted themselves, so no
+    /// unmount-ordering constraint applies.
+    pub frozen_dirs: Vec<PathBuf>,
+    /// Live FUSE session. Drop / [`MountHandle::unmount`] tears the mount down.
+    mount_handle: Option<MountHandle>,
+    /// The native session and lifecycle owner use the same operation fence.
+    overlay: Option<FencedFilesystem<OverlayFs>>,
+    /// A failed helper fallback still needs an explicit unmount retry even
+    /// after the native session handle has been consumed.
+    unmount_failed: bool,
+}
+impl FixedLayerFuse {
+    /// Build directories for upper / optional CL layers.
+    pub async fn new(
+        mountpoint: PathBuf,
+        base_layer: Arc<dyn Layer>,
+        upper_dir: PathBuf,
+        cl_dir: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        if let Some(cl) = &cl_dir {
+            std::fs::create_dir_all(cl)?;
+        }
+        std::fs::create_dir_all(&upper_dir)?;
+        std::fs::create_dir_all(&mountpoint)?;
+        // The passthrough write path executes with the *requesting* user's
+        // credentials (setfsuid per FUSE request), so the rw upper layer must be
+        // owned by that user. Under `sudo` the daemon creates it as root instead,
+        // which makes every user write fail with EACCES.
+        chown_to_invoking_user(&upper_dir);
+
+        Ok(Self {
+            mountpoint,
+            upper_dir,
+            base_layer,
+            cl_dir,
+            frozen_dirs: Vec::new(),
+            mount_handle: None,
+            overlay: None,
+            unmount_failed: false,
+        })
+    }
+
+    /// Keep the same fixed base when rebuilding only the writable layers.
+    pub fn base_layer(&self) -> Arc<dyn Layer> {
+        self.base_layer.clone()
+    }
+
+    pub fn mutation_fence(&self) -> Option<&MutationFence> {
+        self.overlay.as_ref().map(FencedFilesystem::fence)
+    }
+
+    /// Attach sealed chain layers (chain forks). Each path must be an existing
+    /// directory — sealed layers are renamed-in formers uppers, never created
+    /// fresh; creating one accidentally would silently serve a wrong projection.
+    /// Order: nearest first (they shadow the layers below them).
+    pub fn with_frozen_layers(mut self, frozen_dirs: Vec<PathBuf>) -> std::io::Result<Self> {
+        for frozen in &frozen_dirs {
+            if !frozen.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("sealed layer {} does not exist", frozen.display()),
+                ));
+            }
+        }
+        self.frozen_dirs = frozen_dirs;
+        Ok(self)
+    }
+
+    /// Compose the union filesystem instance.
+    pub async fn build_overlay(&self) -> std::io::Result<OverlayFs> {
+        compose_overlay(
+            &self.mountpoint,
+            &self.upper_dir,
+            &self.cl_dir,
+            &self.frozen_dirs,
+            self.base_layer.clone(),
+        )
+        .await
+    }
+
+    /// Mount the composed unionfs into the provided mountpoint, spawning a background task to run the FUSE session.
+    pub async fn mount(&mut self) -> std::io::Result<()> {
+        if self.mount_handle.is_some() {
+            return Ok(());
+        }
+        if self.unmount_failed {
+            self.unmount().await?;
+        }
+
+        // Ensure mountpoint exists *before* mounting. This is a plain filesystem check.
+        // Do not probe it *after* mounting, because that may trigger FUSE getattr and can fail
+        // transiently while Dicfuse is still loading.
+        std::fs::metadata(&self.mountpoint)?;
+
+        let overlay = FencedFilesystem::new(self.build_overlay().await?);
+        self.overlay = Some(overlay.clone());
+        let logfs = LoggingFileSystem::new(overlay);
+        // Keep Antares mounts on the safer non-writeback path for now.
+        // With writeback cache enabled, reopening an existing file in append mode
+        // can fail inside libfuse-fs passthrough I/O with EBADF.
+        let handle =
+            mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), false).await?;
+
+        // Keep the handle so unmount can call MountHandle::unmount() (macOS
+        // uses nix::mount::unmount; Linux uses fusermount3). Spawning a task
+        // that owns the handle would force a fusermount fallback.
+        self.mount_handle = Some(handle);
+        self.unmount_failed = false;
+
+        // Readiness probe: wait until the FUSE mount is actually servicing requests.
+        // Without this, callers (e.g., Buck2) that immediately stat() the mountpoint
+        // may race against the kernel FUSE_INIT handshake and get ENOTCONN (errno 107).
+        let mp = self.mountpoint.clone();
+        let probe_timeout = std::time::Duration::from_secs(10);
+        let probe_interval = std::time::Duration::from_millis(50);
+        let probe_start = std::time::Instant::now();
+        loop {
+            match tokio::fs::metadata(&mp).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "FUSE mount ready at {} (probe took {:.2}s)",
+                        mp.display(),
+                        probe_start.elapsed().as_secs_f64()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    if probe_start.elapsed() >= probe_timeout {
+                        tracing::warn!(
+                            "FUSE mount probe timed out for {} after {:.1}s: {}",
+                            mp.display(),
+                            probe_timeout.as_secs_f64(),
+                            e
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(probe_interval).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Unmount the FUSE session if mounted.
+    ///
+    /// Prefers [`MountHandle::unmount`] (asyncfuse native path). Falls back to
+    /// the platform helper (`fusermount3` on Linux, `umount` on macOS).
+    pub async fn unmount(&mut self) -> std::io::Result<()> {
+        // Do not consume the native handle while a write or orphan-handle
+        // cleanup is still running, or when its outcome is unknown.
+        if let Some(fence) = self.mutation_fence() {
+            fence.seal().await?;
+        }
+        let Some(handle) = self.mount_handle.take() else {
+            if self.unmount_failed {
+                let result = fuse_platform::unmount_path(&self.mountpoint, true).await;
+                let result = match result {
+                    Ok(()) => self.drain_mutations().await,
+                    Err(error) => Err(error),
+                };
+                self.unmount_failed = result.is_err();
+                return result;
+            }
+            return Ok(());
+        };
+        let mount_path = self.mountpoint.clone();
+        // Cancellation after consuming the native handle must also require
+        // an explicit retry, rather than treating None as successful cleanup.
+        self.unmount_failed = true;
+        let result =
+            match tokio::time::timeout(tokio::time::Duration::from_millis(1200), handle.unmount())
+                .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        path = %mount_path.display(),
+                        error = %e,
+                        "MountHandle::unmount failed; falling back to platform unmount"
+                    );
+                    fuse_platform::unmount_path(&mount_path, true).await
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        path = %mount_path.display(),
+                        "MountHandle::unmount timed out; falling back to platform unmount"
+                    );
+                    fuse_platform::unmount_path(&mount_path, true).await
+                }
+            };
+        let result = match result {
+            Ok(()) => self.drain_mutations().await,
+            Err(error) => Err(error),
+        };
+        self.unmount_failed = result.is_err();
+        result
+    }
+
+    /// Native teardown can process additional handle retirement. Re-audit
+    /// it before reporting success; keep the same owner on failure/cancel.
+    async fn drain_mutations(&self) -> std::io::Result<()> {
+        match self.mutation_fence() {
+            Some(fence) => fence.seal().await,
+            None => Ok(()),
         }
     }
 }

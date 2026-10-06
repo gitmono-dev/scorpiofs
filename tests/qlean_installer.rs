@@ -62,6 +62,17 @@ fn stage_fixture() -> Result<tempfile::TempDir> {
             .with_context(|| format!("could not stage release binary {binary}"))?;
     }
 
+    // The workflow obtains this exact artifact path from Cargo's compiler
+    // output. Do not select a possibly stale test executable by globbing.
+    let launcher_tests = std::env::var_os("SCORPIO_LAUNCHER_TEST_EXE")
+        .map(PathBuf::from)
+        .context("build mst2_workspace_launcher_http and set SCORPIO_LAUNCHER_TEST_EXE")?;
+    fs::copy(
+        &launcher_tests,
+        staging.path().join("workspace-launcher-tests"),
+    )
+    .context("could not stage the exact workspace launcher test executable")?;
+
     Ok(staging)
 }
 
@@ -114,7 +125,7 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
             run_checked(
                 vm,
                 &format!(
-                    "chmod 0755 {root}/install.sh {root}/script/test_installer.sh {root}/script/test_installer_systemd.sh {root}/scorpio {root}/antares"
+                    "chmod 0755 {root}/install.sh {root}/script/test_installer.sh {root}/script/test_installer_systemd.sh {root}/scorpio {root}/antares {root}/workspace-launcher-tests"
                 ),
             )
             .await?;
@@ -142,7 +153,7 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
             run_checked(
                 vm,
                 &format!(
-                    "set -euo pipefail; root={root}; runtime=$root/real-fuse-runtime; mountpoint=$runtime/mount; mkdir -p $runtime/store $mountpoint; test -c /dev/fuse || modprobe fuse; test -c /dev/fuse || {{ echo '/dev/fuse is unavailable after loading the guest fuse module' >&2; exit 1; }}; printf '%s\\n' 'base_url = \"http://127.0.0.1:9\"' 'lfs_url = \"http://127.0.0.1:9/lfs\"' \"workspace = \\\"$mountpoint\\\"\" \"store_path = \\\"$runtime/store\\\"\" \"config_file = \\\"$runtime/state.toml\\\"\" 'git_author = \"Qlean\"' 'git_email = \"qlean@example.invalid\"' >$runtime/scorpio.toml; printf '%s\\n' 'works = []' >$runtime/state.toml; server_log=$runtime/scorpio.log; $root/scorpio --config-path $runtime/scorpio.toml --http-addr 127.0.0.1:2726 serve >$server_log 2>&1 & server_pid=$!; cleanup() {{ if findmnt --mountpoint $mountpoint --noheadings >/dev/null 2>&1; then fusermount3 -u -z $mountpoint || true; fi; kill $server_pid 2>/dev/null || true; wait $server_pid 2>/dev/null || true; }}; trap cleanup EXIT; mounted=0; for attempt in $(seq 1 30); do if findmnt --mountpoint $mountpoint --noheadings >/dev/null 2>&1; then mounted=1; break; fi; if ! kill -0 $server_pid 2>/dev/null; then cat $server_log >&2; exit 1; fi; sleep 1; done; if [ $mounted -ne 1 ]; then cat $server_log >&2; echo 'ScorpioFS did not create a FUSE mount' >&2; exit 1; fi; findmnt --mountpoint $mountpoint --noheadings --output FSTYPE | grep -E '^fuse([.]|$)'; test -d $mountpoint; stat $mountpoint >/dev/null; kill $server_pid; wait $server_pid || true; test -z \"$(findmnt --mountpoint $mountpoint --noheadings 2>/dev/null || true)\"; trap - EXIT"
+                    "set -euo pipefail; test -c /dev/fuse || modprobe fuse; test -c /dev/fuse; SCORPIO_LAUNCHER_BINARY={root}/scorpio {root}/workspace-launcher-tests --exact explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown --ignored --nocapture"
                 ),
             )
             .await?;

@@ -5,10 +5,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 pub mod config;
+pub mod fenced_fs;
 pub mod file_attr;
 pub mod fuse_platform;
 pub mod logging;
 pub mod mount_owner;
+pub mod mutation_fence;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct GPath {

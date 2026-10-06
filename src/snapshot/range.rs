@@ -98,6 +98,7 @@ impl ChunkedFile {
         size: u64,
     ) -> Result<Self, SnapshotError> {
         reader.authorized_context().validate_relative_path(path)?;
+        reader.client().validate_file_size(size)?;
         if size > MAX_FILE_SIZE {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,

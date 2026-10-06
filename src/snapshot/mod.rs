@@ -20,6 +20,7 @@ pub mod durable;
 pub mod error_wire;
 pub mod frames;
 pub mod fuse;
+mod fuse_owned;
 pub mod incremental;
 pub mod layer;
 mod lease_wire;
@@ -27,11 +28,13 @@ mod lookup;
 mod owned_range;
 mod owned_reader;
 mod owned_transport;
+mod proven_file;
 pub mod range;
 pub mod reader;
 mod resolve_receipt;
 mod resolve_wire;
 pub mod types;
+pub mod workspace_pins;
 
 pub use auth::{AuthorizedSnapshotContext, CacheDomain};
 pub use client::Mst2Client;
@@ -42,10 +45,12 @@ pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMete
 pub use frames::LeaseReleaseOutcome;
 pub use incremental::{ClosureRecord, IncrementalSync, ScopeCache, SyncMeters};
 pub use owned_range::{OwnedChunkedFile, VerifiedRange};
+pub use proven_file::{FileMembershipError, ProvenSnapshotFile};
 pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use resolve_receipt::ResolveTraceReceipt;
 pub use types::{
-    Capabilities, Descriptor, DirEntry, DirectoryResponse, LookupResult, SnapshotError,
-    SnapshotErrorCode,
+    Capabilities, Descriptor, DirEntry, DirectoryResponse, LookupResult, ResolveDelivery,
+    ResolveRequest, ResolveTarget, SnapshotError, SnapshotErrorCode,
 };
+pub use workspace_pins::{LocalPinState, ReleaseLocalPinReceipt, WorkspaceBinding};

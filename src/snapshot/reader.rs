@@ -268,7 +268,7 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
     let expires = parse_rfc3339_timestamp(expiry).ok_or_else(|| {
         SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
-            "lease expiry is not a valid UTC RFC3339 timestamp",
+            "lease expiry is not a valid RFC3339 timestamp",
         )
     })?;
     // Sample the monotonic clock first: scheduling delay between clock reads
@@ -280,15 +280,26 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
             "system clock precedes the Unix epoch",
         )
     })?;
-    let remaining = expires
-        .checked_sub(now)
-        .filter(|d| !d.is_zero())
+    // A std Duration's nanoseconds fit in i128. Signed comparison also treats
+    // valid timestamps before 1970 as expired, rather than malformed data.
+    let remaining_nanos = expires
+        .checked_sub(now.as_nanos() as i128)
+        .filter(|nanos| *nanos > 0)
         .ok_or_else(|| {
             SnapshotError::new(
                 SnapshotErrorCode::LeaseExpired,
                 "server returned an expired snapshot lease",
             )
-        })?;
+        })? as u128;
+    let remaining = Duration::new(
+        u64::try_from(remaining_nanos / 1_000_000_000).map_err(|_| {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "lease expiry exceeds the clock range",
+            )
+        })?,
+        (remaining_nanos % 1_000_000_000) as u32,
+    );
     let deadline = instant.checked_add(remaining).ok_or_else(|| {
         SnapshotError::new(
             SnapshotErrorCode::IntegrityError,
@@ -324,72 +335,19 @@ impl Drop for LeaseKeeper {
     }
 }
 
-/// Minimal RFC3339 (`YYYY-MM-DDTHH:MM:SSZ`) → unix seconds. Only the exact
-/// shape this deployment emits is accepted. Calendar validation rejects
-/// impossible dates instead of granting a fictitious extra lease window.
-fn parse_rfc3339_unix(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if b.len() != 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'Z'
-    {
-        return None;
-    }
-    let num = |from: usize, to: usize| -> Option<u64> {
-        if !b[from..to].iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        std::str::from_utf8(&b[from..to]).ok()?.parse::<u64>().ok()
-    };
-    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
-    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = match mo {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return None,
-    };
-    if !(1..=month_days).contains(&d) || h > 23 || mi > 59 || sec > 59 {
-        return None;
-    }
-    // days_from_civil (Howard Hinnant), matching runtime.rs' inverse.
-    let y_adj = if mo <= 2 { y as i64 - 1 } else { y as i64 };
-    let era = y_adj.div_euclid(400);
-    let yoe = y_adj - era * 400;
-    let mp = (mo as i64 + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    if days < 0 {
-        return None;
-    }
-    Some(days as u64 * 86_400 + h * 3600 + mi * 60 + sec)
+/// Share the wire contract's actual RFC3339 instant, including known offsets.
+/// Subnanosecond precision is floored by the parser, never rounded upward.
+fn parse_rfc3339_timestamp(value: &str) -> Option<i128> {
+    super::resolve_wire::timestamp(value)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp_nanos())
 }
 
-fn parse_rfc3339_timestamp(value: &str) -> Option<Duration> {
-    if value.len() == 20 {
-        return parse_rfc3339_unix(value).map(Duration::from_secs);
-    }
-    let bytes = value.as_bytes();
-    if !(22..=30).contains(&bytes.len()) || bytes[19] != b'.' || bytes.last() != Some(&b'Z') {
-        return None;
-    }
-    let fraction = &bytes[20..bytes.len() - 1];
-    if !fraction.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let mut canonical = bytes[..19].to_vec();
-    canonical.push(b'Z');
-    let seconds = parse_rfc3339_unix(std::str::from_utf8(&canonical).ok()?)?;
-    let nanos = std::str::from_utf8(fraction).ok()?.parse::<u32>().ok()?
-        * 10u32.pow(9 - fraction.len() as u32);
-    Some(Duration::new(seconds, nanos))
+#[cfg(test)]
+fn parse_rfc3339_unix(value: &str) -> Option<i64> {
+    super::resolve_wire::timestamp(value)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp())
 }
 
 /// A fixed view plus everything needed to read its content.
@@ -399,9 +357,12 @@ pub struct SnapshotReader {
     lease_id: String,
     context: AuthorizedSnapshotContext,
     caps: Capabilities,
+    advertisement: super::capabilities::CapabilityAdvertisement,
+    delivery: super::ResolveDelivery,
     lease: Arc<LeaseKeeper>,
     pub(crate) content_scope: Arc<super::content::ContentBudget>,
     pub(crate) content_membership: Arc<tokio::sync::OnceCell<HashMap<String, SnapshotFile>>>,
+    pub(crate) path_membership: Arc<super::proven_file::PathMembership>,
 }
 
 impl SnapshotReader {
@@ -411,9 +372,14 @@ impl SnapshotReader {
         scope: &str,
         lease_seconds: u64,
     ) -> Result<Self, SnapshotError> {
-        Ok(Self::resolve_internal(client, scope, lease_seconds, None)
-            .await?
-            .0)
+        Ok(Self::resolve_internal(
+            client,
+            &super::ResolveRequest::latest(scope, lease_seconds),
+            None,
+            false,
+        )
+        .await?
+        .0)
     }
 
     /// Resolve once with opt-in trace correlation. The returned receipt belongs
@@ -425,8 +391,13 @@ impl SnapshotReader {
         logical_request_id: &str,
     ) -> Result<(Self, super::ResolveTraceReceipt), SnapshotError> {
         super::resolve_receipt::validate_logical_id(logical_request_id)?;
-        let (reader, receipt) =
-            Self::resolve_internal(client, scope, lease_seconds, Some(logical_request_id)).await?;
+        let (reader, receipt) = Self::resolve_internal(
+            client,
+            &super::ResolveRequest::latest(scope, lease_seconds),
+            Some(logical_request_id),
+            false,
+        )
+        .await?;
         let receipt = receipt.ok_or_else(|| {
             SnapshotError::new(
                 SnapshotErrorCode::IntegrityError,
@@ -436,14 +407,55 @@ impl SnapshotReader {
         Ok((reader, receipt))
     }
 
+    /// Resolve an explicit canonical target and delivery. Lazy does not imply
+    /// that metadata, content or durable hydration has completed.
+    pub async fn resolve_request(
+        client: Mst2Client,
+        request: &super::ResolveRequest,
+    ) -> Result<Self, SnapshotError> {
+        Ok(Self::resolve_internal(client, request, None, true).await?.0)
+    }
+
+    pub async fn resolve_request_observed(
+        client: Mst2Client,
+        request: &super::ResolveRequest,
+        logical_request_id: &str,
+    ) -> Result<(Self, super::ResolveTraceReceipt), SnapshotError> {
+        super::resolve_receipt::validate_logical_id(logical_request_id)?;
+        let (reader, receipt) =
+            Self::resolve_internal(client, request, Some(logical_request_id), true).await?;
+        Ok((
+            reader,
+            receipt.ok_or_else(|| {
+                SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "typed resolve is missing its receipt",
+                )
+            })?,
+        ))
+    }
+
     async fn resolve_internal(
         client: Mst2Client,
-        scope: &str,
-        lease_seconds: u64,
+        request: &super::ResolveRequest,
         logical_request_id: Option<&str>,
+        require_canonical: bool,
     ) -> Result<(Self, Option<super::ResolveTraceReceipt>), SnapshotError> {
         let client = client.for_resolve();
-        let caps = client.capabilities().await?;
+        let advertisement = client.capability_advertisement().await?;
+        if require_canonical
+            && matches!(
+                advertisement,
+                super::capabilities::CapabilityAdvertisement::Legacy(_)
+            )
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "typed resolve requires canonical discovery",
+            ));
+        }
+        let caps = advertisement.reader_capabilities();
+        let client = client.with_advertisement(&advertisement);
         if !caps.features.resolve || !caps.features.directory {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
@@ -456,17 +468,41 @@ impl SnapshotReader {
                 "server does not support metadata codec 1",
             ));
         }
+        if client.is_canonical()
+            && request.delivery == super::ResolveDelivery::Full
+            && !caps.features.full_hydration
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "full delivery is disabled by discovery",
+            ));
+        }
         let (res, receipt) = match logical_request_id {
             Some(id) => {
-                let (response, receipt) = client.resolve_observed(scope, lease_seconds, id).await?;
+                let (response, receipt) = if client.is_canonical() {
+                    client.resolve_request_observed(request, id).await?
+                } else {
+                    client
+                        .resolve_observed(&request.scope, request.lease_seconds, id)
+                        .await?
+                };
                 (response, Some(receipt))
             }
-            None => (client.resolve(scope, lease_seconds).await?, None),
+            None => (
+                if client.is_canonical() {
+                    client.resolve_request(request).await?
+                } else {
+                    client
+                        .resolve(&request.scope, request.lease_seconds)
+                        .await?
+                },
+                None,
+            ),
         };
         let context = AuthorizedSnapshotContext::new(
             client.base(),
             &client.credential_partition(),
-            scope,
+            &request.scope,
             res.descriptor.clone(),
             &res.authorization_epoch,
             &res.publication_sequence,
@@ -475,7 +511,7 @@ impl SnapshotReader {
         // Cloned clients resolving another view cannot overwrite this pair.
         let client = client.with_snapshot_lease(&res.lease_id);
         let lease = Arc::new(LeaseKeeper::new(
-            lease_seconds,
+            request.lease_seconds,
             &res.lease_id,
             &res.descriptor.snapshot_id,
             &res.lease_expires_at,
@@ -494,11 +530,14 @@ impl SnapshotReader {
                 context,
                 lease_id: res.lease_id,
                 caps,
+                advertisement,
+                delivery: request.delivery,
                 lease,
                 content_scope: super::content::ContentBudget::new(
                     super::ContentBudgetLimits::default(),
                 ),
                 content_membership: Arc::new(tokio::sync::OnceCell::new()),
+                path_membership: Arc::new(super::proven_file::PathMembership::new()),
             },
             receipt,
         ))
@@ -531,6 +570,15 @@ impl SnapshotReader {
     /// transports on these rather than assuming the server profile.
     pub fn capabilities(&self) -> &Capabilities {
         &self.caps
+    }
+
+    /// Exact discovery; legacy advertisements have no canonical limits.
+    pub fn capability_advertisement(&self) -> &super::capabilities::CapabilityAdvertisement {
+        &self.advertisement
+    }
+
+    pub fn delivery(&self) -> super::ResolveDelivery {
+        self.delivery
     }
 
     /// Negotiated content encoding for frame responses, exposed for the
@@ -648,7 +696,12 @@ impl SnapshotReader {
     /// A deployment without the page surface cannot provide a full closure.
     pub async fn snapshot_closure(&self) -> Result<ValidatedSnapshotClosure, SnapshotError> {
         let (pages, _, _) = self.snapshot_pages_with(&mut NetworkPages).await?;
-        ValidatedSnapshotClosure::from_pages(self.descriptor(), pages)
+        let closure = ValidatedSnapshotClosure::from_pages(self.descriptor(), pages)?;
+        for file in closure.files() {
+            self.client.validate_path(&file.rel_path)?;
+            self.client.validate_file_size(file.size)?;
+        }
+        Ok(closure)
     }
 
     /// Collect only dependencies reached from this reader's fixed root.
@@ -679,12 +732,16 @@ impl SnapshotReader {
         let mut route_visits = 0;
         let mut page_decodes = 0;
         while !frontier.is_empty() {
-            let take = frontier.len().min(PAGES_BATCH);
+            let take = frontier
+                .len()
+                .min(PAGES_BATCH)
+                .min(self.client.metadata_item_limit());
             let batch: Vec<PageFrontier> = frontier.drain(..take).collect();
             let mut items = Vec::with_capacity(batch.len());
             let mut requested = HashSet::new();
             for f in &batch {
                 self.context.validate_relative_path(&f.dir)?;
+                self.client.validate_path(&f.dir)?;
                 if f.route.len() > mst2_codec::metapage::MAX_DEPTH {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::LimitExceeded,
@@ -877,6 +934,7 @@ impl SnapshotReader {
         digest: &str,
         size: u64,
     ) -> Result<Vec<u8>, SnapshotError> {
+        self.client.validate_file_size(size)?;
         if size > crate::snapshot::client::MAX_BUFFERED_FILE_BYTES || usize::try_from(size).is_err()
         {
             return Err(SnapshotError::new(
@@ -1048,6 +1106,8 @@ impl SnapshotReader {
                 "whole-file accounted read exceeds the local 64 MiB budget; use range reads",
             ));
         }
+        self.client.validate_file_size(file.size)?;
+        self.client.validate_path(&file.rel_path)?;
         let size = usize::try_from(file.size).map_err(|_| {
             SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
@@ -1100,6 +1160,7 @@ impl SnapshotReader {
                 expected_digest: &file.content_digest,
             };
             let body = owned_transport::request_body(
+                &self.client,
                 budget,
                 &Request {
                     items: &[item],
@@ -1199,9 +1260,12 @@ impl SnapshotReader {
         let mut last_receipt = None;
         while start < map.chunk_count as usize {
             self.ensure_lease().await?;
-            let mut end = map.chunk_count as usize;
+            let mut end = (map.chunk_count as usize)
+                .min(start + self.client.request_item_limit())
+                .min(start + (self.client.chunk_byte_limit() / CHUNK_SIZE as usize).max(1));
             let body = loop {
                 match owned_transport::request_body(
+                    &self.client,
                     budget,
                     &Request {
                         items: &items[start..end],
@@ -1662,20 +1726,30 @@ mod tests {
             parse_rfc3339_unix("2024-02-29T23:59:59Z"),
             Some(1_709_251_199)
         );
+        assert_eq!(
+            parse_rfc3339_unix("2026-09-16T10:28:42+08:00"),
+            Some(1_789_525_722)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2026-09-15T23:58:42-02:30"),
+            Some(1_789_525_722)
+        );
+        assert_eq!(parse_rfc3339_unix("1969-12-31T23:59:59Z"), Some(-1));
     }
 
     #[test]
-    fn rfc3339_parser_rejects_non_canonical_shapes() {
+    fn rfc3339_parser_rejects_invalid_or_unknown_instants() {
         for bad in [
             "",
             "2026-09-16T02:28:42",       // missing Z
             "2026-09-16 02:28:42Z",      // space separator
             "2026-13-01T00:00:00Z",      // month 13
             "2026-09-16T24:00:00Z",      // hour 24
-            "2026-09-16T02:28:42+08:00", // offset form not emitted here
+            "2026-09-16T02:28:42-00:00", // unknown local offset
             "2026-02-29T00:00:00Z",      // non-leap year
             "2026-04-31T00:00:00Z",      // April has 30 days
-            "2026-09-16T02:28:60Z",      // invalid second
+            "2026-09-16T02:28:61Z",      // invalid second
+            "2026-09-16T02:28:60Z",      // not a valid leap-second position
             "+026-09-16T02:28:42Z",      // numeric fields are ASCII digits
             "2026-+9-16T02:28:42Z",
         ] {
@@ -1687,17 +1761,32 @@ mod tests {
     fn rfc3339_fraction_is_exact_and_strict() {
         assert_eq!(
             parse_rfc3339_timestamp("1970-01-01T00:00:01.123456789Z"),
-            Some(Duration::new(1, 123_456_789))
+            Some(1_123_456_789)
         );
         assert_eq!(
             parse_rfc3339_timestamp("1970-01-01T00:00:01.1Z"),
-            Some(Duration::new(1, 100_000_000))
+            Some(1_100_000_000)
+        );
+        // Supported wire precision is floored to nanoseconds, never rounded
+        // upward into a longer retention grant.
+        assert_eq!(
+            parse_rfc3339_timestamp("1970-01-01T00:00:01.1234567899Z"),
+            Some(1_123_456_789)
+        );
+        assert_eq!(
+            parse_rfc3339_timestamp("1970-01-01T08:00:01.1+08:00"),
+            Some(1_100_000_000)
+        );
+        // RFC3339 permits a leap second. The shared parser conservatively
+        // clamps it to the last nanosecond of the preceding POSIX second.
+        assert_eq!(
+            parse_rfc3339_timestamp("2016-12-31T23:59:60Z"),
+            Some(1_483_228_799_999_999_999)
         );
         for bad in [
             "1970-01-01T00:00:01.Z",
-            "1970-01-01T00:00:01.1234567890Z",
             "1970-01-01T00:00:01.+1Z",
-            "1970-01-01T00:00:01.1+00:00",
+            "1970-01-01T00:00:01.1-00:00",
             "1970-01-01T00:00:01.１Z",
             "2026-02-29T00:00:01.1Z",
         ] {
@@ -1722,6 +1811,7 @@ mod tests {
             ("", SnapshotErrorCode::IntegrityError),
             ("2026-02-29T00:00:00Z", SnapshotErrorCode::IntegrityError),
             ("1970-01-01T00:00:00Z", SnapshotErrorCode::LeaseExpired),
+            ("1969-12-31T23:59:59Z", SnapshotErrorCode::LeaseExpired),
         ] {
             let error = match LeaseKeeper::new(60, "lease", "snapshot", expiry, 1) {
                 Ok(_) => panic!("invalid initial expiry was accepted: {expiry}"),

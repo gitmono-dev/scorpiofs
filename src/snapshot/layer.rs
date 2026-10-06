@@ -8,7 +8,8 @@
 //!
 //! The layer is read-only by construction: every mutation answers `EROFS`
 //! (see `fuse.rs`), so the overlay routes all writes to its upper layer and
-//! the whiteout format stays the Antares-wide OCI convention.
+//! the upper layer retains its OCI whiteout convention. A committed snapshot
+//! is a complete namespace, not an OCI delta: `.wh.*` names are ordinary files.
 
 use std::ffi::OsStr;
 
@@ -35,10 +36,18 @@ impl Layer for Mst2Fuse {
         fuse::ROOT_INODE
     }
 
-    /// Same convention as every other Antares layer: deletions are recorded as
-    /// OCI `.wh.<name>` markers, never character devices (no `CAP_MKNOD`).
+    /// Snapshot entries cannot be character devices, so none is a whiteout.
+    /// Using OCI here would hide ordinary committed `.wh.*` names and probe
+    /// each child's contents while importing only its parent's directory.
     fn whiteout_format(&self) -> WhiteoutFormat {
-        WhiteoutFormat::OciWhiteout
+        WhiteoutFormat::CharDev
+    }
+
+    async fn is_opaque(&self, _ctx: asyncfuse::raw::Request, inode: Inode) -> Result<bool> {
+        match self.node(inode)? {
+            Node::Dir(_) => Ok(false),
+            Node::File(_) => Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into()),
+        }
     }
 
     /// The union filesystem's copy-up path asks the lower layer for a raw
@@ -155,10 +164,10 @@ mod tests {
     }
 
     #[test]
-    fn lower_layer_identity_and_whiteout_convention() {
+    fn lower_layer_identity_and_complete_namespace_convention() {
         let fs = empty_view();
         assert_eq!(Layer::root_inode(&fs), 1);
-        assert_eq!(Layer::whiteout_format(&fs), WhiteoutFormat::OciWhiteout);
+        assert_eq!(Layer::whiteout_format(&fs), WhiteoutFormat::CharDev);
     }
 
     /// A lower RELEASE error must not escape from copy-up through OPEN: Linux

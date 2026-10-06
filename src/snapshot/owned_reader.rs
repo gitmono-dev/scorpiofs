@@ -36,6 +36,11 @@ impl SnapshotReader {
         closure: &ValidatedSnapshotClosure,
     ) -> Result<(), SnapshotError> {
         closure.matches_descriptor(self.descriptor())?;
+        for file in closure.files() {
+            self.client().validate_path(&file.rel_path)?;
+            self.client().validate_file_size(file.size)?;
+        }
+        self.path_membership.seed_directories(closure);
         let files: HashMap<_, _> = closure
             .files()
             .iter()
@@ -55,11 +60,13 @@ impl SnapshotReader {
 
     pub(crate) async fn content_member(&self, path: &str) -> Result<&SnapshotFile, SnapshotError> {
         self.authorized_context().validate_relative_path(path)?;
+        self.client().validate_path(path)?;
         self.ensure_lease().await?;
         let files = self
             .content_membership
             .get_or_try_init(|| async {
                 let closure = self.snapshot_closure().await?;
+                self.path_membership.seed_directories(&closure);
                 Ok::<_, SnapshotError>(
                     closure
                         .files()
@@ -82,6 +89,7 @@ impl SnapshotReader {
         &self,
         file: &SnapshotFile,
     ) -> Result<(), SnapshotError> {
+        self.client().validate_file_size(file.size)?;
         let expected = self.content_member(&file.rel_path).await?;
         if file.content_digest != expected.content_digest
             || file.size != expected.size
@@ -218,9 +226,20 @@ impl SnapshotReader {
         let mut last_receipt = None;
         while start < count {
             self.ensure_lease().await?;
-            let mut end = count;
+            let mut end = count.min(start + self.client().request_item_limit());
+            while end - start > 1
+                && units[start..end]
+                    .iter()
+                    .flatten()
+                    .map(|unit| unit.file.size as usize)
+                    .sum::<usize>()
+                    > self.client().object_byte_limit()
+            {
+                end -= 1;
+            }
             let body = loop {
                 match request_body(
+                    self.client(),
                     &self.content_scope,
                     &Request {
                         items: &items[start..end],
