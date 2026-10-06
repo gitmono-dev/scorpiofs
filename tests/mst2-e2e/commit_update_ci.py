@@ -173,6 +173,37 @@ def dependencies(source, project, ports, deadline):
     return {"services": selected, "networks": {"default": {"name": project + "-network"}}}
 
 
+def verify_workspace_cleanup(measurements, deadline):
+    # Normal execution owns and joins the worker/daemon children before this
+    # server cleanup. A fallback must not claim PASS if abrupt interruption
+    # bypassed those owners; persisted PID text is not signal authority.
+    if measurements.exists():
+        from workspace_update_daemon import mounts_under
+        if measurements.is_symlink() or mounts_under(measurements):
+            raise AssertionError("owned workspace cleanup left native mounts")
+        for round_root in measurements.iterdir():
+            if not re.fullmatch(r"round-[0-9]{2}", round_root.name):
+                continue
+            if round_root.is_symlink() or not round_root.is_dir():
+                raise AssertionError("owned round cleanup path changed")
+            for name in ("owned-workspace-daemon.json", "owned-workspace-worker.json"):
+                receipt = round_root / name
+                if not receipt.exists():
+                    raise AssertionError("owned workspace cleanup receipt is missing")
+                if receipt.exists():
+                    if receipt.is_symlink() or not receipt.is_file() or receipt.stat().st_size > 4096:
+                        raise AssertionError("owned workspace cleanup receipt changed")
+                    record = json.loads(receipt.read_text())
+                    if (set(record) != {"pid", "starttime", "cleanup_complete"}
+                            or type(record["pid"]) is not int or record["pid"] <= 0
+                            or type(record["starttime"]) is not str or not record["starttime"].isdecimal()
+                            or record["cleanup_complete"] is not True
+                            or budget_module.group_members(record["pid"], record["starttime"])):
+                        raise AssertionError("owned workspace cleanup was incomplete")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("owned workspace cleanup verification exceeded its original deadline")
+
+
 def stop_owned(root, project, deadline, process=None):
     state_path = root / "owned.json"
     if not state_path.exists():
@@ -183,6 +214,11 @@ def stop_owned(root, project, deadline, process=None):
     compose = root / "dependencies.json"
     if hashlib.sha256(compose.read_bytes()).hexdigest() != state["compose_sha256"]:
         raise AssertionError("cleanup Compose configuration differs from owned startup")
+    workspace_error = None
+    try:
+        verify_workspace_cleanup(root / "measurements", deadline)
+    except Exception as error:
+        workspace_error = error
     service = state.get("service")
     if service:
         pid = service["pid"]
@@ -215,6 +251,8 @@ def stop_owned(root, project, deadline, process=None):
     state_path.write_text(json.dumps(state))
     if time.monotonic() >= deadline:
         raise TimeoutError("owned cleanup metadata exceeded original deadline")
+    if workspace_error is not None:
+        raise workspace_error
     print(json.dumps({"record": "owned_cleanup", "project": project, "correctness": "PASS"}), flush=True)
 
 

@@ -137,12 +137,8 @@ jobs:
           python3 -B tests/mst2-e2e/test_commit_update_bench.py -v
           python3 -B tests/mst2-e2e/test_commit_update_budget.py -v
           python3 -B tests/mst2-e2e/test_commit_update_projection.py -v
+          python3 -B -m unittest discover -s tests/mst2-e2e -p 'test_workspace_update_*.py' -v
 
-      - name: Check measurement driver old-view audit
-        run: |
-          cargo build --locked --release --example mst2_update_measure
-          MST2_MEASURE_DRIVER="$GITHUB_WORKSPACE/target/release/examples/mst2_update_measure" \
-            cargo test --locked --release --example mst2_update_measure
 
   docker:
     name: Docker image

@@ -87,26 +87,16 @@ class CommitUpdateBenchTests(unittest.TestCase):
                     raise KeyError("private-connection-string")
         self.assertEqual(BENCH.failure_record(nested.exception)["phase"], "updated_publication_identity")
 
-    def test_command_failure_keeps_only_closed_typed_snapshot_diagnostics(self):
-        private = b'{"record":"measurement_failure","stage":"metadata","snapshot_error_code":"IntegrityError"}\n'
+    def test_command_failure_keeps_only_closed_fields(self):
+        private = b'private-token and child stderr must never be copied into the record\n'
         with self.assertRaises(BENCH.PhaseFailure) as failed:
             with BENCH.phase("scorpio_sync"):
-                raise BENCH.CommandFailure("mst2_update_measure", 1, private)
+                raise BENCH.CommandFailure("scorpio", 1, private)
         self.assertEqual(BENCH.failure_record(failed.exception), {
             "execution_failed": True, "error_type": "CommandFailure", "phase": "scorpio_sync",
-            "command": "mst2_update_measure", "exit_status": 1, "measurement_stage": "metadata",
-            "snapshot_error_code": "IntegrityError",
+            "command": "scorpio", "exit_status": 1,
         })
         self.assertNotIn("private-token", json.dumps(BENCH.failure_record(failed.exception)))
-        for stderr in [b"private-token", b"Error: SnapshotError { code: IntegrityError, message: x }",
-                       b'{"record":"measurement_failure","stage":"metadata","snapshot_error_code":"Unknown"}',
-                       b'{"record":"measurement_failure","stage":"secret-stage"}',
-                       b'{"record":"measurement_failure","stage":"metadata","message":"private-token"}',
-                       private + b"private-token", b"[]", b"null", b"\xff", b" " * 4097]:
-            error = BENCH.CommandFailure("mst2_update_measure", 1, stderr)
-            self.assertNotIn("snapshot_error_code", BENCH.failure_record(error))
-            self.assertNotIn("measurement_stage", BENCH.failure_record(error))
-        # Git/SQL messages cannot impersonate a driver's typed error.
         error = BENCH.CommandFailure("git", 128, private)
         self.assertEqual(BENCH.failure_record(error), {
             "execution_failed": True, "error_type": "CommandFailure", "command": "git", "exit_status": 128,
@@ -123,28 +113,29 @@ class CommitUpdateBenchTests(unittest.TestCase):
             self.assertIsNone(BENCH.query(BENCH.NATIVE_SQL, time.monotonic() + 30))
 
     def test_workflow_recovery_preserves_deadline_and_rejects_extension_before_setup(self):
-        workflow = SOURCE.parents[2] / ".github/workflows/mst2-real-update.yml"
-        script = textwrap.dedent(workflow.read_text().split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
-        deadline = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        workflow = SOURCE.parents[2] / ".github/workflows/mst2-workspace-update.yml"
+        script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+        started = datetime.now(timezone.utc) - timedelta(minutes=1)
+        deadline = (started + timedelta(minutes=235)).isoformat()
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "github-env"
             env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
-                       GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2", RESUME_SPEC="",
-                       DEADLINE_INPUT=deadline, TIMEOUT_INPUT="19")
-            subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
-            self.assertIn("MST2_SESSION_DEADLINE=" + deadline, output.read_text())
-            output.unlink()
-            spec = json.dumps({"session_deadline_utc": deadline, "timeout_minutes": 19})
-            subprocess.run([os.sys.executable, "-c", script], check=True,
-                           env=dict(env, DEADLINE_INPUT="", TIMEOUT_INPUT="", RESUME_SPEC=spec), capture_output=True)
-            self.assertIn("MST2_SESSION_DEADLINE=" + deadline, output.read_text())
-            output.unlink()
-            for bad in [dict(env, TIMEOUT_INPUT="21"),
+                       GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
+                       STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
+                       PYTHONPATH=str(SOURCE.parent))
+            for _ in range(2):
+                subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
+                self.assertIn("MST2_SESSION_STARTED=" + started.isoformat(), output.read_text())
+                self.assertIn("MST2_SESSION_DEADLINE=" + deadline, output.read_text())
+                output.unlink()
+            for bad in [dict(env, DEADLINE_INPUT=(started + timedelta(minutes=236)).isoformat()),
+                        dict(env, STARTED_INPUT=(started - timedelta(minutes=20)).isoformat(),
+                             DEADLINE_INPUT=(started + timedelta(minutes=215)).isoformat()),
                         dict(env, DEADLINE_INPUT="2000-01-01T00:00:00Z"),
                         dict(env, DEADLINE_INPUT="2099-01-01T00:00:00Z"),
                         dict(env, DEADLINE_INPUT=deadline[:-6]),
                         dict(env, DEADLINE_INPUT=deadline[:-6] + "+08:00"),
-                        dict(env, DEADLINE_INPUT="", RESUME_SPEC='{"timeout_minutes":19}')]:
+                        dict(env, STARTED_INPUT="")]:
                 result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(output.exists())

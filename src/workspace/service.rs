@@ -567,7 +567,13 @@ impl WorkspaceService {
         {
             runtime.hydration_state = HydrationState::Idle;
         }
-        let dirty_state = if scan {
+        // Hydration owns the lower snapshot and may materialize many files at
+        // once. A status poll during that task must not repeatedly walk the
+        // entire private upper; the durable pin result remains Unknown until
+        // reconcile_hydrate joins the task, after which the next status does a
+        // complete dirty scan. This keeps polling overhead out of the update
+        // latency while preserving the final dirty-state proof.
+        let dirty_state = if scan && runtime.hydrate.is_none() {
             match trace_async("upper_scan", self.dirty(workspace, runtime)).await {
                 Ok(state) => state,
                 Err(error) => {

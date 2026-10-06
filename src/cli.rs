@@ -116,8 +116,8 @@ pub async fn serve_with_observation(
     let mut exit_code = exit::SUCCESS;
     let mut daemon_finished = false;
 
-    // The daemon owns its explicitly created mounts. There is no separate
-    // dictionary workspace session to initialize or supervise at startup.
+    // The daemon owns its explicitly created mounts. No workspace lifecycle
+    // is initialized before the HTTP listener admits an explicit request.
     tokio::select! {
         res = &mut daemon_task => {
             daemon_finished = true;
