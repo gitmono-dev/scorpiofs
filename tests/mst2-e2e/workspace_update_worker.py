@@ -849,11 +849,32 @@ class WorkerSession:
         return value
 
     def _hydrate(self, first, deadline, timing_start, initial_metadata_ms=None):
+        """Wait for the full create's automatic hydration to finish.
+
+        ``delivery=full`` starts the hydration task as part of workspace
+        creation.  Calling the explicit ``/hydrate`` control endpoint here
+        would race that task: if it finishes between create and this call,
+        the endpoint can start a second full hydration.  Besides adding work
+        only to the ScorpioFS side, that would make the Git comparison
+        dependent on a timing race.  The worker therefore treats the create
+        response as the start signal and only observes status until the
+        durable full-snapshot pin is visible.
+        """
         with self._stage("hydrate"):
-            status = self._fixed_status(first, self.http.request(
-                "POST", "/v3/workspaces/" + quote(first["workspace_id"], safe="") + "/hydrate",
-                deadline, expected=(200,)))
+            status = self._fixed_status(first, first)
         metadata_ms = initial_metadata_ms
+        if status["mount_state"] == "mounted" and status["metadata_ready"] and metadata_ms is None:
+            metadata_ms = (time.monotonic() - timing_start) * 1000
+        if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
+                or status["last_error"] is not None):
+            raise WorkerError("workspace hydration failed", stage="hydrate")
+        if (status["mount_state"] == "mounted" and status["metadata_ready"]
+                and status["hydration_state"] == "complete"
+                and status["local_pin_state"] == "complete_snapshot"
+                and status["lease_state"] == "granted_locally"
+                and status["last_error"] is None):
+            complete_ms = (time.monotonic() - timing_start) * 1000
+            return status, metadata_ms, complete_ms
         complete_ms = None
         while True:
             with self._stage("poll"):

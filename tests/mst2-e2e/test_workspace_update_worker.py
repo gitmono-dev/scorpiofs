@@ -122,8 +122,6 @@ class WorkerFullProfileTests(unittest.TestCase):
                         code, value = 422, {"error": "delivery unsupported"}
                     else:
                         value = profile.create_status
-                elif self.command == "POST" and self.path == workspace_path + "/hydrate":
-                    value = profile.hydrate_status
                 elif self.command == "GET" and self.path == workspace_path and profile.poll_statuses:
                     value = profile.poll_statuses.pop(0)
                 else:
@@ -155,12 +153,14 @@ class WorkerFullProfileTests(unittest.TestCase):
         worker._assert_status_path = mock.Mock()
         return worker
 
-    def test_full_only_create_still_requires_hydrate_and_complete_snapshot_pin(self):
+    def test_full_only_create_waits_for_automatic_hydration_and_complete_snapshot_pin(self):
         worker = self.worker()
         deadline = time.monotonic() + 5
-        # Full resolve makes metadata available, while durable completion
-        # still requires hydrate and a complete snapshot pin on the same view.
-        self.poll_statuses = [valid_status(local_pin_state="incomplete"), valid_status()]
+        # Full create starts hydration asynchronously.  The worker must only
+        # observe status; an explicit /hydrate would be an unfair second
+        # hydration and can race the automatically started task.
+        self.poll_statuses = [valid_status(hydration_state="running", local_pin_state="incomplete"),
+                              valid_status()]
         started = time.monotonic()
         first = worker._create_workspace(deadline)
         status, metadata_ms, complete_ms = worker._hydrate(first, deadline, started,
@@ -169,7 +169,6 @@ class WorkerFullProfileTests(unittest.TestCase):
         self.assertEqual(self.requests, [
             ("POST", "/v3/workspaces", {"target": {"kind": "latest"}, "scope": "/project",
                                        "delivery": "full", "upper_policy": "private"}),
-            ("POST", workspace_path + "/hydrate", None),
             ("GET", workspace_path, None), ("GET", workspace_path, None),
         ])
         self.assertEqual(status, valid_status())
@@ -177,27 +176,40 @@ class WorkerFullProfileTests(unittest.TestCase):
         self.assertEqual(metadata_ms, 7.25)
         self.assertGreaterEqual(complete_ms, 0)
 
-    def test_full_profile_rejects_fixed_identity_changes_in_hydrate_and_poll(self):
+    def test_full_profile_rejects_fixed_identity_changes_while_polling(self):
         changes = {"workspace_id": "33333333-2222-4333-8444-666666666666",
                    "generation": "33333333-2222-4333-8444-666666666666",
                    "snapshot_id": "sha256:" + "b" * 64,
                    "mountpoint": "/private/workspaces-v3/changed/mount"}
-        for stage in ("hydrate", "poll"):
-            for field, value in changes.items():
-                with self.subTest(stage=stage, field=field):
-                    self.requests.clear()
-                    changed = valid_status(**{field: value})
-                    self.hydrate_status = changed if stage == "hydrate" else valid_status()
-                    self.poll_statuses = [changed]
-                    worker = self.worker()
-                    deadline = time.monotonic() + 5
-                    first = worker._create_workspace(deadline)
-                    with self.assertRaises(WorkerError) as failed:
-                        worker._hydrate(first, deadline, time.monotonic())
-                    self.assertEqual(failed.exception.error_code, "workspace_identity_invalid")
-                    self.assertEqual(failed.exception.worker_stage, stage)
-                    self.assertEqual(worker._workspace_ids, [first["workspace_id"]])
-                    self.assertEqual(len(self.requests), 2 if stage == "hydrate" else 3)
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                self.requests.clear()
+                changed = valid_status(**{field: value})
+                self.poll_statuses = [changed]
+                worker = self.worker()
+                deadline = time.monotonic() + 5
+                first = worker._create_workspace(deadline)
+                with self.assertRaises(WorkerError) as failed:
+                    worker._hydrate(first, deadline, time.monotonic())
+                self.assertEqual(failed.exception.error_code, "workspace_identity_invalid")
+                self.assertEqual(failed.exception.worker_stage, "poll")
+                self.assertEqual(worker._workspace_ids, [first["workspace_id"]])
+                self.assertEqual(len(self.requests), 2)
+
+    def test_full_create_already_complete_does_not_issue_hydrate_request(self):
+        self.create_status = valid_status()
+        self.poll_statuses = []
+        worker = self.worker()
+        started = time.monotonic()
+        first = worker._create_workspace(time.monotonic() + 5)
+        status, metadata_ms, complete_ms = worker._hydrate(first, time.monotonic() + 5, started)
+        self.assertEqual(status, first)
+        self.assertGreaterEqual(metadata_ms, 0)
+        self.assertGreaterEqual(complete_ms, 0)
+        self.assertEqual(self.requests, [
+            ("POST", "/v3/workspaces", {"target": {"kind": "latest"}, "scope": "/project",
+                                       "delivery": "full", "upper_policy": "private"}),
+        ])
 
     def test_full_profile_rejects_create_without_fixed_snapshot(self):
         self.create_status = valid_status(snapshot_id=None)
