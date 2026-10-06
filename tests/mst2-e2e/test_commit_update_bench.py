@@ -127,6 +127,51 @@ class CommitUpdateBenchTests(unittest.TestCase):
         error.worker_stage = "private-path"
         self.assertNotIn("worker_stage", BENCH.failure_record(error))
 
+    def test_worker_failure_record_carries_only_a_closed_retention_substage(self):
+        private = "private-token /run/secret response body"
+        error = WorkerError(private, error_code="worker_error", retention_substage="old_view_oracle")
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("shipped_workspace_and_git_measurement"):
+                raise error
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["retention_substage"], "old_view_oracle")
+        self.assertNotIn(private, json.dumps(record))
+        error.retention_substage = "private-path"
+        self.assertNotIn("retention_substage", BENCH.failure_record(error))
+
+    def test_worker_failure_record_carries_only_a_closed_hydration_substage(self):
+        private = "private-token /run/secret response body"
+        error = WorkerError(private, error_code="worker_http_status_5xx",
+                            hydration_substage="dependency_audit")
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("shipped_workspace_and_git_measurement"):
+                raise error
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["hydration_substage"], "dependency_audit")
+        self.assertNotIn(private, json.dumps(record))
+        error.hydration_substage = "private-path"
+        self.assertNotIn("hydration_substage", BENCH.failure_record(error))
+
+    def test_worker_failure_record_carries_only_a_closed_backend_code(self):
+        error = WorkerError("private response body", error_code="worker_http_status_5xx",
+                            backend_code="SNAPSHOT_ERROR", snapshot_code="ObjectUnavailable")
+        record = BENCH.failure_record(error)
+        self.assertEqual(record["backend_code"], "SNAPSHOT_ERROR")
+        self.assertEqual(record["snapshot_code"], "ObjectUnavailable")
+        self.assertNotIn("private response body", json.dumps(record))
+        unknown = WorkerError("private response body", backend_code="private-token")
+        self.assertNotIn("backend_code", BENCH.failure_record(unknown))
+        unknown = WorkerError("private response body", snapshot_code="private-token")
+        self.assertNotIn("snapshot_code", BENCH.failure_record(unknown))
+
+    def test_worker_failure_record_carries_only_a_closed_snapshot_code(self):
+        error = WorkerError("workspace id: ObjectUnavailable: private response body",
+                            error_code="worker_http_status_5xx", snapshot_code="ObjectUnavailable")
+        record = BENCH.failure_record(error)
+        self.assertEqual(record["snapshot_code"], "ObjectUnavailable")
+        self.assertNotIn("private response body", json.dumps(record))
+        self.assertNotIn("workspace id", json.dumps(record))
+
     def test_ci_persists_only_safe_failure_record(self):
         private = "private-token /run/secret response body"
         with tempfile.TemporaryDirectory() as temp:
@@ -198,6 +243,36 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(output.exists())
+
+    def test_explicit_recovery_keeps_the_original_window_after_queue_freshness_expires(self):
+        started = datetime.now(timezone.utc) - timedelta(minutes=20)
+        deadline = (started + timedelta(minutes=235)).isoformat()
+        for name in ("mst2-real-update.yml", "mst2-workspace-update.yml"):
+            workflow = SOURCE.parents[2] / ".github/workflows" / name
+            script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+            with tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "github-env"
+                env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
+                           GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                           STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
+                           PYTHONPATH=str(SOURCE.parent), RECOVERY_INPUT="true")
+                for _ in range(2):
+                    subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
+                    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                    self.assertEqual(values["MST2_SESSION_STARTED"], started.isoformat())
+                    self.assertEqual(values["MST2_SESSION_DEADLINE"], deadline)
+                    remaining = float(values["MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"]) - time.monotonic()
+                    self.assertGreater(remaining, 199 * 60)
+                    self.assertLessEqual(remaining, 200 * 60)
+                    output.unlink()
+                overdue = datetime.now(timezone.utc) - timedelta(minutes=221)
+                for bad in (dict(env, RECOVERY_INPUT="false"), dict(env, RECOVERY_INPUT="yes"),
+                            dict(env, DEADLINE_INPUT=(started + timedelta(minutes=236)).isoformat()),
+                            dict(env, STARTED_INPUT=overdue.isoformat(),
+                                 DEADLINE_INPUT=(overdue + timedelta(minutes=235)).isoformat())):
+                    result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
 
     def test_ci_setup_plan_cannot_create_local_resources(self):
         with tempfile.TemporaryDirectory() as temp:

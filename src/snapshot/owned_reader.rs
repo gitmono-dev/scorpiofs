@@ -195,16 +195,7 @@ impl SnapshotReader {
             expected_digest: &'a str,
         }
         fn scope_path<S: serde::Serializer>(path: &&str, serializer: S) -> Result<S::Ok, S::Error> {
-            struct Path<'a>(&'a str);
-            impl std::fmt::Display for Path<'_> {
-                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    if !self.0.starts_with('/') {
-                        f.write_str("/")?;
-                    }
-                    f.write_str(self.0)
-                }
-            }
-            serializer.collect_str(&Path(path))
+            serializer.collect_str(&super::reader::ScopeRequestPath(path))
         }
         #[derive(Serialize)]
         struct Request<'a> {

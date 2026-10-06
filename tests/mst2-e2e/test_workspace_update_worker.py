@@ -13,13 +13,17 @@ import uuid
 
 from workspace_update_worker import (
     HTTP_BODY_LIMIT,
+    HYDRATION_SUBSTAGES,
     ORACLE_MANIFEST_LIMIT,
+    RETENTION_SUBSTAGES,
     STATUS_FIELDS,
     WORKER_STAGES,
     WorkerError,
     WorkerSession,
     _NoRedirectHTTP,
     _check_deadline,
+    _status_error_codes,
+    _status_hydration_substage,
     _status,
 )
 
@@ -62,6 +66,44 @@ class WorkerShapeTests(unittest.TestCase):
         ]:
             self.assertEqual(WorkerError(message).error_code, expected)
 
+    def test_backend_error_code_is_closed(self):
+        self.assertEqual(WorkerError("private", backend_code="SNAPSHOT_ERROR").backend_code,
+                         "SNAPSHOT_ERROR")
+        self.assertIsNone(WorkerError("private", backend_code="private-token").backend_code)
+
+    def test_snapshot_error_code_is_closed(self):
+        self.assertEqual(WorkerError("private", snapshot_code="ObjectUnavailable").snapshot_code,
+                         "ObjectUnavailable")
+        self.assertIsNone(WorkerError("private", snapshot_code="private-token").snapshot_code)
+
+    def test_status_error_codes_are_closed_and_discard_details(self):
+        self.assertEqual(_status_error_codes(valid_status(last_error="WORKSPACE_IO: /private/path")),
+                         ("WORKSPACE_IO", None))
+        self.assertEqual(_status_error_codes(valid_status(last_error="ObjectUnavailable: private body")),
+                         (None, "ObjectUnavailable"))
+        self.assertEqual(_status_error_codes(valid_status(last_error=(
+            "workspace 11111111-2222-4333-8444-666666666666: LeaseExpired: private body"))),
+                         (None, "LeaseExpired"))
+        self.assertEqual(_status_error_codes(valid_status(last_error="PrivateToken: secret")),
+                         (None, None))
+        self.assertEqual(_status_error_codes(valid_status(last_error=None)), (None, None))
+
+    def test_status_hydration_substage_is_closed_and_separate_from_snapshot_code(self):
+        self.assertEqual(_status_hydration_substage(
+            valid_status(last_error="IntegrityError: dependency_audit")),
+            "dependency_audit")
+        self.assertEqual(_status_hydration_substage(
+            valid_status(last_error="Internal: hydration_task")),
+            "hydration_task")
+        self.assertIsNone(_status_hydration_substage(
+            valid_status(last_error="IntegrityError: /private/path")))
+        self.assertEqual(HYDRATION_SUBSTAGES, {
+            "metadata_closure", "cas_resume_audit", "small_object_fetch",
+            "large_content_fetch", "large_chunk_map", "large_chunk_read",
+            "large_cas_write", "hydration_commit", "snapshot_links",
+            "dependency_audit", "hydration_task",
+        })
+
     def test_status_requires_exact_wire_shape_and_canonical_identity(self):
         self.assertEqual(set(_status(valid_status())), STATUS_FIELDS)
         for key, value in (("metadata_ready", 1), ("snapshot_id", "sha256:" + "A" * 64),
@@ -89,6 +131,20 @@ class WorkerShapeTests(unittest.TestCase):
         self.assertEqual(failed.exception.worker_stage, "poll")
         self.assertEqual(WorkerError("private", stage="private").worker_stage, None)
         self.assertEqual(WorkerError("private", stage=[]).worker_stage, None)
+
+    def test_retention_substage_is_closed(self):
+        self.assertEqual(RETENTION_SUBSTAGES, {
+            "retain_path", "upper_check", "sentinel_write", "retained_fd",
+            "old_view_oracle", "old_view_fd", "old_view_sentinel", "final_view_oracle",
+        })
+        self.assertEqual(WorkerError("private", retention_substage="old_view_oracle").retention_substage,
+                         "old_view_oracle")
+        self.assertIsNone(WorkerError("private", retention_substage="private-path").retention_substage)
+        worker = WorkerSession.__new__(WorkerSession)
+        with self.assertRaises(WorkerError) as failed:
+            with worker._retention_substage("old_view_oracle"):
+                raise WorkerError("private response body")
+        self.assertEqual(failed.exception.retention_substage, "old_view_oracle")
 
 
 class WorkerFullProfileTests(unittest.TestCase):
@@ -121,6 +177,16 @@ class WorkerFullProfileTests(unittest.TestCase):
                         code, value = 422, {"error": "delivery unsupported"}
                     else:
                         value = profile.create_status
+                elif self.command == "POST" and self.path == "/error":
+                    code, value = 500, {
+                        "code": "SNAPSHOT_ERROR",
+                        "message": "workspace 11111111-2222-4333-8444-666666666666: ObjectUnavailable: private details",
+                    }
+                elif self.command == "POST" and self.path == "/unknown-snapshot":
+                    code, value = 500, {
+                        "code": "SNAPSHOT_ERROR",
+                        "message": "workspace 11111111-2222-4333-8444-666666666666: PrivateToken: private details",
+                    }
                 elif self.command == "GET" and self.path == workspace_path and profile.poll_statuses:
                     value = profile.poll_statuses.pop(0)
                 else:
@@ -174,6 +240,20 @@ class WorkerFullProfileTests(unittest.TestCase):
         self.assertEqual(worker._workspace_ids, [first["workspace_id"]])
         self.assertEqual(metadata_ms, 7.25)
         self.assertGreaterEqual(complete_ms, 0)
+
+    def test_http_backend_error_code_is_captured_without_response_message(self):
+        worker = self.worker()
+        with self.assertRaises(WorkerError) as failed:
+            worker.http.request("POST", "/error", time.monotonic() + 5, {}, expected=(200,))
+        self.assertEqual(failed.exception.error_code, "worker_http_status_5xx")
+        self.assertEqual(failed.exception.backend_code, "SNAPSHOT_ERROR")
+        self.assertEqual(failed.exception.snapshot_code, "ObjectUnavailable")
+        self.assertNotIn("private details", str(failed.exception))
+
+        with self.assertRaises(WorkerError) as unknown:
+            worker.http.request("POST", "/unknown-snapshot", time.monotonic() + 5, {}, expected=(200,))
+        self.assertEqual(unknown.exception.backend_code, "SNAPSHOT_ERROR")
+        self.assertIsNone(unknown.exception.snapshot_code)
 
     def test_full_profile_rejects_fixed_identity_changes_while_polling(self):
         changes = {"workspace_id": "33333333-2222-4333-8444-666666666666",
@@ -327,10 +407,26 @@ class WorkerReceiptTests(unittest.TestCase):
         if marker.exists():
             grandchild = int(marker.read_text())
             for _ in range(100):
-                if not Path(f"/proc/{grandchild}").exists():
+                proc = Path(f"/proc/{grandchild}")
+                if not proc.exists():
+                    break
+                try:
+                    state = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[0]
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                # PID 1 on a hosted/containerized runner may retain an orphan
+                # as a zombie after the owned process group is dead. That is
+                # no longer executable work and is covered by group_members.
+                if state in ("Z", "X"):
                     break
                 time.sleep(.01)
-            self.assertFalse(Path(f"/proc/{grandchild}").exists())
+            proc = Path(f"/proc/{grandchild}")
+            if proc.exists():
+                try:
+                    state = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[0]
+                except (FileNotFoundError, ProcessLookupError):
+                    state = None
+                self.assertIn(state, (None, "Z", "X"))
         self.assertEqual(__import__("commit_update_budget").group_members(anchor_pid, anchor_start), [])
 
     def test_complete_receipt_refuses_active_group_or_mount(self):

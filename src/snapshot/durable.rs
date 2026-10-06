@@ -89,6 +89,92 @@ pub enum CompletionKind {
     FullSnapshot,
 }
 
+/// Fixed, non-sensitive labels for failures reported by workspace hydration.
+///
+/// The durable APIs retain their normal [`SnapshotError`] details for callers
+/// that need them.  Workspace status surfaces only this bounded vocabulary so
+/// paths, digests and remote response bodies cannot leak through `last_error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HydrationSubstage {
+    MetadataClosure,
+    CasResumeAudit,
+    SmallObjectFetch,
+    LargeContentFetch,
+    /// Large-file source opened and its authenticated map/leaf metadata was
+    /// resolved. This stays a closed label for hosted benchmark evidence.
+    LargeChunkMap,
+    /// A verified chunk/range request failed before local CAS publication.
+    LargeChunkRead,
+    /// Local temporary-file write, sync, or rename failed after chunk reads.
+    LargeCasWrite,
+    HydrationCommit,
+    SnapshotLinks,
+    DependencyAudit,
+    Task,
+}
+
+impl HydrationSubstage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::MetadataClosure => "metadata_closure",
+            Self::CasResumeAudit => "cas_resume_audit",
+            Self::SmallObjectFetch => "small_object_fetch",
+            Self::LargeContentFetch => "large_content_fetch",
+            Self::LargeChunkMap => "large_chunk_map",
+            Self::LargeChunkRead => "large_chunk_read",
+            Self::LargeCasWrite => "large_cas_write",
+            Self::HydrationCommit => "hydration_commit",
+            Self::SnapshotLinks => "snapshot_links",
+            Self::DependencyAudit => "dependency_audit",
+            Self::Task => "hydration_task",
+        }
+    }
+
+    fn from_message(message: &str) -> Option<Self> {
+        Some(match message {
+            "metadata_closure" => Self::MetadataClosure,
+            "cas_resume_audit" => Self::CasResumeAudit,
+            "small_object_fetch" => Self::SmallObjectFetch,
+            "large_content_fetch" => Self::LargeContentFetch,
+            "large_chunk_map" => Self::LargeChunkMap,
+            "large_chunk_read" => Self::LargeChunkRead,
+            "large_cas_write" => Self::LargeCasWrite,
+            "hydration_commit" => Self::HydrationCommit,
+            "snapshot_links" => Self::SnapshotLinks,
+            "dependency_audit" => Self::DependencyAudit,
+            "hydration_task" => Self::Task,
+            _ => return None,
+        })
+    }
+}
+
+/// Attach a bounded hydration label while preserving the original error code.
+///
+/// The first label wins, allowing a low-level phase to remain visible when an
+/// outer helper adds a broader fallback label. The detailed message is logged
+/// only through the normal tracing path and is never returned in workspace
+/// status.
+pub(crate) fn tag_hydration_error(
+    mut error: SnapshotError,
+    stage: HydrationSubstage,
+) -> SnapshotError {
+    if HydrationSubstage::from_message(&error.message).is_none() {
+        tracing::debug!(
+            target: "scorpiofs::workspace::performance",
+            hydration_stage = stage.as_str(),
+            error_code = ?error.code,
+            "workspace hydration stage failed"
+        );
+        error.message = stage.as_str().to_owned();
+    }
+    error
+}
+
+/// Convert a hydration error into the status-safe label used by `last_error`.
+pub(crate) fn hydration_error_label(error: &SnapshotError) -> Option<&'static str> {
+    HydrationSubstage::from_message(&error.message).map(HydrationSubstage::as_str)
+}
+
 /// The fixed-view binding a store was hydrated from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ViewMeta {
@@ -891,7 +977,9 @@ impl DurableStore {
         Fut: std::future::Future<Output = Result<std::sync::Arc<B>, SnapshotError>>,
         B: AsRef<[u8]>,
     {
-        let _transaction = self.prepare_hydration_for_kind(view, manifest, closure.is_some())?;
+        let _transaction = self
+            .prepare_hydration_for_kind(view, manifest, closure.is_some())
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let journal = JournalBatch::new(self);
         let mut fetched = 0u64;
         let mut resumed = 0u64;
@@ -904,7 +992,10 @@ impl DurableStore {
             // from an earlier version is already here. A journal entry is not
             // required — but every hit is re-hashed before it is credited, and
             // a truncated or tampered object is repaired rather than served.
-            match self.verify_blob(&f.content_digest, f.size, CasVerificationReason::Resume) {
+            match self
+                .verify_blob(&f.content_digest, f.size, CasVerificationReason::Resume)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::CasResumeAudit))
+            {
                 Ok(true) => {
                     journal.append(&FileRecord {
                         rel_path: f.rel_path.clone(),
@@ -916,7 +1007,13 @@ impl DurableStore {
                     continue;
                 }
                 Ok(false) => {
-                    if self.blob_path(&f.content_digest)?.exists() {
+                    if self
+                        .blob_path(&f.content_digest)
+                        .map_err(|error| {
+                            tag_hydration_error(error, HydrationSubstage::CasResumeAudit)
+                        })?
+                        .exists()
+                    {
                         // Present but wrong: refetch and atomically replace it.
                         repaired += 1;
                     }
@@ -927,42 +1024,60 @@ impl DurableStore {
             if let Some(reader) = stream_reader.filter(|reader| {
                 f.size > crate::snapshot::OBJECT_CAP && reader.capabilities().features.chunk_reads
             }) {
-                write_reader_blob(&self.content, reader, f).await?;
+                write_reader_blob(&self.content, reader, f)
+                    .await
+                    .map_err(|error| {
+                        tag_hydration_error(error, HydrationSubstage::LargeContentFetch)
+                    })?;
             } else {
-                let owner = fetch(f).await?;
+                let owner = fetch(f).await.map_err(|error| {
+                    tag_hydration_error(error, HydrationSubstage::SmallObjectFetch)
+                })?;
                 let bytes = owner.as_ref().as_ref();
                 // The store owns its own correctness: verify whatever the source
                 // returned, regardless of whether the source claimed to verify.
                 let got = digest_of(bytes);
                 if got != f.content_digest {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::DigestMismatch,
-                        format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
+                    return Err(tag_hydration_error(
+                        SnapshotError::new(
+                            SnapshotErrorCode::DigestMismatch,
+                            format!("{}: expected {}, got {got}", f.rel_path, f.content_digest),
+                        ),
+                        HydrationSubstage::SmallObjectFetch,
                     ));
                 }
                 if bytes.len() as u64 != f.size {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::DigestMismatch,
-                        format!(
-                            "{}: view advertises {} bytes, content is {}",
-                            f.rel_path,
-                            f.size,
-                            bytes.len()
+                    return Err(tag_hydration_error(
+                        SnapshotError::new(
+                            SnapshotErrorCode::DigestMismatch,
+                            format!(
+                                "{}: view advertises {} bytes, content is {}",
+                                f.rel_path,
+                                f.size,
+                                bytes.len()
+                            ),
                         ),
+                        HydrationSubstage::SmallObjectFetch,
                     ));
                 }
-                write_atomic(&self.content, &blob_name(&f.content_digest), bytes)?;
+                write_atomic(&self.content, &blob_name(&f.content_digest), bytes).map_err(
+                    |error| tag_hydration_error(error, HydrationSubstage::SmallObjectFetch),
+                )?;
             }
-            journal.append(&FileRecord {
-                rel_path: f.rel_path.clone(),
-                digest: f.content_digest.clone(),
-                size: f.size,
-            })?;
+            journal
+                .append(&FileRecord {
+                    rel_path: f.rel_path.clone(),
+                    digest: f.content_digest.clone(),
+                    size: f.size,
+                })
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
             fetched += 1;
             bytes_total += f.size;
         }
 
-        journal.flush()?;
+        journal
+            .flush()
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         match closure {
             Some(closure) => self.finish_hydration_commit(
                 view,
@@ -1117,9 +1232,12 @@ impl DurableStore {
         let closure = snapshot.as_ref().map(|snapshot| snapshot.closure);
         let stream_reader = snapshot.as_ref().and_then(|snapshot| snapshot.reader);
         if let Some(closure) = closure {
-            validate_snapshot_view(view, closure)?;
+            validate_snapshot_view(view, closure)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         }
-        let _transaction = self.prepare_hydration_for_kind(view, manifest, closure.is_some())?;
+        let _transaction = self
+            .prepare_hydration_for_kind(view, manifest, closure.is_some())
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let journal = JournalBatch::new(self);
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
@@ -1502,9 +1620,12 @@ impl DurableStore {
         let closure = snapshot.as_ref().map(|snapshot| snapshot.closure);
         let stream_reader = snapshot.as_ref().and_then(|snapshot| snapshot.reader);
         if let Some(closure) = closure {
-            validate_snapshot_view(view, closure)?;
+            validate_snapshot_view(view, closure)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         }
-        let _transaction = self.prepare_hydration_for_kind(view, manifest, closure.is_some())?;
+        let _transaction = self
+            .prepare_hydration_for_kind(view, manifest, closure.is_some())
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let journal = JournalBatch::new(self);
         let fetched = std::sync::atomic::AtomicU64::new(0);
         let resumed = std::sync::atomic::AtomicU64::new(0);
@@ -1537,7 +1658,8 @@ impl DurableStore {
                 }
             }
             Ok::<_, SnapshotError>(need)
-        })?;
+        })
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::CasResumeAudit))?;
 
         // Phase 2: split small (OBJECT batch) from large (chunk path).
         const OBJECT_CAP: u64 = 256 * 1024;
@@ -1626,7 +1748,8 @@ impl DurableStore {
                     }
                 }),
         )
-        .await?;
+        .await
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::SmallObjectFetch))?;
 
         // Phase 4: large files, one chunked fetch per file, concurrent.
         let fetched_l = &fetched;
@@ -1680,9 +1803,12 @@ impl DurableStore {
                     }
                 }),
         )
-        .await?;
+        .await
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeContentFetch))?;
 
-        journal.flush()?;
+        journal
+            .flush()
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let fetched = fetched.load(Relaxed);
         let resumed = resumed.load(Relaxed);
         let repaired = repaired.load(Relaxed);
@@ -2081,6 +2207,7 @@ impl DurableStore {
         super::stage::trace_sync("durable_hydration_commit", || {
             self.finish_hydration_commit_inner(view, manifest, closure, counts)
         })
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))
     }
 
     fn finish_hydration_commit_inner(
@@ -2091,40 +2218,75 @@ impl DurableStore {
         counts: (u64, u64, u64),
     ) -> Result<HydrateReport, SnapshotError> {
         let (fetched, resumed, repaired) = counts;
-        let (dependencies, bytes_total) = validate_manifest_policy(manifest, closure.is_some())?;
+        let (dependencies, bytes_total) = validate_manifest_policy(manifest, closure.is_some())
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         if let Some(closure) = closure {
-            validate_snapshot_view(view, closure)?;
-            self.verify_snapshot_links(closure)?;
+            validate_snapshot_view(view, closure)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+            super::stage::trace_sync("snapshot_links", || self.verify_snapshot_links(closure))
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::SnapshotLinks))?;
         }
         // Reuse is not a durability certificate. Sync every unique dependency
         // (including cache hits), then its directory, before metadata/pin.
-        for blob in &dependencies {
-            if !self.verify_blob(
-                &blob.digest,
-                blob.size,
-                CasVerificationReason::HydrationCommit,
-            )? {
-                return Err(integrity_err(format!(
-                    "hydration dependency missing or corrupt: {}",
-                    blob.digest
-                )));
+        super::stage::trace_sync("hydration_dependency_audit", || {
+            for blob in &dependencies {
+                if !self
+                    .verify_blob(
+                        &blob.digest,
+                        blob.size,
+                        CasVerificationReason::HydrationCommit,
+                    )
+                    .map_err(|error| {
+                        tag_hydration_error(error, HydrationSubstage::DependencyAudit)
+                    })?
+                {
+                    return Err(tag_hydration_error(
+                        integrity_err(format!(
+                            "hydration dependency missing or corrupt: {}",
+                            blob.digest
+                        )),
+                        HydrationSubstage::DependencyAudit,
+                    ));
+                }
+                let blob_path = self.blob_path(&blob.digest).map_err(|error| {
+                    tag_hydration_error(error, HydrationSubstage::DependencyAudit)
+                })?;
+                sync_file(&blob_path).map_err(|error| {
+                    tag_hydration_error(error, HydrationSubstage::DependencyAudit)
+                })?;
             }
-            sync_file(&self.blob_path(&blob.digest)?)?;
-        }
-        sync_dir(&self.content)?;
-        durability_checkpoint(&self.root, "content-durable")?;
+            Ok::<_, SnapshotError>(())
+        })
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::DependencyAudit))?;
+        sync_dir(&self.content)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+        durability_checkpoint(&self.root, "content-durable")
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         // Keep exactly one hint for each logical path after a successful
         // pass. The old journal remains usable until the replacement commits.
-        self.compact_journal(manifest)?;
-        let manifest_bytes = serde_json::to_vec_pretty(manifest)
-            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
-        write_atomic(&self.root, MANIFEST_FILE, &manifest_bytes)?;
-        durability_checkpoint(&self.root, "manifest-durable")?;
+        self.compact_journal(manifest)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+        let manifest_bytes = serde_json::to_vec_pretty(manifest).map_err(|e| {
+            tag_hydration_error(
+                SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()),
+                HydrationSubstage::HydrationCommit,
+            )
+        })?;
+        write_atomic(&self.root, MANIFEST_FILE, &manifest_bytes)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+        durability_checkpoint(&self.root, "manifest-durable")
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
 
-        let view_bytes = serde_json::to_vec_pretty(view)
-            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
-        write_atomic(&self.root, VIEW_FILE, &view_bytes)?;
-        durability_checkpoint(&self.root, "view-durable")?;
+        let view_bytes = serde_json::to_vec_pretty(view).map_err(|e| {
+            tag_hydration_error(
+                SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()),
+                HydrationSubstage::HydrationCommit,
+            )
+        })?;
+        write_atomic(&self.root, VIEW_FILE, &view_bytes)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+        durability_checkpoint(&self.root, "view-durable")
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let view_digest = digest_of(&view_bytes);
         let manifest_digest = digest_of(&manifest_bytes);
         let completion_kind = if closure.is_some() {
@@ -2134,7 +2296,8 @@ impl DurableStore {
         };
         let metadata = closure
             .map(|closure| self.persist_snapshot_metadata(closure))
-            .transpose()?;
+            .transpose()
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let pin_bytes = if let Some(metadata) = &metadata {
             encode_record(&SnapshotPinRecord {
                 verification_revision: SNAPSHOT_VERIFICATION_REVISION,
@@ -2150,7 +2313,8 @@ impl DurableStore {
                 pages: metadata.pages.clone(),
                 blobs: dependencies,
                 pinned_at_unix: now_unix(),
-            })?
+            })
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?
         } else {
             encode_record(&PinRecord {
                 verification_revision: VERIFICATION_REVISION,
@@ -2163,15 +2327,25 @@ impl DurableStore {
                 manifest_digest: manifest_digest.clone(),
                 blobs: dependencies,
                 pinned_at_unix: now_unix(),
-            })?
+            })
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?
         };
-        write_atomic(&self.root, PIN_FILE, &pin_bytes)?;
-        durability_checkpoint(&self.root, "pin-durable")?;
-        super::workspace_pins::publish_pin(self, view)?;
+        write_atomic(&self.root, PIN_FILE, &pin_bytes)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+        durability_checkpoint(&self.root, "pin-durable")
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+        super::workspace_pins::publish_pin(self, view)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         match fs::remove_file(self.root.join(REPAIR_FILE)) {
-            Ok(()) => sync_dir(&self.root)?,
+            Ok(()) => sync_dir(&self.root)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_err(e)),
+            Err(e) => {
+                return Err(tag_hydration_error(
+                    io_err(e),
+                    HydrationSubstage::HydrationCommit,
+                ))
+            }
         }
 
         let marker_bytes = if let Some(metadata) = metadata {
@@ -2191,7 +2365,8 @@ impl DurableStore {
                 pages: metadata.pages.len() as u64,
                 bytes: bytes_total,
                 hydrated_at_unix: now_unix(),
-            })?
+            })
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?
         } else {
             encode_record(&CompleteMarker {
                 verification_revision: VERIFICATION_REVISION,
@@ -2204,17 +2379,24 @@ impl DurableStore {
                 files: manifest.len() as u64,
                 bytes: bytes_total,
                 hydrated_at_unix: now_unix(),
-            })?
+            })
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?
         };
         // The final rename+directory sync is the linearization point. An
         // error must not leave a visible COMPLETE from a failed repair.
         if let Err(error) = write_atomic(&self.root, COMPLETE_MARKER, &marker_bytes) {
             self.invalidate_complete()?;
-            return Err(error);
+            return Err(tag_hydration_error(
+                error,
+                HydrationSubstage::HydrationCommit,
+            ));
         }
         if let Err(error) = durability_checkpoint(&self.root, "complete-durable") {
             self.invalidate_complete()?;
-            return Err(error);
+            return Err(tag_hydration_error(
+                error,
+                HydrationSubstage::HydrationCommit,
+            ));
         }
 
         Ok(HydrateReport {
@@ -2737,7 +2919,8 @@ async fn write_reader_blob(
             &file.content_digest,
             file.size,
         )
-        .await?;
+        .await
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkMap))?;
         return write_reader_blob_stream(dir, file, |offset, length| {
             source.read_range_owned(offset, length)
         })
@@ -2745,7 +2928,8 @@ async fn write_reader_blob(
     }
     let source =
         crate::snapshot::ChunkedFile::open(reader, &file.rel_path, &file.content_digest, file.size)
-            .await?;
+            .await
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkMap))?;
     write_reader_blob_stream(dir, file, |offset, length| {
         source.read_range(offset, length)
     })
@@ -2762,7 +2946,8 @@ where
     Fut: Future<Output = Result<B, SnapshotError>>,
     B: BlobBytes,
 {
-    create_dirs_durable(dir)?;
+    create_dirs_durable(dir)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     let name = blob_name(&file.content_digest);
     let temporary_path = dir.join(format!(
         ".{name}.tmp.{}-{}",
@@ -2773,39 +2958,61 @@ where
         .write(true)
         .create_new(true)
         .open(&temporary_path)
-        .map_err(io_err)?;
+        .map_err(io_err)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     let temporary = PendingBlob(temporary_path);
     let mut output = tokio::fs::File::from_std(handle);
     let mut hash = Context::new(&SHA256);
     let mut offset = 0;
     while offset < file.size {
         let length = (file.size - offset).min(mst2_codec::chunkmap::CHUNK_SIZE as u64);
-        let bytes = read_range(offset, length).await?;
+        let bytes = read_range(offset, length)
+            .await
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkRead))?;
         if bytes.bytes().len() as u64 != length {
-            return Err(integrity_err(
-                "streamed chunk does not cover the expected file range",
+            return Err(tag_hydration_error(
+                integrity_err("streamed chunk does not cover the expected file range"),
+                HydrationSubstage::LargeChunkRead,
             ));
         }
         let bytes = bytes.bytes();
         hash.update(bytes);
-        output.write_all(bytes).await.map_err(io_err)?;
+        output
+            .write_all(bytes)
+            .await
+            .map_err(io_err)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
         offset += length;
     }
     if format!("sha256:{}", hex::encode(hash.finish().as_ref())) != file.content_digest {
-        return Err(SnapshotError::new(
-            SnapshotErrorCode::DigestMismatch,
-            format!(
-                "{}: streamed file does not match whole-content digest",
-                file.rel_path
+        return Err(tag_hydration_error(
+            SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!(
+                    "{}: streamed file does not match whole-content digest",
+                    file.rel_path
+                ),
             ),
+            HydrationSubstage::LargeChunkRead,
         ));
     }
-    output.flush().await.map_err(io_err)?;
-    durability_checkpoint(dir, "object-file-sync")?;
-    output.sync_all().await.map_err(io_err)?;
+    output
+        .flush()
+        .await
+        .map_err(io_err)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+    durability_checkpoint(dir, "object-file-sync")
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+    output
+        .sync_all()
+        .await
+        .map_err(io_err)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     drop(output);
-    fs::rename(&temporary.0, dir.join(name)).map_err(io_err)?;
-    sync_dir(dir)
+    fs::rename(&temporary.0, dir.join(name))
+        .map_err(io_err)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+    sync_dir(dir).map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))
 }
 
 /// Borrow the streamed body while keeping an owned range reservation alive.
@@ -3104,6 +3311,22 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+
+    #[test]
+    fn hydration_diagnostics_use_only_fixed_labels_and_preserve_first_stage() {
+        let error = SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "private path /tmp/secret and digest sha256:secret",
+        );
+        let tagged = tag_hydration_error(error, HydrationSubstage::DependencyAudit);
+        assert_eq!(tagged.code, SnapshotErrorCode::IntegrityError);
+        assert_eq!(tagged.message, "dependency_audit");
+        assert_eq!(hydration_error_label(&tagged), Some("dependency_audit"));
+
+        let outer = tag_hydration_error(tagged, HydrationSubstage::HydrationCommit);
+        assert_eq!(outer.message, "dependency_audit");
+        assert_eq!(hydration_error_label(&outer), Some("dependency_audit"));
+    }
 
     fn file(rel: &str, content: &[u8]) -> (SnapshotFile, Vec<u8>) {
         (
