@@ -1,6 +1,7 @@
 //! Workspace full hydration uses fixed, bounded OBJECT and streaming lanes.
 
 use crate::snapshot::{
+    durable::{tag_hydration_error, HydrationSubstage},
     stage::{trace_async, trace_sync},
     DurableStore, HydrateReport, IncrementalSync, ScopeCache, SnapshotError, SnapshotErrorCode,
     SnapshotReader,
@@ -27,7 +28,9 @@ pub(crate) async fn hydrate_workspace(
     let cache = ScopeCache::open(scope)?;
     let mut sync = IncrementalSync::new(reader, &cache)
         .with_pin_verification_meters(store.verification_meters());
-    let closure = trace_async("hydrate_metadata_closure", sync.sync_snapshot()).await?;
+    let closure = trace_async("hydrate_metadata_closure", sync.sync_snapshot())
+        .await
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::MetadataClosure))?;
     tracing::debug!(
         target: "scorpiofs::workspace::performance",
         metadata_sync = ?sync.meters(),
@@ -44,7 +47,8 @@ pub(crate) async fn hydrate_workspace(
         )
         .await;
         store.trace_verification_meters("hydration_without_objects");
-        return result;
+        return result
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit));
     }
     let batches = reader.clone();
     let large = reader.clone();
@@ -69,7 +73,7 @@ pub(crate) async fn hydrate_workspace(
     )
     .await;
     store.trace_verification_meters("hydration");
-    result
+    result.map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))
 }
 
 #[cfg(test)]
