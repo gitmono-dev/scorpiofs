@@ -376,12 +376,16 @@ def execute(options):
     process = None
     log = None
     try:
-        bench.command(["docker", "compose", "-p", project, "-f", str(compose_path),
-                       "up", "-d", "--wait", "--wait-timeout", "180"], min(deadline, time.monotonic() + 240))
+        with bench.phase("dependency_startup"):
+            bench.command(["docker", "compose", "-p", project, "-f", str(compose_path),
+                           "up", "-d", "--wait", "--wait-timeout", "180"],
+                          min(deadline, time.monotonic() + 240))
         db = "mst2_bench_" + uuid.uuid4().hex
         env = bench.clean_env({"PGHOST": "127.0.0.1", "PGPORT": str(ports["postgres"]),
                                "PGUSER": "mega2", "PGPASSWORD": "mega2_test_password", "PGDATABASE": "mega2"})
-        bench.command(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE " + db], deadline, env=env)
+        with bench.phase("database_create"):
+            bench.command(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE " + db],
+                          deadline, env=env)
         env["PGDATABASE"] = db
         git_token, token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         for name, secret in (("git-token", git_token), ("mst2-token", token)):
@@ -414,14 +418,17 @@ def execute(options):
         service_env = bench.clean_env({"MEGA_BASE_DIR": config["base_dir"], "MEGA_CACHE_DIR": str(root / "cache"),
                                        "MEGA_GIT_OBJECT_CACHE_PREFIX": project})
         prefix = [str(binary), "--config", str(config_path)]
-        bench.command(prefix + ["config", "validate"], deadline, env=service_env)
-        bench.command(prefix + ["service", "init", "--yes"], deadline, env=service_env)
+        with bench.phase("server_config_validate"):
+            bench.command(prefix + ["config", "validate"], deadline, env=service_env)
+        with bench.phase("server_service_init"):
+            bench.command(prefix + ["service", "init", "--yes"], deadline, env=service_env)
         with bench.phase("owned_native_initialization"):
             print(json.dumps(initialize_owned_native(db, instance, env, deadline)), flush=True)
         log = (root / "service-private.log").open("wb")
-        process = budget_module.PinnedProcess(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
-                                   stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                   env=service_env, start_new_session=True)
+        with bench.phase("server_process_start"):
+            process = budget_module.PinnedProcess(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                       env=service_env, start_new_session=True)
         started = None
         try:
             started = budget_module.process_start(process.pid)
@@ -438,18 +445,20 @@ def execute(options):
             raise
         base = f"http://127.0.0.1:{ports['http']}"
         ready_until = min(deadline, time.monotonic() + 180)
-        while True:
-            if owned_service_exit(process) is not None or time.monotonic() >= ready_until:
-                raise RuntimeError("owned service failed readiness")
-            try:
-                with urlopen(base + "/api/v2/snapshots/capabilities",
-                             timeout=min(2, max(.001, ready_until - time.monotonic()))) as response:
-                    if response.status == 200:
-                        break
-            except OSError:
-                pass
-            time.sleep(min(.2, max(0, ready_until - time.monotonic())))
-        initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"], deadline).decode().split()
+        with bench.phase("server_readiness"):
+            while True:
+                if owned_service_exit(process) is not None or time.monotonic() >= ready_until:
+                    raise RuntimeError("owned service failed readiness")
+                try:
+                    with urlopen(base + "/api/v2/snapshots/capabilities",
+                                 timeout=min(2, max(.001, ready_until - time.monotonic()))) as response:
+                        if response.status == 200:
+                            break
+                except OSError:
+                    pass
+                time.sleep(min(.2, max(0, ready_until - time.monotonic())))
+        with bench.phase("initial_git_identity"):
+            initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"], deadline).decode().split()
         if len(initial) != 2 or initial[1] != "refs/heads/main":
             raise AssertionError("owned service did not initialize exactly one project main")
         env.update(M2_TOKEN=token, M2_GIT_TOKEN=git_token)
