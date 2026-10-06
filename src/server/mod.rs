@@ -1,57 +1,3 @@
-// use std::{path::Path, sync::Arc, thread::JoinHandle};
-
-// use fuse_backend_rs::{api::{filesystem::FileSystem, server::Server}, transport::{FuseChannel, FuseSession}};
-// #[allow(unused)]
-// pub struct FuseServer<T: FileSystem + Send + Sync> {
-//     pub server: Arc<Server<T>>,
-//     pub ch: FuseChannel,
-// }
-// pub fn run<T: FileSystem + Send + Sync+ 'static>(fuse:Arc<T>,path:&str )->JoinHandle<Result<(), std::io::Error>>{
-//     let mut se = FuseSession::new(Path::new(path), "dic", "", false).unwrap();
-//     se.mount().unwrap();
-//     let ch: FuseChannel = se.new_channel().unwrap();
-//     let server = Arc::new(Server::new(fuse));
-//     let mut fuse_server = FuseServer { server, ch };
-//     // Spawn server thread
-//     std::thread::spawn( move || {
-//         fuse_server.svc_loop()
-//     })
-
-// }
-// #[allow(unused)]
-// impl <FS:FileSystem+ Send + Sync>FuseServer<FS> {
-//     pub fn svc_loop(&mut self) -> Result<(), std::io::Error> {
-//         let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-//         println!("entering server loop");
-//         loop {
-//             if let Some((reader, writer)) = self
-//                 .ch
-//                 .get_request()
-//                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
-//             {
-//                 if let Err(e) = self
-//                     .server
-//                     .handle_message(reader, writer.into(), None, None)
-//                 {
-//                     match e {
-//                         fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
-//                             break;
-//                         }
-//                         _ => {
-//                             print!("Handling fuse message failed");
-//                             continue;
-//                         }
-//                     }
-//                 }
-//             } else {
-//                 print!("fuse server exits");
-//                 break;
-//             }
-//         }
-//         Ok(())
-//     }
-// }
-
 use std::ffi::{OsStr, OsString};
 
 use asyncfuse::{
@@ -59,7 +5,18 @@ use asyncfuse::{
     MountOptions,
 };
 
-fn apply_antares_cache_mount_options(options: &mut MountOptions) {
+/// Compatibility name used by existing Antares filesystem consumers.
+pub async fn mount_filesystem_with_antares_cache<
+    F: Filesystem + std::marker::Sync + Send + 'static,
+>(
+    fs: F,
+    mountpoint: &OsStr,
+    enable_antares_cache: bool,
+) -> std::io::Result<MountHandle> {
+    mount_filesystem_with_writeback_cache(fs, mountpoint, enable_antares_cache).await
+}
+
+fn apply_writeback_mount_options(options: &mut MountOptions) {
     // Enable write-back cache for better write performance.
     // This negotiates FUSE_WRITEBACK_CACHE flag during FUSE_INIT.
     //
@@ -74,7 +31,7 @@ pub async fn mount_filesystem<F: Filesystem + std::marker::Sync + Send + 'static
     fs: F,
     mountpoint: &OsStr,
 ) -> std::io::Result<MountHandle> {
-    mount_filesystem_with_antares_cache(fs, mountpoint, false).await
+    mount_filesystem_with_writeback_cache(fs, mountpoint, false).await
 }
 
 /// Make `path` ready to serve as a FUSE mountpoint, or explain why it cannot.
@@ -83,8 +40,8 @@ pub async fn mount_filesystem<F: Filesystem + std::marker::Sync + Send + 'static
 /// be **empty**. An unreadable directory counts as non-empty: mounting over contents
 /// that cannot even be enumerated is not a recoverable mistake.
 ///
-/// Split out of [`mount_filesystem_with_antares_cache`] so that an operation which
-/// creates a worktree *before* mounting it (such as `fork`) can run the identical
+/// Split out of [`mount_filesystem_with_writeback_cache`] so that an operation which
+/// creates a workspace *before* mounting it can run the identical
 /// check up front and fail without leaving a half-created worktree behind.
 pub fn prepare_mountpoint(path: &std::path::Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
@@ -122,16 +79,16 @@ pub fn prepare_mountpoint(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 #[allow(unused)]
-pub async fn mount_filesystem_with_antares_cache<
+pub async fn mount_filesystem_with_writeback_cache<
     F: Filesystem + std::marker::Sync + Send + 'static,
 >(
     fs: F,
     mountpoint: &OsStr,
-    enable_antares_cache: bool,
+    enable_writeback_cache: bool,
 ) -> std::io::Result<MountHandle> {
     use std::io::{Error, ErrorKind};
 
-    // This library function does not install a logger. The scorpio/antares
+    // This library function does not install a logger. The scorpio
     // binaries call `util::logging::init` once at startup, which installs the
     // tracing subscriber and the `log` -> `tracing` bridge; a library consumer
     // that wants `log::` records captured must initialize tracing itself.
@@ -150,8 +107,8 @@ pub async fn mount_filesystem_with_antares_cache<
     // need allow_other.
     #[cfg(target_os = "linux")]
     mount_options.allow_other(true).force_readdir_plus(true);
-    if enable_antares_cache {
-        apply_antares_cache_mount_options(&mut mount_options);
+    if enable_writeback_cache {
+        apply_writeback_mount_options(&mut mount_options);
     }
 
     tracing::debug!("about to mount FUSE filesystem at: {:?}", mount_path);

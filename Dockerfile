@@ -31,7 +31,7 @@ ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=scorpiofs-cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=scorpiofs-cargo-git-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=scorpiofs-target-${TARGETARCH},sharing=locked \
-    cargo build --release --locked --bin scorpio --bin antares \
+    cargo build --release --locked --bins \
     && install -D -m0755 /src/target/release/scorpio /out/scorpio \
     && install -D -m0755 /src/target/release/antares /out/antares
 

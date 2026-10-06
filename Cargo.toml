@@ -2,9 +2,9 @@
 name = "scorpiofs"
 version = "0.4.1"
 edition = "2021"
-# `cargo run` (no --bin) runs the main `scorpio` binary; `antares` is the alias.
+# `cargo run` (no --bin) runs the `scorpio` workspace binary.
 default-run = "scorpio"
-description = "FUSE-based virtual filesystem with Antares overlay for monorepo builds"
+description = "FUSE-based fixed monorepo snapshots and private workspaces"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gitmono-dev/scorpiofs"
 documentation = "https://docs.rs/scorpiofs"
@@ -17,8 +17,7 @@ readme = "README.md"
 name = "scorpiofs"
 path = "src/lib.rs"
 
-# The main binary is `scorpio` (the crate/lib is `scorpiofs`). `antares` is
-# auto-discovered from src/bin/antares.rs and kept as a deprecated alias.
+# The distribution has one binary, `scorpio`; the crate/lib is `scorpiofs`.
 [[bin]]
 name = "scorpio"
 path = "src/main.rs"

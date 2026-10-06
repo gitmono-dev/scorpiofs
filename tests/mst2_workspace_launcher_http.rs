@@ -475,6 +475,24 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 
+async fn workspace_cli(base: &str, arguments: &[&str]) -> std::process::Output {
+    let binary = std::env::var_os("SCORPIO_LAUNCHER_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_scorpio")));
+    tokio::process::Command::new(binary)
+        .args([
+            "--config-path",
+            "/nonexistent-scorpio-client-config",
+            "workspace",
+            "--endpoint",
+            base,
+        ])
+        .args(arguments)
+        .output()
+        .await
+        .unwrap()
+}
+
 #[cfg(target_os = "linux")]
 async fn wait_complete(client: &reqwest::Client, base: &str, id: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -512,6 +530,12 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
     launcher.ready(&client).await;
     assert!(f.requests.lock().unwrap().is_empty());
     launcher.assert_no_dictionary();
+    let listed = workspace_cli(&launcher.base, &["list"]).await;
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&listed.stdout).unwrap(),
+        json!([])
+    );
     let health: Value = client
         .get(format!("{}/health", launcher.base))
         .send()
@@ -620,16 +644,13 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     let mut old_fd = None;
     for index in 0..2 {
         f.latest.store(index, Ordering::SeqCst);
-        let response = client.post(format!("{}/v3/workspaces", launcher.base))
-            .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
-            .send().await.unwrap();
-        let status = response.status();
-        let body: Value = response.json().await.unwrap();
+        let response = workspace_cli(&launcher.base, &["create", "/project"]).await;
         assert!(
-            status.is_success(),
-            "mount rejected: {body}; {}",
+            response.status.success(),
+            "CLI mount rejected: {response:?}; {}",
             launcher.log()
         );
+        let body: Value = serde_json::from_slice(&response.stdout).unwrap();
         ids.push(body["workspace_id"].as_str().unwrap().to_owned());
         generations.push(body["generation"].as_str().unwrap().to_owned());
         assert_eq!(body["snapshot_id"], f.versions[index].sid);

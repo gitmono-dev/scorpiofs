@@ -1,4 +1,4 @@
-"""Check copy-up and truncation on a disposable Antares mount; never push."""
+"""Check copy-up and truncation on a disposable fixed v3 workspace."""
 
 import argparse
 import hashlib
@@ -11,7 +11,7 @@ import uuid
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--api", default="http://127.0.0.1:37255/antares")
+    parser.add_argument("--api", default="http://127.0.0.1:37255")
     parser.add_argument("--scope", default="/project/bench50k")
     parser.add_argument("--file", default="svc00/pkg000/mod00/f00000.rs")
     args = parser.parse_args()
@@ -30,14 +30,19 @@ def main():
             raw = response.read()
             return json.loads(raw) if raw else None
 
-    created = call("/mounts", {"path": args.scope,
-                   "job_id": "truncate-regression-" + str(uuid.uuid4())}, "POST")
+    created = call("/v3/workspaces", {
+        "target": {"kind": "latest"}, "scope": args.scope,
+        "delivery": "lazy", "upper_policy": "private",
+    }, "POST")
     result = {"status": "running", "scope": args.scope, "file": args.file, "checks": []}
     try:
-        entry = next(row for row in call("/mounts")["mounts"]
-                     if row["mount_id"] == created["mount_id"])
+        assert created["mount_state"] == "mounted" and created["metadata_ready"]
+        result.update(workspace_id=created["workspace_id"],
+                      generation=created["generation"], snapshot_id=created["snapshot_id"])
         mount = Path(created["mountpoint"])
-        upper = Path(entry["layers"]["upper"])
+        # This host-side regression explicitly checks the private upper owned by
+        # the fixed workspace. It does not request another projection or refresh.
+        upper = mount.parent() / "upper"
         target = mount / relative
         original = target.read_bytes()
 
@@ -87,7 +92,8 @@ def main():
         raise
     finally:
         try:
-            call("/mounts/" + created["mount_id"], method="DELETE")
+            call("/v3/workspaces/" + created["workspace_id"] + "/destroy",
+                 {"discard_dirty": True}, "POST")
             result["mount_deleted"] = True
         finally:
             print(json.dumps(result, indent=2), flush=True)
