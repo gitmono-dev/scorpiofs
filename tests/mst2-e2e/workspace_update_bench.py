@@ -208,6 +208,7 @@ def execute(options):
             "scorpio_verified_ms": [r["scorpio"]["durable_verified_ms"] for r in samples],
             "scorpio_retain_view_ms": [r["scorpio"]["retain_view_ms"] for r in samples],
             "scorpio_old_view_audit_ms": [r["scorpio"]["old_view_audit_ms"] for r in samples],
+            "scorpio_final_retained_view_audit_ms": [r["final_retained_view_audit_ms"] for r in samples],
             "scorpio_side_total_ms": [r["scorpio"]["side_total_ms"] for r in samples],
             "git_verified_ms": [r["git"]["verified_ms"] for r in samples],
             "git_checkout_verified_ms": [r["git"]["checkout_verified_ms"] for r in samples],
