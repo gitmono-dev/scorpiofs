@@ -13,6 +13,7 @@ import uuid
 
 from workspace_update_worker import (
     HTTP_BODY_LIMIT,
+    HYDRATION_SUBSTAGES,
     ORACLE_MANIFEST_LIMIT,
     RETENTION_SUBSTAGES,
     STATUS_FIELDS,
@@ -22,6 +23,7 @@ from workspace_update_worker import (
     _NoRedirectHTTP,
     _check_deadline,
     _status_error_codes,
+    _status_hydration_substage,
     _status,
 )
 
@@ -85,6 +87,21 @@ class WorkerShapeTests(unittest.TestCase):
         self.assertEqual(_status_error_codes(valid_status(last_error="PrivateToken: secret")),
                          (None, None))
         self.assertEqual(_status_error_codes(valid_status(last_error=None)), (None, None))
+
+    def test_status_hydration_substage_is_closed_and_separate_from_snapshot_code(self):
+        self.assertEqual(_status_hydration_substage(
+            valid_status(last_error="IntegrityError: dependency_audit")),
+            "dependency_audit")
+        self.assertEqual(_status_hydration_substage(
+            valid_status(last_error="Internal: hydration_task")),
+            "hydration_task")
+        self.assertIsNone(_status_hydration_substage(
+            valid_status(last_error="IntegrityError: /private/path")))
+        self.assertEqual(HYDRATION_SUBSTAGES, {
+            "metadata_closure", "cas_resume_audit", "small_object_fetch",
+            "large_content_fetch", "hydration_commit", "snapshot_links",
+            "dependency_audit", "hydration_task",
+        })
 
     def test_status_requires_exact_wire_shape_and_canonical_identity(self):
         self.assertEqual(set(_status(valid_status())), STATUS_FIELDS)

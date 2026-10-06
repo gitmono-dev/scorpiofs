@@ -55,6 +55,11 @@ SAFE_RETENTION_SUBSTAGES = frozenset({
     "retain_path", "upper_check", "sentinel_write", "retained_fd",
     "old_view_oracle", "old_view_fd", "old_view_sentinel", "final_view_oracle",
 })
+SAFE_HYDRATION_SUBSTAGES = frozenset({
+    "metadata_closure", "cas_resume_audit", "small_object_fetch",
+    "large_content_fetch", "hydration_commit", "snapshot_links",
+    "dependency_audit", "hydration_task",
+})
 SAFE_BACKEND_ERROR_CODES = frozenset({
     "INVALID_CONFIG", "SNAPSHOT_ERROR", "WORKSPACE_BUSY", "WORKSPACE_DIRTY",
     "WORKSPACE_IO", "WORKSPACE_NOT_FOUND", "WORKSPACE_NOT_READY",
@@ -83,6 +88,11 @@ def _safe_worker_stage(error):
 def _safe_retention_substage(error):
     substage = getattr(error, "retention_substage", None)
     return substage if type(substage) is str and substage in SAFE_RETENTION_SUBSTAGES else None
+
+
+def _safe_hydration_substage(error):
+    substage = getattr(error, "hydration_substage", None)
+    return substage if type(substage) is str and substage in SAFE_HYDRATION_SUBSTAGES else None
 
 
 def _safe_backend_error_code(error):
@@ -153,6 +163,7 @@ class PhaseFailure(AssertionError):
         self.error_code = _safe_worker_error_code(error)
         self.worker_stage = _safe_worker_stage(error)
         self.retention_substage = _safe_retention_substage(error)
+        self.hydration_substage = _safe_hydration_substage(error)
         self.backend_code = _safe_backend_error_code(error)
         self.snapshot_code = _safe_snapshot_code(error)
         super().__init__(phase + " failed")
@@ -178,6 +189,8 @@ def failure_record(error):
             record["worker_stage"] = error.worker_stage
         if error.retention_substage is not None:
             record["retention_substage"] = error.retention_substage
+        if error.hydration_substage is not None:
+            record["hydration_substage"] = error.hydration_substage
         if error.backend_code is not None:
             record["backend_code"] = error.backend_code
         if error.snapshot_code is not None:
@@ -195,6 +208,9 @@ def failure_record(error):
         retention_substage = _safe_retention_substage(error)
         if retention_substage is not None:
             record["retention_substage"] = retention_substage
+        hydration_substage = _safe_hydration_substage(error)
+        if hydration_substage is not None:
+            record["hydration_substage"] = hydration_substage
         backend_code = _safe_backend_error_code(error)
         if backend_code is not None:
             record["backend_code"] = backend_code
