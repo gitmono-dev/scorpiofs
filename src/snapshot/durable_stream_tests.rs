@@ -896,8 +896,9 @@ async fn parallel_stream_sync_failures_never_complete_and_can_retry() {
                 .unwrap_err();
             drop(fault);
             assert_eq!(error.code, SnapshotErrorCode::Internal, "{core} {phase}");
-            assert!(
-                error.message.contains("injected durability I/O failure"),
+            assert_eq!(
+                hydration_error_label(&error),
+                Some("large_content_fetch"),
                 "{error:?}"
             );
             assert_eq!(
@@ -1106,8 +1107,9 @@ async fn streaming_content_sync_failures_do_not_journal_or_complete_the_file() {
         let fault = FaultGuard::install(store.content_dir(), phase, false);
         let error = store.hydrate_snapshot(&reader).await.unwrap_err();
         assert_eq!(error.code, SnapshotErrorCode::Internal, "{phase}");
-        assert!(
-            error.message.contains("injected durability I/O failure"),
+        assert_eq!(
+            hydration_error_label(&error),
+            Some("large_content_fetch"),
             "{error:?}"
         );
         assert_eq!(
