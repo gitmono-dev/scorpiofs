@@ -13,6 +13,8 @@ use tempfile::tempdir;
 
 const VERSION: &str = "v0.0.0-qlean";
 const TARGET: &str = "x86_64-unknown-linux-gnu";
+const WORKSPACE_KERNEL_TEST: &str =
+    "explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown";
 
 fn cargo_target_dir(repo_root: &Path) -> Result<PathBuf> {
     let output = Command::new("cargo")
@@ -91,6 +93,46 @@ async fn run_checked(vm: &mut qlean::Machine, command: &str) -> Result<()> {
     Ok(())
 }
 
+async fn run_workspace_kernel_checked(vm: &mut qlean::Machine, command: &str) -> Result<()> {
+    let output = vm
+        .exec(command)
+        .await
+        .with_context(|| format!("Qlean could not execute `{command}`"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    let named_result = format!("test {WORKSPACE_KERNEL_TEST} ... ok");
+    let markers = [
+        "PRE_TRANSACTION_HYDRATION_OBSERVE_RUN:",
+        "RUNNING_HYDRATION_OBSERVE_RUN:",
+        "RUNNING_HYDRATION_CANCEL_RUN:",
+        "SHIPPED_DAEMON_STAGE_METERS_RUN:",
+        "SHIPPED_DAEMON_METERS_RUN:",
+        "SHIPPED_DAEMON_RELEASE_METERS_RUN:",
+    ];
+    let diagnostics: Vec<_> = markers
+        .iter()
+        .filter_map(|marker| combined.lines().find(|line| line.starts_with(marker)))
+        .collect();
+    if !output.status.success()
+        || !stdout.lines().any(|line| line == named_result)
+        || !stdout.lines().any(|line| {
+            line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+        })
+        || diagnostics.len() != markers.len()
+    {
+        bail!(
+            "Qlean workspace kernel validation failed or lacks its exact test/diagnostics: `{command}`\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    // Forward only verified fixture diagnostics on success. Installer command
+    // output stays quiet, and a successful zero-test invocation is rejected.
+    for diagnostic in diagnostics {
+        eprintln!("{diagnostic}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires a Linux host with QEMU/KVM and vhost-vsock"]
 async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
@@ -150,10 +192,10 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
                 ),
             )
             .await?;
-            run_checked(
+            run_workspace_kernel_checked(
                 vm,
                 &format!(
-                    "set -euo pipefail; test -c /dev/fuse || modprobe fuse; test -c /dev/fuse; SCORPIO_LAUNCHER_BINARY={root}/scorpio {root}/workspace-launcher-tests --exact explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown --ignored --nocapture"
+                    "set -euo pipefail; test -c /dev/fuse || modprobe fuse; test -c /dev/fuse; SCORPIO_LAUNCHER_BINARY={root}/scorpio {root}/workspace-launcher-tests --exact {WORKSPACE_KERNEL_TEST} --ignored --nocapture"
                 ),
             )
             .await?;

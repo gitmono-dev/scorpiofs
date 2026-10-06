@@ -287,7 +287,7 @@ impl ScopeCache {
     /// transferred to another live pin survives). Returns `SnapshotNotReady`
     /// while another index transaction is active; the caller may retry.
     pub fn drop_records_for_pin(&self, pin_ref: &str) -> Result<u64, SnapshotError> {
-        self.drop_records_for_pin_impl(pin_ref, None)
+        self.drop_records_for_pin_impl(pin_ref, None, None)
     }
 
     // The caller holds the exact owner's transaction and has durably released
@@ -295,21 +295,27 @@ impl ScopeCache {
     pub(super) fn drop_records_for_released_owner(
         &self,
         owner: &super::workspace_pins::WorkspaceBinding,
+        meters: Option<&super::durable::CasVerificationMeters>,
     ) -> Result<u64, SnapshotError> {
-        self.drop_records_for_pin_impl(owner.snapshot_id(), Some(owner))
+        self.drop_records_for_pin_impl(owner.snapshot_id(), Some(owner), meters)
     }
 
     fn drop_records_for_pin_impl(
         &self,
         pin_ref: &str,
         releasing: Option<&super::workspace_pins::WorkspaceBinding>,
+        meters: Option<&super::durable::CasVerificationMeters>,
     ) -> Result<u64, SnapshotError> {
         let _lock = self.index_lock()?;
         // A snapshot may have several independent workspace owners. Unknown
         // ownership is insufficient evidence to remove its retention hints.
-        if self.pin_inventory(releasing)?.iter().any(|(id, audit)| {
-            id == pin_ref && !matches!(audit, super::workspace_pins::PinAudit::Inactive)
-        }) {
+        if self
+            .pin_inventory(releasing, meters)?
+            .iter()
+            .any(|(id, audit)| {
+                id == pin_ref && !matches!(audit, super::workspace_pins::PinAudit::Inactive)
+            })
+        {
             return Ok(0);
         }
         let mut records = self.load_records()?;
@@ -326,7 +332,7 @@ impl ScopeCache {
 
     pub fn try_live_pins(&self) -> Result<Vec<String>, SnapshotError> {
         let mut out: Vec<_> = self
-            .pin_inventory(None)?
+            .pin_inventory(None, None)?
             .into_iter()
             .filter_map(|(_, audit)| {
                 if let super::workspace_pins::PinAudit::Active(id) = audit {
@@ -344,8 +350,9 @@ impl ScopeCache {
     fn pin_inventory(
         &self,
         releasing: Option<&super::workspace_pins::WorkspaceBinding>,
+        meters: Option<&super::durable::CasVerificationMeters>,
     ) -> Result<Vec<(String, super::workspace_pins::PinAudit)>, SnapshotError> {
-        let mut out = super::workspace_pins::owner_inventory(&self.dir, releasing)?;
+        let mut out = super::workspace_pins::owner_inventory(&self.dir, releasing, meters)?;
         for entry in fs::read_dir(&self.dir).map_err(io_err)? {
             let entry = entry.map_err(io_err)?;
             let name = entry.file_name();
@@ -375,6 +382,7 @@ impl ScopeCache {
             let store = super::DurableStore {
                 root: entry.path(),
                 content: self.dir.join("blobs"),
+                verification_meters: meters.cloned(),
             };
             let audit = store.audit_pin()?;
             if matches!(&audit, super::workspace_pins::PinAudit::Active(id) if id != &sid) {
