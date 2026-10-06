@@ -896,9 +896,11 @@ async fn parallel_stream_sync_failures_never_complete_and_can_retry() {
                 .unwrap_err();
             drop(fault);
             assert_eq!(error.code, SnapshotErrorCode::Internal, "{core} {phase}");
-            // Hydration status errors intentionally expose only the bounded
-            // stage label; the injected I/O detail remains in tracing output.
-            assert_eq!(error.message, "large_content_fetch", "{error:?}");
+            assert_eq!(
+                hydration_error_label(&error),
+                Some("large_content_fetch"),
+                "{error:?}"
+            );
             assert_eq!(
                 fixture.chunks.load(Ordering::SeqCst) as u64,
                 fixture.map.chunk_count
@@ -1105,9 +1107,11 @@ async fn streaming_content_sync_failures_do_not_journal_or_complete_the_file() {
         let fault = FaultGuard::install(store.content_dir(), phase, false);
         let error = store.hydrate_snapshot(&reader).await.unwrap_err();
         assert_eq!(error.code, SnapshotErrorCode::Internal, "{phase}");
-        // Hydration status errors intentionally expose only the bounded
-        // stage label; the injected I/O detail remains in tracing output.
-        assert_eq!(error.message, "large_content_fetch", "{error:?}");
+        assert_eq!(
+            hydration_error_label(&error),
+            Some("large_content_fetch"),
+            "{error:?}"
+        );
         assert_eq!(
             fixture.chunks.load(Ordering::SeqCst) as u64,
             fixture.map.chunk_count

@@ -164,6 +164,11 @@ async fn main() {
     if let Some(value) = &cli.store_path {
         overrides.insert("store_path".to_owned(), value.clone());
     }
+    if let Some(value) = &cli.log_level {
+        // Resolve the CLI value before parsing the persisted file so a stale
+        // or malformed configured level cannot shadow the explicit override.
+        overrides.insert("log_level".to_owned(), value.clone());
+    }
 
     // These commands need neither a loaded config nor logging; handle them
     // before `cli::init` so they work even when the config is missing/invalid.

@@ -270,6 +270,9 @@ fn explicit_canonical_parser_retains_all_spec_error_types() {
         ("RELEASE_IMMUTABLE", 409, ReleaseImmutable),
         ("RATE_LIMITED", 429, RateLimited),
         ("TEMPORARY_UNAVAILABLE", 503, TemporaryUnavailable),
+        // Deployed compatibility code accepted by the legacy parser also
+        // needs canonical retry classification when it carries full hints.
+        ("INTERNAL", 500, Internal),
     ] {
         let bytes = serde_json::to_vec(&envelope(code)).unwrap();
         let error = CanonicalSnapshotError::parse_response(&bytes, status).unwrap();

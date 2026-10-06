@@ -127,6 +127,38 @@ class CommitUpdateBenchTests(unittest.TestCase):
         error.worker_stage = "private-path"
         self.assertNotIn("worker_stage", BENCH.failure_record(error))
 
+    def test_worker_failure_record_carries_only_a_closed_retention_substage(self):
+        private = "private-token /run/secret response body"
+        error = WorkerError(private, error_code="worker_error", retention_substage="old_view_oracle")
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("shipped_workspace_and_git_measurement"):
+                raise error
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["retention_substage"], "old_view_oracle")
+        self.assertNotIn(private, json.dumps(record))
+        error.retention_substage = "private-path"
+        self.assertNotIn("retention_substage", BENCH.failure_record(error))
+
+    def test_worker_failure_record_carries_only_a_closed_backend_code(self):
+        error = WorkerError("private response body", error_code="worker_http_status_5xx",
+                            backend_code="SNAPSHOT_ERROR", snapshot_code="ObjectUnavailable")
+        record = BENCH.failure_record(error)
+        self.assertEqual(record["backend_code"], "SNAPSHOT_ERROR")
+        self.assertEqual(record["snapshot_code"], "ObjectUnavailable")
+        self.assertNotIn("private response body", json.dumps(record))
+        unknown = WorkerError("private response body", backend_code="private-token")
+        self.assertNotIn("backend_code", BENCH.failure_record(unknown))
+        unknown = WorkerError("private response body", snapshot_code="private-token")
+        self.assertNotIn("snapshot_code", BENCH.failure_record(unknown))
+
+    def test_worker_failure_record_carries_only_a_closed_snapshot_code(self):
+        error = WorkerError("workspace id: ObjectUnavailable: private response body",
+                            error_code="worker_http_status_5xx", snapshot_code="ObjectUnavailable")
+        record = BENCH.failure_record(error)
+        self.assertEqual(record["snapshot_code"], "ObjectUnavailable")
+        self.assertNotIn("private response body", json.dumps(record))
+        self.assertNotIn("workspace id", json.dumps(record))
+
     def test_ci_persists_only_safe_failure_record(self):
         private = "private-token /run/secret response body"
         with tempfile.TemporaryDirectory() as temp:
