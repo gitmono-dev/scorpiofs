@@ -27,7 +27,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -226,13 +226,7 @@ impl ScopeCache {
     fn try_index_lock(&self) -> Result<Option<IndexLock>, SnapshotError> {
         // Lock a stable inode, not closures.json which publication replaces.
         // No blocking lock call may stall the async task that owns the lock.
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.dir.join("closures.lock"))
-            .map_err(io_err)?;
+        let lock = secure_fs::open_rw_create(&self.dir.join("closures.lock")).map_err(io_err)?;
         match lock.try_lock() {
             Ok(()) => Ok(Some(IndexLock { file: lock })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
@@ -1091,7 +1085,7 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
     ));
     let result = (|| {
         use std::io::Write as _;
-        let mut f = fs::File::create(&tmp).map_err(io_err)?;
+        let mut f = secure_fs::open_create_new(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
         f.sync_all().map_err(io_err)?;
         #[cfg(test)]

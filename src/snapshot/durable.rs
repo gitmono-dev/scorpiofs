@@ -1820,13 +1820,7 @@ impl DurableStore {
     // a short critical-section lock held by a downloading task. Dropping the
     // handle (including after process exit) releases the OS lock.
     pub(super) fn try_transaction(&self) -> Result<Option<TransactionGuard>, SnapshotError> {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join(TRANSACTION_LOCK))
-            .map_err(io_err)?;
+        let lock = secure_fs::open_rw_create(&self.root.join(TRANSACTION_LOCK)).map_err(io_err)?;
         match lock.try_lock() {
             Ok(()) => Ok(Some(TransactionGuard(lock))),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
@@ -2775,11 +2769,7 @@ impl DurableStore {
         if bytes.is_empty() {
             return Ok(());
         }
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join(JOURNAL_FILE))
-            .map_err(io_err)?;
+        let mut f = secure_fs::open_append_create(&self.root.join(JOURNAL_FILE)).map_err(io_err)?;
         durability_checkpoint(&self.root, "journal-write")?;
         f.write_all(bytes).map_err(io_err)?;
         durability_checkpoint(&self.root, "journal-written")?;
@@ -2798,11 +2788,7 @@ impl DurableStore {
             uuid::Uuid::new_v4()
         ));
         let result = (|| {
-            let file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp)
-                .map_err(io_err)?;
+            let file = secure_fs::open_create_new(&tmp).map_err(io_err)?;
             let mut output = io::BufWriter::with_capacity(256 * 1024, &file);
             durability_checkpoint(&self.root, "journal-compact-write")?;
             for file in manifest {
@@ -2846,7 +2832,7 @@ impl DurableStore {
             .iter()
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |idx| idx + 1);
-        let file = OpenOptions::new().write(true).open(&path).map_err(io_err)?;
+        let file = secure_fs::open_write(&path).map_err(io_err)?;
         file.set_len(end as u64).map_err(io_err)?;
         file.sync_all().map_err(io_err)?;
         sync_dir(&self.root)
@@ -2876,7 +2862,7 @@ pub(super) fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), Sn
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
-        let mut f = File::create(&tmp).map_err(io_err)?;
+        let mut f = secure_fs::open_create_new(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
         durability_checkpoint(dir, "object-file-sync")?;
         f.sync_all().map_err(io_err)?;
@@ -2954,10 +2940,7 @@ where
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let handle = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary_path)
+    let handle = secure_fs::open_create_new(&temporary_path)
         .map_err(io_err)
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     let temporary = PendingBlob(temporary_path);
@@ -3060,7 +3043,7 @@ fn buffered_allocation_error() -> SnapshotError {
 
 fn sync_file(path: &Path) -> Result<(), SnapshotError> {
     durability_checkpoint(path, "file-sync")?;
-    File::open(path)
+    secure_fs::open_regular(path)
         .map_err(io_err)?
         .sync_all()
         .map_err(io_err)?;

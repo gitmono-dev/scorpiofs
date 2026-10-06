@@ -440,13 +440,9 @@ fn register(
     let scope = binding.validate_store(store)?;
     create_child(&scope, REGISTRY_DIR)?;
     let dir = scope.join(REGISTRY_DIR);
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join(format!("{}.lock", binding.workspace_id)))
-        .map_err(io_error)?;
+    let file =
+        super::secure_fs::open_rw_create(&dir.join(format!("{}.lock", binding.workspace_id)))
+            .map_err(io_error)?;
     let _lock = match file.try_lock() {
         Ok(()) => RegistryLock(file),
         Err(fs::TryLockError::WouldBlock) => {

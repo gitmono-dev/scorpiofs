@@ -21,7 +21,69 @@ use std::{
 pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
+    add_no_follow(&mut options);
 
+    open_checked(options, path)
+}
+
+/// Open a fixed lock/record for read-write coordination without following a
+/// final symlink.  The caller decides whether to lock or write the handle.
+pub(crate) fn open_rw_create(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    add_no_follow(&mut options);
+    open_checked(options, path)
+}
+
+/// Open a fixed record for replacement without following an existing final
+/// symlink.  This is used only for files whose name is controlled by the
+/// caller and whose contents are replaced atomically afterwards.
+pub(crate) fn open_write_truncate(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    add_no_follow(&mut options);
+    open_checked(options, path)
+}
+
+/// Open an existing local record for append without following a final
+/// symlink.  The journal is append-only during normal hydration, but it is
+/// still integrity metadata and must not be redirected outside the cache.
+pub(crate) fn open_append_create(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    add_no_follow(&mut options);
+    open_checked(options, path)
+}
+
+/// Open an existing local record for in-place updates without following a
+/// final symlink.
+pub(crate) fn open_write(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    add_no_follow(&mut options);
+    open_checked(options, path)
+}
+
+/// Create a unique local temporary file without following a final symlink.
+pub(crate) fn open_create_new(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    add_no_follow(&mut options);
+    open_checked(options, path)
+}
+
+fn open_checked(options: OpenOptions, path: &Path) -> io::Result<File> {
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local integrity object is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn add_no_follow(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -36,15 +98,6 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "local integrity object is not a regular file",
-        ));
-    }
-    Ok(file)
 }
 
 /// Read a local integrity object through [`open_regular`].
@@ -101,6 +154,32 @@ fn validate_directory_chain(path: &Path) -> io::Result<()> {
                 }
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn all_fixed_record_writers_reject_a_final_symlink() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("outside");
+        let link = temp.path().join("record");
+        fs::write(&target, b"sentinel").unwrap();
+        for open in [
+            super::open_rw_create as fn(&std::path::Path) -> std::io::Result<std::fs::File>,
+            super::open_write_truncate,
+            super::open_append_create,
+            super::open_write,
+            super::open_create_new,
+        ] {
+            symlink(&target, &link).unwrap();
+            assert!(open(&link).is_err());
+            fs::remove_file(&link).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"sentinel");
         }
     }
 }
