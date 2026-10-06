@@ -309,7 +309,7 @@ mod tests {
                 .pages
                 .iter()
                 .filter(|(path, _)| path.as_str() != "/")
-                .map(|(path, bytes)| Entry::dir(path[1..].as_bytes(), page_id(bytes)))
+                .map(|(path, bytes)| Entry::dir(&path.as_bytes()[1..], page_id(bytes)))
                 .collect();
             let root = Page::build(&entries).unwrap();
             fixture.descriptor.metadata_root = page_id(&root);
