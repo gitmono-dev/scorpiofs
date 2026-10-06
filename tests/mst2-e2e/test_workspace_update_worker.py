@@ -139,7 +139,12 @@ class WorkerReceiptTests(unittest.TestCase):
         with self.assertRaises((TimeoutError, WorkerError)):
             worker._owned_command([sys.executable, "-c", script, str(marker)],
                                   time.monotonic() + 1)
-        worker.abort(time.monotonic() + 10)
+        try:
+            worker.abort(time.monotonic() + 10)
+        except WorkerError:
+            # The test daemon endpoint is intentionally absent; the abort
+            # path must still fence the anchor group before reporting it.
+            pass
         if marker.exists():
             grandchild = int(marker.read_text())
             for _ in range(100):

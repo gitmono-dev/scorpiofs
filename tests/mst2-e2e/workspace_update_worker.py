@@ -26,7 +26,6 @@ import uuid
 
 import commit_update_budget as budget
 from workspace_update_daemon import mounts_under
-from workspace_update_oracle import verify_workspace
 
 
 STATUS_FIELDS = frozenset({
