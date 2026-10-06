@@ -155,22 +155,6 @@ impl Mst2Fuse {
         Self::build(Some(reader), Some(store), manifest)
     }
 
-    /// Build over a reader, a store and an already-computed manifest (the
-    /// incremental sync's result), so the tree is not walked twice.
-    pub fn from_manifest(
-        reader: SnapshotReader,
-        store: Arc<DurableStore>,
-        manifest: Vec<SnapshotFile>,
-    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
-        store.bind_reader(&reader)?;
-        for file in &manifest {
-            reader
-                .authorized_context()
-                .validate_relative_path(&file.rel_path)?;
-        }
-        Self::build(Some(reader), Some(store), manifest)
-    }
-
     /// Reopen a completed, pinned hydration with no server contact at all.
     /// The manifest comes from the store, and every read re-verifies against
     /// the digest the view advertised when it was hydrated.
