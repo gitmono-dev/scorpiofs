@@ -21,6 +21,7 @@ from workspace_update_worker import (
     WorkerSession,
     _NoRedirectHTTP,
     _check_deadline,
+    _status_error_codes,
     _status,
 )
 
@@ -72,6 +73,18 @@ class WorkerShapeTests(unittest.TestCase):
         self.assertEqual(WorkerError("private", snapshot_code="ObjectUnavailable").snapshot_code,
                          "ObjectUnavailable")
         self.assertIsNone(WorkerError("private", snapshot_code="private-token").snapshot_code)
+
+    def test_status_error_codes_are_closed_and_discard_details(self):
+        self.assertEqual(_status_error_codes(valid_status(last_error="WORKSPACE_IO: /private/path")),
+                         ("WORKSPACE_IO", None))
+        self.assertEqual(_status_error_codes(valid_status(last_error="ObjectUnavailable: private body")),
+                         (None, "ObjectUnavailable"))
+        self.assertEqual(_status_error_codes(valid_status(last_error=(
+            "workspace 11111111-2222-4333-8444-666666666666: LeaseExpired: private body"))),
+                         (None, "LeaseExpired"))
+        self.assertEqual(_status_error_codes(valid_status(last_error="PrivateToken: secret")),
+                         (None, None))
+        self.assertEqual(_status_error_codes(valid_status(last_error=None)), (None, None))
 
     def test_status_requires_exact_wire_shape_and_canonical_identity(self):
         self.assertEqual(set(_status(valid_status())), STATUS_FIELDS)

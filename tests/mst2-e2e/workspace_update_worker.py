@@ -130,6 +130,24 @@ def _snapshot_code_from_workspace_message(message):
     return code if code in SNAPSHOT_ERROR_CODES else None
 
 
+def _status_error_codes(status):
+    """Return only allowlisted backend/snapshot codes from a status error."""
+    message = status.get("last_error") if isinstance(status, dict) else None
+    if type(message) is not str:
+        return None, None
+    backend = None
+    for code in BACKEND_ERROR_CODES:
+        if message.startswith(code + ":"):
+            backend = code
+            break
+    if backend is not None:
+        return backend, None
+    snapshot = message.split(":", 1)[0]
+    if snapshot in SNAPSHOT_ERROR_CODES:
+        return None, snapshot
+    return None, _snapshot_code_from_workspace_message(message)
+
+
 def _message_error_code(message):
     """Map only known message shapes to a closed, non-sensitive code."""
     if type(message) is not str:
@@ -955,7 +973,9 @@ class WorkerSession:
             metadata_ms = (time.monotonic() - timing_start) * 1000
         if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
                 or status["last_error"] is not None):
-            raise WorkerError("workspace hydration failed", stage="hydrate")
+            backend_code, snapshot_code = _status_error_codes(status)
+            raise WorkerError("workspace hydration failed", stage="hydrate",
+                               backend_code=backend_code, snapshot_code=snapshot_code)
         if (status["mount_state"] == "mounted" and status["metadata_ready"]
                 and status["hydration_state"] == "complete"
                 and status["local_pin_state"] == "complete_snapshot"
@@ -974,7 +994,9 @@ class WorkerSession:
                         metadata_ms = (time.monotonic() - timing_start) * 1000
                 if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
                         or status["last_error"] is not None):
-                    raise WorkerError("workspace hydration failed")
+                    backend_code, snapshot_code = _status_error_codes(status)
+                    raise WorkerError("workspace hydration failed",
+                                       backend_code=backend_code, snapshot_code=snapshot_code)
                 if (status["mount_state"] == "mounted" and status["metadata_ready"]
                         and status["hydration_state"] == "complete"
                         and status["local_pin_state"] == "complete_snapshot"
