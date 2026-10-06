@@ -1269,6 +1269,10 @@ validate_runtime_migration_mounts() {
 
 reconcile_runtime_directories() {
     local runtime_dir
+    # Dry-run never changes ownership, so a mocked or still-visible mount
+    # cannot block the preview after stale-mount handling has printed the
+    # detach command. The real migration keeps the mount safety gate below.
+    [ "$DRY_RUN" -eq 1 ] && return 0
     validate_runtime_migration_mounts
     for runtime_dir in "$STORE_PATH" "$CACHE_ROOT"; do
         if run_readonly test -d "$runtime_dir"; then
