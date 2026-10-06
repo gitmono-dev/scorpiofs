@@ -104,7 +104,9 @@ def _message_error_code(message):
         return "worker_json_invalid"
     if message.startswith("invalid "):
         return "worker_input_invalid"
-    if message.startswith("workspace status ") or message.startswith("workspace snapshot id "):
+    if (message.startswith("workspace status ") or message.startswith("workspace snapshot id ")
+            or message.startswith("workspace metadata_ready ")
+            or message.startswith("workspace last_error ")):
         return "workspace_status_invalid"
     if message.startswith("workspace mountpoint "):
         return "workspace_mount_invalid"
@@ -117,7 +119,7 @@ def _message_error_code(message):
     if (message.startswith("retained old ") or message.startswith("workspace upper ")
             or message.startswith("dirty sentinel ") or message.startswith("dirty upper ")):
         return "workspace_retention_invalid"
-    if message.startswith("workspace oracle failed"):
+    if message.startswith("workspace oracle ") or message.startswith("isolated oracle "):
         return "workspace_oracle_failed"
     if message.startswith("oracle ") or message.startswith("expected manifest "):
         return "workspace_oracle_failed"
@@ -126,7 +128,8 @@ def _message_error_code(message):
         return "worker_process_invalid"
     if message.startswith("owned command ") or message.startswith("worker command "):
         return "worker_command_failed"
-    if message.startswith("worker receipt ") or message.startswith("worker roots "):
+    if (message.startswith("worker receipt ") or message.startswith("worker roots ")
+            or message.startswith("worker ownership receipt ")):
         return "worker_receipt_invalid"
     if (message.startswith("worker cleanup ") or message.startswith("worker has no bound")
             or message.startswith("workspace mounts remained ")):
