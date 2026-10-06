@@ -129,12 +129,23 @@ class CommitUpdateBenchTests(unittest.TestCase):
 
     def test_worker_failure_record_carries_only_a_closed_backend_code(self):
         error = WorkerError("private response body", error_code="worker_http_status_5xx",
-                            backend_code="SNAPSHOT_ERROR")
+                            backend_code="SNAPSHOT_ERROR", snapshot_code="ObjectUnavailable")
         record = BENCH.failure_record(error)
         self.assertEqual(record["backend_code"], "SNAPSHOT_ERROR")
+        self.assertEqual(record["snapshot_code"], "ObjectUnavailable")
         self.assertNotIn("private response body", json.dumps(record))
         unknown = WorkerError("private response body", backend_code="private-token")
         self.assertNotIn("backend_code", BENCH.failure_record(unknown))
+        unknown = WorkerError("private response body", snapshot_code="private-token")
+        self.assertNotIn("snapshot_code", BENCH.failure_record(unknown))
+
+    def test_worker_failure_record_carries_only_a_closed_snapshot_code(self):
+        error = WorkerError("workspace id: ObjectUnavailable: private response body",
+                            error_code="worker_http_status_5xx", snapshot_code="ObjectUnavailable")
+        record = BENCH.failure_record(error)
+        self.assertEqual(record["snapshot_code"], "ObjectUnavailable")
+        self.assertNotIn("private response body", json.dumps(record))
+        self.assertNotIn("workspace id", json.dumps(record))
 
     def test_ci_persists_only_safe_failure_record(self):
         private = "private-token /run/secret response body"

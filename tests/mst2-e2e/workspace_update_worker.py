@@ -94,6 +94,32 @@ BACKEND_ERROR_CODES = frozenset({
     "SNAPSHOT_ERROR", "WORKSPACE_UNKNOWN",
 })
 
+# ScorpioFS wraps the typed snapshot error in the workspace HTTP envelope.
+# Only the enum-like PascalCase prefix is allowed to cross the CI boundary;
+# the remainder of the message is deliberately discarded.
+SNAPSHOT_ERROR_CODES = frozenset({
+    "ScopeInvalid", "InvalidRequest", "LimitExceeded", "Unauthenticated",
+    "ScopeForbidden", "ViewNotFound", "SnapshotNotReady", "SnapshotGone",
+    "PathNotFound", "NotDirectory", "UnsupportedEntry", "LeaseUnknown",
+    "LeaseExpired", "CursorInvalid", "CursorStale", "ProofBudgetExceeded",
+    "DigestMismatch", "IntegrityError", "ObjectUnavailable", "RangeNotSupported",
+    "SymlinkTraversal", "DurableViewConflict", "TemporaryUnavailable", "Internal",
+})
+
+
+def _snapshot_code_from_workspace_message(message):
+    """Extract only a known SnapshotErrorCode from a workspace error shape."""
+    if type(message) is not str or not message.startswith("workspace "):
+        return None
+    remainder = message[len("workspace "):]
+    workspace_id, separator, detail = remainder.partition(": ")
+    if not separator or UUID_RE.fullmatch(workspace_id) is None:
+        return None
+    code, separator, _ = detail.partition(":")
+    if not separator or not re.fullmatch(r"[A-Z][A-Za-z0-9]*", code):
+        return None
+    return code if code in SNAPSHOT_ERROR_CODES else None
+
 
 def _message_error_code(message):
     """Map only known message shapes to a closed, non-sensitive code."""
@@ -177,15 +203,18 @@ class WorkerError(RuntimeError):
     """Closed diagnostics for a failed worker operation.
 
     ``str(error)`` remains useful to local callers, but only the closed
-    ``error_code``, ``worker_stage`` and ``backend_code`` fields may cross into
-    CI evidence.  Unknown or caller-supplied codes are discarded.
+    ``error_code``, ``worker_stage``, ``backend_code`` and ``snapshot_code``
+    fields may cross into CI evidence.  Unknown or caller-supplied codes are
+    discarded.
     """
 
-    def __init__(self, message="", error_code=None, stage=None, backend_code=None):
+    def __init__(self, message="", error_code=None, stage=None, backend_code=None,
+                 snapshot_code=None):
         inferred = _message_error_code(message) if error_code is None else error_code
         self.error_code = inferred if inferred in WORKER_ERROR_CODES else WORKER_ERROR
         self.worker_stage = stage if type(stage) is str and stage in WORKER_STAGES else None
         self.backend_code = (backend_code if backend_code in BACKEND_ERROR_CODES else None)
+        self.snapshot_code = (snapshot_code if snapshot_code in SNAPSHOT_ERROR_CODES else None)
         super().__init__(message)
 
 
@@ -336,6 +365,7 @@ class _NoRedirectHTTP:
                 raise WorkerError("worker HTTP body length is truncated")
             if response.status not in expected:
                 backend_code = None
+                snapshot_code = None
                 if 400 <= response.status < 600:
                     try:
                         value = _decode_json(raw)
@@ -345,8 +375,10 @@ class _NoRedirectHTTP:
                         candidate = value.get("code")
                         if candidate in BACKEND_ERROR_CODES:
                             backend_code = candidate
+                        if candidate == "SNAPSHOT_ERROR":
+                            snapshot_code = _snapshot_code_from_workspace_message(value.get("message"))
                 raise WorkerError(f"worker HTTP status {response.status} was not accepted",
-                                   backend_code=backend_code)
+                                   backend_code=backend_code, snapshot_code=snapshot_code)
             if response.status != 204:
                 ctype = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
                 if ctype != "application/json":

@@ -67,6 +67,11 @@ class WorkerShapeTests(unittest.TestCase):
                          "SNAPSHOT_ERROR")
         self.assertIsNone(WorkerError("private", backend_code="private-token").backend_code)
 
+    def test_snapshot_error_code_is_closed(self):
+        self.assertEqual(WorkerError("private", snapshot_code="ObjectUnavailable").snapshot_code,
+                         "ObjectUnavailable")
+        self.assertIsNone(WorkerError("private", snapshot_code="private-token").snapshot_code)
+
     def test_status_requires_exact_wire_shape_and_canonical_identity(self):
         self.assertEqual(set(_status(valid_status())), STATUS_FIELDS)
         for key, value in (("metadata_ready", 1), ("snapshot_id", "sha256:" + "A" * 64),
@@ -127,7 +132,15 @@ class WorkerFullProfileTests(unittest.TestCase):
                     else:
                         value = profile.create_status
                 elif self.command == "POST" and self.path == "/error":
-                    code, value = 500, {"code": "SNAPSHOT_ERROR", "message": "private details"}
+                    code, value = 500, {
+                        "code": "SNAPSHOT_ERROR",
+                        "message": "workspace 11111111-2222-4333-8444-666666666666: ObjectUnavailable: private details",
+                    }
+                elif self.command == "POST" and self.path == "/unknown-snapshot":
+                    code, value = 500, {
+                        "code": "SNAPSHOT_ERROR",
+                        "message": "workspace 11111111-2222-4333-8444-666666666666: PrivateToken: private details",
+                    }
                 elif self.command == "GET" and self.path == workspace_path and profile.poll_statuses:
                     value = profile.poll_statuses.pop(0)
                 else:
@@ -188,7 +201,13 @@ class WorkerFullProfileTests(unittest.TestCase):
             worker.http.request("POST", "/error", time.monotonic() + 5, {}, expected=(200,))
         self.assertEqual(failed.exception.error_code, "worker_http_status_5xx")
         self.assertEqual(failed.exception.backend_code, "SNAPSHOT_ERROR")
+        self.assertEqual(failed.exception.snapshot_code, "ObjectUnavailable")
         self.assertNotIn("private details", str(failed.exception))
+
+        with self.assertRaises(WorkerError) as unknown:
+            worker.http.request("POST", "/unknown-snapshot", time.monotonic() + 5, {}, expected=(200,))
+        self.assertEqual(unknown.exception.backend_code, "SNAPSHOT_ERROR")
+        self.assertIsNone(unknown.exception.snapshot_code)
 
     def test_full_profile_rejects_fixed_identity_changes_while_polling(self):
         changes = {"workspace_id": "33333333-2222-4333-8444-666666666666",
