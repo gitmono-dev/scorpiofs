@@ -45,7 +45,7 @@ use tokio::io::AsyncWriteExt;
 pub use super::cas_index::LocalCasRangeMeters;
 use crate::snapshot::{
     closure::{SnapshotDirectory, ValidatedSnapshotClosure},
-    SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
+    OfflineGrant, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
 };
 
 trait BorrowedBatch {
@@ -69,6 +69,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 const JOURNAL_FILE: &str = "journal.log";
 const COMPLETE_MARKER: &str = "DURABLE_COMPLETE";
 const PIN_FILE: &str = "pin.json";
+const OFFLINE_GRANT_FILE: &str = "offline_grant.json";
 const BLOB_DIR: &str = "blobs";
 const TRANSACTION_LOCK: &str = ".hydrate.lock";
 const REPAIR_FILE: &str = "NEEDS_REPAIR";
@@ -192,6 +193,8 @@ struct CompleteMarker {
     manifest_digest: String,
     #[serde(default)]
     pin_digest: String,
+    #[serde(default)]
+    offline_grant_digest: String,
     files: u64,
     bytes: u64,
     hydrated_at_unix: u64,
@@ -215,6 +218,8 @@ struct PinRecord {
     manifest_digest: String,
     #[serde(default)]
     blobs: Vec<BlobDependency>,
+    #[serde(default)]
+    offline_grant_digest: String,
     pinned_at_unix: u64,
 }
 
@@ -261,6 +266,8 @@ struct SnapshotPinRecord {
     metadata_index_digest: String,
     pages: Vec<PageDependency>,
     blobs: Vec<BlobDependency>,
+    #[serde(default)]
+    offline_grant_digest: String,
     pinned_at_unix: u64,
 }
 
@@ -276,6 +283,8 @@ struct SnapshotCompleteMarker {
     descriptor_digest: String,
     metadata_index_digest: String,
     pin_digest: String,
+    #[serde(default)]
+    offline_grant_digest: String,
     files: u64,
     directories: u64,
     pages: u64,
@@ -630,6 +639,87 @@ impl DurableStore {
         Ok(Some(meta))
     }
 
+    /// Return the grant bound to the currently committed full snapshot, if
+    /// one was issued by canonical resolve. A loose JSON file is never a
+    /// capability: completion validates its digest and fixed-view binding.
+    pub fn offline_grant(&self) -> Result<Option<OfflineGrant>, SnapshotError> {
+        let Some(_transaction) = self.try_transaction()? else {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "offline grant is busy during local hydration",
+            ));
+        };
+        self.offline_grant_locked()
+    }
+
+    fn offline_grant_locked(&self) -> Result<Option<OfflineGrant>, SnapshotError> {
+        if self.completed_manifest_locked()?.is_none() {
+            return Ok(None);
+        }
+        let marker_bytes = required_dependency(&self.root.join(COMPLETE_MARKER))?;
+        let digest = if completion_revision(&marker_bytes)? == SNAPSHOT_VERIFICATION_REVISION {
+            decode_commit::<SnapshotCompleteMarker>(&marker_bytes, COMPLETE_MARKER)?
+                .offline_grant_digest
+        } else {
+            decode_commit::<CompleteMarker>(&marker_bytes, COMPLETE_MARKER)?.offline_grant_digest
+        };
+        if digest.is_empty() {
+            return Ok(None);
+        }
+        let bytes = required_dependency(&self.root.join(OFFLINE_GRANT_FILE))?;
+        if digest_of(&bytes) != digest {
+            return Err(integrity_err("offline grant digest mismatch"));
+        }
+        let grant: OfflineGrant = decode_commit(&bytes, OFFLINE_GRANT_FILE)?;
+        let view = self
+            .stored_view()?
+            .ok_or_else(|| integrity_err("offline grant has no fixed view"))?;
+        grant.validate_for(&view.snapshot_id, None)?;
+        Ok(Some(grant))
+    }
+
+    /// Authorize an offline reopen using the exact grant persisted by this
+    /// completion. The actor domain comes from local mount policy and is
+    /// never inferred from object presence or the snapshot id.
+    pub fn validate_offline_grant(
+        &self,
+        grant: &OfflineGrant,
+        actor_domain_id: &str,
+    ) -> Result<(), SnapshotError> {
+        let Some(_transaction) = self.try_transaction()? else {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "offline grant is busy during local hydration",
+            ));
+        };
+        let view = self.stored_view()?.ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "offline grant has no fixed view",
+            )
+        })?;
+        let stored = self.offline_grant_locked()?.ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::ScopeForbidden,
+                "the completed snapshot has no offline grant",
+            )
+        })?;
+        if stored != *grant {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeForbidden,
+                "offline grant does not match the committed local grant",
+            ));
+        }
+        grant.validate_for(&view.snapshot_id, Some(actor_domain_id))?;
+        if grant.expired() {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LeaseExpired,
+                "offline grant has expired",
+            ));
+        }
+        Ok(())
+    }
+
     /// Pin this view locally. A pin only means something for a view that was
     /// actually hydrated into this store, so a missing or different binding is
     /// refused instead of writing a marker that would claim protection the
@@ -968,6 +1058,7 @@ impl DurableStore {
                 view,
                 manifest,
                 Some(closure),
+                stream_reader.and_then(|reader| reader.offline_grant()),
                 (fetched, resumed, repaired),
             ),
             None => self.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired),
@@ -1225,7 +1316,15 @@ impl DurableStore {
         let fetched = fetched.load(std::sync::atomic::Ordering::Relaxed);
         let resumed = resumed.load(std::sync::atomic::Ordering::Relaxed);
         let repaired = repaired.load(std::sync::atomic::Ordering::Relaxed);
-        store.finish_hydration_commit(view, manifest, closure, (fetched, resumed, repaired))
+        store.finish_hydration_commit(
+            view,
+            manifest,
+            closure,
+            snapshot
+                .as_ref()
+                .and_then(|s| s.reader.and_then(|r| r.offline_grant())),
+            (fetched, resumed, repaired),
+        )
     }
 
     /// Batched hydration: same verification, write-ahead, resume and journal
@@ -1686,7 +1785,15 @@ impl DurableStore {
         let fetched = fetched.load(Relaxed);
         let resumed = resumed.load(Relaxed);
         let repaired = repaired.load(Relaxed);
-        store.finish_hydration_commit(view, manifest, closure, (fetched, resumed, repaired))
+        store.finish_hydration_commit(
+            view,
+            manifest,
+            closure,
+            snapshot
+                .as_ref()
+                .and_then(|s| s.reader.and_then(|r| r.offline_grant())),
+            (fetched, resumed, repaired),
+        )
     }
 
     // A file lock is held for the whole publication transaction, including
@@ -1871,6 +1978,7 @@ impl DurableStore {
         validate_view(&view)?;
         let manifest: Vec<SnapshotFile> = decode_commit(&manifest_bytes, MANIFEST_FILE)?;
         let pin: PinRecord = decode_commit(&pin_bytes, PIN_FILE)?;
+        self.verify_offline_grant(&marker.offline_grant_digest, &view.snapshot_id)?;
         let (dependencies, bytes_total) = validate_manifest(&manifest)?;
         if marker.snapshot_id != view.snapshot_id
             || marker.namespace_view_id != view.namespace_view_id
@@ -1885,6 +1993,7 @@ impl DurableStore {
             || pin.view_digest != marker.view_digest
             || pin.manifest_digest != marker.manifest_digest
             || pin.blobs != dependencies
+            || pin.offline_grant_digest != marker.offline_grant_digest
         {
             return Err(integrity_err(
                 "completion view, pin or file closure mismatch",
@@ -1980,6 +2089,7 @@ impl DurableStore {
         let (blobs, bytes_total) = validate_manifest_policy(&manifest, true)?;
         let pin: SnapshotPinRecord = decode_commit(&pin_bytes, PIN_FILE)?;
         let index: MetadataIndex = decode_commit(&index_bytes, METADATA_INDEX_FILE)?;
+        self.verify_offline_grant(&marker.offline_grant_digest, &view.snapshot_id)?;
         if index.verification_revision != SNAPSHOT_VERIFICATION_REVISION
             || marker.snapshot_id != view.snapshot_id
             || marker.namespace_view_id != view.namespace_view_id
@@ -1999,6 +2109,7 @@ impl DurableStore {
             || pin.metadata_index_digest != marker.metadata_index_digest
             || pin.pages != index.pages
             || pin.blobs != blobs
+            || pin.offline_grant_digest != marker.offline_grant_digest
         {
             return Err(integrity_err(
                 "snapshot view, pin or closure index mismatch",
@@ -2039,6 +2150,31 @@ impl DurableStore {
         Ok(closure)
     }
 
+    fn verify_offline_grant(
+        &self,
+        expected_digest: &str,
+        snapshot_id: &str,
+    ) -> Result<(), SnapshotError> {
+        let path = self.root.join(OFFLINE_GRANT_FILE);
+        let Some(bytes) = read_optional(&path)? else {
+            return if expected_digest.is_empty() {
+                Ok(())
+            } else {
+                Err(integrity_err(
+                    "completion references a missing offline grant",
+                ))
+            };
+        };
+        if expected_digest.is_empty() || digest_of(&bytes) != expected_digest {
+            return Err(integrity_err(
+                "offline grant digest is not bound to completion",
+            ));
+        }
+        let grant: OfflineGrant = decode_commit(&bytes, OFFLINE_GRANT_FILE)?;
+        grant.validate_for(snapshot_id, None)?;
+        Ok(())
+    }
+
     fn verify_snapshot_links(
         &self,
         closure: &ValidatedSnapshotClosure,
@@ -2068,7 +2204,7 @@ impl DurableStore {
         resumed: u64,
         repaired: u64,
     ) -> Result<HydrateReport, SnapshotError> {
-        self.finish_hydration_commit(view, manifest, None, (fetched, resumed, repaired))
+        self.finish_hydration_commit(view, manifest, None, None, (fetched, resumed, repaired))
     }
 
     fn finish_hydration_commit(
@@ -2076,10 +2212,11 @@ impl DurableStore {
         view: &ViewMeta,
         manifest: &[SnapshotFile],
         closure: Option<&ValidatedSnapshotClosure>,
+        offline_grant: Option<&OfflineGrant>,
         counts: (u64, u64, u64),
     ) -> Result<HydrateReport, SnapshotError> {
         super::stage::trace_sync("durable_hydration_commit", || {
-            self.finish_hydration_commit_inner(view, manifest, closure, counts)
+            self.finish_hydration_commit_inner(view, manifest, closure, offline_grant, counts)
         })
     }
 
@@ -2088,6 +2225,7 @@ impl DurableStore {
         view: &ViewMeta,
         manifest: &[SnapshotFile],
         closure: Option<&ValidatedSnapshotClosure>,
+        offline_grant: Option<&OfflineGrant>,
         counts: (u64, u64, u64),
     ) -> Result<HydrateReport, SnapshotError> {
         let (fetched, resumed, repaired) = counts;
@@ -2135,6 +2273,20 @@ impl DurableStore {
         let metadata = closure
             .map(|closure| self.persist_snapshot_metadata(closure))
             .transpose()?;
+        let offline_grant_digest = if let Some(grant) = offline_grant {
+            grant.validate_for(&view.snapshot_id, None)?;
+            let bytes = encode_record(grant)?;
+            write_atomic(&self.root, OFFLINE_GRANT_FILE, &bytes)?;
+            durability_checkpoint(&self.root, "offline-grant-durable")?;
+            digest_of(&bytes)
+        } else {
+            match fs::remove_file(self.root.join(OFFLINE_GRANT_FILE)) {
+                Ok(()) => sync_dir(&self.root)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_err(error)),
+            }
+            String::new()
+        };
         let pin_bytes = if let Some(metadata) = &metadata {
             encode_record(&SnapshotPinRecord {
                 verification_revision: SNAPSHOT_VERIFICATION_REVISION,
@@ -2149,6 +2301,7 @@ impl DurableStore {
                 metadata_index_digest: metadata.metadata_index_digest.clone(),
                 pages: metadata.pages.clone(),
                 blobs: dependencies,
+                offline_grant_digest: offline_grant_digest.clone(),
                 pinned_at_unix: now_unix(),
             })?
         } else {
@@ -2162,6 +2315,7 @@ impl DurableStore {
                 view_digest: view_digest.clone(),
                 manifest_digest: manifest_digest.clone(),
                 blobs: dependencies,
+                offline_grant_digest: offline_grant_digest.clone(),
                 pinned_at_unix: now_unix(),
             })?
         };
@@ -2186,6 +2340,7 @@ impl DurableStore {
                 descriptor_digest: metadata.descriptor_digest,
                 metadata_index_digest: metadata.metadata_index_digest,
                 pin_digest: digest_of(&pin_bytes),
+                offline_grant_digest,
                 files: manifest.len() as u64,
                 directories: closure.directories().len() as u64,
                 pages: metadata.pages.len() as u64,
@@ -2201,6 +2356,7 @@ impl DurableStore {
                 view_digest,
                 manifest_digest,
                 pin_digest: digest_of(&pin_bytes),
+                offline_grant_digest,
                 files: manifest.len() as u64,
                 bytes: bytes_total,
                 hydrated_at_unix: now_unix(),

@@ -18,7 +18,10 @@ use crate::snapshot::{
     client::Mst2Client,
     closure::{decode_page, ValidatedSnapshotClosure},
     frames::MetadataPageItem,
-    types::{Capabilities, Descriptor, DirEntry, LookupResult, SnapshotError, SnapshotErrorCode},
+    types::{
+        Capabilities, Descriptor, DirEntry, LookupResult, OfflineGrant, SnapshotError,
+        SnapshotErrorCode,
+    },
 };
 
 /// Batch cap for one `metadata/pages` request: the server accepts 1..64.
@@ -360,6 +363,10 @@ pub struct SnapshotReader {
     advertisement: super::capabilities::CapabilityAdvertisement,
     delivery: super::ResolveDelivery,
     lease: Arc<LeaseKeeper>,
+    /// Optional server-issued trusted-local export capability.  It is kept
+    /// separate from the retention lease: a lease preserves bytes, while
+    /// this grant is the only input that can authorize an offline reopen.
+    offline_grant: Option<OfflineGrant>,
     pub(crate) content_scope: Arc<super::content::ContentBudget>,
     pub(crate) content_membership: Arc<tokio::sync::OnceCell<HashMap<String, SnapshotFile>>>,
     pub(crate) path_membership: Arc<super::proven_file::PathMembership>,
@@ -507,6 +514,24 @@ impl SnapshotReader {
             &res.authorization_epoch,
             &res.publication_sequence,
         )?;
+        let offline_grant = match res.offline_grant {
+            Some(grant) => {
+                let canonical_export = matches!(
+                    &advertisement,
+                    super::capabilities::CapabilityAdvertisement::Canonical(caps)
+                        if caps.features().offline_export
+                );
+                if !canonical_export {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::IntegrityError,
+                        "offline grant returned without the offline_export capability",
+                    ));
+                }
+                grant.validate_for(context.descriptor().snapshot_id.as_str(), None)?;
+                Some(grant)
+            }
+            None => None,
+        };
         // Retention is bound independently of the actor's bearer credential.
         // Cloned clients resolving another view cannot overwrite this pair.
         let client = client.with_snapshot_lease(&res.lease_id);
@@ -533,6 +558,7 @@ impl SnapshotReader {
                 advertisement,
                 delivery: request.delivery,
                 lease,
+                offline_grant,
                 content_scope: super::content::ContentBudget::new(
                     super::ContentBudgetLimits::default(),
                 ),
@@ -577,6 +603,14 @@ impl SnapshotReader {
 
     pub fn lease_id(&self) -> &str {
         &self.lease_id
+    }
+
+    /// The optional, closed offline-export grant returned by canonical
+    /// resolve.  A value here is only a persisted capability candidate; an
+    /// offline mount must validate it against its local actor domain and
+    /// current clock before opening the store.
+    pub fn offline_grant(&self) -> Option<&OfflineGrant> {
+        self.offline_grant.as_ref()
     }
 
     pub fn authorized_context(&self) -> &AuthorizedSnapshotContext {
