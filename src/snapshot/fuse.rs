@@ -913,19 +913,6 @@ impl Mst2Fuse {
         }
     }
 
-    /// Digest lookup retained for the explicit legacy mount/rebase API.
-    pub(crate) async fn digest_for_path(&self, rel_path: &str) -> Option<String> {
-        match self.path_state(rel_path).await.ok()? {
-            SnapshotPathState::Present(SnapshotNodeIdentity::Regular {
-                content_digest, ..
-            })
-            | SnapshotPathState::Present(SnapshotNodeIdentity::Symlink {
-                content_digest, ..
-            }) => Some(content_digest),
-            _ => None,
-        }
-    }
-
     /// Complete, ordered immediate children. Logical child directories are
     /// not expanded; opaque upper diff can inspect only metadata it needs.
     pub async fn directory_entries(
