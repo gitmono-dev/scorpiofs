@@ -454,7 +454,8 @@ async fn chunks(
     assert_eq!(items.len(), 1);
     let index: u64 = items[0]["chunk_index"].as_str().unwrap().parse().unwrap();
     assert!(
-        items[0]["path"] == "large.bin" || (fixture.mixed && items[0]["path"] == "large-alias.bin")
+        items[0]["path"] == "/large.bin"
+            || (fixture.mixed && items[0]["path"] == "/large-alias.bin")
     );
     assert_eq!(items[0]["map_id"], id(&fixture.map.map_id()));
     assert_eq!(items[0]["expected_digest"], id(&fixture.advertised));
