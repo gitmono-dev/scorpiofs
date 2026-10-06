@@ -110,6 +110,23 @@ class CommitUpdateBenchTests(unittest.TestCase):
         self.assertEqual(unknown.error_code, "worker_error")
         self.assertEqual(BENCH.failure_record(unknown)["error_code"], "worker_error")
 
+    def test_worker_failure_record_carries_only_a_closed_substage(self):
+        private = "private-token /run/secret response body"
+        error = WorkerError(private, error_code="worker_http_status_5xx")
+        error.worker_stage = "poll"
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("commit_update_benchmark"):
+                with BENCH.phase("shipped_workspace_and_git_measurement"):
+                    raise error
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["error_code"], "worker_http_status_5xx")
+        self.assertEqual(record["worker_stage"], "poll")
+        self.assertNotIn(private, json.dumps(record))
+        self.assertNotIn("/run/secret", json.dumps(record))
+
+        error.worker_stage = "private-path"
+        self.assertNotIn("worker_stage", BENCH.failure_record(error))
+
     def test_ci_persists_only_safe_failure_record(self):
         private = "private-token /run/secret response body"
         with tempfile.TemporaryDirectory() as temp:

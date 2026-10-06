@@ -10,6 +10,7 @@ shut it down after :meth:`stop` has retired the workspaces.
 from copy import deepcopy
 import base64
 import binascii
+from contextlib import contextmanager
 import hashlib
 import http.client
 import json
@@ -76,6 +77,13 @@ WORKER_ERROR_CODES = frozenset({
     "worker_receipt_invalid",
     "worker_cleanup_invalid",
     "git_baseline_invalid",
+})
+
+# A failure record also carries the bounded worker sub-stage.  These labels
+# deliberately describe only the operation class; they never contain a URL,
+# path, status code, response body, or exception text.
+WORKER_STAGES = frozenset({
+    "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
 })
 
 
@@ -165,10 +173,29 @@ class WorkerError(RuntimeError):
     reduced to the fixed ``worker_error`` fallback.
     """
 
-    def __init__(self, message="", error_code=None):
+    def __init__(self, message="", error_code=None, stage=None):
         inferred = _message_error_code(message) if error_code is None else error_code
         self.error_code = inferred if inferred in WORKER_ERROR_CODES else WORKER_ERROR
+        self.worker_stage = stage if stage in WORKER_STAGES else None
         super().__init__(message)
+
+
+def _tag_worker_stage(error, stage):
+    """Attach one closed worker stage without copying exception details."""
+    if stage not in WORKER_STAGES:
+        return error
+    # Preserve a more specific nested stage (for example poll inside hydrate)
+    # when the exception crosses an outer stage boundary.
+    current = getattr(error, "worker_stage", None)
+    if current in WORKER_STAGES:
+        return error
+    try:
+        setattr(error, "worker_stage", stage)
+    except BaseException:
+        # A foreign exception may reject attributes; its enclosing phase still
+        # records the fixed benchmark phase safely.
+        pass
+    return error
 
 
 def _check_deadline(deadline):
@@ -481,6 +508,15 @@ class WorkerSession:
             self._stop_anchor(time.monotonic() + 10)
             raise
 
+    @contextmanager
+    def _stage(self, name):
+        """Tag failures with a closed sub-stage for safe CI diagnostics."""
+        try:
+            yield
+        except BaseException as error:
+            _tag_worker_stage(error, name)
+            raise
+
     def _validate_roots(self):
         if (self.root.is_symlink() or self.workspace_root.is_symlink()
                 or self.git_store.is_symlink() or not self.workspace_root.is_dir()
@@ -781,15 +817,16 @@ class WorkerSession:
                     pass
 
     def _create_workspace(self, deadline):
-        raw = self.http.request("POST", "/v3/workspaces", deadline,
-                                {"target": {"kind": "latest"}, "scope": "/project",
-                                 "delivery": "lazy", "upper_policy": "private"})
-        status = _status(raw)
-        if status["snapshot_id"] is None:
-            raise WorkerError("workspace create omitted its fixed snapshot id")
-        self._assert_status_path(status)
-        self._workspace_ids.append(status["workspace_id"])
-        return status
+        with self._stage("create"):
+            raw = self.http.request("POST", "/v3/workspaces", deadline,
+                                    {"target": {"kind": "latest"}, "scope": "/project",
+                                     "delivery": "lazy", "upper_policy": "private"})
+            status = _status(raw)
+            if status["snapshot_id"] is None:
+                raise WorkerError("workspace create omitted its fixed snapshot id")
+            self._assert_status_path(status)
+            self._workspace_ids.append(status["workspace_id"])
+            return status
 
     def _assert_status_path(self, status):
         mount = _safe_mount_path(self.workspace_root, status["mountpoint"])
@@ -806,32 +843,34 @@ class WorkerSession:
         return value
 
     def _hydrate(self, first, deadline, timing_start, initial_metadata_ms=None):
-        status = self._fixed_status(first, self.http.request(
-            "POST", "/v3/workspaces/" + quote(first["workspace_id"], safe="") + "/hydrate",
-            deadline, expected=(200,)))
+        with self._stage("hydrate"):
+            status = self._fixed_status(first, self.http.request(
+                "POST", "/v3/workspaces/" + quote(first["workspace_id"], safe="") + "/hydrate",
+                deadline, expected=(200,)))
         metadata_ms = initial_metadata_ms
         complete_ms = None
         while True:
-            _check_deadline(deadline)
-            status = self._fixed_status(first, self.http.request(
-                "GET", "/v3/workspaces/" + quote(first["workspace_id"], safe=""), deadline))
-            if status["mount_state"] == "mounted" and status["metadata_ready"]:
-                if metadata_ms is None:
-                    metadata_ms = (time.monotonic() - timing_start) * 1000
-            if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
-                    or status["last_error"] is not None):
-                raise WorkerError("workspace hydration failed")
-            if (status["mount_state"] == "mounted" and status["metadata_ready"]
-                    and status["hydration_state"] == "complete"
-                    and status["local_pin_state"] == "complete_snapshot"
-                    and status["lease_state"] == "granted_locally"
-                    and status["last_error"] is None):
-                complete_ms = (time.monotonic() - timing_start) * 1000
-                return status, metadata_ms, complete_ms
-            pause = min(POLL_SECONDS, max(0, deadline - time.monotonic()))
-            if pause <= 0:
-                raise TimeoutError("workspace hydration did not become durable before its deadline")
-            time.sleep(pause)
+            with self._stage("poll"):
+                _check_deadline(deadline)
+                status = self._fixed_status(first, self.http.request(
+                    "GET", "/v3/workspaces/" + quote(first["workspace_id"], safe=""), deadline))
+                if status["mount_state"] == "mounted" and status["metadata_ready"]:
+                    if metadata_ms is None:
+                        metadata_ms = (time.monotonic() - timing_start) * 1000
+                if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
+                        or status["last_error"] is not None):
+                    raise WorkerError("workspace hydration failed")
+                if (status["mount_state"] == "mounted" and status["metadata_ready"]
+                        and status["hydration_state"] == "complete"
+                        and status["local_pin_state"] == "complete_snapshot"
+                        and status["lease_state"] == "granted_locally"
+                        and status["last_error"] is None):
+                    complete_ms = (time.monotonic() - timing_start) * 1000
+                    return status, metadata_ms, complete_ms
+                pause = min(POLL_SECONDS, max(0, deadline - time.monotonic()))
+                if pause <= 0:
+                    raise TimeoutError("workspace hydration did not become durable before its deadline")
+                time.sleep(pause)
 
     def _open_retained_fd(self, mount, expected, deadline):
         candidates = [file for file in expected["files"] if file.get("fs_kind") in ("regular", "executable")]
@@ -906,8 +945,9 @@ class WorkerSession:
         mount = self._assert_status_path(status)
         mount_identity = _mount_record(mount, self.daemon_uid)
         verify_start = time.monotonic()
-        oracle = self._oracle(mount, expected, deadline, manifest_path=self._expected_path,
-                              manifest_digest=self._expected_digest)
+        with self._stage("oracle"):
+            oracle = self._oracle(mount, expected, deadline, manifest_path=self._expected_path,
+                                  manifest_digest=self._expected_digest)
         verified_ms = (time.monotonic() - started) * 1000
         verification_endpoint_ms = (time.monotonic() - verify_start) * 1000
         # Retain the just-verified view before auditing earlier views. The
@@ -915,11 +955,12 @@ class WorkerSession:
         # retention setup and retained-view audits remain visible as separate
         # wall-clock work.
         retain_start = time.monotonic()
-        self._retain_view(status, expected, deadline)
-        retain_view_ms = (time.monotonic() - retain_start) * 1000
-        old_audit_start = time.monotonic()
-        old = [self._audit_view(view, deadline) for view in self._views[:-1]]
-        old_audit_ms = (time.monotonic() - old_audit_start) * 1000
+        with self._stage("retained"):
+            self._retain_view(status, expected, deadline)
+            retain_view_ms = (time.monotonic() - retain_start) * 1000
+            old_audit_start = time.monotonic()
+            old = [self._audit_view(view, deadline) for view in self._views[:-1]]
+            old_audit_ms = (time.monotonic() - old_audit_start) * 1000
         side_total_ms = (time.monotonic() - started) * 1000
         return {
             "actual_status": dict(status), "complete_status": dict(status),
@@ -931,38 +972,39 @@ class WorkerSession:
         }
 
     def _measure_git(self, expected, commit, deadline):
-        if type(commit) is not str or COMMIT_RE.fullmatch(commit) is None:
-            raise ValueError("fixed Git commit must be a lowercase SHA-1")
-        self._git_index += 1
-        ref = f"refs/mst2-workspace/{self._git_index:04d}-{commit}"
-        git_start = time.monotonic()
-        fetch_start = time.monotonic()
-        args = ["--git-dir", str(self.git_store), "fetch", "--no-tags"]
-        if not self._git_fetched:
-            args.append("--depth=1")
-        args.extend([self.git_url, "refs/heads/main:" + ref])
-        self._git(deadline, *args)
-        self._git_fetched = True
-        fetched = self._git(deadline, "--git-dir", str(self.git_store), "rev-parse", ref).decode().strip()
-        if fetched != commit:
-            raise WorkerError("Git target ref differs from the fixed commit")
-        fetch_ms = (time.monotonic() - fetch_start) * 1000
-        path = self.root / "git-worktrees" / f"{self._git_index:04d}-{commit[:12]}"
-        path.parent.mkdir(mode=0o700, exist_ok=True)
-        if path.exists() or path.is_symlink():
-            raise WorkerError("Git detached worktree path already exists")
-        self._git(deadline, "--git-dir", str(self.git_store), "worktree", "add", "--detach",
-                  str(path), commit)
-        self._git_worktrees.append(path)
-        oracle = self._oracle(path, expected, deadline, git_checkout=True,
-                              manifest_path=self._expected_path,
-                              manifest_digest=self._expected_digest)
-        verified_ms = (time.monotonic() - git_start) * 1000
-        return {"commit": commit, "worktree": str(path), "fetch_ms": fetch_ms,
-                "verified_ms": verified_ms, "side_total_ms": verified_ms,
-                # Keep the old key for consumers that have not migrated to
-                # the unambiguous full-side timing name yet.
-                "checkout_verified_ms": verified_ms, "oracle": oracle}
+        with self._stage("git"):
+            if type(commit) is not str or COMMIT_RE.fullmatch(commit) is None:
+                raise ValueError("fixed Git commit must be a lowercase SHA-1")
+            self._git_index += 1
+            ref = f"refs/mst2-workspace/{self._git_index:04d}-{commit}"
+            git_start = time.monotonic()
+            fetch_start = time.monotonic()
+            args = ["--git-dir", str(self.git_store), "fetch", "--no-tags"]
+            if not self._git_fetched:
+                args.append("--depth=1")
+            args.extend([self.git_url, "refs/heads/main:" + ref])
+            self._git(deadline, *args)
+            self._git_fetched = True
+            fetched = self._git(deadline, "--git-dir", str(self.git_store), "rev-parse", ref).decode().strip()
+            if fetched != commit:
+                raise WorkerError("Git target ref differs from the fixed commit")
+            fetch_ms = (time.monotonic() - fetch_start) * 1000
+            path = self.root / "git-worktrees" / f"{self._git_index:04d}-{commit[:12]}"
+            path.parent.mkdir(mode=0o700, exist_ok=True)
+            if path.exists() or path.is_symlink():
+                raise WorkerError("Git detached worktree path already exists")
+            self._git(deadline, "--git-dir", str(self.git_store), "worktree", "add", "--detach",
+                      str(path), commit)
+            self._git_worktrees.append(path)
+            oracle = self._oracle(path, expected, deadline, git_checkout=True,
+                                  manifest_path=self._expected_path,
+                                  manifest_digest=self._expected_digest)
+            verified_ms = (time.monotonic() - git_start) * 1000
+            return {"commit": commit, "worktree": str(path), "fetch_ms": fetch_ms,
+                    "verified_ms": verified_ms, "side_total_ms": verified_ms,
+                    # Keep the old key for consumers that have not migrated to
+                    # the unambiguous full-side timing name yet.
+                    "checkout_verified_ms": verified_ms, "oracle": oracle}
 
     def measure(self, expected_path, commit, side_order, version, round_number, deadline):
         if side_order not in {"scorpio-first", "git-first"}:
@@ -1033,15 +1075,18 @@ class WorkerSession:
     def stop(self, deadline):
         _check_deadline(deadline)
         final_audit_start = time.monotonic()
-        final = [self._audit_view(view, deadline) for view in self._views]
+        with self._stage("retained"):
+            final = [self._audit_view(view, deadline) for view in self._views]
         final_retained_view_audit_ms = (time.monotonic() - final_audit_start) * 1000
         try:
-            self._destroy_all(deadline)
-            if _owned_mounts(self.workspace_root):
-                raise WorkerError("workspace mounts remained after explicit retirement")
-            self._close_views()
-            self._stop_anchor(deadline)
-            self._complete_receipt()
+            with self._stage("destroy"):
+                self._destroy_all(deadline)
+            with self._stage("cleanup"):
+                if _owned_mounts(self.workspace_root):
+                    raise WorkerError("workspace mounts remained after explicit retirement")
+                self._close_views()
+                self._stop_anchor(deadline)
+                self._complete_receipt()
             return {"retained": len(final), "verified": True, "views": final,
                     "final_retained_view_audit_ms": final_retained_view_audit_ms}
         except BaseException:
@@ -1053,14 +1098,16 @@ class WorkerSession:
             if self._active_process is not None and self._active_identity is not None:
                 self._stop_anchor(deadline)
             try:
-                self._destroy_all(deadline)
+                with self._stage("destroy"):
+                    self._destroy_all(deadline)
             except BaseException as error:
                 errors.append(error)
-            self._close_views()
-            self._stop_anchor(deadline)
-            if not _owned_mounts(self.workspace_root) and self._groups_empty():
-                if self._last_identity is not None:
-                    self._write_receipt(self._last_identity[0], self._last_identity[1], True)
+            with self._stage("cleanup"):
+                self._close_views()
+                self._stop_anchor(deadline)
+                if not _owned_mounts(self.workspace_root) and self._groups_empty():
+                    if self._last_identity is not None:
+                        self._write_receipt(self._last_identity[0], self._last_identity[1], True)
         except BaseException as error:
             errors.append(error)
         if errors:

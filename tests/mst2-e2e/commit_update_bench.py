@@ -48,11 +48,19 @@ SAFE_WORKER_ERROR_CODES = frozenset({
     "worker_process_invalid", "worker_command_failed",
     "worker_receipt_invalid", "worker_cleanup_invalid", "git_baseline_invalid",
 })
+SAFE_WORKER_STAGES = frozenset({
+    "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
+})
 
 
 def _safe_worker_error_code(error):
     code = getattr(error, "error_code", None)
     return code if code in SAFE_WORKER_ERROR_CODES else None
+
+
+def _safe_worker_stage(error):
+    stage = getattr(error, "worker_stage", None)
+    return stage if stage in SAFE_WORKER_STAGES else None
 
 
 IDENTITY_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
@@ -111,6 +119,7 @@ class PhaseFailure(AssertionError):
         # separate from ``details`` so existing CommandFailure records remain
         # byte-for-byte compatible.
         self.error_code = _safe_worker_error_code(error)
+        self.worker_stage = _safe_worker_stage(error)
         super().__init__(phase + " failed")
 
 
@@ -130,6 +139,8 @@ def failure_record(error):
         record.update(error_type=error.failure_type, phase=error.phase)
         if error.error_code is not None:
             record["error_code"] = error.error_code
+        if error.worker_stage is not None:
+            record["worker_stage"] = error.worker_stage
         record.update(error.details)
     elif isinstance(error, CommandFailure):
         record.update(error.details)
@@ -137,6 +148,9 @@ def failure_record(error):
         code = _safe_worker_error_code(error)
         if code is not None:
             record["error_code"] = code
+        stage = _safe_worker_stage(error)
+        if stage is not None:
+            record["worker_stage"] = stage
     return record
 
 

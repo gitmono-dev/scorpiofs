@@ -13,6 +13,7 @@ from workspace_update_worker import (
     HTTP_BODY_LIMIT,
     ORACLE_MANIFEST_LIMIT,
     STATUS_FIELDS,
+    WORKER_STAGES,
     WorkerError,
     WorkerSession,
     _NoRedirectHTTP,
@@ -73,6 +74,18 @@ class WorkerShapeTests(unittest.TestCase):
         client = _NoRedirectHTTP("http://127.0.0.1:1")
         with self.assertRaises(TimeoutError):
             client.request("GET", "/health", time.monotonic() - 1)
+
+    def test_worker_stage_is_closed_and_preserves_nested_specific_stage(self):
+        worker = WorkerSession.__new__(WorkerSession)
+        self.assertEqual(WORKER_STAGES, {
+            "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
+        })
+        with self.assertRaises(WorkerError) as failed:
+            with worker._stage("hydrate"):
+                with worker._stage("poll"):
+                    raise WorkerError("private response body", error_code="worker_http_status_5xx")
+        self.assertEqual(failed.exception.worker_stage, "poll")
+        self.assertEqual(WorkerError("private", stage="private").worker_stage, None)
 
 
 class WorkerReceiptTests(unittest.TestCase):
