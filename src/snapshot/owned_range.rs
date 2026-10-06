@@ -230,6 +230,10 @@ impl OwnedChunkedFile {
             ));
         }
         let chunks = ChunkCache::new(reader)?;
+        // Opening a range reader reaches the fixed-view service to obtain its
+        // map.  Keep the reader's independent retention claim current at this
+        // boundary rather than relying on the caller's prior operation.
+        reader.ensure_lease().await?;
         let map = reader
             .client()
             .chunk_map(reader.snapshot_id(), &file.rel_path, &file.content_digest)
@@ -400,6 +404,7 @@ impl OwnedChunkedFile {
                 encoding: self.reader.encoding_hint(),
             },
         )?;
+        self.reader.ensure_lease().await?;
         let mut seen = false;
         let receipt = consume_frames(
             self.reader.client(),
@@ -448,6 +453,7 @@ impl OwnedChunkedFile {
         if let Some(digests) = self.leaves.lock().await.get(page) {
             return Ok(digests);
         }
+        self.reader.ensure_lease().await?;
         let leaf = self
             .reader
             .client()
