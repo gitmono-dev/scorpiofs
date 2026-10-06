@@ -14,6 +14,7 @@ import uuid
 from workspace_update_worker import (
     HTTP_BODY_LIMIT,
     ORACLE_MANIFEST_LIMIT,
+    RETENTION_SUBSTAGES,
     STATUS_FIELDS,
     WORKER_STAGES,
     WorkerError,
@@ -99,6 +100,20 @@ class WorkerShapeTests(unittest.TestCase):
         self.assertEqual(failed.exception.worker_stage, "poll")
         self.assertEqual(WorkerError("private", stage="private").worker_stage, None)
         self.assertEqual(WorkerError("private", stage=[]).worker_stage, None)
+
+    def test_retention_substage_is_closed(self):
+        self.assertEqual(RETENTION_SUBSTAGES, {
+            "retain_path", "upper_check", "sentinel_write", "retained_fd",
+            "old_view_oracle", "old_view_fd", "old_view_sentinel", "final_view_oracle",
+        })
+        self.assertEqual(WorkerError("private", retention_substage="old_view_oracle").retention_substage,
+                         "old_view_oracle")
+        self.assertIsNone(WorkerError("private", retention_substage="private-path").retention_substage)
+        worker = WorkerSession.__new__(WorkerSession)
+        with self.assertRaises(WorkerError) as failed:
+            with worker._retention_substage("old_view_oracle"):
+                raise WorkerError("private response body")
+        self.assertEqual(failed.exception.retention_substage, "old_view_oracle")
 
 
 class WorkerFullProfileTests(unittest.TestCase):

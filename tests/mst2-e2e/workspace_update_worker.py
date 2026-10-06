@@ -86,6 +86,15 @@ WORKER_STAGES = frozenset({
     "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
 })
 
+# Retention failures cross the hosted-runner boundary through a closed,
+# operation-level vocabulary.  These labels identify only the retention
+# boundary that failed; they never contain a path, workspace id, or exception
+# text.
+RETENTION_SUBSTAGES = frozenset({
+    "retain_path", "upper_check", "sentinel_write", "retained_fd",
+    "old_view_oracle", "old_view_fd", "old_view_sentinel", "final_view_oracle",
+})
+
 # Workspace HTTP errors cross the hosted-runner boundary only as a closed
 # diagnostic label.  Never persist the response message, path, or body.
 BACKEND_ERROR_CODES = frozenset({
@@ -203,16 +212,18 @@ class WorkerError(RuntimeError):
     """Closed diagnostics for a failed worker operation.
 
     ``str(error)`` remains useful to local callers, but only the closed
-    ``error_code``, ``worker_stage``, ``backend_code`` and ``snapshot_code``
+    ``error_code``, ``worker_stage``, ``retention_substage``, ``backend_code`` and ``snapshot_code``
     fields may cross into CI evidence.  Unknown or caller-supplied codes are
     discarded.
     """
 
-    def __init__(self, message="", error_code=None, stage=None, backend_code=None,
-                 snapshot_code=None):
+    def __init__(self, message="", error_code=None, stage=None, retention_substage=None,
+                 backend_code=None, snapshot_code=None):
         inferred = _message_error_code(message) if error_code is None else error_code
         self.error_code = inferred if inferred in WORKER_ERROR_CODES else WORKER_ERROR
         self.worker_stage = stage if type(stage) is str and stage in WORKER_STAGES else None
+        self.retention_substage = (retention_substage if type(retention_substage) is str
+                                   and retention_substage in RETENTION_SUBSTAGES else None)
         self.backend_code = (backend_code if backend_code in BACKEND_ERROR_CODES else None)
         self.snapshot_code = (snapshot_code if snapshot_code in SNAPSHOT_ERROR_CODES else None)
         super().__init__(message)
@@ -231,6 +242,22 @@ def _tag_worker_stage(error, stage):
         setattr(error, "worker_stage", stage)
     except BaseException:
         # A foreign exception may reject attributes; its enclosing phase still
+        # records the fixed benchmark phase safely.
+        pass
+    return error
+
+
+def _tag_retention_substage(error, substage):
+    """Attach one closed retention sub-stage without copying exception details."""
+    if type(substage) is not str or substage not in RETENTION_SUBSTAGES:
+        return error
+    current = getattr(error, "retention_substage", None)
+    if type(current) is str and current in RETENTION_SUBSTAGES:
+        return error
+    try:
+        setattr(error, "retention_substage", substage)
+    except BaseException:
+        # A foreign exception may reject attributes; the enclosing phase still
         # records the fixed benchmark phase safely.
         pass
     return error
@@ -567,6 +594,15 @@ class WorkerSession:
             yield
         except BaseException as error:
             _tag_worker_stage(error, name)
+            raise
+
+    @contextmanager
+    def _retention_substage(self, name):
+        """Tag failures with a closed retention boundary for safe CI diagnostics."""
+        try:
+            yield
+        except BaseException as error:
+            _tag_retention_substage(error, name)
             raise
 
     def _validate_roots(self):
@@ -967,50 +1003,57 @@ class WorkerSession:
         return fd, "file", file["rel_path"], file["content_digest"]
 
     def _retain_view(self, status, expected, deadline):
-        mount = self._assert_status_path(status)
-        upper = mount.parent / "upper"
-        if upper.is_symlink() or not upper.is_dir():
-            raise WorkerError("workspace upper is not a private directory")
-        upper_info = upper.stat()
-        if upper_info.st_uid != self.daemon_uid:
-            raise WorkerError("workspace upper owner differs from daemon uid")
-        sentinel = upper / DIRTY_SENTINEL
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-        fd = os.open(sentinel, flags, 0o600)
-        try:
-            _write_all(fd, DIRTY_BYTES)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        upper_fd = os.open(upper, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-                           | getattr(os, "O_CLOEXEC", 0))
-        try:
-            os.fsync(upper_fd)
-        finally:
-            os.close(upper_fd)
-        retained_fd, fd_kind, fd_rel, fd_digest = self._open_retained_fd(mount, expected, deadline)
+        with self._retention_substage("retain_path"):
+            mount = self._assert_status_path(status)
+        with self._retention_substage("upper_check"):
+            upper = mount.parent / "upper"
+            if upper.is_symlink() or not upper.is_dir():
+                raise WorkerError("workspace upper is not a private directory")
+            upper_info = upper.stat()
+            if upper_info.st_uid != self.daemon_uid:
+                raise WorkerError("workspace upper owner differs from daemon uid")
+        with self._retention_substage("sentinel_write"):
+            sentinel = upper / DIRTY_SENTINEL
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            fd = os.open(sentinel, flags, 0o600)
+            try:
+                _write_all(fd, DIRTY_BYTES)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            upper_fd = os.open(upper, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                               | getattr(os, "O_CLOEXEC", 0))
+            try:
+                os.fsync(upper_fd)
+            finally:
+                os.close(upper_fd)
+        with self._retention_substage("retained_fd"):
+            retained_fd, fd_kind, fd_rel, fd_digest = self._open_retained_fd(mount, expected, deadline)
         self._views.append({"status": dict(status), "expected": deepcopy(expected), "fd": retained_fd,
                             "fd_kind": fd_kind, "fd_rel": fd_rel, "fd_digest": fd_digest,
                             "sentinel": sentinel, "mountpoint": mount})
 
     def _audit_view(self, view, deadline):
-        expected = deepcopy(view["expected"])
-        if any(file["rel_path"] == DIRTY_SENTINEL for file in expected["files"]):
-            raise WorkerError("dirty sentinel collides with committed content")
-        expected["files"].append({"rel_path": DIRTY_SENTINEL, "fs_kind": "regular",
-                                  "size": len(DIRTY_BYTES),
-                                  "content_digest": "sha256:" + hashlib.sha256(DIRTY_BYTES).hexdigest()})
-        oracle = self._oracle(view["mountpoint"], expected, deadline)
-        if view["fd_kind"] == "file":
-            if _fd_digest(view["fd"], next(file["size"] for file in view["expected"]["files"]
-                                             if file["rel_path"] == view["fd_rel"]), deadline) != view["fd_digest"]:
-                raise WorkerError("retained old file descriptor changed")
-        else:
-            info = os.fstat(view["fd"])
-            if not stat.S_ISDIR(info.st_mode):
-                raise WorkerError("retained old directory descriptor changed")
-        if view["sentinel"].read_bytes() != DIRTY_BYTES:
-            raise WorkerError("dirty upper sentinel changed")
+        with self._retention_substage("old_view_oracle"):
+            expected = deepcopy(view["expected"])
+            if any(file["rel_path"] == DIRTY_SENTINEL for file in expected["files"]):
+                raise WorkerError("dirty sentinel collides with committed content")
+            expected["files"].append({"rel_path": DIRTY_SENTINEL, "fs_kind": "regular",
+                                      "size": len(DIRTY_BYTES),
+                                      "content_digest": "sha256:" + hashlib.sha256(DIRTY_BYTES).hexdigest()})
+            oracle = self._oracle(view["mountpoint"], expected, deadline)
+        with self._retention_substage("old_view_fd"):
+            if view["fd_kind"] == "file":
+                if _fd_digest(view["fd"], next(file["size"] for file in view["expected"]["files"]
+                                                 if file["rel_path"] == view["fd_rel"]), deadline) != view["fd_digest"]:
+                    raise WorkerError("retained old file descriptor changed")
+            else:
+                info = os.fstat(view["fd"])
+                if not stat.S_ISDIR(info.st_mode):
+                    raise WorkerError("retained old directory descriptor changed")
+        with self._retention_substage("old_view_sentinel"):
+            if view["sentinel"].read_bytes() != DIRTY_BYTES:
+                raise WorkerError("dirty upper sentinel changed")
         return {"workspace_id": view["status"]["workspace_id"],
                 "generation": view["status"]["generation"], "snapshot_id": view["status"]["snapshot_id"],
                 "fd_verified": True, "dirty_upper_verified": True, "oracle": oracle}
@@ -1025,8 +1068,9 @@ class WorkerSession:
         mount_identity = _mount_record(mount, self.daemon_uid)
         verify_start = time.monotonic()
         with self._stage("oracle"):
-            oracle = self._oracle(mount, expected, deadline, manifest_path=self._expected_path,
-                                  manifest_digest=self._expected_digest)
+            with self._retention_substage("final_view_oracle"):
+                oracle = self._oracle(mount, expected, deadline, manifest_path=self._expected_path,
+                                      manifest_digest=self._expected_digest)
         verified_ms = (time.monotonic() - started) * 1000
         verification_endpoint_ms = (time.monotonic() - verify_start) * 1000
         # Retain the just-verified view before auditing earlier views. The
