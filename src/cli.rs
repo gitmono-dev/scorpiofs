@@ -311,16 +311,16 @@ pub fn config_init(path: &str, force: bool) -> i32 {
 /// `scorpio config validate`: offline-validate a config file, reporting all
 /// problems. Does not load the process-wide config.
 pub fn config_validate(config_path: &str, overrides: HashMap<String, String>) -> i32 {
-    let problems = config::validate_file(config_path, overrides);
-    if problems.is_empty() {
-        println!("{config_path}: OK");
-        exit::SUCCESS
-    } else {
-        eprintln!("{config_path}: {} problem(s) found:", problems.len());
-        for p in &problems {
-            eprintln!("  - {p}");
+    match config::validate_file(config_path, overrides) {
+        Ok(()) => {
+            println!("{config_path}: OK");
+            exit::SUCCESS
         }
-        exit::CONFIG
+        Err(problem) => {
+            eprintln!("{config_path}: 1 problem(s) found:");
+            eprintln!("  - {problem}");
+            exit::CONFIG
+        }
     }
 }
 
