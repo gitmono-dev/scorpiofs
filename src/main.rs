@@ -21,6 +21,14 @@ struct Cli {
     #[arg(long, global = true)]
     log_level: Option<String>,
 
+    /// Override the MST/2 service URL for this invocation.
+    #[arg(long, global = true)]
+    mst2_base_url: Option<String>,
+
+    /// Override the v3 workspace store path for this invocation.
+    #[arg(long, global = true)]
+    store_path: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -142,7 +150,13 @@ async fn main() {
         }
         cli => cli,
     };
-    let overrides = HashMap::new();
+    let mut overrides = HashMap::new();
+    if let Some(value) = &cli.mst2_base_url {
+        overrides.insert("mst2_base_url".to_owned(), value.clone());
+    }
+    if let Some(value) = &cli.store_path {
+        overrides.insert("store_path".to_owned(), value.clone());
+    }
 
     // These commands need neither a loaded config nor logging; handle them
     // before `cli::init` so they work even when the config is missing/invalid.
