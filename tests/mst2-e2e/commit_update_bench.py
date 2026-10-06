@@ -51,6 +51,29 @@ SAFE_WORKER_ERROR_CODES = frozenset({
 SAFE_WORKER_STAGES = frozenset({
     "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
 })
+SAFE_RETENTION_SUBSTAGES = frozenset({
+    "retain_path", "upper_check", "sentinel_write", "retained_fd",
+    "old_view_oracle", "old_view_fd", "old_view_sentinel", "final_view_oracle",
+})
+SAFE_HYDRATION_SUBSTAGES = frozenset({
+    "metadata_closure", "cas_resume_audit", "small_object_fetch",
+    "large_content_fetch", "large_chunk_map", "large_chunk_read",
+    "large_cas_write", "hydration_commit", "snapshot_links",
+    "dependency_audit", "hydration_task",
+})
+SAFE_BACKEND_ERROR_CODES = frozenset({
+    "INVALID_CONFIG", "SNAPSHOT_ERROR", "WORKSPACE_BUSY", "WORKSPACE_DIRTY",
+    "WORKSPACE_IO", "WORKSPACE_NOT_FOUND", "WORKSPACE_NOT_READY",
+    "WORKSPACE_UNKNOWN",
+})
+SAFE_SNAPSHOT_CODES = frozenset({
+    "ScopeInvalid", "InvalidRequest", "LimitExceeded", "Unauthenticated",
+    "ScopeForbidden", "ViewNotFound", "SnapshotNotReady", "SnapshotGone",
+    "PathNotFound", "NotDirectory", "UnsupportedEntry", "LeaseUnknown",
+    "LeaseExpired", "CursorInvalid", "CursorStale", "ProofBudgetExceeded",
+    "DigestMismatch", "IntegrityError", "ObjectUnavailable", "RangeNotSupported",
+    "SymlinkTraversal", "DurableViewConflict", "TemporaryUnavailable", "Internal",
+})
 
 
 def _safe_worker_error_code(error):
@@ -61,6 +84,26 @@ def _safe_worker_error_code(error):
 def _safe_worker_stage(error):
     stage = getattr(error, "worker_stage", None)
     return stage if type(stage) is str and stage in SAFE_WORKER_STAGES else None
+
+
+def _safe_retention_substage(error):
+    substage = getattr(error, "retention_substage", None)
+    return substage if type(substage) is str and substage in SAFE_RETENTION_SUBSTAGES else None
+
+
+def _safe_hydration_substage(error):
+    substage = getattr(error, "hydration_substage", None)
+    return substage if type(substage) is str and substage in SAFE_HYDRATION_SUBSTAGES else None
+
+
+def _safe_backend_error_code(error):
+    code = getattr(error, "backend_code", None)
+    return code if code in SAFE_BACKEND_ERROR_CODES else None
+
+
+def _safe_snapshot_code(error):
+    code = getattr(error, "snapshot_code", None)
+    return code if code in SAFE_SNAPSHOT_CODES else None
 
 
 IDENTITY_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
@@ -120,6 +163,10 @@ class PhaseFailure(AssertionError):
         # byte-for-byte compatible.
         self.error_code = _safe_worker_error_code(error)
         self.worker_stage = _safe_worker_stage(error)
+        self.retention_substage = _safe_retention_substage(error)
+        self.hydration_substage = _safe_hydration_substage(error)
+        self.backend_code = _safe_backend_error_code(error)
+        self.snapshot_code = _safe_snapshot_code(error)
         super().__init__(phase + " failed")
 
 
@@ -141,6 +188,14 @@ def failure_record(error):
             record["error_code"] = error.error_code
         if error.worker_stage is not None:
             record["worker_stage"] = error.worker_stage
+        if error.retention_substage is not None:
+            record["retention_substage"] = error.retention_substage
+        if error.hydration_substage is not None:
+            record["hydration_substage"] = error.hydration_substage
+        if error.backend_code is not None:
+            record["backend_code"] = error.backend_code
+        if error.snapshot_code is not None:
+            record["snapshot_code"] = error.snapshot_code
         record.update(error.details)
     elif isinstance(error, CommandFailure):
         record.update(error.details)
@@ -151,6 +206,18 @@ def failure_record(error):
         stage = _safe_worker_stage(error)
         if stage is not None:
             record["worker_stage"] = stage
+        retention_substage = _safe_retention_substage(error)
+        if retention_substage is not None:
+            record["retention_substage"] = retention_substage
+        hydration_substage = _safe_hydration_substage(error)
+        if hydration_substage is not None:
+            record["hydration_substage"] = hydration_substage
+        backend_code = _safe_backend_error_code(error)
+        if backend_code is not None:
+            record["backend_code"] = backend_code
+        snapshot_code = _safe_snapshot_code(error)
+        if snapshot_code is not None:
+            record["snapshot_code"] = snapshot_code
     return record
 
 
@@ -441,7 +508,15 @@ def create_version(repo, round_number, version, smoke, deadline):
                       "GIT_AUTHOR_EMAIL": "benchmark@example.invalid", "GIT_COMMITTER_EMAIL": "benchmark@example.invalid"})
     if version == "v1":
         git(repo, deadline, "read-tree", "--empty")
-        modules, buckets, files, size = (8, 1, 8, 1024) if smoke else (64, 8, 32, 16384)
+        if smoke:
+            modules, buckets, files, size = 8, 1, 8, 1024
+        else:
+            # Keep medium large enough to exercise metadata fan-out, retained
+            # views, and the Git oracle while staying practical for the shared
+            # four-hour cloud budget.  This is 1,024 generated files (about
+            # 8 MiB) plus the wide-directory and large-file probes below;
+            # m001 and m007 remain present for the v3 rename and alias checks.
+            modules, buckets, files, size = 16, 4, 16, 8192
         for module in range(modules):
             for bucket in range(buckets):
                 directory = repo / prefix / f"m{module:03}" / f"d{bucket:02}"

@@ -161,11 +161,15 @@ async fn main() {
     for (key, value) in [
         ("mst2_base_url", &cli.mst2_base_url),
         ("store_path", &cli.store_path),
-        ("log_level", &cli.log_level),
     ] {
         if let Some(value) = value {
             overrides.insert(key.into(), value.clone());
         }
+    }
+    if let Some(value) = &cli.log_level {
+        // Resolve the CLI value before parsing the persisted file so a stale
+        // or malformed configured level cannot shadow the explicit override.
+        overrides.insert("log_level".to_owned(), value.clone());
     }
 
     // These commands need neither a loaded config nor logging; handle them

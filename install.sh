@@ -59,6 +59,7 @@ SERVICE_HEALTH_CONFIRMED=0
 ARTIFACT_BACKUP_DIR=""
 ARTIFACT_BACKUP_READY=0
 HAD_OLD_SCORPIO=0
+HAD_OLD_ANTARES=0
 HAD_OLD_CONFIG=0
 HAD_OLD_UNIT=0
 PREVIOUS_DATA_ROOT=""
@@ -78,25 +79,33 @@ BIND_PORT=""
 
 cleanup() {
     local exit_status=$?
-    if [ "$exit_status" -ne 0 ] && [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] && \
-        [ "$SERVICE_HEALTH_CONFIRMED" -ne 1 ] && command -v systemctl >/dev/null 2>&1; then
-        if run_root systemctl is-active --quiet scorpiofs.service; then
+    if [ "$exit_status" -ne 0 ] && [ "$ARTIFACT_BACKUP_READY" -eq 1 ] && \
+        [ "$SERVICE_HEALTH_CONFIRMED" -ne 1 ]; then
+        if [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] && command -v systemctl >/dev/null 2>&1 && \
+            run_root systemctl is-active --quiet scorpiofs.service; then
             warn "stopping the failed replacement service before rollback"
             if ! run_root systemctl stop scorpiofs.service; then
                 warn "could not stop the failed replacement service before rollback"
             fi
         fi
         if [ "$ARTIFACT_BACKUP_READY" -eq 1 ]; then
+        if [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ]; then
             if ! restore_upgrade_artifacts; then
                 warn "could not restore all previous ScorpioFS artifacts"
             fi
+        elif ! restore_upgrade_artifact "$HAD_OLD_ANTARES" \
+            "${ARTIFACT_BACKUP_DIR}/antares" "${PREFIX}/bin/antares"; then
+            warn "could not restore the previous antares entry point"
+        fi
         fi
         if ! restore_runtime_ownership; then
             warn "could not restore runtime ownership for the previous service user"
         fi
-        warn "installation failed after stopping scorpiofs.service; attempting to restore the managed service"
-        if ! run_root systemctl start scorpiofs.service; then
-            warn "could not restore scorpiofs.service; inspect: systemctl status scorpiofs"
+        if [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ]; then
+            warn "installation failed after stopping scorpiofs.service; attempting to restore the managed service"
+            if ! run_root systemctl start scorpiofs.service; then
+                warn "could not restore scorpiofs.service; inspect: systemctl status scorpiofs"
+            fi
         fi
     fi
     if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ]; then
@@ -1010,7 +1019,17 @@ backup_upgrade_artifacts() {
     [ -n "$WORKDIR" ] || die "internal error: upgrade backup requires a working directory"
     ARTIFACT_BACKUP_DIR="${WORKDIR}/previous-install"
     mkdir -m 0700 -- "$ARTIFACT_BACKUP_DIR"
-    [ "$SERVICE_STOPPED_FOR_UPGRADE" -eq 1 ] || return 0
+    # The retired entry point can still be the user's only executable when no
+    # managed service is active or --no-service is selected. Preserve it even
+    # though the managed config/unit rollback below is service-scoped.
+    if run_root test -e "${PREFIX}/bin/antares"; then
+        HAD_OLD_ANTARES=1
+        run_root cp -a -- "${PREFIX}/bin/antares" "${ARTIFACT_BACKUP_DIR}/antares"
+    fi
+    if [ "$SERVICE_STOPPED_FOR_UPGRADE" -ne 1 ]; then
+        [ "$HAD_OLD_ANTARES" -eq 1 ] && ARTIFACT_BACKUP_READY=1
+        return 0
+    fi
     if run_root test -e "${PREFIX}/bin/scorpio"; then
         HAD_OLD_SCORPIO=1
         run_root cp -a -- "${PREFIX}/bin/scorpio" "${ARTIFACT_BACKUP_DIR}/scorpio"
@@ -1043,6 +1062,8 @@ restore_upgrade_artifacts() {
     warn "restoring ScorpioFS artifacts from before the failed upgrade"
     restore_upgrade_artifact "$HAD_OLD_SCORPIO" \
         "${ARTIFACT_BACKUP_DIR}/scorpio" "${PREFIX}/bin/scorpio" || restore_failed=1
+    restore_upgrade_artifact "$HAD_OLD_ANTARES" \
+        "${ARTIFACT_BACKUP_DIR}/antares" "${PREFIX}/bin/antares" || restore_failed=1
     restore_upgrade_artifact "$HAD_OLD_CONFIG" \
         "${ARTIFACT_BACKUP_DIR}/scorpio.toml" "${CONFDIR}/scorpio.toml" || restore_failed=1
     restore_upgrade_artifact "$HAD_OLD_UNIT" \
