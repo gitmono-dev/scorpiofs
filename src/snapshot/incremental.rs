@@ -161,7 +161,7 @@ impl ScopeCache {
     /// the scope live in subdirectories, so pin liveness is discoverable.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
         let dir = dir.into();
-        fs::create_dir_all(dir.join("pages")).map_err(io_err)?;
+        secure_fs::create_dir_all_no_symlink(&dir.join("pages")).map_err(io_err)?;
         Ok(ScopeCache { dir })
     }
 
@@ -1083,7 +1083,7 @@ fn io_err(e: std::io::Error) -> SnapshotError {
 
 /// Temp-file + rename so a crash never leaves a half-written record or page.
 fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
-    fs::create_dir_all(dir).map_err(io_err)?;
+    secure_fs::create_dir_all_no_symlink(dir).map_err(io_err)?;
     let tmp = dir.join(format!(
         ".{name}.tmp.{}-{}",
         std::process::id(),

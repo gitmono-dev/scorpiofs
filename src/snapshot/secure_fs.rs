@@ -10,7 +10,7 @@
 use std::{
     fs::{File, OpenOptions},
     io,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 /// Open a local object for reading without following a final symlink.
@@ -53,4 +53,54 @@ pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     io::Read::read_to_end(&mut file, &mut bytes)?;
     Ok(bytes)
+}
+
+/// Create a directory chain after checking every existing component is a
+/// real directory.  `std::fs::create_dir_all` follows intermediate symlinks;
+/// that is unsafe for cache and authority roots because a redirected parent
+/// can move integrity state outside the configured domain.  The second check
+/// catches a symlink already present at the requested leaf after creation.
+///
+/// This is a conservative preflight.  Callers still use regular descriptor
+/// opens for files, so a concurrent component replacement cannot turn a file
+/// read into a symlink traversal.  A future dirfd/openat implementation can
+/// replace this helper without changing call sites.
+pub(crate) fn create_dir_all_no_symlink(path: &Path) -> io::Result<()> {
+    validate_directory_chain(path)?;
+    std::fs::create_dir_all(path)?;
+    validate_directory_chain(path)
+}
+
+fn validate_directory_chain(path: &Path) -> io::Result<()> {
+    let mut cursor = PathBuf::from(path);
+    loop {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("directory component is a symlink: {}", cursor.display()),
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        format!(
+                            "directory component is not a directory: {}",
+                            cursor.display()
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = cursor.parent().map(Path::to_path_buf);
+                match parent {
+                    Some(parent) if parent != cursor => cursor = parent,
+                    _ => return Ok(()),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }

@@ -195,7 +195,7 @@ impl Drop for AuthorityLock {
 fn bind_directory(dir: &Path, binding: &CacheBinding) -> Result<(), SnapshotError> {
     let io_error =
         |error: std::io::Error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string());
-    fs::create_dir_all(dir).map_err(io_error)?;
+    super::secure_fs::create_dir_all_no_symlink(dir).map_err(io_error)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)

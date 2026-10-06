@@ -3095,7 +3095,7 @@ pub(super) fn create_dirs_durable(path: &Path) -> Result<(), SnapshotError> {
             Err(e) => return Err(io_err(e)),
         }
     }
-    fs::create_dir_all(path).map_err(io_err)?;
+    secure_fs::create_dir_all_no_symlink(path).map_err(io_err)?;
     for directory in missing.iter().rev() {
         sync_dir(directory)?;
         sync_dir(parent_dir(directory))?;
@@ -3787,6 +3787,23 @@ mod tests {
             err.code,
             SnapshotErrorCode::Internal | SnapshotErrorCode::DigestMismatch
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_creation_rejects_an_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        symlink(&outside, root.join("redirect")).unwrap();
+
+        let err = create_dirs_durable(&root.join("redirect").join("child")).unwrap_err();
+        assert_eq!(err.code, SnapshotErrorCode::Internal);
+        assert!(!outside.join("child").exists());
     }
 
     #[test]
