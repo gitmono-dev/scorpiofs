@@ -17,7 +17,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 service_user="${SUDO_USER:-root}"
 unit_capture="${test_root}/scorpiofs.service"
 systemctl_log="${test_root}/systemctl.log"
-mock_service_active=0
+mock_service_active=1
 
 mkdir -p "$test_root"
 : >"$systemctl_log"
@@ -103,7 +103,7 @@ if ! grep -Fq 'ExecStart='"${v3_root}"'/prefix/bin/scorpio --config-path '"${v3_
     exit 1
 fi
 grep -Fq 'User='"${service_user}" "$unit_capture"
-grep -Fxq 'start scorpiofs.service' "$systemctl_log"
+grep -Fxq 'restart scorpiofs.service' "$systemctl_log"
 
 if bash "${repo_root}/install.sh" \
     --version "$version" \
