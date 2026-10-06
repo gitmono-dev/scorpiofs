@@ -172,7 +172,10 @@ def command(args, deadline, env=None, data=None):
         args, min(deadline, time.monotonic() + 1800), env=env or clean_env(), data=data)
     if status:
         name = Path(str(args[0])).name.removesuffix(".exe")
-        program = name if name in {"git", "psql", "docker", "scorpio"} else "external_command"
+        # The shipped server is an owned executable in the setup phase. Keep
+        # its label closed so safe failure evidence identifies the failing
+        # command without copying arguments, paths, or child stderr.
+        program = name if name in {"git", "psql", "docker", "mega2", "scorpio"} else "external_command"
         raise CommandFailure(program, status, error_output)
     return out
 

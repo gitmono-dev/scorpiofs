@@ -489,8 +489,11 @@ class SessionBudgetTests(unittest.TestCase):
                     patch.object(budget, "process_start", side_effect=process_start), \
                     patch.object(ci, "stop_owned", side_effect=stop), \
                     patch("sys.stdout", new_callable=io.StringIO):
+                # Setup, readiness, and round failures are reported through
+                # the closed phase envelope. Startup identity errors happen
+                # before that envelope and retain their original type.
                 expected_error = (PermissionError if failure == "startup"
-                                  else bench.PhaseFailure if failure == "round" else RuntimeError)
+                                  else bench.PhaseFailure)
                 with self.assertRaises(expected_error):
                     ci.execute(opts)
             self.assertEqual(cleanup_deadlines, [shared.cleanup_deadline])
