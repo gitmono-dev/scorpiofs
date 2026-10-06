@@ -316,9 +316,11 @@ pub fn config_validate(config_path: &str, overrides: HashMap<String, String>) ->
             println!("{config_path}: OK");
             exit::SUCCESS
         }
-        Err(problem) => {
-            eprintln!("{config_path}: 1 problem(s) found:");
-            eprintln!("  - {problem}");
+        Err(problems) => {
+            eprintln!("{config_path}: {} problem(s) found:", problems.len());
+            for problem in &problems {
+                eprintln!("  - {problem}");
+            }
             exit::CONFIG
         }
     }
