@@ -59,6 +59,9 @@ WORKER_ERROR_CODES = frozenset({
     "worker_http_content_length_invalid",
     "worker_http_body_truncated",
     "worker_http_status_rejected",
+    "worker_http_status_4xx",
+    "worker_http_status_5xx",
+    "worker_http_status_other",
     "worker_http_response_invalid",
     "worker_http_request_failed",
     "worker_json_invalid",
@@ -90,8 +93,14 @@ def _message_error_code(message):
         return "worker_http_content_length_invalid"
     if message.startswith("worker HTTP body length is truncated"):
         return "worker_http_body_truncated"
-    if message.startswith("worker HTTP status "):
-        return "worker_http_status_rejected"
+    status = re.fullmatch(r"worker HTTP status ([0-9]{3}) was not accepted", message)
+    if status:
+        value = int(status.group(1))
+        if 400 <= value < 500:
+            return "worker_http_status_4xx"
+        if 500 <= value < 600:
+            return "worker_http_status_5xx"
+        return "worker_http_status_other"
     if message.startswith("worker HTTP response is not JSON"):
         return "worker_http_response_invalid"
     if message.startswith("worker HTTP no-content response has a body"):

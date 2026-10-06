@@ -42,8 +42,12 @@ def valid_status(**changes):
 class WorkerShapeTests(unittest.TestCase):
     def test_worker_error_codes_are_fixed_and_status_values_are_not_embedded(self):
         status = WorkerError("worker HTTP status 503 was not accepted")
-        self.assertEqual(status.error_code, "worker_http_status_rejected")
+        self.assertEqual(status.error_code, "worker_http_status_5xx")
         self.assertNotIn("503", status.error_code)
+        self.assertEqual(WorkerError("worker HTTP status 409 was not accepted").error_code,
+                         "worker_http_status_4xx")
+        self.assertEqual(WorkerError("worker HTTP status 302 was not accepted").error_code,
+                         "worker_http_status_other")
         self.assertEqual(WorkerError("daemon leaked token", error_code="token").error_code,
                          "worker_error")
         for message, expected in [
