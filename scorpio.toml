@@ -1,34 +1,5 @@
-# Local hybrid: sibling mega2-compose.yml (127.0.0.1:9000). Do not use /lfs.
-base_url = "http://127.0.0.1:9000"
-lfs_url = "http://127.0.0.1:9000/api/v1/lfs"
+# Local MST/2 v3 development configuration.
+mst2_base_url = "http://127.0.0.1:9000"
+mst2_auth_token = ""
 store_path = "/tmp/scorpio-megadir/store"
-config_file = "config.toml"
-git_author = "MEGA"
-git_email = "admin@mega.org"
-workspace = "/tmp/scorpio-megadir/mount"
-dicfuse_readable = "true"
-load_dir_depth = "5"
-fetch_file_thread = "10"
-dicfuse_import_concurrency = "4"
-dicfuse_dir_sync_ttl_secs = "5"
-dicfuse_reply_ttl_secs = "2"
-dicfuse_fetch_dir_timeout_secs = "10"
-dicfuse_connect_timeout_secs = "3"
-dicfuse_fetch_dir_max_retries = "3"
-dicfuse_stat_mode = "accurate"
-dicfuse_open_buff_max_bytes = "268435456"
-dicfuse_open_buff_max_files = "4096"
-antares_load_dir_depth = "3"
-# "fast" skips remote size probes, but then getattr reports size 0 for files
-# never read in this revision; the kernel caches that attr and truncates every
-# subsequent read to empty (git status sees bogus diffs against the index).
-# "accurate" probes once per file per revision and caches the result in size.db.
-antares_dicfuse_stat_mode = "accurate"
-antares_dicfuse_open_buff_max_bytes = "67108864"
-antares_dicfuse_open_buff_max_files = "1024"
-antares_dicfuse_dir_sync_ttl_secs = "120"
-antares_dicfuse_reply_ttl_secs = "60"
-antares_upper_root = "/tmp/scorpio-megadir/antares/upper"
-antares_cl_root = "/tmp/scorpio-megadir/antares/cl"
-antares_mount_root = "/tmp/scorpio-megadir/antares/mnt"
-antares_state_file = "/tmp/scorpio-megadir/antares/state.toml"
+log_level = "info"

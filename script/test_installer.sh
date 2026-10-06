@@ -13,8 +13,7 @@ common=(
     --no-deps
     --no-service
     --enable-user-allow-other
-    --base-url https://mega.example.com
-    --lfs-url https://mega.example.com/lfs
+    --mst2-base-url https://mega.example.com
     --prefix "$test_root/prefix"
     --config-dir "$test_root/etc"
     --data-root "$test_root/data"
@@ -38,8 +37,7 @@ expect_failure() {
 
 bash "$installer" "${common[@]}" --http-addr 192.168.1.10:2725 --allow-public-api >/dev/null
 bash "$installer" "${common[@]}" \
-    --base-url 'http://[::1]:8000' \
-    --lfs-url 'http://[::1]:8000/lfs' \
+    --mst2-base-url 'http://[::1]:8000' \
     --http-addr '[::1]:2725' >/dev/null
 
 grep() {
@@ -59,8 +57,7 @@ interactive_public=(
     --enable-user-allow-other
     --yes
     --allow-public-api
-    --base-url https://mega.example.com
-    --lfs-url https://mega.example.com/lfs
+    --mst2-base-url https://mega.example.com
     --prefix "$test_root/interactive-prefix"
     --config-dir "$test_root/interactive-etc"
     --data-root "$test_root/interactive-data"
@@ -75,10 +72,9 @@ if [[ "$output" != *"health: curl http://192.168.1.10:2725/health"* ]]; then
     exit 1
 fi
 
-expect_failure "missing URL host" "must include a host" "${common[@]}" --base-url http://
-expect_failure "URL control character" "base_url must not contain control characters" \
-    "${common[@]}" --base-url $'https://mega.example.com/a\bpath'
-expect_failure "URL port overflow" "between 1 and 65535" "${common[@]}" --lfs-url http://host:99999
+expect_failure "missing URL host" "must include a host" "${common[@]}" --mst2-base-url http://
+expect_failure "URL control character" "mst2-base-url must not contain control characters" \
+    "${common[@]}" --mst2-base-url $'https://mega.example.com/a\bpath'
 expect_failure "bind port overflow" "between 1 and 65535" "${common[@]}" --http-addr 127.0.0.1:99999
 expect_failure "unbracketed IPv6 bind" "IPv4:port or [IPv6]:port" "${common[@]}" --http-addr ::1:2725
 expect_failure "unauthorized public bind" "without --allow-public-api" \
@@ -93,18 +89,12 @@ expect_failure "workspace overlaps store" "workspace must not overlap store-path
     "${common[@]}" --store-path "$test_root/data/mount"
 expect_failure "workspace contains installed binary" "workspace must not contain scorpio-binary" \
     "${common[@]}" --prefix "$test_root/data/mount/tools"
-expect_failure "Antares mount root contains main config" "antares-mount-root must not contain main-config" \
-    "${common[@]}" --config-dir "$test_root/data/antares/mnt/config"
 expect_failure "systemd path specifier" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio%Q" \
     --workspace "$test_root/scorpio%Q/mount" --store-path "$test_root/scorpio%Q/store"
 expect_failure "cleanup shell metacharacter" "unsafe for shell or systemd" \
     "${common[@]}" --data-root "$test_root/scorpio;false" \
     --workspace "$test_root/scorpio;false/mount" --store-path "$test_root/scorpio;false/store"
-SCORPIO_GIT_AUTHOR=$'Bob\bBuilder' expect_failure \
-    "TOML author control character" "git author must not contain control characters" \
-    "${common[@]}"
-
 no_systemctl_bin="$test_root/no-systemctl-bin"
 mkdir -p "$no_systemctl_bin"
 for tool in curl tar realpath find findmnt; do
@@ -116,8 +106,7 @@ if output="$(PATH="$no_systemctl_bin" /bin/bash "$installer" \
     --dry-run \
     --no-deps \
     --no-user-allow-other \
-    --base-url https://mega.example.com \
-    --lfs-url https://mega.example.com/lfs \
+    --mst2-base-url https://mega.example.com \
     --prefix "$test_root/service-prefix" \
     --config-dir "$test_root/service-etc" \
     --data-root "$test_root/service-data" \

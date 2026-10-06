@@ -153,7 +153,6 @@ jobs:
           # The workspace binary runs through the entrypoint.
           docker run --rm scorpiofs:ci --version
           docker run --rm scorpiofs:ci workspace --help
-          docker run --rm --entrypoint sh scorpiofs:ci -c 'test ! -e /usr/local/bin/antares'
 
           # The entrypoint must refuse `serve` without the actual MST/2 URL.
           if docker run --rm scorpiofs:ci serve; then

@@ -21,37 +21,28 @@ SupplementaryGroups=fuse
 # the `fuse3` package) — see deploy/README.md for the trade-offs.
 AmbientCapabilities=CAP_SYS_ADMIN
 
-# Ensure runtime directories exist (FHS-friendly paths). Adjust to match
-# scorpio.toml / the SCORPIO_* environment. The leading '+' runs this step as
-# root (regardless of User= above) so it can create and chown the directories.
-# The parent data dirs are listed FIRST so `install -d` chowns them too (it does
-# not chown intermediate components it auto-creates) — otherwise the daemon,
-# running as scorpiofs, can't create config.toml/state.toml under a root-owned
-# /var/lib/scorpiofs.
+# Ensure the v3 storage roots exist (FHS-friendly paths). The leading '+' runs
+# this step as root (regardless of User= above) so it can create and chown the
+# directories before the unprivileged daemon starts.
 ExecStartPre=+/usr/bin/install -d -o scorpiofs -g scorpiofs \
     /var/lib/scorpiofs \
-    /var/lib/scorpiofs/mount \
     /var/lib/scorpiofs/store \
-    /var/lib/scorpiofs/antares \
-    /var/lib/scorpiofs/antares/upper \
-    /var/lib/scorpiofs/antares/cl \
-    /var/lib/scorpiofs/antares/mnt
+    /var/lib/scorpiofs/store/workspaces-v3 \
+    /var/lib/scorpiofs/store/mst2-cache
 
 # Bind the (unauthenticated) HTTP API to loopback by default. To expose it,
 # change to 0.0.0.0 ONLY behind a firewall / reverse proxy with access control.
 ExecStart=/usr/local/bin/scorpio --config-path /etc/scorpiofs/scorpio.toml serve --http-addr 127.0.0.1:2725
 
-# Belt-and-suspenders cleanup of residual mountpoints after stop (the daemon
-# already unmounts on SIGTERM). The leading '-' ignores failures. The first line
-# lazily unmounts any per-job Antares mounts (deepest first); the second the root.
-ExecStopPost=-/bin/sh -c 'for m in $(findmnt -rno TARGET --submounts /var/lib/scorpiofs/antares/mnt 2>/dev/null | sort -r); do fusermount3 -u -z "$m"; done'
-ExecStopPost=-/usr/bin/fusermount3 -u -z /var/lib/scorpiofs/mount
+# Belt-and-suspenders cleanup of the v3 workspace mount after stop (the daemon
+# already unmounts on SIGTERM). The leading '-' ignores failures.
+ExecStopPost=-/usr/bin/fusermount3 -u -z /var/lib/scorpiofs/store/workspaces-v3
 
 Restart=on-failure
 RestartSec=5s
 
-# Must exceed the in-process shutdown budget (daemon join 20s + Antares cleanup
-# 15s) so systemd does not SIGKILL before graceful unmount completes.
+# Must exceed the in-process shutdown budget so systemd does not SIGKILL before
+# graceful unmount completes.
 TimeoutStopSec=45
 KillMode=mixed
 
