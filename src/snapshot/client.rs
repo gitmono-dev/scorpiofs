@@ -502,8 +502,10 @@ impl Mst2Client {
                     // A canonical error owns its retry classification. Read
                     // the bounded body once so deterministic projection or
                     // integrity failures do not spend the full retry budget.
-                    // Legacy or malformed envelopes have no retry authority;
+                    // A malformed canonical envelope has no retry authority;
                     // fail closed instead of repeating a deterministic 5xx.
+                    // Older/plain deployments do not carry the canonical
+                    // hints, so retain their bounded status retry policy.
                     let status = resp.status();
                     let bytes = read_json_bytes(resp, self.response_byte_limit())
                         .await
@@ -516,7 +518,17 @@ impl Mst2Client {
                         status.as_u16(),
                     )
                     .map(|error| error.retryable)
-                    .unwrap_or(false);
+                    .unwrap_or_else(|_| {
+                        let has_canonical_hint =
+                            serde_json::from_slice::<serde_json::Value>(&bytes)
+                                .ok()
+                                .and_then(|value| value.get("error").cloned())
+                                .is_some_and(|error| {
+                                    error.get("request_id").is_some()
+                                        || error.get("retryable").is_some()
+                                });
+                        !has_canonical_hint && retryable_status(status)
+                    });
                     if attempt < MAX_ATTEMPTS && retryable {
                         tokio::time::timeout_at(deadline, sleep_backoff(attempt))
                             .await
@@ -947,6 +959,12 @@ impl<'de> Deserialize<'de> for UniqueJson {
     }
 }
 
+/// Statuses worth another attempt for legacy/plain responses. Canonical
+/// envelopes are handled by their explicit `retryable` field above.
+fn retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
 /// Transport failures that a retry can plausibly fix. A malformed-URL or
 /// body-encoding error is not retryable.
 fn retryable_transport(e: &reqwest::Error) -> bool {
@@ -1109,6 +1127,65 @@ mod retry_classification_tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(client.retry_count(), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_503_without_retry_hint_keeps_bounded_status_retry() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base, task) = server(Arc::clone(&requests), |number| {
+            if number == 1 {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "TEMPORARY_UNAVAILABLE",
+                            "message": "legacy transient"
+                        }
+                    })),
+                )
+                    .into_response()
+            } else {
+                StatusCode::NO_CONTENT.into_response()
+            }
+        })
+        .await;
+        let client = Mst2Client::new(base.clone());
+        let response = client
+            .send_retrying(client.http.get(format!("{base}/probe")))
+            .await
+            .expect("legacy status retry succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(client.retry_count(), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_canonical_503_with_hint_is_not_retried() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base, task) = server(Arc::clone(&requests), |_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "SNAPSHOT_NOT_READY",
+                        "message": "missing retryable",
+                        "request_id": "test-request"
+                    }
+                })),
+            )
+                .into_response()
+        })
+        .await;
+        let client = Mst2Client::new(base.clone());
+        let error = client
+            .send_retrying(client.http.get(format!("{base}/probe")))
+            .await
+            .unwrap_err();
+        assert_eq!(error.http_status, 503);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(client.retry_count(), 0);
         task.abort();
     }
 }
