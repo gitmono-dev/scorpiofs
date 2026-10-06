@@ -96,8 +96,12 @@ SCORPIO_SERVICE_USER="$service_user" bash "${repo_root}/install.sh" \
 config="${v3_root}/etc/scorpio.toml"
 grep -Fxq 'mst2_base_url = "https://mega.example.com"' "$config"
 grep -Fxq "store_path = \"${v3_root}/data/store\"" "$config"
-grep -Fq 'ExecStart='"${v3_root}"'/prefix/bin/scorpio --config-path '"${v3_root}"'/etc/scorpio.toml serve' \
-    "$unit_capture"
+if ! grep -Fq 'ExecStart='"${v3_root}"'/prefix/bin/scorpio --config-path '"${v3_root}"'/etc/scorpio.toml serve' \
+    "$unit_capture"; then
+    printf 'generated unit does not contain the v3 daemon command:\n' >&2
+    cat "$unit_capture" >&2
+    exit 1
+fi
 grep -Fq 'User='"${service_user}" "$unit_capture"
 grep -Fxq 'start scorpiofs.service' "$systemctl_log"
 
