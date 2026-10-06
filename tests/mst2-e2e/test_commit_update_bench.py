@@ -139,6 +139,19 @@ class CommitUpdateBenchTests(unittest.TestCase):
         error.retention_substage = "private-path"
         self.assertNotIn("retention_substage", BENCH.failure_record(error))
 
+    def test_worker_failure_record_carries_only_a_closed_hydration_substage(self):
+        private = "private-token /run/secret response body"
+        error = WorkerError(private, error_code="worker_http_status_5xx",
+                            hydration_substage="dependency_audit")
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("shipped_workspace_and_git_measurement"):
+                raise error
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["hydration_substage"], "dependency_audit")
+        self.assertNotIn(private, json.dumps(record))
+        error.hydration_substage = "private-path"
+        self.assertNotIn("hydration_substage", BENCH.failure_record(error))
+
     def test_worker_failure_record_carries_only_a_closed_backend_code(self):
         error = WorkerError("private response body", error_code="worker_http_status_5xx",
                             backend_code="SNAPSHOT_ERROR", snapshot_code="ObjectUnavailable")
