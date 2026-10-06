@@ -1507,7 +1507,11 @@ main() {
     check_fuse
     prepare_release_binaries
     recover_stale_runtime_mounts
-    validate_runtime_migration_mounts
+    # A dry run prints the stale mount detach action but must not inspect the
+    # still-visible mock mount as a live ownership migration target.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        validate_runtime_migration_mounts
+    fi
     ensure_service_account
     validate_service_config_traversal
     stop_active_service_for_upgrade
