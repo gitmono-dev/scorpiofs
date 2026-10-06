@@ -190,6 +190,7 @@ pub mod manager;
 pub mod server;
 pub mod snapshot;
 pub mod util;
+pub mod workspace;
 
 /// Commonly used types and traits for working with Antares.
 ///

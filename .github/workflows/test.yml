@@ -62,6 +62,9 @@ jobs:
       - name: cargo test --lib
         run: cargo test --lib --verbose
 
+      - name: Native v3 HTTP lifecycle and launcher contracts
+        run: cargo test --test mst2_workspace_v3_http --test mst2_workspace_launcher_http -- --nocapture
+
       - name: Native namespace and upper-diff HTTP cases
         run: |
           cargo test --lib snapshot::upper_diff::unix::tests:: -- --nocapture

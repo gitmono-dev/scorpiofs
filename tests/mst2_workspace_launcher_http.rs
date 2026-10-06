@@ -30,13 +30,17 @@ use axum::{
 use mst2_codec::{
     descriptor::ServingDescriptor,
     metapage::{page_id, Entry, EntryKind, Page},
-    treeframe::{EndPayload, MetaPayload},
+    treeframe::{EndPayload, MetaPayload, ObjectPayload},
 };
 use scorpiofs::snapshot::{durable::digest_of, frames::parse_digest};
 use serde_json::{json, Value};
 
 const INSTANCE: &str = "11111111-2222-4333-8444-555555555555";
-const CONTENT: [&[u8]; 2] = [b"old fixed content", b"new fixed content"];
+const CONTENT: [&[u8]; 3] = [
+    b"old fixed content",
+    b"new fixed content",
+    b"cancelled fixed content must be fetched independently",
+];
 
 fn digest(id: &[u8; 32]) -> String {
     format!("sha256:{}", hex::encode(id))
@@ -52,7 +56,22 @@ struct Version {
 
 impl Version {
     fn new(content: &[u8]) -> Self {
-        let child_bytes = Page::Leaf { entries: vec![] }.encode().unwrap();
+        let child_entries = if content == CONTENT[2] {
+            // Give the pending full closure an independently unseen META page.
+            vec![Entry::file(
+                EntryKind::Regular,
+                b"leaf.txt",
+                content.len() as u64,
+                parse_digest(&digest_of(content)).unwrap(),
+            )]
+        } else {
+            vec![]
+        };
+        let child_bytes = Page::Leaf {
+            entries: child_entries,
+        }
+        .encode()
+        .unwrap();
         let child = page_id(&child_bytes);
         let root_bytes = Page::Leaf {
             entries: vec![
@@ -101,12 +120,20 @@ impl Version {
 }
 
 struct Fixture {
-    versions: [Version; 2],
+    versions: [Version; 3],
     latest: AtomicUsize,
     reject_resolve: AtomicBool,
     requests: Mutex<Vec<String>>,
     child_pages: AtomicUsize,
     blobs: AtomicUsize,
+    block_child_metadata: AtomicBool,
+    child_metadata_started: tokio::sync::Notify,
+    child_metadata_release: tokio::sync::Semaphore,
+    pending_child_metadata_calls: AtomicUsize,
+    block_objects: AtomicBool,
+    objects_started: tokio::sync::Notify,
+    objects_release: tokio::sync::Semaphore,
+    pending_object_calls: AtomicUsize,
 }
 
 impl Fixture {
@@ -118,6 +145,14 @@ impl Fixture {
             requests: Mutex::new(Vec::new()),
             child_pages: AtomicUsize::new(0),
             blobs: AtomicUsize::new(0),
+            block_child_metadata: AtomicBool::new(false),
+            child_metadata_started: tokio::sync::Notify::new(),
+            child_metadata_release: tokio::sync::Semaphore::new(0),
+            pending_child_metadata_calls: AtomicUsize::new(0),
+            block_objects: AtomicBool::new(false),
+            objects_started: tokio::sync::Notify::new(),
+            objects_release: tokio::sync::Semaphore::new(0),
+            pending_object_calls: AtomicUsize::new(0),
         }
     }
 
@@ -140,11 +175,7 @@ async fn record(request: axum::extract::Request, next: axum::middleware::Next) -
 }
 
 async fn capabilities() -> Json<Value> {
-    Json(json!({
-        "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
-        "features": {"resolve": true, "directory": true, "leases": true,
-            "metadata_pages": true, "raw_blob": true}
-    }))
+    Json(serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap())
 }
 
 async fn resolve(State(f): State<Arc<Fixture>>, Json(request): Json<Value>) -> Json<Value> {
@@ -162,7 +193,9 @@ async fn resolve(State(f): State<Arc<Fixture>>, Json(request): Json<Value>) -> J
             "metadata_root": digest(&v.root), "snapshot_id": v.sid
         },
         "lease_id": "launcher-lease", "lease_expires_at": "2099-01-01T00:00:00Z",
-        "publication_sequence": "1", "authorization_epoch": "1"
+        "publication_sequence": "1", "authorization_epoch": "1",
+        "writer_epoch": "1", "resolved_at": "2026-10-05T00:00:00Z",
+        "delivery": request["delivery"]
     }))
 }
 
@@ -180,6 +213,14 @@ async fn metadata(
         "/" => (v.root, &v.root_bytes),
         "/deep" => {
             f.child_pages.fetch_add(1, Ordering::SeqCst);
+            if f.version(&sid) == 2 {
+                f.pending_child_metadata_calls
+                    .fetch_add(1, Ordering::SeqCst);
+                if f.block_child_metadata.load(Ordering::SeqCst) {
+                    f.child_metadata_started.notify_one();
+                    f.child_metadata_release.acquire().await.unwrap().forget();
+                }
+            }
             (v.child, &v.child_bytes)
         }
         _ => panic!("unexpected metadata path"),
@@ -212,6 +253,49 @@ async fn blob(State(f): State<Arc<Fixture>>, AxumPath(sid): AxumPath<String>) ->
     CONTENT[f.version(&sid)].to_vec().into_response()
 }
 
+async fn objects(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(sid): AxumPath<String>,
+    body: Bytes,
+) -> Response {
+    let version = f.version(&sid);
+    let content = CONTENT[version];
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let items = request["items"].as_array().unwrap();
+    // All committed file paths share one digest, so the durable lane
+    // requests one independently verified body for all logical aliases.
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["expected_digest"], digest_of(content));
+    f.blobs.fetch_add(1, Ordering::SeqCst);
+    if version == 2 {
+        f.pending_object_calls.fetch_add(1, Ordering::SeqCst);
+        if f.block_objects.load(Ordering::SeqCst) {
+            f.objects_started.notify_one();
+            f.objects_release.acquire().await.unwrap().forget();
+        }
+    }
+    let mut wire = ObjectPayload {
+        objects: vec![(parse_digest(&digest_of(content)).unwrap(), content.to_vec())],
+    }
+    .encode(7, 0)
+    .unwrap();
+    wire.extend(
+        EndPayload {
+            request_item_count: 1,
+            unique_unit_count: 1,
+            logical_bytes: content.len() as u64,
+            request_body_sha256: parse_digest(&digest_of(&body)).unwrap(),
+        }
+        .encode(7, 1),
+    );
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", sid)
+        .header("x-mega-request-digest", digest_of(&body))
+        .body(Body::from(wire))
+        .unwrap()
+}
+
 struct Server(tokio::task::JoinHandle<()>);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -227,6 +311,7 @@ async fn fixture_server(f: Arc<Fixture>) -> (String, Server) {
         .route("/api/v2/snapshots/resolve", post(resolve))
         .route("/api/v2/snapshots/{sid}/metadata/pages", post(metadata))
         .route("/api/v2/snapshots/{sid}/blob", get(blob))
+        .route("/api/v2/snapshots/{sid}/objects", post(objects))
         .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR })
         .layer(axum::middleware::from_fn(record))
         .layer(axum::Extension(f.clone()))
@@ -243,6 +328,7 @@ struct Launcher {
     child: Child,
     temp: tempfile::TempDir,
     base: String,
+    mounts: Vec<PathBuf>,
 }
 
 impl Drop for Launcher {
@@ -252,10 +338,10 @@ impl Drop for Launcher {
         if cfg!(target_os = "linux") {
             // Only exact mount paths owned by this fixture. A failing assertion
             // must not leave either mount behind in the VM.
-            for name in ["mount-old", "mount-new"] {
+            for path in &self.mounts {
                 let _ = Command::new("fusermount3")
                     .args(["-u", "-z"])
-                    .arg(self.temp.path().join(name))
+                    .arg(path)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
@@ -318,6 +404,7 @@ impl Launcher {
             child,
             temp,
             base: format!("http://{addr}"),
+            mounts: Vec::new(),
         }
     }
 
@@ -364,12 +451,13 @@ impl Launcher {
     }
 
     fn assert_no_dictionary(&self) {
-        assert_eq!(
-            std::fs::read_dir(self.temp.path().join("dictionary"))
-                .unwrap()
-                .count(),
-            0
-        );
+        for entry in std::fs::read_dir(self.temp.path().join("dictionary")).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                name == "workspaces-v3" || name == "mst2-cache",
+                "unexpected dictionary artifact: {name:?}"
+            );
+        }
     }
 }
 
@@ -385,6 +473,33 @@ fn client() -> reqwest::Client {
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_complete(client: &reqwest::Client, base: &str, id: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: Value = client
+                .get(format!("{base}/v3/workspaces/{id}"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_ne!(status["hydration_state"], "failed", "{status}");
+            if status["hydration_state"] == "complete" {
+                assert_eq!(status["local_pin_state"], "complete_snapshot");
+                assert_eq!(status["metadata_ready"], true);
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("full workspace did not durably complete")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -416,6 +531,9 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
         (reqwest::Method::POST, "/api/fs/unmount"),
         (reqwest::Method::GET, "/api/config"),
         (reqwest::Method::POST, "/api/config"),
+        (reqwest::Method::GET, "/antares/mounts"),
+        (reqwest::Method::POST, "/antares/mounts"),
+        (reqwest::Method::GET, "/antares/worktrees"),
     ] {
         assert_eq!(
             client
@@ -429,8 +547,8 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
         );
     }
     let response = client
-        .post(format!("{}/antares/mounts", launcher.base))
-        .json(&json!({"job_id": "rejected", "path": "/project"}))
+        .post(format!("{}/v3/workspaces", launcher.base))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
         .send()
         .await
         .unwrap();
@@ -444,14 +562,18 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
     );
     launcher.assert_no_dictionary();
     let mounts: Value = client
-        .get(format!("{}/antares/mounts", launcher.base))
+        .get(format!("{}/v3/workspaces", launcher.base))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(mounts["mounts"], json!([]));
+    let entries = mounts.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["mount_state"], "failed");
+    assert_eq!(entries[0]["metadata_ready"], false);
+    assert!(entries[0]["snapshot_id"].is_null());
     launcher.stop().await;
 }
 
@@ -493,14 +615,13 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     let mut launcher = Launcher::start(&upstream, address());
     let client = client();
     launcher.ready(&client).await;
-    let old = launcher.temp.path().join("mount-old");
-    let new = launcher.temp.path().join("mount-new");
     let mut ids = Vec::new();
+    let mut generations = Vec::new();
     let mut old_fd = None;
-    for (index, path) in [&old, &new].into_iter().enumerate() {
+    for index in 0..2 {
         f.latest.store(index, Ordering::SeqCst);
-        let response = client.post(format!("{}/antares/mounts", launcher.base))
-            .json(&json!({"job_id": format!("snapshot-{index}"), "path": "/project", "mountpoint": path}))
+        let response = client.post(format!("{}/v3/workspaces", launcher.base))
+            .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
             .send().await.unwrap();
         let status = response.status();
         let body: Value = response.json().await.unwrap();
@@ -509,23 +630,39 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
             "mount rejected: {body}; {}",
             launcher.log()
         );
-        ids.push(body["mount_id"].as_str().unwrap().to_owned());
-        assert!(mounted(path));
+        ids.push(body["workspace_id"].as_str().unwrap().to_owned());
+        generations.push(body["generation"].as_str().unwrap().to_owned());
+        assert_eq!(body["snapshot_id"], f.versions[index].sid);
+        assert_eq!(body["mount_state"], "mounted");
+        assert_eq!(body["metadata_ready"], true);
+        assert_eq!(body["hydration_state"], "idle");
+        assert_eq!(body["local_pin_state"], "incomplete");
+        assert_eq!(
+            body["dirty_state"], "unknown",
+            "creation must not perform a full upper scan"
+        );
+        let path = PathBuf::from(body["mountpoint"].as_str().unwrap());
+        assert!(path.starts_with(launcher.temp.path().join("dictionary/workspaces-v3")));
+        launcher.mounts.push(path.clone());
+        assert!(mounted(&path));
         if index == 0 {
             // Keep this handle and dirty upper alive before changing latest
             // and admitting the second snapshot.
-            old_fd = Some(File::open(old.join("base.txt")).unwrap());
+            old_fd = Some(File::open(path.join("base.txt")).unwrap());
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
-                .open(old.join("dirty.txt"))
+                .open(path.join("dirty.txt"))
                 .unwrap();
             file.write_all(b"keep this dirty upper").unwrap();
             file.sync_all().unwrap();
-            File::open(&old).unwrap().sync_all().unwrap();
+            File::open(&path).unwrap().sync_all().unwrap();
         }
     }
+    let old = launcher.mounts[0].clone();
+    let new = launcher.mounts[1].clone();
     assert_ne!(ids[0], ids[1]);
+    assert_ne!(generations[0], generations[1]);
     assert!(!mounted(&launcher.temp.path().join("unused-root")));
     launcher.assert_no_dictionary();
     // Give the retired background preload walk time to run. A nested leaf must
@@ -552,20 +689,377 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     // Explicit child lookup still fetches and verifies the committed page.
     assert_eq!(std::fs::read_dir(new.join("deep")).unwrap().count(), 0);
     assert_eq!(f.child_pages.load(Ordering::SeqCst), 1);
+    let status: Value = client
+        .get(format!("{}/v3/workspaces/{}", launcher.base, ids[0]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["snapshot_id"], f.versions[0].sid);
+    assert_eq!(status["dirty_state"], "dirty");
+    let refused = client
+        .post(format!(
+            "{}/v3/workspaces/{}/destroy",
+            launcher.base, ids[0]
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["code"],
+        "WORKSPACE_DIRTY"
+    );
+    assert!(mounted(&old));
+    // The rejected scan releases its pause, so an existing writable handle
+    // still accepts real kernel writes. The earlier lower handle stays fixed.
+    let mut old_write = OpenOptions::new()
+        .write(true)
+        .open(old.join("base.txt"))
+        .unwrap();
+    old_write.write_all(b"upper edit").unwrap();
+    old_write.sync_all().unwrap();
+    drop(old_write);
+    old_fd.seek(SeekFrom::Start(0)).unwrap();
+    bytes.clear();
+    old_fd.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, CONTENT[0]);
+    // A pathname replacement must not change which private upper belongs to
+    // the native overlay. An empty replacement would otherwise look clean.
+    let new_upper = new.parent().unwrap().join("upper");
+    let held_upper = new.parent().unwrap().join("upper-original");
+    std::fs::rename(&new_upper, &held_upper).unwrap();
+    std::fs::create_dir(&new_upper).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&new_upper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let replaced: Value = client
+        .get(format!("{}/v3/workspaces/{}", launcher.base, ids[1]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replaced["dirty_state"], "unknown");
+    for discard in [false, true] {
+        let response = client
+            .post(format!(
+                "{}/v3/workspaces/{}/destroy",
+                launcher.base, ids[1]
+            ))
+            .json(&json!({"discard_dirty": discard}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["code"],
+            "WORKSPACE_UNKNOWN"
+        );
+        assert!(mounted(&new));
+        assert!(held_upper.is_dir());
+    }
+    assert_eq!(std::fs::read(new.join("base.txt")).unwrap(), CONTENT[1]);
+    std::fs::remove_dir(&new_upper).unwrap();
+    std::fs::rename(&held_upper, &new_upper).unwrap();
+    let destroyed = client
+        .post(format!(
+            "{}/v3/workspaces/{}/destroy",
+            launcher.base, ids[1]
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(destroyed.status(), StatusCode::NO_CONTENT);
+    assert!(!mounted(&new));
+    assert!(mounted(&old));
+    // An externally lost native mount cannot keep advertising readiness based
+    // on the original create response. The service retains its retirement owner.
+    let third: Value = client
+        .post(format!("{}/v3/workspaces", launcher.base))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"full","upper_policy":"private"}))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let third_id = third["workspace_id"].as_str().unwrap();
+    let third_mount = PathBuf::from(third["mountpoint"].as_str().unwrap());
+    launcher.mounts.push(third_mount.clone());
+    assert!(mounted(&third_mount));
+    let complete = wait_complete(&client, &launcher.base, third_id).await;
+    assert_eq!(complete["snapshot_id"], f.versions[1].sid);
+    let cancelled: Value = client
+        .post(format!(
+            "{}/v3/workspaces/{third_id}/hydrate/cancel",
+            launcher.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled["hydration_state"], "complete");
+    let mut release_operation = None;
+    for _ in 0..2 {
+        let receipt: Value = client
+            .post(format!(
+                "{}/v3/workspaces/{third_id}/local-pin/release",
+                launcher.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(receipt["workspace_id"], third_id);
+        assert_eq!(receipt["snapshot_id"], f.versions[1].sid);
+        if let Some(operation) = &release_operation {
+            assert_eq!(&receipt["operation_id"], operation);
+        } else {
+            uuid::Uuid::parse_str(receipt["operation_id"].as_str().unwrap()).unwrap();
+            release_operation = Some(receipt["operation_id"].clone());
+        }
+    }
+    let released: Value = client
+        .get(format!("{}/v3/workspaces/{third_id}", launcher.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(released["local_pin_state"], "released");
+    assert_eq!(released["hydration_state"], "idle");
+    client
+        .post(format!(
+            "{}/v3/workspaces/{third_id}/hydrate",
+            launcher.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    wait_complete(&client, &launcher.base, third_id).await;
+    scorpiofs::util::fuse_platform::unmount_path(&third_mount, true)
+        .await
+        .unwrap();
+    assert!(!mounted(&third_mount));
+    let unavailable: Value = client
+        .get(format!("{}/v3/workspaces/{third_id}", launcher.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unavailable["mount_state"], "failed");
+    assert_eq!(unavailable["metadata_ready"], false);
+    let retired = client
+        .post(format!(
+            "{}/v3/workspaces/{third_id}/destroy",
+            launcher.base
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retired.status(), StatusCode::NO_CONTENT);
+    let fourth: Value = client
+        .post(format!("{}/v3/workspaces", launcher.base))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let fourth_id = fourth["workspace_id"].as_str().unwrap();
+    let fourth_mount = PathBuf::from(fourth["mountpoint"].as_str().unwrap());
+    launcher.mounts.push(fourth_mount.clone());
+    std::fs::write(
+        fourth_mount.join("discard.txt"),
+        b"explicitly discarded edit",
+    )
+    .unwrap();
+    let discarded = client
+        .post(format!(
+            "{}/v3/workspaces/{fourth_id}/destroy",
+            launcher.base
+        ))
+        .json(&json!({"discard_dirty":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(discarded.status(), StatusCode::NO_CONTENT);
+    assert!(!mounted(&fourth_mount));
+    assert!(!fourth_mount.parent().unwrap().exists());
+
+    // A third digest has never entered this shared CAS. Hold its actual
+    // OBJECT response until the already-returned Full workspace is cancelled
+    // through the shipped service endpoint, then retry the same fixed owner.
+    assert_ne!(digest_of(CONTENT[2]), digest_of(CONTENT[0]));
+    assert_ne!(digest_of(CONTENT[2]), digest_of(CONTENT[1]));
+    f.latest.store(2, Ordering::SeqCst);
+    f.block_child_metadata.store(true, Ordering::SeqCst);
+    f.block_objects.store(true, Ordering::SeqCst);
+    let pending: Value = client
+        .post(format!("{}/v3/workspaces", launcher.base))
+        .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"full","upper_policy":"private"}))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let pending_id = pending["workspace_id"].as_str().unwrap();
+    let pending_mount = PathBuf::from(pending["mountpoint"].as_str().unwrap());
+    launcher.mounts.push(pending_mount.clone());
+    assert_eq!(pending["snapshot_id"], f.versions[2].sid);
+    assert_eq!(pending["metadata_ready"], true);
+    assert_eq!(pending["hydration_state"], "running");
+    assert_eq!(pending["local_pin_state"], "unknown");
+    assert!(mounted(&pending_mount));
+    tokio::time::timeout(Duration::from_secs(5), f.child_metadata_started.notified())
+        .await
+        .expect("full closure must actually reach the pending child META request");
+    assert_eq!(f.pending_child_metadata_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 0);
+    // The child META response precedes the durable transaction acquisition.
+    // A status audit here would obtain the free lock and report Incomplete;
+    // observing the admitted task must return Unknown without taking that lock.
+    for _ in 0..2 {
+        let status: Value = client
+            .get(format!("{}/v3/workspaces/{pending_id}", launcher.base))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["hydration_state"], "running");
+        assert_eq!(status["local_pin_state"], "unknown");
+        assert_eq!(status["snapshot_id"], f.versions[2].sid);
+        assert_eq!(status["generation"], pending["generation"]);
+        assert_eq!(status["metadata_ready"], true);
+        assert!(status["last_error"].is_null());
+        assert!(mounted(&pending_mount));
+        assert_eq!(f.pending_child_metadata_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 0);
+    }
+    eprintln!("PRE_TRANSACTION_HYDRATION_OBSERVE_RUN: actual child META holds Full closure before publication transaction; creation and repeated status report fixed running workspace without a pin audit");
+    f.block_child_metadata.store(false, Ordering::SeqCst);
+    f.child_metadata_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), f.objects_started.notified())
+        .await
+        .expect("new content must actually reach the pending OBJECT request");
+    assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 1);
+    // Observing an admitted hydration must not compete for its publication
+    // lock, fail the task, or advertise completion while OBJECT is pending.
+    for _ in 0..2 {
+        let status: Value = client
+            .get(format!("{}/v3/workspaces/{pending_id}", launcher.base))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["hydration_state"], "running");
+        assert_eq!(status["local_pin_state"], "unknown");
+        assert_eq!(status["snapshot_id"], f.versions[2].sid);
+        assert_eq!(status["generation"], pending["generation"]);
+        assert_eq!(status["metadata_ready"], true);
+        assert!(status["last_error"].is_null());
+        assert!(mounted(&pending_mount));
+        assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 1);
+    }
+    eprintln!("RUNNING_HYDRATION_OBSERVE_RUN: actual pending OBJECT remains running across fixed workspace creation and repeated status observations");
+    let cancelled: Value = client
+        .post(format!(
+            "{}/v3/workspaces/{pending_id}/hydrate/cancel",
+            launcher.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled["hydration_state"], "cancelled");
+    assert_eq!(cancelled["local_pin_state"], "incomplete");
+    assert_eq!(cancelled["metadata_ready"], true);
+    for _ in 0..2 {
+        let status: Value = client
+            .get(format!("{}/v3/workspaces/{pending_id}", launcher.base))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["hydration_state"], "cancelled");
+        assert_eq!(status["local_pin_state"], "incomplete");
+        assert_eq!(status["snapshot_id"], f.versions[2].sid);
+        assert_eq!(status["metadata_ready"], true);
+    }
+    // A semaphore permit releases even a handler that has not yet reached its
+    // await. Future retry requests bypass the hold; no shared CAS is deleted.
+    f.block_objects.store(false, Ordering::SeqCst);
+    f.objects_release.add_permits(1);
+    client
+        .post(format!(
+            "{}/v3/workspaces/{pending_id}/hydrate",
+            launcher.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let retried = wait_complete(&client, &launcher.base, pending_id).await;
+    assert_eq!(retried["snapshot_id"], f.versions[2].sid);
+    assert_eq!(
+        std::fs::read(pending_mount.join("base.txt")).unwrap(),
+        CONTENT[2]
+    );
+    assert_eq!(
+        std::fs::read(pending_mount.join("deep/leaf.txt")).unwrap(),
+        CONTENT[2]
+    );
+    assert_eq!(f.pending_object_calls.load(Ordering::SeqCst), 2);
+    let destroyed = client
+        .post(format!(
+            "{}/v3/workspaces/{pending_id}/destroy",
+            launcher.base
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(destroyed.status(), StatusCode::NO_CONTENT);
+    assert!(!mounted(&pending_mount));
+    assert!(!pending_mount.parent().unwrap().exists());
+    eprintln!("RUNNING_HYDRATION_CANCEL_RUN: actual pending OBJECT cancelled through service; fixed owner retried to FullSnapshot");
     drop(old_fd);
     launcher.stop().await;
     assert!(!mounted(&old));
     assert!(!mounted(&new));
     assert_eq!(
-        std::fs::read(
-            launcher
-                .temp
-                .path()
-                .join("upper")
-                .join(&ids[0])
-                .join("dirty.txt")
-        )
-        .unwrap(),
+        std::fs::read(old.parent().unwrap().join("upper").join("dirty.txt")).unwrap(),
         b"keep this dirty upper"
     );
     launcher.assert_no_dictionary();
