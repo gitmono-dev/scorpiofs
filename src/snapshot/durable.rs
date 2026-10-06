@@ -27,7 +27,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     future::Future,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -3291,7 +3291,7 @@ mod streaming_durability_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, fs::OpenOptions};
 
     use super::*;
 
