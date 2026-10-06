@@ -96,7 +96,6 @@ class WorkerFullProfileTests(unittest.TestCase):
 
     def setUp(self):
         self.create_status = valid_status(hydration_state="idle", local_pin_state="incomplete")
-        self.hydrate_status = valid_status(hydration_state="running", local_pin_state="incomplete")
         self.poll_statuses = [valid_status()]
         self.requests = []
         profile = self
