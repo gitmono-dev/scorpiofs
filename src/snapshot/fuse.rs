@@ -666,11 +666,6 @@ impl Mst2Fuse {
         })
     }
 
-    /// The snapshot this mount is pinned to, when resolved from a live view.
-    pub fn snapshot_id(&self) -> Option<&str> {
-        self.reader.as_ref().map(|r| r.snapshot_id())
-    }
-
     /// One directory listing from `offset` on, in the offset convention both
     /// `readdir` and `readdirplus` use: entry `n` carries the offset of entry
     /// `n + 1`, so the kernel resumes without duplicates.
