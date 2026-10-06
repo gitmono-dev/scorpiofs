@@ -62,6 +62,11 @@ class WorkerShapeTests(unittest.TestCase):
         ]:
             self.assertEqual(WorkerError(message).error_code, expected)
 
+    def test_backend_error_code_is_closed(self):
+        self.assertEqual(WorkerError("private", backend_code="SNAPSHOT_ERROR").backend_code,
+                         "SNAPSHOT_ERROR")
+        self.assertIsNone(WorkerError("private", backend_code="private-token").backend_code)
+
     def test_status_requires_exact_wire_shape_and_canonical_identity(self):
         self.assertEqual(set(_status(valid_status())), STATUS_FIELDS)
         for key, value in (("metadata_ready", 1), ("snapshot_id", "sha256:" + "A" * 64),
@@ -121,6 +126,8 @@ class WorkerFullProfileTests(unittest.TestCase):
                         code, value = 422, {"error": "delivery unsupported"}
                     else:
                         value = profile.create_status
+                elif self.command == "POST" and self.path == "/error":
+                    code, value = 500, {"code": "SNAPSHOT_ERROR", "message": "private details"}
                 elif self.command == "GET" and self.path == workspace_path and profile.poll_statuses:
                     value = profile.poll_statuses.pop(0)
                 else:
@@ -174,6 +181,14 @@ class WorkerFullProfileTests(unittest.TestCase):
         self.assertEqual(worker._workspace_ids, [first["workspace_id"]])
         self.assertEqual(metadata_ms, 7.25)
         self.assertGreaterEqual(complete_ms, 0)
+
+    def test_http_backend_error_code_is_captured_without_response_message(self):
+        worker = self.worker()
+        with self.assertRaises(WorkerError) as failed:
+            worker.http.request("POST", "/error", time.monotonic() + 5, {}, expected=(200,))
+        self.assertEqual(failed.exception.error_code, "worker_http_status_5xx")
+        self.assertEqual(failed.exception.backend_code, "SNAPSHOT_ERROR")
+        self.assertNotIn("private details", str(failed.exception))
 
     def test_full_profile_rejects_fixed_identity_changes_while_polling(self):
         changes = {"workspace_id": "33333333-2222-4333-8444-666666666666",

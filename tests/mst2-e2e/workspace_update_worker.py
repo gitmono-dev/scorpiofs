@@ -86,6 +86,14 @@ WORKER_STAGES = frozenset({
     "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
 })
 
+# Workspace HTTP errors cross the hosted-runner boundary only as a closed
+# diagnostic label.  Never persist the response message, path, or body.
+BACKEND_ERROR_CODES = frozenset({
+    "WORKSPACE_NOT_FOUND", "WORKSPACE_BUSY", "WORKSPACE_DIRTY",
+    "WORKSPACE_NOT_READY", "INVALID_CONFIG", "WORKSPACE_IO",
+    "SNAPSHOT_ERROR", "WORKSPACE_UNKNOWN",
+})
+
 
 def _message_error_code(message):
     """Map only known message shapes to a closed, non-sensitive code."""
@@ -168,15 +176,16 @@ def _owned_mounts(root):
 class WorkerError(RuntimeError):
     """Closed diagnostics for a failed worker operation.
 
-    ``str(error)`` remains useful to local callers, but only ``error_code`` is
-    allowed to cross into CI evidence.  Unknown or caller-supplied codes are
-    reduced to the fixed ``worker_error`` fallback.
+    ``str(error)`` remains useful to local callers, but only the closed
+    ``error_code``, ``worker_stage`` and ``backend_code`` fields may cross into
+    CI evidence.  Unknown or caller-supplied codes are discarded.
     """
 
-    def __init__(self, message="", error_code=None, stage=None):
+    def __init__(self, message="", error_code=None, stage=None, backend_code=None):
         inferred = _message_error_code(message) if error_code is None else error_code
         self.error_code = inferred if inferred in WORKER_ERROR_CODES else WORKER_ERROR
         self.worker_stage = stage if type(stage) is str and stage in WORKER_STAGES else None
+        self.backend_code = (backend_code if backend_code in BACKEND_ERROR_CODES else None)
         super().__init__(message)
 
 
@@ -326,7 +335,18 @@ class _NoRedirectHTTP:
             if expected_length is not None and len(raw) != expected_length:
                 raise WorkerError("worker HTTP body length is truncated")
             if response.status not in expected:
-                raise WorkerError(f"worker HTTP status {response.status} was not accepted")
+                backend_code = None
+                if 400 <= response.status < 600:
+                    try:
+                        value = _decode_json(raw)
+                    except WorkerError:
+                        value = None
+                    if isinstance(value, dict):
+                        candidate = value.get("code")
+                        if candidate in BACKEND_ERROR_CODES:
+                            backend_code = candidate
+                raise WorkerError(f"worker HTTP status {response.status} was not accepted",
+                                   backend_code=backend_code)
             if response.status != 204:
                 ctype = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
                 if ctype != "application/json":

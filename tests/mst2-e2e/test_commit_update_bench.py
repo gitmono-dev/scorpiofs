@@ -127,6 +127,15 @@ class CommitUpdateBenchTests(unittest.TestCase):
         error.worker_stage = "private-path"
         self.assertNotIn("worker_stage", BENCH.failure_record(error))
 
+    def test_worker_failure_record_carries_only_a_closed_backend_code(self):
+        error = WorkerError("private response body", error_code="worker_http_status_5xx",
+                            backend_code="SNAPSHOT_ERROR")
+        record = BENCH.failure_record(error)
+        self.assertEqual(record["backend_code"], "SNAPSHOT_ERROR")
+        self.assertNotIn("private response body", json.dumps(record))
+        unknown = WorkerError("private response body", backend_code="private-token")
+        self.assertNotIn("backend_code", BENCH.failure_record(unknown))
+
     def test_ci_persists_only_safe_failure_record(self):
         private = "private-token /run/secret response body"
         with tempfile.TemporaryDirectory() as temp:
