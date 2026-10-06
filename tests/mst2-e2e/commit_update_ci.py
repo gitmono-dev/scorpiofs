@@ -156,6 +156,56 @@ COMMIT;"""
             "production_service_init_wired": False}
 
 
+def bootstrap_ready_baseline(root, base, env, instance, deadline):
+    """Publish one real setup commit so the first workspace has a READY view.
+
+    Native resolve deliberately rejects an INITIALIZING head.  The maintenance
+    bootstrap above only creates that guarded head; a real Git push must create
+    its first certificate and transition it to READY before ScorpioFS can mount
+    the baseline workspace.  This setup commit is outside the measured matrix;
+    the first measured push still exercises the normal commit-update path.
+    """
+    git_token = env.get("M2_GIT_TOKEN")
+    if not git_token:
+        raise ValueError("native baseline requires the owned Git token")
+    git_env = bench.clean_env({
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": "Authorization: Bearer " + git_token,
+        "GIT_CONFIG_KEY_1": "http.followRedirects",
+        "GIT_CONFIG_VALUE_1": "false",
+        "GIT_CONFIG_KEY_2": "credential.helper",
+        "GIT_CONFIG_VALUE_2": "",
+    })
+    checkout = root / "native-baseline"
+    if checkout.exists() or checkout.is_symlink():
+        raise AssertionError("native baseline checkout path already exists")
+    bench.command(["git", "clone", "--no-checkout", "--single-branch", "--branch", "main",
+                   base + "/project", str(checkout)], deadline, env=git_env)
+    bench.git(checkout, deadline, "config", "user.name", "MST2 setup baseline", env=git_env)
+    bench.git(checkout, deadline, "config", "user.email", "mst2-setup@example.invalid", env=git_env)
+    bench.git(checkout, deadline, "commit", "--allow-empty", "-m", "MST2 setup baseline",
+              env=git_env)
+    commit = bench.git(checkout, deadline, "rev-parse", "HEAD", env=git_env).decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise AssertionError("native baseline commit is not canonical SHA-1")
+    bench.git(checkout, deadline, "push", "--no-thin", "origin",
+              f"{commit}:refs/heads/main", env=git_env)
+
+    while time.monotonic() < deadline:
+        native = bench.query(bench.NATIVE_SQL, deadline, env=env)
+        if native and native.get("state") == "READY":
+            rows = bench.query(bench.IDENTITY_SQL, deadline, env=env)
+            identity = bench.validate_identity(rows, commit,
+                                                bench.git(checkout, deadline, "rev-parse", "HEAD^{tree}", env=git_env).decode().strip(),
+                                                env["PGDATABASE"])
+            bench.validate_native(native, identity, instance, True)
+            return {"record": "owned_native_baseline", "commit": commit,
+                    "sequence": native["sequence"], "correctness": "PASS"}
+        time.sleep(min(.2, max(0, deadline - time.monotonic())))
+    raise TimeoutError("native baseline publication did not become READY before setup deadline")
+
+
 def dependencies(source, project, ports, deadline):
     raw = bench.command(["docker", "compose", "-f", str(source / "docker/docker-compose.test.yml"),
                          "config", "--format", "json"], deadline)
@@ -457,11 +507,27 @@ def execute(options):
                 except OSError:
                     pass
                 time.sleep(min(.2, max(0, ready_until - time.monotonic())))
-        with bench.phase("initial_git_identity"):
+        with bench.phase("initial_git_identity_seed"):
             initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"], deadline).decode().split()
         if len(initial) != 2 or initial[1] != "refs/heads/main":
             raise AssertionError("owned service did not initialize exactly one project main")
         env.update(M2_TOKEN=token, M2_GIT_TOKEN=git_token)
+        with bench.phase("owned_native_baseline"):
+            baseline = bootstrap_ready_baseline(root, base, env, instance, deadline)
+            print(json.dumps(baseline), flush=True)
+        with bench.phase("initial_git_identity"):
+            initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"],
+                                    deadline, env=bench.clean_env({
+                                        "GIT_CONFIG_COUNT": "3",
+                                        "GIT_CONFIG_KEY_0": "http.extraHeader",
+                                        "GIT_CONFIG_VALUE_0": "Authorization: Bearer " + git_token,
+                                        "GIT_CONFIG_KEY_1": "http.followRedirects",
+                                        "GIT_CONFIG_VALUE_1": "false",
+                                        "GIT_CONFIG_KEY_2": "credential.helper",
+                                        "GIT_CONFIG_VALUE_2": "",
+                                    })).decode().split()
+        if len(initial) != 2 or initial[1] != "refs/heads/main" or initial[0] != baseline["commit"]:
+            raise AssertionError("native baseline did not publish exactly one project main")
         budget.require(options.rounds * budget_module.ROUND_SECONDS
                        + budget_module.REPORT_RESERVE + budget_module.CLEANUP_RESERVE
                        + budget_module.MARGIN)

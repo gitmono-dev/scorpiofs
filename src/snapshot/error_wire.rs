@@ -37,6 +37,9 @@ pub enum CanonicalSnapshotErrorCode {
     ReleaseImmutable,
     RateLimited,
     TemporaryUnavailable,
+    /// Compatibility spelling emitted by deployed servers for an otherwise
+    /// retryable internal failure.
+    Internal,
 }
 
 impl CanonicalSnapshotErrorCode {
@@ -69,6 +72,7 @@ impl CanonicalSnapshotErrorCode {
             "RELEASE_IMMUTABLE" => Self::ReleaseImmutable,
             "RATE_LIMITED" => Self::RateLimited,
             "TEMPORARY_UNAVAILABLE" => Self::TemporaryUnavailable,
+            "INTERNAL" => Self::Internal,
             _ => return None,
         })
     }
