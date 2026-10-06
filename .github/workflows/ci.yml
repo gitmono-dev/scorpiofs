@@ -153,7 +153,7 @@ jobs:
           # The workspace binary runs through the entrypoint.
           docker run --rm scorpiofs:ci --version
           docker run --rm scorpiofs:ci workspace --help
-          docker run --rm --entrypoint sh scorpiofs:ci -c 'test ! -e /usr/local/bin/antares'
+          docker run --rm --entrypoint sh scorpiofs:ci -c 'test -x /usr/local/bin/antares'
 
           # The entrypoint must refuse `serve` without backend URLs.
           if docker run --rm scorpiofs:ci serve; then
