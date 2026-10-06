@@ -4,14 +4,14 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${MEDIUM_WORKDIR:?Directory holding fixture manifests and repo/.git}"
 : "${MEDIUM_REGISTRY:?Registry/repository for the output images}"
 : "${MEDIUM_TAG:?Unique tag prefix for this run}"
-: "${MEDIUM_RELEASE_DIR:?Directory containing release scorpio and antares}"
+: "${MEDIUM_RELEASE_DIR:?Directory containing the release scorpio binary}"
 : "${MEDIUM_LIBRA_BINARY:?Path to the Linux Libra executable for development tests}"
 : "${MEDIUM_BASE_IMAGE:?Linux base with Bash, Git, Python, curl, GNU coreutils and FUSE runtime}"
 : "${MEDIUM_BACKEND_IMAGE:?Backend image built from the frozen source version}"
 RUN="$MEDIUM_WORKDIR"
 REG="$MEDIUM_REGISTRY"
 TAG="$MEDIUM_TAG"
-for binary in "$MEDIUM_RELEASE_DIR/scorpio" "$MEDIUM_RELEASE_DIR/antares" "$MEDIUM_LIBRA_BINARY"; do
+for binary in "$MEDIUM_RELEASE_DIR/scorpio" "$MEDIUM_LIBRA_BINARY"; do
   test -f "$binary" && test -x "$binary" || { echo "Missing executable: $binary" >&2; exit 1; }
 done
 for f in manifest.jsonl manifest.refs.json manifest.summary.json repo/.git/HEAD; do
@@ -21,7 +21,7 @@ for d in runtime-context fixture-context; do
   test ! -e "$RUN/$d" || { echo "Preserve existing build context: $d" >&2; exit 1; }
 done
 mkdir -p "$RUN/runtime-context"
-cp "$MEDIUM_RELEASE_DIR/scorpio" "$MEDIUM_RELEASE_DIR/antares" "$RUN/runtime-context/"
+cp "$MEDIUM_RELEASE_DIR/scorpio" "$RUN/runtime-context/"
 cp "$MEDIUM_LIBRA_BINARY" "$RUN/runtime-context/libra"
 # Windows checkouts may have CRLF; a Linux shebang must not retain CR.
 sed 's/\r$//' "$ROOT/deploy/docker-entrypoint.sh" > "$RUN/runtime-context/docker-entrypoint.sh"
@@ -32,22 +32,16 @@ cp "$ROOT/bench/bin/first-directory-ready.py" "$ROOT/bench/cases/medium-profile.
 cat > "$RUN/runtime-context/Dockerfile" <<'EOF'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
-COPY scorpio antares libra docker-entrypoint.sh /usr/local/bin/
+COPY scorpio libra docker-entrypoint.sh /usr/local/bin/
 COPY scorpio.toml /etc/scorpiofs/scorpio.toml
 COPY *.py /bench-medium/
-ENV SCORPIO_WORKSPACE=/var/lib/scorpiofs/mount \
-    SCORPIO_STORE_PATH=/var/lib/scorpiofs/store \
-    SCORPIO_CONFIG_FILE=/var/lib/scorpiofs/config.toml \
-    SCORPIO_ANTARES_UPPER_ROOT=/var/lib/scorpiofs/antares/upper \
-    SCORPIO_ANTARES_CL_ROOT=/var/lib/scorpiofs/antares/cl \
-    SCORPIO_ANTARES_MOUNT_ROOT=/var/lib/scorpiofs/antares/mnt \
-    SCORPIO_ANTARES_STATE_FILE=/var/lib/scorpiofs/antares/state.toml
+ENV SCORPIO_STORE_PATH=/var/lib/scorpiofs/store \
+    SCORPIO_MST2_BASE_URL=http://mega2:8000
 RUN bash --version >/dev/null && git --version >/dev/null && curl --version >/dev/null && \
     fusermount3 --version >/dev/null && timeout --kill-after=1 1 true && du -sB1 /tmp >/dev/null && \
     chmod +x /usr/local/bin/docker-entrypoint.sh && \
-    mkdir -p "$SCORPIO_WORKSPACE" "$SCORPIO_STORE_PATH" "$SCORPIO_ANTARES_UPPER_ROOT" \
-        "$SCORPIO_ANTARES_CL_ROOT" "$SCORPIO_ANTARES_MOUNT_ROOT" && \
-    /usr/local/bin/docker-entrypoint.sh --help >/dev/null && antares --help >/dev/null && \
+    mkdir -p "$SCORPIO_STORE_PATH" && \
+    /usr/local/bin/docker-entrypoint.sh --help >/dev/null && \
     libra --help >/dev/null && python3 -m py_compile /bench-medium/*.py
 ENTRYPOINT []
 CMD ["sleep", "infinity"]

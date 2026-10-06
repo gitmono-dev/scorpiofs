@@ -35,7 +35,7 @@ class MediumImageTests(unittest.TestCase):
                 (run / name).write_text("fixture")
             binaries = run / "bin"
             binaries.mkdir()
-            for name in ("scorpio", "antares", "libra"):
+            for name in ("scorpio", "libra"):
                 path = binaries / name
                 path.write_text("#!/bin/sh\nexit 0\n")
                 path.chmod(0o755)
@@ -51,8 +51,9 @@ class MediumImageTests(unittest.TestCase):
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(result.returncode, 42, result.stderr.decode())
             context = run / "runtime-context"
-            for name in ("scorpio", "antares", "libra", "docker-entrypoint.sh", "scorpio.toml"):
+            for name in ("scorpio", "libra", "docker-entrypoint.sh", "scorpio.toml"):
                 self.assertTrue((context / name).is_file(), name)
+            self.assertFalse((context / "antares").exists())
             self.assertEqual((context / "docker-entrypoint.sh").read_bytes(),
                              (ROOT / "deploy/docker-entrypoint.sh").read_bytes().replace(b"\r\n", b"\n"))
             self.assertEqual((context / "scorpio.toml").read_bytes(),
@@ -60,7 +61,10 @@ class MediumImageTests(unittest.TestCase):
             dockerfile = (context / "Dockerfile").read_text()
             self.assertIn("/usr/local/bin/docker-entrypoint.sh --help", dockerfile)
             self.assertIn("libra --help", dockerfile)
-            self.assertIn("SCORPIO_CONFIG_FILE=", dockerfile)
+            self.assertIn("SCORPIO_STORE_PATH=/var/lib/scorpiofs/store", dockerfile)
+            self.assertIn("SCORPIO_MST2_BASE_URL=http://mega2:8000", dockerfile)
+            for legacy in ("antares", "SCORPIO_WORKSPACE", "SCORPIO_CONFIG_FILE", "SCORPIO_ANTARES_"):
+                self.assertNotIn(legacy, dockerfile)
 
 
 if __name__ == "__main__":
