@@ -26,8 +26,6 @@ pub(crate) const TREEFRAME_REQUEST_MAX_BYTES: usize = 131_072;
 use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize};
 
-#[allow(unused_imports)]
-use crate::snapshot::types::Descriptor;
 use crate::snapshot::types::{
     Capabilities, DirectoryResponse, LookupResponse, ResolveResponse, SnapshotError,
     SnapshotErrorCode,
@@ -1022,9 +1020,6 @@ fn urlencode(s: &str) -> String {
     }
     out
 }
-
-#[allow(dead_code)]
-fn _statuscode_marker(_: StatusCode) {}
 
 #[cfg(test)]
 mod retry_classification_tests {

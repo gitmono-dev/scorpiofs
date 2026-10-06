@@ -35,7 +35,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{
-    client::Mst2Client, closure::decode_page, frames::MetadataPageItem, reader::SnapshotPageSource,
+    closure::decode_page, frames::MetadataPageItem, reader::SnapshotPageSource,
     SnapshotClosureMeters, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
     ValidatedSnapshotClosure,
 };
@@ -1106,10 +1106,6 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
     }
     result
 }
-
-/// Unused-import guard for the type used only in signatures above.
-#[allow(dead_code)]
-fn _client_marker(_: &Mst2Client) {}
 
 #[cfg(test)]
 mod tests {

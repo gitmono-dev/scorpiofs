@@ -18,7 +18,7 @@ use crate::snapshot::{
     client::Mst2Client,
     closure::{decode_page, ValidatedSnapshotClosure},
     frames::MetadataPageItem,
-    types::{Capabilities, Descriptor, DirEntry, LookupResult, SnapshotError, SnapshotErrorCode},
+    types::{Capabilities, Descriptor, LookupResult, SnapshotError, SnapshotErrorCode},
 };
 
 /// Batch cap for one `metadata/pages` request: the server accepts 1..64.
@@ -1371,10 +1371,6 @@ impl SnapshotReader {
             .collect())
     }
 }
-
-/// Kept for potential future use of directory entry inspection.
-#[allow(dead_code)]
-fn _entry_marker(_e: &DirEntry) {}
 
 /// Discover logical child directories; files are derived only after the
 /// complete page graph has passed the closure validator.
