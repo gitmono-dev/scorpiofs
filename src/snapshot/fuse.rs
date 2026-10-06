@@ -106,7 +106,6 @@ fn entry_kind(node: &Node) -> FileType {
         Node::File(f) if f.fs_kind == "symlink" => FileType::Symlink,
         Node::File(_) => FileType::RegularFile,
     }
-
 }
 
 fn is_symlink(node: &Node) -> bool {
