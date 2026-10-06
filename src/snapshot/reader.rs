@@ -60,6 +60,19 @@ pub struct SnapshotFile {
     pub content_digest: String,
 }
 
+/// An already validated local path in the scope-relative HTTP form. Local
+/// manifests omit the leading slash; every content endpoint requires it.
+pub(crate) struct ScopeRequestPath<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for ScopeRequestPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.0.starts_with('/') {
+            f.write_str("/")?;
+        }
+        f.write_str(self.0)
+    }
+}
+
 /// Keeps the fixed view's retention lease alive across every operation that
 /// reaches the server (spec 04 §4). The view itself never changes — only the
 /// server-side retention claim does — so renewal is invisible to callers.
@@ -629,13 +642,7 @@ impl SnapshotReader {
     /// capacity credits and fixed-root membership checks.
     pub async fn read_file(&self, rel_path: &str, digest: &str) -> Result<Vec<u8>, SnapshotError> {
         self.context.validate_relative_path(rel_path)?;
-        let request_path = if rel_path.is_empty() || rel_path == "/" {
-            "/".to_string()
-        } else if rel_path.starts_with('/') {
-            rel_path.to_string()
-        } else {
-            format!("/{rel_path}")
-        };
+        let request_path = ScopeRequestPath(rel_path).to_string();
         self.ensure_lease().await?;
         self.client
             .blob_verified(self.snapshot_id(), &request_path, digest)
@@ -969,11 +976,7 @@ impl SnapshotReader {
         self.context.validate_relative_path(rel_path)?;
         self.ensure_lease().await?;
         let sid = self.snapshot_id();
-        let request_path = if rel_path.starts_with('/') {
-            rel_path.to_string()
-        } else {
-            format!("/{rel_path}")
-        };
+        let request_path = ScopeRequestPath(rel_path).to_string();
         if size <= 256 * 1024 {
             let map = self
                 .client
@@ -1150,11 +1153,7 @@ impl SnapshotReader {
             size,
             std::mem::size_of::<VerifiedContent>(),
         )?;
-        let request_path = if file.rel_path.starts_with('/') {
-            file.rel_path.clone()
-        } else {
-            format!("/{}", file.rel_path)
-        };
+        let request_path = ScopeRequestPath(&file.rel_path).to_string();
         if !use_frames {
             let receipt = owned_transport::raw_content(
                 &self.client,

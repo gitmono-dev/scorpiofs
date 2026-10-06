@@ -244,6 +244,36 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(output.exists())
 
+    def test_explicit_recovery_keeps_the_original_window_after_queue_freshness_expires(self):
+        started = datetime.now(timezone.utc) - timedelta(minutes=20)
+        deadline = (started + timedelta(minutes=235)).isoformat()
+        for name in ("mst2-real-update.yml", "mst2-workspace-update.yml"):
+            workflow = SOURCE.parents[2] / ".github/workflows" / name
+            script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+            with tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "github-env"
+                env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
+                           GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                           STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
+                           PYTHONPATH=str(SOURCE.parent), RECOVERY_INPUT="true")
+                for _ in range(2):
+                    subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
+                    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                    self.assertEqual(values["MST2_SESSION_STARTED"], started.isoformat())
+                    self.assertEqual(values["MST2_SESSION_DEADLINE"], deadline)
+                    remaining = float(values["MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"]) - time.monotonic()
+                    self.assertGreater(remaining, 199 * 60)
+                    self.assertLessEqual(remaining, 200 * 60)
+                    output.unlink()
+                overdue = datetime.now(timezone.utc) - timedelta(minutes=221)
+                for bad in (dict(env, RECOVERY_INPUT="false"), dict(env, RECOVERY_INPUT="yes"),
+                            dict(env, DEADLINE_INPUT=(started + timedelta(minutes=236)).isoformat()),
+                            dict(env, STARTED_INPUT=overdue.isoformat(),
+                                 DEADLINE_INPUT=(overdue + timedelta(minutes=235)).isoformat())):
+                    result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
+
     def test_ci_setup_plan_cannot_create_local_resources(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "nonexistent-owned-root"

@@ -100,6 +100,13 @@ pub(crate) enum HydrationSubstage {
     CasResumeAudit,
     SmallObjectFetch,
     LargeContentFetch,
+    /// Large-file source opened and its authenticated map/leaf metadata was
+    /// resolved. This stays a closed label for hosted benchmark evidence.
+    LargeChunkMap,
+    /// A verified chunk/range request failed before local CAS publication.
+    LargeChunkRead,
+    /// Local temporary-file write, sync, or rename failed after chunk reads.
+    LargeCasWrite,
     HydrationCommit,
     SnapshotLinks,
     DependencyAudit,
@@ -113,6 +120,9 @@ impl HydrationSubstage {
             Self::CasResumeAudit => "cas_resume_audit",
             Self::SmallObjectFetch => "small_object_fetch",
             Self::LargeContentFetch => "large_content_fetch",
+            Self::LargeChunkMap => "large_chunk_map",
+            Self::LargeChunkRead => "large_chunk_read",
+            Self::LargeCasWrite => "large_cas_write",
             Self::HydrationCommit => "hydration_commit",
             Self::SnapshotLinks => "snapshot_links",
             Self::DependencyAudit => "dependency_audit",
@@ -126,6 +136,9 @@ impl HydrationSubstage {
             "cas_resume_audit" => Self::CasResumeAudit,
             "small_object_fetch" => Self::SmallObjectFetch,
             "large_content_fetch" => Self::LargeContentFetch,
+            "large_chunk_map" => Self::LargeChunkMap,
+            "large_chunk_read" => Self::LargeChunkRead,
+            "large_cas_write" => Self::LargeCasWrite,
             "hydration_commit" => Self::HydrationCommit,
             "snapshot_links" => Self::SnapshotLinks,
             "dependency_audit" => Self::DependencyAudit,
@@ -2906,7 +2919,8 @@ async fn write_reader_blob(
             &file.content_digest,
             file.size,
         )
-        .await?;
+        .await
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkMap))?;
         return write_reader_blob_stream(dir, file, |offset, length| {
             source.read_range_owned(offset, length)
         })
@@ -2914,7 +2928,8 @@ async fn write_reader_blob(
     }
     let source =
         crate::snapshot::ChunkedFile::open(reader, &file.rel_path, &file.content_digest, file.size)
-            .await?;
+            .await
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkMap))?;
     write_reader_blob_stream(dir, file, |offset, length| {
         source.read_range(offset, length)
     })
@@ -2931,7 +2946,8 @@ where
     Fut: Future<Output = Result<B, SnapshotError>>,
     B: BlobBytes,
 {
-    create_dirs_durable(dir)?;
+    create_dirs_durable(dir)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     let name = blob_name(&file.content_digest);
     let temporary_path = dir.join(format!(
         ".{name}.tmp.{}-{}",
@@ -2942,39 +2958,61 @@ where
         .write(true)
         .create_new(true)
         .open(&temporary_path)
-        .map_err(io_err)?;
+        .map_err(io_err)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     let temporary = PendingBlob(temporary_path);
     let mut output = tokio::fs::File::from_std(handle);
     let mut hash = Context::new(&SHA256);
     let mut offset = 0;
     while offset < file.size {
         let length = (file.size - offset).min(mst2_codec::chunkmap::CHUNK_SIZE as u64);
-        let bytes = read_range(offset, length).await?;
+        let bytes = read_range(offset, length)
+            .await
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkRead))?;
         if bytes.bytes().len() as u64 != length {
-            return Err(integrity_err(
-                "streamed chunk does not cover the expected file range",
+            return Err(tag_hydration_error(
+                integrity_err("streamed chunk does not cover the expected file range"),
+                HydrationSubstage::LargeChunkRead,
             ));
         }
         let bytes = bytes.bytes();
         hash.update(bytes);
-        output.write_all(bytes).await.map_err(io_err)?;
+        output
+            .write_all(bytes)
+            .await
+            .map_err(io_err)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
         offset += length;
     }
     if format!("sha256:{}", hex::encode(hash.finish().as_ref())) != file.content_digest {
-        return Err(SnapshotError::new(
-            SnapshotErrorCode::DigestMismatch,
-            format!(
-                "{}: streamed file does not match whole-content digest",
-                file.rel_path
+        return Err(tag_hydration_error(
+            SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!(
+                    "{}: streamed file does not match whole-content digest",
+                    file.rel_path
+                ),
             ),
+            HydrationSubstage::LargeChunkRead,
         ));
     }
-    output.flush().await.map_err(io_err)?;
-    durability_checkpoint(dir, "object-file-sync")?;
-    output.sync_all().await.map_err(io_err)?;
+    output
+        .flush()
+        .await
+        .map_err(io_err)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+    durability_checkpoint(dir, "object-file-sync")
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+    output
+        .sync_all()
+        .await
+        .map_err(io_err)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     drop(output);
-    fs::rename(&temporary.0, dir.join(name)).map_err(io_err)?;
-    sync_dir(dir)
+    fs::rename(&temporary.0, dir.join(name))
+        .map_err(io_err)
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+    sync_dir(dir).map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))
 }
 
 /// Borrow the streamed body while keeping an owned range reservation alive.

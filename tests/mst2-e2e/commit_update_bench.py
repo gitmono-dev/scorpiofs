@@ -57,7 +57,8 @@ SAFE_RETENTION_SUBSTAGES = frozenset({
 })
 SAFE_HYDRATION_SUBSTAGES = frozenset({
     "metadata_closure", "cas_resume_audit", "small_object_fetch",
-    "large_content_fetch", "hydration_commit", "snapshot_links",
+    "large_content_fetch", "large_chunk_map", "large_chunk_read",
+    "large_cas_write", "hydration_commit", "snapshot_links",
     "dependency_audit", "hydration_task",
 })
 SAFE_BACKEND_ERROR_CODES = frozenset({
