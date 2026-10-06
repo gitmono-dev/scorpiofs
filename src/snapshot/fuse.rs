@@ -106,6 +106,7 @@ fn entry_kind(node: &Node) -> FileType {
         Node::File(f) if f.fs_kind == "symlink" => FileType::Symlink,
         Node::File(_) => FileType::RegularFile,
     }
+
 }
 
 fn is_symlink(node: &Node) -> bool {
@@ -910,6 +911,19 @@ impl Mst2Fuse {
                 Ok(SnapshotPathState::Present(node_identity(node)?))
             }
             None => Ok(SnapshotPathState::AbsentProven),
+        }
+    }
+
+    /// Digest lookup retained for the explicit legacy mount/rebase API.
+    pub(crate) async fn digest_for_path(&self, rel_path: &str) -> Option<String> {
+        match self.path_state(rel_path).await.ok()? {
+            SnapshotPathState::Present(SnapshotNodeIdentity::Regular {
+                content_digest, ..
+            })
+            | SnapshotPathState::Present(SnapshotNodeIdentity::Symlink {
+                content_digest, ..
+            }) => Some(content_digest),
+            _ => None,
         }
     }
 
