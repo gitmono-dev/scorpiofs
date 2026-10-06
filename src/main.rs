@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -21,6 +21,19 @@ struct Cli {
     #[arg(long, global = true)]
     log_level: Option<String>,
 
+    /// Override the Antares per-job upper-layer root.
+    #[arg(long, global = true)]
+    upper_root: Option<PathBuf>,
+    /// Override the Antares per-job CL-layer root.
+    #[arg(long, global = true)]
+    cl_root: Option<PathBuf>,
+    /// Override the Antares per-job mountpoint root.
+    #[arg(long, global = true)]
+    mount_root: Option<PathBuf>,
+    /// Override the Antares state file path.
+    #[arg(long, global = true)]
+    state_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -29,6 +42,35 @@ struct Cli {
 enum Commands {
     /// Run the workspace HTTP control daemon. Mounts are created by explicit requests.
     Serve,
+    /// Mount an Antares job instance.
+    Mount {
+        /// Unique job identifier.
+        job_id: String,
+        /// Optional CL layer name.
+        #[arg(long)]
+        cl: Option<String>,
+    },
+    /// Unmount an Antares job instance.
+    Umount {
+        /// Job identifier to remove.
+        job_id: String,
+    },
+    /// List tracked Antares instances.
+    List,
+    /// Mount via a running HTTP daemon (recommended for build systems).
+    HttpMount {
+        /// Unique job identifier (recommended).
+        #[arg(long)]
+        job_id: Option<String>,
+        /// Monorepo path to mount (e.g. "/third-party/mega").
+        path: String,
+        /// Optional CL identifier.
+        #[arg(long)]
+        cl: Option<String>,
+        /// Daemon base URL (the request goes to `{endpoint}/mounts`).
+        #[arg(long, default_value = "http://127.0.0.1:2725/antares")]
+        endpoint: String,
+    },
     /// Control workspaces through the daemon that owns their mounts.
     Workspace {
         /// Daemon base URL.
@@ -107,6 +149,37 @@ impl WorkspaceAction {
     }
 }
 
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_commands_and_path_flags_remain_accepted_alongside_workspace_commands() {
+        for args in [
+            vec!["scorpio", "mount", "job", "--cl", "change"],
+            vec!["scorpio", "umount", "job"],
+            vec!["scorpio", "list"],
+            vec!["scorpio", "http-mount", "/project", "--job-id", "job"],
+            vec![
+                "scorpio",
+                "--upper-root",
+                "/tmp/upper",
+                "--cl-root",
+                "/tmp/cl",
+                "--mount-root",
+                "/tmp/mounts",
+                "--state-file",
+                "/tmp/state",
+                "list",
+            ],
+            vec!["scorpio", "workspace", "list"],
+            vec!["scorpio", "serve"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigAction {
     /// Write a configuration template to a file.
@@ -142,7 +215,12 @@ async fn main() {
         }
         cli => cli,
     };
-    let overrides = HashMap::new();
+    let overrides = cli::antares_overrides(
+        cli.upper_root.clone(),
+        cli.cl_root.clone(),
+        cli.mount_root.clone(),
+        cli.state_file.clone(),
+    );
 
     // These commands need neither a loaded config nor logging; handle them
     // before `cli::init` so they work even when the config is missing/invalid.
@@ -187,6 +265,15 @@ async fn main() {
             cli::serve(cli.http_addr).await
         }
         Some(Commands::Serve) => cli::serve(cli.http_addr).await,
+        Some(Commands::Mount { job_id, cl }) => cli::antares_mount(&job_id, cl.as_deref()).await,
+        Some(Commands::Umount { job_id }) => cli::antares_umount(&job_id).await,
+        Some(Commands::List) => cli::antares_list().await,
+        Some(Commands::HttpMount {
+            job_id,
+            path,
+            cl,
+            endpoint,
+        }) => cli::http_mount(job_id.as_deref(), &path, cl.as_deref(), &endpoint).await,
         Some(Commands::Workspace { .. }) => unreachable!("workspace handled before config init"),
         Some(Commands::Config {
             action: ConfigAction::Show,

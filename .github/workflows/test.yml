@@ -71,4 +71,4 @@ jobs:
           cargo test --test mst2_namespace_http -- --nocapture
 
       - name: cargo build --release
-        run: cargo build --release --locked --bin scorpio
+        run: cargo build --release --locked --bins
