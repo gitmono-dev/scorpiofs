@@ -15,7 +15,7 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::{mount::WorkspaceMount, types::*};
+use super::{mount::WorkspaceMount, observation::WorkspaceObserver, types::*};
 use crate::snapshot::{
     fuse::Mst2Fuse,
     stage::{trace_async, trace_blocking, trace_sync},
@@ -106,12 +106,26 @@ pub struct WorkspaceService {
     operations: Arc<Semaphore>,
     hydrations: Arc<Semaphore>,
     shutting_down: AtomicBool,
+    observer: Option<Arc<WorkspaceObserver>>,
 }
 
 impl WorkspaceService {
-    pub fn new(
+    pub fn new(client: Mst2Client, config: WorkspaceConfig) -> Result<Arc<Self>, WorkspaceError> {
+        Self::new_inner(client, config, None)
+    }
+
+    pub fn new_with_observer(
+        client: Mst2Client,
+        config: WorkspaceConfig,
+        observer: Arc<WorkspaceObserver>,
+    ) -> Result<Arc<Self>, WorkspaceError> {
+        Self::new_inner(client, config, Some(observer))
+    }
+
+    fn new_inner(
         client: Mst2Client,
         mut config: WorkspaceConfig,
+        observer: Option<Arc<WorkspaceObserver>>,
     ) -> Result<Arc<Self>, WorkspaceError> {
         if config.max_workspaces == 0
             || config.max_operations == 0
@@ -136,6 +150,7 @@ impl WorkspaceService {
             config,
             entries: StdMutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            observer,
         }))
     }
 
@@ -257,14 +272,29 @@ impl WorkspaceService {
         } else {
             None
         };
-        let reader = trace_async(
-            "resolve",
-            SnapshotReader::resolve_request(
-                self.client.clone(),
-                &request.resolve_request(self.config.lease_seconds),
-            ),
-        )
-        .await?;
+        let resolve_request = request.resolve_request(self.config.lease_seconds);
+        let (reader, receipt) = if let Some(observer) = &self.observer {
+            let logical_id = observer.logical_id(&workspace.id);
+            let (reader, receipt) = trace_async(
+                "resolve",
+                SnapshotReader::resolve_request_observed(
+                    self.client.clone(),
+                    &resolve_request,
+                    &logical_id,
+                ),
+            )
+            .await?;
+            (reader, Some(receipt))
+        } else {
+            (
+                trace_async(
+                    "resolve",
+                    SnapshotReader::resolve_request(self.client.clone(), &resolve_request),
+                )
+                .await?,
+                None,
+            )
+        };
         runtime.reader = Some(reader.clone());
         let cache_root = self.config.cache_root.clone();
         let id = workspace.id.clone();
@@ -283,6 +313,16 @@ impl WorkspaceService {
             .map_err(|_| WorkspaceError::new("WORKSPACE_UNKNOWN", "cache binding task failed"))??,
         );
         runtime.store = Some(store.clone());
+        if let (Some(observer), Some(receipt)) = (&self.observer, &receipt) {
+            observer.record_binding(
+                &workspace.id,
+                &workspace.generation,
+                &reader,
+                receipt,
+                &store,
+                &self.config.cache_root,
+            );
+        }
         let lower = Arc::new(
             trace_async(
                 "root_metadata_proof",
