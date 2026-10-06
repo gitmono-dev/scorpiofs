@@ -56,14 +56,14 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin scorpio
+        run: cargo build --release --locked --target ${{ matrix.target }} --bins
 
       - name: Build (cross)
         if: matrix.cross
         env:
           OPENSSL_STATIC: "1"
           OPENSSL_VENDORED: "1"
-        run: cross build --release --locked --target ${{ matrix.target }} --bin scorpio
+        run: cross build --release --locked --target ${{ matrix.target }} --bins
 
       - name: Package tarball + checksum
         run: |
@@ -72,6 +72,7 @@ jobs:
           dist="scorpiofs-${version}-${{ matrix.target }}"
           mkdir -p "$dist"
           cp "target/${{ matrix.target }}/release/scorpio" "$dist/"
+          cp "target/${{ matrix.target }}/release/antares" "$dist/"
           cp LICENSE-MIT LICENSE-APACHE README.md "$dist/"
           tar -czf "${dist}.tar.gz" "$dist"
           if command -v sha256sum >/dev/null 2>&1; then

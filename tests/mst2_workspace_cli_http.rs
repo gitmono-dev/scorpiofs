@@ -150,7 +150,9 @@ async fn invalid_identity_and_retired_commands_do_not_contact_the_daemon() {
             .await
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
+        // Legacy commands remain recognized for API compatibility; with an
+        // unavailable config they fail before attempting any daemon access.
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
     }
     for endpoint in [
         "file:///tmp/daemon",

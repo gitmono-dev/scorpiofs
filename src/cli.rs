@@ -405,3 +405,9 @@ async fn shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
     }
 }
+
+#[path = "cli_legacy.rs"]
+pub mod legacy;
+pub use legacy::{
+    antares_list, antares_mount, antares_overrides, antares_serve, antares_umount, http_mount,
+};

@@ -60,7 +60,7 @@ jobs:
           key: ${{ runner.os }}-qlean-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release fixture
-        run: cargo build --release --locked --bin scorpio
+        run: cargo build --release --locked --bins
 
       - name: Build exact workspace launcher test fixture
         run: |
