@@ -60,7 +60,7 @@ def _safe_worker_error_code(error):
 
 def _safe_worker_stage(error):
     stage = getattr(error, "worker_stage", None)
-    return stage if stage in SAFE_WORKER_STAGES else None
+    return stage if type(stage) is str and stage in SAFE_WORKER_STAGES else None
 
 
 IDENTITY_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;

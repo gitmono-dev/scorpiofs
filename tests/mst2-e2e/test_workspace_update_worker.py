@@ -86,6 +86,7 @@ class WorkerShapeTests(unittest.TestCase):
                     raise WorkerError("private response body", error_code="worker_http_status_5xx")
         self.assertEqual(failed.exception.worker_stage, "poll")
         self.assertEqual(WorkerError("private", stage="private").worker_stage, None)
+        self.assertEqual(WorkerError("private", stage=[]).worker_stage, None)
 
 
 class WorkerReceiptTests(unittest.TestCase):

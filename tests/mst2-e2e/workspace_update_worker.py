@@ -176,18 +176,18 @@ class WorkerError(RuntimeError):
     def __init__(self, message="", error_code=None, stage=None):
         inferred = _message_error_code(message) if error_code is None else error_code
         self.error_code = inferred if inferred in WORKER_ERROR_CODES else WORKER_ERROR
-        self.worker_stage = stage if stage in WORKER_STAGES else None
+        self.worker_stage = stage if type(stage) is str and stage in WORKER_STAGES else None
         super().__init__(message)
 
 
 def _tag_worker_stage(error, stage):
     """Attach one closed worker stage without copying exception details."""
-    if stage not in WORKER_STAGES:
+    if type(stage) is not str or stage not in WORKER_STAGES:
         return error
     # Preserve a more specific nested stage (for example poll inside hydrate)
     # when the exception crosses an outer stage boundary.
     current = getattr(error, "worker_stage", None)
-    if current in WORKER_STAGES:
+    if type(current) is str and current in WORKER_STAGES:
         return error
     try:
         setattr(error, "worker_stage", stage)
