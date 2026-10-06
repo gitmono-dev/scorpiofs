@@ -1385,6 +1385,11 @@ impl Filesystem for Mst2Fuse {
             Node::File(f) => f,
             Node::Dir(_) => return Err(Errno::from(libc::EISDIR)),
         };
+        if let Some(reader) = self.owned_reader() {
+            return self
+                .read_owned(reader, inode, &f, offset, size as u64)
+                .await;
+        }
         if size == 0 || offset >= f.size {
             return Ok(ReplyData { data: Bytes::new() });
         }
@@ -1408,14 +1413,6 @@ impl Filesystem for Mst2Fuse {
                     self.state.lock().unwrap().contents.insert(inode, arc);
                     return Ok(ReplyData { data: out });
                 }
-            }
-            // A live v3 reader owns the response bytes when the durable CAS
-            // does not contain this file. Keep this after the CAS probe so a
-            // hydrated store remains usable without a network connection.
-            if let Some(reader) = self.owned_reader() {
-                return self
-                    .read_owned(reader, inode, &f, offset, size as u64)
-                    .await;
             }
             let bytes = Arc::new(self.fetch_content(&f).await?);
             let out = verified_slice(&bytes, f.size, offset, end)?;
@@ -1441,15 +1438,6 @@ impl Filesystem for Mst2Fuse {
                     data: Bytes::from(bytes),
                 });
             }
-        }
-
-        // A live v3 reader owns the response bytes only after the local CAS
-        // probe misses. This preserves offline/local performance for hydrated
-        // files while still avoiding the legacy Vec/cache path on a miss.
-        if let Some(reader) = self.owned_reader() {
-            return self
-                .read_owned(reader, inode, &f, offset, size as u64)
-                .await;
         }
 
         // 4. Large file online: verified chunk reader, transferred range only.
