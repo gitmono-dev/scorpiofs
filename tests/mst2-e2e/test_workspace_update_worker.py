@@ -46,6 +46,14 @@ class WorkerShapeTests(unittest.TestCase):
         self.assertNotIn("503", status.error_code)
         self.assertEqual(WorkerError("daemon leaked token", error_code="token").error_code,
                          "worker_error")
+        for message, expected in [
+            ("workspace hydration failed", "workspace_hydration_failed"),
+            ("retained old file differs from its fixed snapshot", "workspace_retention_invalid"),
+            ("workspace FUSE mount identity is missing or ambiguous", "workspace_mount_invalid"),
+            ("Linux mount ownership inventory is unavailable", "worker_process_invalid"),
+            ("workspace mounts remained after explicit retirement", "worker_cleanup_invalid"),
+        ]:
+            self.assertEqual(WorkerError(message).error_code, expected)
 
     def test_status_requires_exact_wire_shape_and_canonical_identity(self):
         self.assertEqual(set(_status(valid_status())), STATUS_FIELDS)

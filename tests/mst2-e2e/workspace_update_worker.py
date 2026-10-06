@@ -65,6 +65,8 @@ WORKER_ERROR_CODES = frozenset({
     "workspace_status_invalid",
     "workspace_mount_invalid",
     "workspace_identity_invalid",
+    "workspace_hydration_failed",
+    "workspace_retention_invalid",
     "workspace_oracle_failed",
     "worker_process_invalid",
     "worker_command_failed",
@@ -106,19 +108,28 @@ def _message_error_code(message):
         return "workspace_status_invalid"
     if message.startswith("workspace mountpoint "):
         return "workspace_mount_invalid"
+    if message.startswith("Linux mountinfo ") or message.startswith("workspace FUSE "):
+        return "workspace_mount_invalid"
     if message.startswith("workspace identity ") or message.startswith("workspace create "):
         return "workspace_identity_invalid"
+    if message.startswith("workspace hydration failed"):
+        return "workspace_hydration_failed"
+    if (message.startswith("retained old ") or message.startswith("workspace upper ")
+            or message.startswith("dirty sentinel ") or message.startswith("dirty upper ")):
+        return "workspace_retention_invalid"
     if message.startswith("workspace oracle failed"):
         return "workspace_oracle_failed"
     if message.startswith("oracle ") or message.startswith("expected manifest "):
         return "workspace_oracle_failed"
-    if message.startswith("worker process-group ") or message.startswith("worker anchor "):
+    if (message.startswith("worker process-group ") or message.startswith("worker anchor ")
+            or message.startswith("Linux mount ownership inventory ")):
         return "worker_process_invalid"
     if message.startswith("owned command ") or message.startswith("worker command "):
         return "worker_command_failed"
     if message.startswith("worker receipt ") or message.startswith("worker roots "):
         return "worker_receipt_invalid"
-    if message.startswith("worker cleanup ") or message.startswith("worker has no bound"):
+    if (message.startswith("worker cleanup ") or message.startswith("worker has no bound")
+            or message.startswith("workspace mounts remained ")):
         return "worker_cleanup_invalid"
     if message.startswith("Git "):
         return "git_baseline_invalid"

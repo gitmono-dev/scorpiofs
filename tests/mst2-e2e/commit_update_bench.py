@@ -41,7 +41,8 @@ SAFE_WORKER_ERROR_CODES = frozenset({
     "worker_http_status_rejected", "worker_http_response_invalid",
     "worker_http_request_failed", "worker_json_invalid",
     "workspace_status_invalid", "workspace_mount_invalid",
-    "workspace_identity_invalid", "workspace_oracle_failed",
+    "workspace_identity_invalid", "workspace_hydration_failed",
+    "workspace_retention_invalid", "workspace_oracle_failed",
     "worker_process_invalid", "worker_command_failed",
     "worker_receipt_invalid", "worker_cleanup_invalid", "git_baseline_invalid",
 })
