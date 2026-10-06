@@ -692,6 +692,7 @@ def execute(options):
                       "publication_timing_scope": "push start through read-only DB certificate observation; an upper bound, not internal server projection duration",
                       "native_publication": native, "publication_mode": options.publication_mode,
                       "server_projection": trace,
+                      "server_projection_rebuilt_pages": None, "server_projection_reused_pages": None,
                       "server_projection_stats": "typed directory-root work; codec-internal radix work is NOT_EXPOSED" if projection else "NOT_EXPOSED",
                       "durable_verified_scope": "each side operation through its immediate independent full-byte oracle; old-view audits excluded",
                       "side_order": side_order, "scorpio": measured, "git": git_measured,
