@@ -1215,12 +1215,17 @@ class WorkerSession:
             final = [self._audit_view(view, deadline) for view in self._views]
         final_retained_view_audit_ms = (time.monotonic() - final_audit_start) * 1000
         try:
+            # Retained FUSE descriptors prove the old view during the audit,
+            # but they must be closed before workspace retirement.  The v3
+            # service waits for retired native owners while unmounting; an
+            # open retained descriptor turns that explicit destroy into a
+            # WORKSPACE_IO failure.
+            self._close_views()
             with self._stage("destroy"):
                 self._destroy_all(deadline)
             with self._stage("cleanup"):
                 if _owned_mounts(self.workspace_root):
                     raise WorkerError("workspace mounts remained after explicit retirement")
-                self._close_views()
                 self._stop_anchor(deadline)
                 self._complete_receipt()
             return {"retained": len(final), "verified": True, "views": final,
@@ -1231,6 +1236,10 @@ class WorkerSession:
     def abort(self, deadline):
         errors = []
         try:
+            # Abort can run after a measurement failure with retained FUSE
+            # handles still open; release them before the best-effort destroy
+            # for the same unmount/wait-for-owners contract as stop().
+            self._close_views()
             if self._active_process is not None and self._active_identity is not None:
                 self._stop_anchor(deadline)
             try:
@@ -1239,7 +1248,6 @@ class WorkerSession:
             except BaseException as error:
                 errors.append(error)
             with self._stage("cleanup"):
-                self._close_views()
                 self._stop_anchor(deadline)
                 if not _owned_mounts(self.workspace_root) and self._groups_empty():
                     if self._last_identity is not None:
