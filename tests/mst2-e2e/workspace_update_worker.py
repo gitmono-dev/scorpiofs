@@ -95,6 +95,16 @@ RETENTION_SUBSTAGES = frozenset({
     "old_view_oracle", "old_view_fd", "old_view_sentinel", "final_view_oracle",
 })
 
+# ScorpioFS status exposes only this bounded hydration phase after it has
+# removed paths, digests and remote response details. Keep the phase separate
+# from the typed snapshot code so safe benchmark evidence can identify the
+# failing commit-update segment without widening the status contract.
+HYDRATION_SUBSTAGES = frozenset({
+    "metadata_closure", "cas_resume_audit", "small_object_fetch",
+    "large_content_fetch", "hydration_commit", "snapshot_links",
+    "dependency_audit", "hydration_task",
+})
+
 # Workspace HTTP errors cross the hosted-runner boundary only as a closed
 # diagnostic label.  Never persist the response message, path, or body.
 BACKEND_ERROR_CODES = frozenset({
@@ -146,6 +156,18 @@ def _status_error_codes(status):
     if snapshot in SNAPSHOT_ERROR_CODES:
         return None, snapshot
     return None, _snapshot_code_from_workspace_message(message)
+
+
+def _status_hydration_substage(status):
+    """Return the closed hydration phase from a status last_error, if any."""
+    message = status.get("last_error") if isinstance(status, dict) else None
+    if type(message) is not str:
+        return None
+    _, separator, phase = message.partition(":")
+    if not separator:
+        return None
+    phase = phase.strip()
+    return phase if phase in HYDRATION_SUBSTAGES else None
 
 
 def _message_error_code(message):
@@ -230,18 +252,21 @@ class WorkerError(RuntimeError):
     """Closed diagnostics for a failed worker operation.
 
     ``str(error)`` remains useful to local callers, but only the closed
-    ``error_code``, ``worker_stage``, ``retention_substage``, ``backend_code`` and ``snapshot_code``
+    ``error_code``, ``worker_stage``, ``retention_substage``, ``hydration_substage``,
+    ``backend_code`` and ``snapshot_code``
     fields may cross into CI evidence.  Unknown or caller-supplied codes are
     discarded.
     """
 
     def __init__(self, message="", error_code=None, stage=None, retention_substage=None,
-                 backend_code=None, snapshot_code=None):
+                 hydration_substage=None, backend_code=None, snapshot_code=None):
         inferred = _message_error_code(message) if error_code is None else error_code
         self.error_code = inferred if inferred in WORKER_ERROR_CODES else WORKER_ERROR
         self.worker_stage = stage if type(stage) is str and stage in WORKER_STAGES else None
         self.retention_substage = (retention_substage if type(retention_substage) is str
                                    and retention_substage in RETENTION_SUBSTAGES else None)
+        self.hydration_substage = (hydration_substage if type(hydration_substage) is str
+                                   and hydration_substage in HYDRATION_SUBSTAGES else None)
         self.backend_code = (backend_code if backend_code in BACKEND_ERROR_CODES else None)
         self.snapshot_code = (snapshot_code if snapshot_code in SNAPSHOT_ERROR_CODES else None)
         super().__init__(message)
@@ -974,8 +999,10 @@ class WorkerSession:
         if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
                 or status["last_error"] is not None):
             backend_code, snapshot_code = _status_error_codes(status)
+            hydration_substage = _status_hydration_substage(status)
             raise WorkerError("workspace hydration failed", stage="hydrate",
-                               backend_code=backend_code, snapshot_code=snapshot_code)
+                               backend_code=backend_code, snapshot_code=snapshot_code,
+                               hydration_substage=hydration_substage)
         if (status["mount_state"] == "mounted" and status["metadata_ready"]
                 and status["hydration_state"] == "complete"
                 and status["local_pin_state"] == "complete_snapshot"
@@ -995,8 +1022,10 @@ class WorkerSession:
                 if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
                         or status["last_error"] is not None):
                     backend_code, snapshot_code = _status_error_codes(status)
+                    hydration_substage = _status_hydration_substage(status)
                     raise WorkerError("workspace hydration failed",
-                                       backend_code=backend_code, snapshot_code=snapshot_code)
+                                       backend_code=backend_code, snapshot_code=snapshot_code,
+                                       hydration_substage=hydration_substage)
                 if (status["mount_state"] == "mounted" and status["metadata_ready"]
                         and status["hydration_state"] == "complete"
                         and status["local_pin_state"] == "complete_snapshot"
