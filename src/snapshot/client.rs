@@ -1009,7 +1009,7 @@ fn urlencode(s: &str) -> String {
 fn _statuscode_marker(_: StatusCode) {}
 
 #[cfg(test)]
-mod tests {
+mod retry_classification_tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
