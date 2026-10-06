@@ -43,6 +43,9 @@ jobs:
 
       - name: Record native namespace and upper-diff coverage
         run: cargo test --test mst2_namespace_http -- --nocapture
+
+      - name: Record actual v3 metadata reuse and audited hydration costs
+        run: cargo test --lib workspace::hydrate::tests:: -- --nocapture
       
       - name: Run doc tests
         run: cargo test --doc --verbose
@@ -64,6 +67,9 @@ jobs:
 
       - name: Native v3 HTTP lifecycle and launcher contracts
         run: cargo test --test mst2_workspace_v3_http --test mst2_workspace_launcher_http --test mst2_workspace_cli_http -- --nocapture
+
+      - name: Record actual v3 metadata reuse and audited hydration costs
+        run: cargo test --lib workspace::hydrate::tests:: -- --nocapture
 
       - name: Native namespace and upper-diff HTTP cases
         run: |
