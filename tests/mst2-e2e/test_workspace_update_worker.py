@@ -1,9 +1,11 @@
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -87,6 +89,125 @@ class WorkerShapeTests(unittest.TestCase):
         self.assertEqual(failed.exception.worker_stage, "poll")
         self.assertEqual(WorkerError("private", stage="private").worker_stage, None)
         self.assertEqual(WorkerError("private", stage=[]).worker_stage, None)
+
+
+class WorkerFullProfileTests(unittest.TestCase):
+    """Exercise the worker against a control endpoint that rejects lazy."""
+
+    def setUp(self):
+        self.create_status = valid_status(hydration_state="idle", local_pin_state="incomplete")
+        self.hydrate_status = valid_status(hydration_state="running", local_pin_state="incomplete")
+        self.poll_statuses = [valid_status()]
+        self.requests = []
+        profile = self
+
+        class FullOnlyHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                self.respond()
+
+            def do_GET(self):
+                self.respond()
+
+            def respond(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = json.loads(raw) if raw else None
+                profile.requests.append((self.command, self.path, body))
+                workspace_path = "/v3/workspaces/" + profile.create_status["workspace_id"]
+                code = 200
+                if self.command == "POST" and self.path == "/v3/workspaces":
+                    if type(body) is not dict or body.get("delivery") != "full":
+                        code, value = 422, {"error": "delivery unsupported"}
+                    else:
+                        value = profile.create_status
+                elif self.command == "POST" and self.path == workspace_path + "/hydrate":
+                    value = profile.hydrate_status
+                elif self.command == "GET" and self.path == workspace_path and profile.poll_statuses:
+                    value = profile.poll_statuses.pop(0)
+                else:
+                    code, value = 404, {"error": "unexpected request"}
+                encoded = json.dumps(value).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FullOnlyHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01},
+                                       daemon=True)
+        self.thread.start()
+        self.addCleanup(self.close_server)
+
+    def close_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def worker(self):
+        worker = WorkerSession.__new__(WorkerSession)
+        worker.http = _NoRedirectHTTP("http://127.0.0.1:" + str(self.server.server_port))
+        worker._workspace_ids = []
+        # This control-plane test has no native FUSE mount. Identity equality
+        # and the complete wire shape still use the production validators.
+        worker._assert_status_path = mock.Mock()
+        return worker
+
+    def test_full_only_create_still_requires_hydrate_and_complete_snapshot_pin(self):
+        worker = self.worker()
+        deadline = time.monotonic() + 5
+        # Full resolve makes metadata available, while durable completion
+        # still requires hydrate and a complete snapshot pin on the same view.
+        self.poll_statuses = [valid_status(local_pin_state="incomplete"), valid_status()]
+        started = time.monotonic()
+        first = worker._create_workspace(deadline)
+        status, metadata_ms, complete_ms = worker._hydrate(first, deadline, started,
+                                                          initial_metadata_ms=7.25)
+        workspace_path = "/v3/workspaces/" + first["workspace_id"]
+        self.assertEqual(self.requests, [
+            ("POST", "/v3/workspaces", {"target": {"kind": "latest"}, "scope": "/project",
+                                       "delivery": "full", "upper_policy": "private"}),
+            ("POST", workspace_path + "/hydrate", None),
+            ("GET", workspace_path, None), ("GET", workspace_path, None),
+        ])
+        self.assertEqual(status, valid_status())
+        self.assertEqual(worker._workspace_ids, [first["workspace_id"]])
+        self.assertEqual(metadata_ms, 7.25)
+        self.assertGreaterEqual(complete_ms, 0)
+
+    def test_full_profile_rejects_fixed_identity_changes_in_hydrate_and_poll(self):
+        changes = {"workspace_id": "33333333-2222-4333-8444-666666666666",
+                   "generation": "33333333-2222-4333-8444-666666666666",
+                   "snapshot_id": "sha256:" + "b" * 64,
+                   "mountpoint": "/private/workspaces-v3/changed/mount"}
+        for stage in ("hydrate", "poll"):
+            for field, value in changes.items():
+                with self.subTest(stage=stage, field=field):
+                    self.requests.clear()
+                    changed = valid_status(**{field: value})
+                    self.hydrate_status = changed if stage == "hydrate" else valid_status()
+                    self.poll_statuses = [changed]
+                    worker = self.worker()
+                    deadline = time.monotonic() + 5
+                    first = worker._create_workspace(deadline)
+                    with self.assertRaises(WorkerError) as failed:
+                        worker._hydrate(first, deadline, time.monotonic())
+                    self.assertEqual(failed.exception.error_code, "workspace_identity_invalid")
+                    self.assertEqual(failed.exception.worker_stage, stage)
+                    self.assertEqual(worker._workspace_ids, [first["workspace_id"]])
+                    self.assertEqual(len(self.requests), 2 if stage == "hydrate" else 3)
+
+    def test_full_profile_rejects_create_without_fixed_snapshot(self):
+        self.create_status = valid_status(snapshot_id=None)
+        worker = self.worker()
+        with self.assertRaises(WorkerError) as failed:
+            worker._create_workspace(time.monotonic() + 5)
+        self.assertEqual(failed.exception.error_code, "workspace_identity_invalid")
+        self.assertEqual(failed.exception.worker_stage, "create")
+        self.assertEqual(worker._workspace_ids, [])
+        self.assertEqual(self.requests[0][2]["delivery"], "full")
 
 
 class WorkerReceiptTests(unittest.TestCase):
