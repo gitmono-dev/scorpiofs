@@ -38,6 +38,7 @@ enum SinkError {
     FooterWrite,
     FooterSync,
     DirectorySync,
+    DaemonExit,
     FinalizeTimeout,
     MissingDaemonExit,
 }
@@ -61,6 +62,7 @@ impl SinkError {
             Self::FooterWrite => "footer_write",
             Self::FooterSync => "footer_sync",
             Self::DirectorySync => "directory_sync",
+            Self::DaemonExit => "daemon_exit",
             Self::FinalizeTimeout => "finalize_timeout",
             Self::MissingDaemonExit => "missing_daemon_exit",
         }
@@ -253,6 +255,14 @@ async fn write_observations(
             }
         },
     };
+    // A closed observation channel only proves that all producers stopped.
+    // Keep a non-zero daemon result visible in the safe footer as well, so a
+    // run cannot look like a clean producer drain with an unexplained failed
+    // native shutdown.  More specific sink/observation errors retain priority
+    // through `fail`'s first-error rule.
+    if daemon_exit_code != super::exit::SUCCESS {
+        fail(&mut first_error, &mut notification, SinkError::DaemonExit);
+    }
     let status = observations.status();
     let drained = observations.finish().is_ok();
     if let Some(error) = status.first_error {
@@ -463,6 +473,14 @@ mod tests {
             assert_eq!(footer["record"], "workspace_observation_footer");
             assert_eq!(footer["daemon_exit_code"], code);
             assert_eq!(footer["complete"], code == 0);
+            assert_eq!(
+                footer["first_error"],
+                if code == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!("daemon_exit")
+                }
+            );
             assert_eq!(footer["producers_closed"], true);
             assert_eq!(footer["drained"], true);
             assert_eq!(footer["written_records"], 0);
