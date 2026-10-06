@@ -25,8 +25,6 @@ struct CanonicalResolve {
     offline_grant: Option<OfflineGrant>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 fn present_grant<'de, D: Deserializer<'de>>(decoder: D) -> Result<Option<OfflineGrant>, D::Error> {
     OfflineGrant::deserialize(decoder).map(Some)
 }
