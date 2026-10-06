@@ -206,7 +206,7 @@ fn bind_directory(dir: &Path, binding: &CacheBinding) -> Result<(), SnapshotErro
     lock.lock().map_err(io_error)?;
     let _guard = AuthorityLock(lock);
     let path = dir.join(AUTHORITY_FILE);
-    match fs::read(&path) {
+    match super::secure_fs::read(&path) {
         Ok(bytes) => {
             let stored: CacheBinding = serde_json::from_slice(&bytes).map_err(|_| {
                 SnapshotError::new(

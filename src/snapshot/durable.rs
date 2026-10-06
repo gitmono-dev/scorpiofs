@@ -45,7 +45,7 @@ use tokio::io::AsyncWriteExt;
 pub use super::cas_index::LocalCasRangeMeters;
 use crate::snapshot::{
     closure::{SnapshotDirectory, ValidatedSnapshotClosure},
-    SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
+    secure_fs, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
 };
 
 trait BorrowedBatch {
@@ -706,7 +706,7 @@ impl DurableStore {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&path).map_err(io_err)?;
+        let bytes = secure_fs::read(&path).map_err(io_err)?;
         let meta = serde_json::from_slice(&bytes).map_err(|e| {
             SnapshotError::new(
                 SnapshotErrorCode::Internal,
@@ -2482,7 +2482,7 @@ impl DurableStore {
         len: usize,
     ) -> Result<Option<Vec<u8>>, SnapshotError> {
         let path = self.blob_path(digest)?;
-        let mut f = match fs::File::open(&path) {
+        let mut f = match secure_fs::open_regular(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(e)),
@@ -2623,7 +2623,7 @@ impl DurableStore {
     pub fn read_blob(&self, digest: &str, expected_size: u64) -> Result<Vec<u8>, SnapshotError> {
         let capacity = buffered_size(expected_size)?;
         let path = self.blob_path(digest)?;
-        let mut input = File::open(&path).map_err(|e| {
+        let mut input = secure_fs::open_regular(&path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 SnapshotError::new(
                     SnapshotErrorCode::PathNotFound,
@@ -2700,7 +2700,7 @@ impl DurableStore {
         // Completion and resume must not collect a potentially 8 TiB CAS
         // object into memory. Read at most one byte beyond its advertised
         // size so growth cannot turn verification into an unbounded stream.
-        let mut input = File::open(&path)
+        let mut input = secure_fs::open_regular(&path)
             .map_err(io_err)?
             .take(expected_size.saturating_add(1));
         let mut hash = Context::new(&SHA256);
@@ -2736,7 +2736,7 @@ impl DurableStore {
     /// rather than a silently smaller set of hydrated files.
     fn read_journal(&self) -> Result<HashMap<String, FileRecord>, SnapshotError> {
         let path = self.root.join(JOURNAL_FILE);
-        let bytes = match fs::read(&path) {
+        let bytes = match secure_fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(io_err(e)),
@@ -3110,7 +3110,7 @@ fn parent_dir(path: &Path) -> &Path {
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SnapshotError> {
-    match fs::read(path) {
+    match secure_fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(io_err(e)),
@@ -3764,6 +3764,29 @@ mod tests {
             .read_blob(&digest, body.len() as u64)
             .expect_err("tampered blob must not be served");
         assert_eq!(err.code, SnapshotErrorCode::DigestMismatch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_blob_rejects_a_final_symlink_even_when_target_matches() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(tmp.path()).unwrap();
+        let body = b"symlink target must not be trusted";
+        let digest = digest_of(body);
+        let blob = store.blob_path(&digest).unwrap();
+        let target = tmp.path().join("outside");
+        std::fs::write(&target, body).unwrap();
+        symlink(&target, &blob).unwrap();
+
+        let err = store
+            .read_blob(&digest, body.len() as u64)
+            .expect_err("CAS reads must not follow a final symlink");
+        assert!(matches!(
+            err.code,
+            SnapshotErrorCode::Internal | SnapshotErrorCode::DigestMismatch
+        ));
     }
 
     #[test]

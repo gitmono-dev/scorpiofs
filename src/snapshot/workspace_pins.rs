@@ -684,7 +684,7 @@ fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>,
         Ok(_) => {}
     }
     let mut bytes = Vec::new();
-    File::open(path)
+    super::secure_fs::open_regular(path)
         .map_err(io_error)?
         .take(16 * 1024 + 1)
         .read_to_end(&mut bytes)

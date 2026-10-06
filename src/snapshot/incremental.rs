@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{
     client::Mst2Client, closure::decode_page, frames::MetadataPageItem, reader::SnapshotPageSource,
-    SnapshotClosureMeters, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
-    ValidatedSnapshotClosure,
+    secure_fs, SnapshotClosureMeters, SnapshotError, SnapshotErrorCode, SnapshotFile,
+    SnapshotReader, ValidatedSnapshotClosure,
 };
 
 /// Local cache-policy revision; bump when the reuse rules change so older
@@ -187,7 +187,7 @@ impl ScopeCache {
         meters: &mut SyncMeters,
     ) -> Result<HashMap<String, ClosureRecord>, SnapshotError> {
         meters.closure_index_reads += 1;
-        let bytes = match fs::read(self.closures_path()) {
+        let bytes = match secure_fs::read(&self.closures_path()) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(io_err(e)),
@@ -282,8 +282,7 @@ impl ScopeCache {
                     })
                     .collect()
             })
-        })
-        .unwrap_or_default();
+        })?;
         Ok(ClosureTransaction {
             _lock: lock,
             records,
@@ -351,8 +350,8 @@ impl ScopeCache {
     }
 
     /// Snapshot ids holding a local pin in this scope.
-    pub fn live_pins(&self) -> Vec<String> {
-        self.try_live_pins().unwrap_or_default()
+    pub fn live_pins(&self) -> Result<Vec<String>, SnapshotError> {
+        self.try_live_pins()
     }
 
     pub fn try_live_pins(&self) -> Result<Vec<String>, SnapshotError> {
@@ -447,7 +446,7 @@ impl ScopeCache {
             Err(_) => return Ok(None),
         };
         let path = self.page_path(&want);
-        let bytes = match fs::read(&path) {
+        let bytes = match secure_fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(e)),
@@ -1219,7 +1218,7 @@ mod tests {
     async fn live_pins_require_a_committed_dependency_audit() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = ScopeCache::open(tmp.path()).unwrap();
-        assert!(cache.live_pins().is_empty());
+        assert!(cache.live_pins().unwrap().is_empty());
         let id = format!("sha256:{}", "ab".repeat(32));
         let view = tmp.path().join(id.trim_start_matches("sha256:"));
         std::fs::create_dir_all(&view).unwrap();
@@ -1229,7 +1228,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            cache.live_pins().is_empty(),
+            cache.live_pins().unwrap().is_empty(),
             "a prepare pin cannot authorize reuse"
         );
         let store =
@@ -1245,10 +1244,10 @@ mod tests {
             .hydrate_with(&meta, &[], |_| async { Ok(Vec::new()) })
             .await
             .unwrap();
-        assert_eq!(cache.live_pins(), vec![id]);
+        assert_eq!(cache.live_pins().unwrap(), vec![id]);
         fs::remove_file(view.join("DURABLE_COMPLETE")).unwrap();
         assert!(
-            cache.live_pins().is_empty(),
+            cache.live_pins().unwrap().is_empty(),
             "an orphan pin cannot authorize reuse"
         );
     }
