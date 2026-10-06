@@ -99,7 +99,8 @@ class WorkerShapeTests(unittest.TestCase):
             valid_status(last_error="IntegrityError: /private/path")))
         self.assertEqual(HYDRATION_SUBSTAGES, {
             "metadata_closure", "cas_resume_audit", "small_object_fetch",
-            "large_content_fetch", "hydration_commit", "snapshot_links",
+            "large_content_fetch", "large_chunk_map", "large_chunk_read",
+            "large_cas_write", "hydration_commit", "snapshot_links",
             "dependency_audit", "hydration_task",
         })
 

@@ -21,6 +21,10 @@ on:
       session_deadline_utc:
         description: Original UTC deadline, exactly start plus 235 minutes
         required: true
+      recover_original_window:
+        type: boolean
+        description: Retry a failed measurement using its original start and deadline
+        default: false
 
 permissions:
   contents: read
@@ -40,6 +44,7 @@ jobs:
       ROUNDS: ${{ inputs.rounds }}
       STARTED_INPUT: ${{ inputs.session_started_utc }}
       DEADLINE_INPUT: ${{ inputs.session_deadline_utc }}
+      RECOVERY_INPUT: ${{ inputs.recover_original_window }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -54,7 +59,10 @@ jobs:
           import os, sys
           sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
           from commit_update_projection import window_anchor
-          anchor = window_anchor(os.environ['STARTED_INPUT'], os.environ['DEADLINE_INPUT'], admission=True)
+          recovery = os.environ.get('RECOVERY_INPUT', 'false')
+          if recovery not in ('false', 'true'):
+              raise ValueError('invalid original-window recovery flag')
+          anchor = window_anchor(os.environ['STARTED_INPUT'], os.environ['DEADLINE_INPUT'], admission=recovery == 'false')
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
               stream.write('MST2_SESSION_STARTED=' + os.environ['STARTED_INPUT'] + '\n')
               stream.write('MST2_SESSION_DEADLINE=' + os.environ['DEADLINE_INPUT'] + '\n')

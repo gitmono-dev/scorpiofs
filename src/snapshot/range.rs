@@ -112,9 +112,10 @@ impl ChunkedFile {
             ));
         }
         reader.ensure_lease().await?;
+        let request_path = super::reader::ScopeRequestPath(path).to_string();
         let map = reader
             .client
-            .chunk_map(reader.snapshot_id(), path, digest)
+            .chunk_map(reader.snapshot_id(), &request_path, digest)
             .await?;
         if map.file_size != size {
             return Err(SnapshotError::new(
@@ -124,7 +125,7 @@ impl ChunkedFile {
         }
         Ok(ChunkedFile {
             reader: reader.clone(),
-            path: path.to_string(),
+            path: request_path,
             digest: digest.to_string(),
             size,
             map,

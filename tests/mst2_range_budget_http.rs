@@ -161,7 +161,7 @@ async fn chunks(
     let items = request["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     let index: u64 = items[0]["chunk_index"].as_str().unwrap().parse().unwrap();
-    assert_eq!(items[0]["path"], "file");
+    assert_eq!(items[0]["path"], "/file");
     assert_eq!(items[0]["map_id"], id(&fixture.map.map_id()));
     assert_eq!(items[0]["expected_digest"], id(&CONTENT));
     fixture.chunk_requests.lock().unwrap().push(index);
