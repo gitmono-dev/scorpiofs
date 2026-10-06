@@ -49,6 +49,36 @@ impl<FS> FencedFilesystem<FS> {
     pub(crate) fn inner(&self) -> &Arc<FS> {
         &self.inner
     }
+
+    /// Await all mounted wrappers and retained native operations before the
+    /// control owner is dropped. The lifecycle caller must keep this inner Arc
+    /// private and expose no Weak capability that could resurrect an owner.
+    pub(crate) async fn wait_for_retired_owners(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        tokio::time::timeout(timeout, async {
+            // get_mut checks actual uniqueness with Acquire synchronization,
+            // including absence of Weak capabilities; a relaxed count alone
+            // cannot publish a waiting RELEASE cancellation's Unknown flag.
+            while Arc::get_mut(&mut self.inner).is_none() {
+                if self.fence.is_uncertain() {
+                    return Err(std::io::Error::other(
+                        "native handle retirement has an unknown outcome",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "native filesystem owners are still retiring",
+            )
+        })?
+    }
 }
 
 struct WaitingCleanup {

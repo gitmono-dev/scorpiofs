@@ -70,10 +70,20 @@ struct Large {
 }
 impl Large {
     fn new() -> Self {
+        Self::with_full_chunks(2)
+    }
+    fn with_full_chunks(full_chunks: u64) -> Self {
         let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
         let mut chunk_sha256 = Vec::new();
-        for index in 0..3 {
-            let bytes = vec![index as u8; if index == 2 { 7 } else { CHUNK_SIZE as usize }];
+        for index in 0..=full_chunks {
+            let bytes = vec![
+                index as u8;
+                if index == full_chunks {
+                    7
+                } else {
+                    CHUNK_SIZE as usize
+                }
+            ];
             digest.update(&bytes);
             chunk_sha256.push(hash(&bytes));
         }
@@ -83,7 +93,7 @@ impl Large {
         };
         let map = ChunkMap::new(
             digest.finish().as_ref().try_into().unwrap(),
-            2 * CHUNK_SIZE as u64 + 7,
+            full_chunks * CHUNK_SIZE as u64 + 7,
             leaf.leaf_hash().unwrap(),
         )
         .unwrap();
@@ -165,8 +175,10 @@ impl Fixture {
             nested_page: None,
         }
     }
-    fn with_large(mut self) -> Self {
-        let large = Large::new();
+    fn with_large(self) -> Self {
+        self.with_large_file(Large::new())
+    }
+    fn with_large_file(mut self, large: Large) -> Self {
         let mut entries: Vec<_> = self
             .bodies
             .iter()
@@ -393,6 +405,15 @@ async fn chunks(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Respon
         .unwrap()
         .parse::<u64>()
         .unwrap();
+    if mode == 11 && index >= 4 {
+        f.release.acquire().await.unwrap().forget();
+    }
+    if mode == 10 && index >= 4 {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("late chunk transport failure"))
+            .unwrap();
+    }
     let bytes = large.bytes(index);
     let mut payload = ChunkPayload {
         map_id: large.map.map_id(),
@@ -413,11 +434,11 @@ async fn chunks(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Respon
         logical_bytes: bytes.len() as u64,
         request_body_sha256: hash(&request),
     };
-    if mode == 2 || mode == 7 && index > 0 {
+    if mode == 2 || mode == 7 && index > 0 || mode == 8 && index >= 4 {
         end.request_body_sha256[0] ^= 1;
     }
     wire.extend(end.encode(53, 1));
-    f.response(&request, wire, mode == 3)
+    f.response(&request, wire, mode == 3 || mode == 9 && index >= 4)
 }
 struct Server {
     reader: SnapshotReader,
