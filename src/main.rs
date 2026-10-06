@@ -30,7 +30,7 @@ struct Cli {
     log_level: Option<String>,
 
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
@@ -143,7 +143,7 @@ async fn main() {
     // local storage or construct a second lifecycle owner.
     let cli = match cli {
         Cli {
-            command: Some(Commands::Workspace { endpoint, action }),
+            command: Commands::Workspace { endpoint, action },
             ..
         } => {
             std::process::exit(cli::workspace_request(&endpoint, action.into_command()).await);
@@ -164,24 +164,24 @@ async fn main() {
     // These commands need neither a loaded config nor logging; handle them
     // before `cli::init` so they work even when the config is missing/invalid.
     match &cli.command {
-        Some(Commands::Completions { shell }) => {
+        Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(*shell, &mut cmd, "scorpio", &mut std::io::stdout());
             return;
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::Init { path, force },
-        }) => {
+        } => {
             std::process::exit(cli::config_init(path, *force));
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::Validate,
-        }) => {
+        } => {
             std::process::exit(cli::config_validate(&cli.config_path, overrides.clone()));
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::InstallerPaths,
-        }) => {
+        } => {
             std::process::exit(cli::config_installer_paths(
                 &cli.config_path,
                 overrides.clone(),
@@ -195,24 +195,16 @@ async fn main() {
     }
 
     let code = match cli.command {
-        None => {
-            // Unconditional (not log-level gated) deprecation note for the
-            // legacy flag-only invocation form.
-            eprintln!(
-                "note: running `scorpio` without a subcommand is deprecated; use `scorpio serve`"
-            );
-            cli::serve(cli.http_addr).await
-        }
-        Some(Commands::Serve) => cli::serve(cli.http_addr).await,
-        Some(Commands::Workspace { .. }) => unreachable!("workspace handled before config init"),
-        Some(Commands::Config {
+        Commands::Serve => cli::serve(cli.http_addr).await,
+        Commands::Workspace { .. } => unreachable!("workspace handled before config init"),
+        Commands::Config {
             action: ConfigAction::Show,
-        }) => cli::config_show(),
-        Some(Commands::Config { .. }) => {
+        } => cli::config_show(),
+        Commands::Config { .. } => {
             unreachable!("config init/validate/installer-paths handled before config init")
         }
-        Some(Commands::Doctor) => doctor::run().await,
-        Some(Commands::Completions { .. }) => unreachable!("handled before config init"),
+        Commands::Doctor => doctor::run().await,
+        Commands::Completions { .. } => unreachable!("handled before config init"),
     };
 
     std::process::exit(code);
