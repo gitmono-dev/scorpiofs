@@ -507,12 +507,24 @@ impl Mst2Client {
                     // Older/plain deployments do not carry the canonical
                     // hints, so retain their bounded status retry policy.
                     let status = resp.status();
-                    let bytes = read_json_bytes(resp, self.response_byte_limit())
-                        .await
-                        .map_err(|mut error| {
+                    let bytes = match read_json_bytes(resp, self.response_byte_limit()).await {
+                        Ok(bytes) => bytes,
+                        Err(_error) if attempt < MAX_ATTEMPTS && retryable_status(status) => {
+                            // A retryable status with a truncated, reset, or
+                            // oversized body cannot be classified safely. Keep
+                            // the bounded legacy status retry so transient
+                            // gateways do not turn a transport read failure
+                            // into a deterministic hydration failure.
+                            tokio::time::timeout_at(deadline, sleep_backoff(attempt))
+                                .await
+                                .map_err(|_| request_deadline())?;
+                            continue;
+                        }
+                        Err(mut error) => {
                             error.http_status = status.as_u16();
-                            error
-                        })?;
+                            return Err(error);
+                        }
+                    };
                     let retryable = super::error_wire::CanonicalSnapshotError::parse_response(
                         &bytes,
                         status.as_u16(),
@@ -1155,6 +1167,34 @@ mod retry_classification_tests {
             .send_retrying(client.http.get(format!("{base}/probe")))
             .await
             .expect("legacy status retry succeeds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(client.retry_count(), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn retryable_status_with_truncated_body_keeps_bounded_status_retry() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base, task) = server(Arc::clone(&requests), |number| {
+            if number == 1 {
+                // The declared length exceeds the bytes delivered. Reqwest
+                // must report a body-read error before any envelope exists.
+                Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header("content-length", "1024")
+                    .body(axum::body::Body::from("truncated"))
+                    .unwrap()
+            } else {
+                StatusCode::NO_CONTENT.into_response()
+            }
+        })
+        .await;
+        let client = Mst2Client::new(base.clone());
+        let response = client
+            .send_retrying(client.http.get(format!("{base}/probe")))
+            .await
+            .expect("retry succeeds after a transient body read failure");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(client.retry_count(), 1);

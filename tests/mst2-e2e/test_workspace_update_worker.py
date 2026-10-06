@@ -376,10 +376,26 @@ class WorkerReceiptTests(unittest.TestCase):
         if marker.exists():
             grandchild = int(marker.read_text())
             for _ in range(100):
-                if not Path(f"/proc/{grandchild}").exists():
+                proc = Path(f"/proc/{grandchild}")
+                if not proc.exists():
+                    break
+                try:
+                    state = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[0]
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                # PID 1 on a hosted/containerized runner may retain an orphan
+                # as a zombie after the owned process group is dead. That is
+                # no longer executable work and is covered by group_members.
+                if state in ("Z", "X"):
                     break
                 time.sleep(.01)
-            self.assertFalse(Path(f"/proc/{grandchild}").exists())
+            proc = Path(f"/proc/{grandchild}")
+            if proc.exists():
+                try:
+                    state = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[0]
+                except (FileNotFoundError, ProcessLookupError):
+                    state = None
+                self.assertIn(state, (None, "Z", "X"))
         self.assertEqual(__import__("commit_update_budget").group_members(anchor_pid, anchor_start), [])
 
     def test_complete_receipt_refuses_active_group_or_mount(self):

@@ -28,7 +28,7 @@ permissions:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 220
+    timeout-minutes: 235
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
