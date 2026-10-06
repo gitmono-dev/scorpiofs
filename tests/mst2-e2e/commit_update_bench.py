@@ -491,7 +491,15 @@ def create_version(repo, round_number, version, smoke, deadline):
                       "GIT_AUTHOR_EMAIL": "benchmark@example.invalid", "GIT_COMMITTER_EMAIL": "benchmark@example.invalid"})
     if version == "v1":
         git(repo, deadline, "read-tree", "--empty")
-        modules, buckets, files, size = (8, 1, 8, 1024) if smoke else (64, 8, 32, 16384)
+        if smoke:
+            modules, buckets, files, size = 8, 1, 8, 1024
+        else:
+            # Keep medium large enough to exercise metadata fan-out, retained
+            # views, and the Git oracle while staying practical for the shared
+            # four-hour cloud budget.  This is 1,024 generated files (about
+            # 8 MiB) plus the wide-directory and large-file probes below;
+            # m001 and m007 remain present for the v3 rename and alias checks.
+            modules, buckets, files, size = 16, 4, 16, 8192
         for module in range(modules):
             for bucket in range(buckets):
                 directory = repo / prefix / f"m{module:03}" / f"d{bucket:02}"
