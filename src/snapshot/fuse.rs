@@ -1486,13 +1486,6 @@ impl Filesystem for Mst2Fuse {
             Node::File(_) => return Err(Errno::from(libc::EINVAL)),
             Node::Dir(_) => return Err(Errno::from(libc::EINVAL)),
         };
-        if let Some(store) = &self.store {
-            if let Ok(target) = store.read_blob(&f.digest, f.size) {
-                return Ok(ReplyData {
-                    data: Bytes::from(target),
-                });
-            }
-        }
         if let Some(reader) = self.owned_reader() {
             return self.read_owned(reader, inode, &f, 0, f.size).await;
         }
