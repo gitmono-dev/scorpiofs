@@ -28,6 +28,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
+    future::Future,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -1077,6 +1078,10 @@ impl DurableStore {
         B: AsRef<[u8]> + Send + Sync + 'static,
     {
         let view = self.snapshot_view(reader, closure).await?;
+        // Large-file streaming uses the owned range reader below. Seed the
+        // already authenticated closure so each range does not reacquire the
+        // complete metadata graph through content_member().
+        reader.seed_content_membership(closure)?;
         self.hydrate_concurrent_closure(
             &view,
             closure.files(),
@@ -1397,6 +1402,9 @@ impl DurableStore {
         BLarge: AsRef<[u8]> + Send + Sync + 'static,
     {
         let view = self.snapshot_view(reader, closure).await?;
+        // The owned large-file lane validates against this fixed closure;
+        // avoid a second snapshot_closure() acquisition on its first range.
+        reader.seed_content_membership(closure)?;
         self.hydrate_batches_closure(
             &view,
             closure.files(),
@@ -2716,9 +2724,44 @@ async fn write_reader_blob(
     reader: &SnapshotReader,
     file: &SnapshotFile,
 ) -> Result<(), SnapshotError> {
+    // Keep canonical v3 hydration on the owned range implementation. The
+    // previous compatibility `ChunkedFile` reader returned a fresh Vec for
+    // every chunk, bypassing the reader's output budget and retaining no proof
+    // ownership across the write. Legacy advertisements may expose chunk
+    // reads without metadata/pages, so retain their established reader until
+    // that protocol profile is retired.
+    if reader.capabilities().features.metadata_pages {
+        let source = crate::snapshot::OwnedChunkedFile::open(
+            reader,
+            &file.rel_path,
+            &file.content_digest,
+            file.size,
+        )
+        .await?;
+        return write_reader_blob_stream(dir, file, |offset, length| {
+            source.read_range_owned(offset, length)
+        })
+        .await;
+    }
     let source =
         crate::snapshot::ChunkedFile::open(reader, &file.rel_path, &file.content_digest, file.size)
             .await?;
+    write_reader_blob_stream(dir, file, |offset, length| {
+        source.read_range(offset, length)
+    })
+    .await
+}
+
+async fn write_reader_blob_stream<F, Fut, B>(
+    dir: &Path,
+    file: &SnapshotFile,
+    mut read_range: F,
+) -> Result<(), SnapshotError>
+where
+    F: FnMut(u64, u64) -> Fut,
+    Fut: Future<Output = Result<B, SnapshotError>>,
+    B: BlobBytes,
+{
     create_dirs_durable(dir)?;
     let name = blob_name(&file.content_digest);
     let temporary_path = dir.join(format!(
@@ -2737,14 +2780,15 @@ async fn write_reader_blob(
     let mut offset = 0;
     while offset < file.size {
         let length = (file.size - offset).min(mst2_codec::chunkmap::CHUNK_SIZE as u64);
-        let bytes = source.read_range(offset, length).await?;
-        if bytes.len() as u64 != length {
+        let bytes = read_range(offset, length).await?;
+        if bytes.bytes().len() as u64 != length {
             return Err(integrity_err(
                 "streamed chunk does not cover the expected file range",
             ));
         }
-        hash.update(&bytes);
-        output.write_all(&bytes).await.map_err(io_err)?;
+        let bytes = bytes.bytes();
+        hash.update(bytes);
+        output.write_all(bytes).await.map_err(io_err)?;
         offset += length;
     }
     if format!("sha256:{}", hex::encode(hash.finish().as_ref())) != file.content_digest {
@@ -2762,6 +2806,26 @@ async fn write_reader_blob(
     drop(output);
     fs::rename(&temporary.0, dir.join(name)).map_err(io_err)?;
     sync_dir(dir)
+}
+
+/// Borrow the streamed body while keeping an owned range reservation alive.
+/// `Arc<VerifiedRange>` cannot implement `AsRef<[u8]>` through the standard
+/// library's `AsRef<T>` implementation, so the private adapter keeps the
+/// generic writer independent of the two source reader representations.
+trait BlobBytes {
+    fn bytes(&self) -> &[u8];
+}
+
+impl BlobBytes for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl BlobBytes for Arc<crate::snapshot::VerifiedRange> {
+    fn bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
 }
 
 struct PendingBlob(PathBuf);
