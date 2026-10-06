@@ -14,7 +14,7 @@ set -e
 is_serve=1
 for arg in "$@"; do
     case "$arg" in
-    mount | umount | list | http-mount | config | doctor | completions | help | -h | --help | -V | --version)
+    workspace | config | doctor | completions | help | -h | --help | -V | --version)
         is_serve=0
         break
         ;;

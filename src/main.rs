@@ -4,10 +4,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use scorpiofs::{cli, doctor};
 
-/// Scorpio: FUSE-based virtual filesystem with an Antares build overlay.
-///
-/// With no subcommand, `scorpio` runs the workspace daemon (`serve`), preserving
-/// backward compatibility with `scorpio -c <cfg> --http-addr <addr>`.
+/// Scorpio: fixed snapshot workspaces with private writable layers.
 #[derive(Parser, Debug)]
 #[command(name = "scorpio", author, version, about, long_about = None)]
 struct Cli {
@@ -15,7 +12,7 @@ struct Cli {
     #[arg(short, long, default_value = "scorpio.toml", global = true)]
     config_path: String,
 
-    /// HTTP bind address for the workspace daemon (Antares API lives under /antares/*).
+    /// HTTP bind address for the v3 workspace daemon.
     #[arg(long, default_value = "0.0.0.0:2725", global = true)]
     http_addr: SocketAddr,
 
@@ -74,6 +71,14 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:2725/antares")]
         endpoint: String,
     },
+    /// Control workspaces through the daemon that owns their mounts.
+    Workspace {
+        /// Daemon base URL.
+        #[arg(long, default_value = "http://127.0.0.1:2725", global = true)]
+        endpoint: String,
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     /// Inspect or validate configuration.
     Config {
         #[command(subcommand)]
@@ -86,6 +91,93 @@ enum Commands {
         /// Target shell.
         shell: Shell,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceAction {
+    /// Create a new workspace; the previous workspace stays fixed.
+    Create {
+        /// Canonical monorepo scope, such as /project.
+        scope: String,
+        /// Fixed namespace view ID. Omit to resolve latest once.
+        #[arg(long)]
+        view_id: Option<String>,
+        /// Start full hydration in the background.
+        #[arg(long)]
+        full: bool,
+    },
+    /// List workspaces owned by the daemon.
+    List,
+    /// Observe mount, hydration, dirty, lease and local-pin state.
+    Status { id: String },
+    /// Hydrate the existing fixed snapshot.
+    Hydrate { id: String },
+    /// Cancel and join the workspace's hydration task.
+    CancelHydrate { id: String },
+    /// Release this workspace's local pin.
+    ReleaseLocalPin { id: String },
+    /// Destroy a workspace. Dirty contents are preserved by default.
+    Destroy {
+        id: String,
+        /// Explicitly discard dirty upper contents.
+        #[arg(long)]
+        discard_dirty: bool,
+    },
+}
+
+impl WorkspaceAction {
+    fn into_command(self) -> cli::WorkspaceCommand {
+        match self {
+            Self::Create {
+                scope,
+                view_id,
+                full,
+            } => cli::WorkspaceCommand::Create {
+                scope,
+                view_id,
+                full,
+            },
+            Self::List => cli::WorkspaceCommand::List,
+            Self::Status { id } => cli::WorkspaceCommand::Status { id },
+            Self::Hydrate { id } => cli::WorkspaceCommand::Hydrate { id },
+            Self::CancelHydrate { id } => cli::WorkspaceCommand::CancelHydrate { id },
+            Self::ReleaseLocalPin { id } => cli::WorkspaceCommand::ReleaseLocalPin { id },
+            Self::Destroy { id, discard_dirty } => {
+                cli::WorkspaceCommand::Destroy { id, discard_dirty }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_commands_and_path_flags_remain_accepted_alongside_workspace_commands() {
+        for args in [
+            vec!["scorpio", "mount", "job", "--cl", "change"],
+            vec!["scorpio", "umount", "job"],
+            vec!["scorpio", "list"],
+            vec!["scorpio", "http-mount", "/project", "--job-id", "job"],
+            vec![
+                "scorpio",
+                "--upper-root",
+                "/tmp/upper",
+                "--cl-root",
+                "/tmp/cl",
+                "--mount-root",
+                "/tmp/mounts",
+                "--state-file",
+                "/tmp/state",
+                "list",
+            ],
+            vec!["scorpio", "workspace", "list"],
+            vec!["scorpio", "serve"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,6 +204,17 @@ enum ConfigAction {
 async fn main() {
     let cli = Cli::parse();
 
+    // Workspace clients require only the daemon URL. They must not initialize
+    // local storage or construct a second lifecycle owner.
+    let cli = match cli {
+        Cli {
+            command: Some(Commands::Workspace { endpoint, action }),
+            ..
+        } => {
+            std::process::exit(cli::workspace_request(&endpoint, action.into_command()).await);
+        }
+        cli => cli,
+    };
     let overrides = cli::antares_overrides(
         cli.upper_root.clone(),
         cli.cl_root.clone(),
@@ -171,6 +274,7 @@ async fn main() {
             cl,
             endpoint,
         }) => cli::http_mount(job_id.as_deref(), &path, cl.as_deref(), &endpoint).await,
+        Some(Commands::Workspace { .. }) => unreachable!("workspace handled before config init"),
         Some(Commands::Config {
             action: ConfigAction::Show,
         }) => cli::config_show(),

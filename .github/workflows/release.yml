@@ -56,14 +56,14 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin scorpio --bin antares
+        run: cargo build --release --locked --target ${{ matrix.target }} --bins
 
       - name: Build (cross)
         if: matrix.cross
         env:
           OPENSSL_STATIC: "1"
           OPENSSL_VENDORED: "1"
-        run: cross build --release --locked --target ${{ matrix.target }} --bin scorpio --bin antares
+        run: cross build --release --locked --target ${{ matrix.target }} --bins
 
       - name: Package tarball + checksum
         run: |
