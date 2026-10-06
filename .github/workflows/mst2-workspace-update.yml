@@ -132,3 +132,48 @@ jobs:
             python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --cleanup --run-root "$MST2_OWNED_ROOT" \
               --session-deadline-utc "$MST2_SESSION_DEADLINE" --rounds "$ROUNDS"
           fi
+
+      - name: Stage safe benchmark evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe="$RUNNER_TEMP/mst2-safe-evidence"
+          rm -rf -- "$safe"
+          install -d -m 700 "$safe"
+          printf '{"run_id":"%s","attempt":"%s","scorpio_sha":"%s","mega_sha":"%s","profile":"%s","rounds":%s}\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SCORPIO_SHA" "$MEGA_SHA" "$PROFILE" "$ROUNDS" \
+            > "$safe/run.json"
+          owned_root="${MST2_OWNED_ROOT:-}"
+          root="$owned_root/measurements"
+          if test -f "$owned_root/failure.json" && test ! -L "$owned_root/failure.json"; then
+            cp --no-preserve=mode,ownership --no-target-directory -- "$owned_root/failure.json" "$safe/failure.json"
+            chmod 600 "$safe/failure.json"
+          fi
+          if test -d "$root"; then
+            while IFS= read -r -d '' source; do
+              relative="${source#"$root"/}"
+              target="$safe/measurements/$relative"
+              case "$relative" in
+                */service.toml|*/dependencies.json|*/token*|*/service-private.log|*/scorpio-private.log) continue ;;
+              esac
+              case "$relative" in
+                measurements.jsonl|workspace-observation.jsonl|failure.json|*/measurements.jsonl|*/workspace-observation.jsonl|*/failure.json|*/owned-workspace-daemon.json|*/owned-workspace-worker.json)
+                  install -d -m 700 "$(dirname "$target")"
+                  test -f "$source" && test ! -L "$source"
+                  cp --no-preserve=mode,ownership --no-target-directory -- "$source" "$target"
+                  chmod 600 "$target"
+                  ;;
+              esac
+            done < <(find "$root" -type f -print0)
+          fi
+          find "$safe" -type f -printf '%P\n' | sort
+
+      - name: Upload safe benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mst2-v3-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mst2-safe-evidence
+          if-no-files-found: error
+          retention-days: 7

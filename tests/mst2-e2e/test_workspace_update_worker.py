@@ -40,6 +40,13 @@ def valid_status(**changes):
 
 
 class WorkerShapeTests(unittest.TestCase):
+    def test_worker_error_codes_are_fixed_and_status_values_are_not_embedded(self):
+        status = WorkerError("worker HTTP status 503 was not accepted")
+        self.assertEqual(status.error_code, "worker_http_status_rejected")
+        self.assertNotIn("503", status.error_code)
+        self.assertEqual(WorkerError("daemon leaked token", error_code="token").error_code,
+                         "worker_error")
+
     def test_status_requires_exact_wire_shape_and_canonical_identity(self):
         self.assertEqual(set(_status(valid_status())), STATUS_FIELDS)
         for key, value in (("metadata_ready", 1), ("snapshot_id", "sha256:" + "A" * 64),

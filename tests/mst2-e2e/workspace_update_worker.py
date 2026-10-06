@@ -46,6 +46,84 @@ COMMAND_OUTPUT_LIMIT = 8 * 1024 * 1024
 DIRTY_SENTINEL = ".scorpiofs-worker-dirty-upper-sentinel"
 DIRTY_BYTES = b"workspace-v3-worker-dirty-upper\n"
 
+# Worker failures cross a CI boundary.  Keep this vocabulary closed so that
+# a status code, path, response body, or an exception supplied by a daemon can
+# never become part of the machine-readable failure record.
+WORKER_ERROR = "worker_error"
+WORKER_ERROR_CODES = frozenset({
+    WORKER_ERROR,
+    "worker_input_invalid",
+    "worker_http_request_too_large",
+    "worker_http_redirect_rejected",
+    "worker_http_body_too_large",
+    "worker_http_content_length_invalid",
+    "worker_http_body_truncated",
+    "worker_http_status_rejected",
+    "worker_http_response_invalid",
+    "worker_http_request_failed",
+    "worker_json_invalid",
+    "workspace_status_invalid",
+    "workspace_mount_invalid",
+    "workspace_identity_invalid",
+    "workspace_oracle_failed",
+    "worker_process_invalid",
+    "worker_command_failed",
+    "worker_receipt_invalid",
+    "worker_cleanup_invalid",
+    "git_baseline_invalid",
+})
+
+
+def _message_error_code(message):
+    """Map only known message shapes to a closed, non-sensitive code."""
+    if type(message) is not str:
+        return WORKER_ERROR
+    if message.startswith("worker HTTP request is too large"):
+        return "worker_http_request_too_large"
+    if message.startswith("worker HTTP redirects are rejected"):
+        return "worker_http_redirect_rejected"
+    if message.startswith("worker HTTP body is too large"):
+        return "worker_http_body_too_large"
+    if message.startswith("worker HTTP content length is invalid"):
+        return "worker_http_content_length_invalid"
+    if message.startswith("worker HTTP body length is truncated"):
+        return "worker_http_body_truncated"
+    if message.startswith("worker HTTP status "):
+        return "worker_http_status_rejected"
+    if message.startswith("worker HTTP response is not JSON"):
+        return "worker_http_response_invalid"
+    if message.startswith("worker HTTP no-content response has a body"):
+        return "worker_http_response_invalid"
+    if message.startswith("worker HTTP request failed"):
+        return "worker_http_request_failed"
+    if message.startswith("HTTP JSON body is invalid") or message.startswith("invalid JSON constant"):
+        return "worker_json_invalid"
+    if message.startswith("worker anchor JSON body is invalid"):
+        return "worker_json_invalid"
+    if message.startswith("invalid "):
+        return "worker_input_invalid"
+    if message.startswith("workspace status ") or message.startswith("workspace snapshot id "):
+        return "workspace_status_invalid"
+    if message.startswith("workspace mountpoint "):
+        return "workspace_mount_invalid"
+    if message.startswith("workspace identity ") or message.startswith("workspace create "):
+        return "workspace_identity_invalid"
+    if message.startswith("workspace oracle failed"):
+        return "workspace_oracle_failed"
+    if message.startswith("oracle ") or message.startswith("expected manifest "):
+        return "workspace_oracle_failed"
+    if message.startswith("worker process-group ") or message.startswith("worker anchor "):
+        return "worker_process_invalid"
+    if message.startswith("owned command ") or message.startswith("worker command "):
+        return "worker_command_failed"
+    if message.startswith("worker receipt ") or message.startswith("worker roots "):
+        return "worker_receipt_invalid"
+    if message.startswith("worker cleanup ") or message.startswith("worker has no bound"):
+        return "worker_cleanup_invalid"
+    if message.startswith("Git "):
+        return "git_baseline_invalid"
+    return WORKER_ERROR
+
 
 def _owned_mounts(root):
     if sys.platform != "linux":
@@ -57,7 +135,17 @@ def _owned_mounts(root):
 
 
 class WorkerError(RuntimeError):
-    """Closed diagnostics for a failed worker operation."""
+    """Closed diagnostics for a failed worker operation.
+
+    ``str(error)`` remains useful to local callers, but only ``error_code`` is
+    allowed to cross into CI evidence.  Unknown or caller-supplied codes are
+    reduced to the fixed ``worker_error`` fallback.
+    """
+
+    def __init__(self, message="", error_code=None):
+        inferred = _message_error_code(message) if error_code is None else error_code
+        self.error_code = inferred if inferred in WORKER_ERROR_CODES else WORKER_ERROR
+        super().__init__(message)
 
 
 def _check_deadline(deadline):

@@ -31,6 +31,27 @@ except ModuleNotFoundError:
     from pip._vendor import tomli as tomllib
 
 
+# Duplicated deliberately at this boundary: the benchmark must remain able
+# to serialize a safe record even when the worker module failed to import.
+# Unknown values are discarded rather than copied from an exception object.
+SAFE_WORKER_ERROR_CODES = frozenset({
+    "worker_error", "worker_input_invalid", "worker_http_request_too_large",
+    "worker_http_redirect_rejected", "worker_http_body_too_large",
+    "worker_http_content_length_invalid", "worker_http_body_truncated",
+    "worker_http_status_rejected", "worker_http_response_invalid",
+    "worker_http_request_failed", "worker_json_invalid",
+    "workspace_status_invalid", "workspace_mount_invalid",
+    "workspace_identity_invalid", "workspace_oracle_failed",
+    "worker_process_invalid", "worker_command_failed",
+    "worker_receipt_invalid", "worker_cleanup_invalid", "git_baseline_invalid",
+})
+
+
+def _safe_worker_error_code(error):
+    code = getattr(error, "error_code", None)
+    return code if code in SAFE_WORKER_ERROR_CODES else None
+
+
 IDENTITY_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL search_path = public;
 SELECT json_agg(row_to_json(x)) FROM (
@@ -83,6 +104,10 @@ class PhaseFailure(AssertionError):
         self.phase = phase
         self.failure_type = type(error).__name__
         self.details = error.details if isinstance(error, CommandFailure) else {}
+        # WorkerError exposes only a closed, non-sensitive code.  Keep this
+        # separate from ``details`` so existing CommandFailure records remain
+        # byte-for-byte compatible.
+        self.error_code = _safe_worker_error_code(error)
         super().__init__(phase + " failed")
 
 
@@ -100,9 +125,15 @@ def failure_record(error):
     record = {"execution_failed": True, "error_type": type(error).__name__}
     if isinstance(error, PhaseFailure):
         record.update(error_type=error.failure_type, phase=error.phase)
+        if error.error_code is not None:
+            record["error_code"] = error.error_code
         record.update(error.details)
     elif isinstance(error, CommandFailure):
         record.update(error.details)
+    else:
+        code = _safe_worker_error_code(error)
+        if code is not None:
+            record["error_code"] = code
     return record
 
 

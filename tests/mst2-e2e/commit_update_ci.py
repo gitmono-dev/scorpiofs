@@ -297,6 +297,47 @@ def graceful_owned(root, project, deadline, process):
     state_path.write_text(json.dumps(state))
 
 
+def persist_failure_record(run_root, error):
+    """Persist a closed failure record without touching private diagnostics.
+
+    The benchmark measurements directory is preferred once it exists.  Early
+    setup failures fall back to the owned run root so the workflow can collect
+    one small, safe artifact even when the measurement directory was never
+    created.  Refuse symlinks and use ``O_NOFOLLOW`` for the final file.
+    """
+    record = bench.failure_record(error)
+    root = Path(run_root)
+    try:
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            return
+        measurements = root / "measurements"
+        if (measurements.exists() and measurements.is_dir()
+                and not measurements.is_symlink()):
+            parent = measurements
+        else:
+            parent = root
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if parent.is_symlink() or not parent.is_dir():
+            return
+        target = parent / "failure.json"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(target), flags, 0o600)
+        try:
+            payload = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=True).encode("ascii")
+            view = memoryview(payload + b"\n")
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    return
+                view = view[written:]
+        finally:
+            os.close(fd)
+    except (OSError, TypeError, ValueError):
+        # Reporting must never hide the original benchmark failure.
+        return
+
+
 def execute(options):
     root, project = hosted_root(options.run_root)
     if root.exists():
@@ -483,5 +524,6 @@ if __name__ == "__main__":
             signal.signal(signal.SIGTERM, interrupted)
             execute(opts)
     except (Exception, KeyboardInterrupt) as error:
+        persist_failure_record(opts.run_root, error)
         print(json.dumps(bench.failure_record(error)), file=sys.stderr)
         raise SystemExit(1)
