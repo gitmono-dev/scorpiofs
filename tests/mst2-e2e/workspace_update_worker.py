@@ -38,6 +38,10 @@ SID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 POLL_SECONDS = 0.025
 HTTP_BODY_LIMIT = 2 * 1024 * 1024
+# HTTP responses stay bounded at HTTP_BODY_LIMIT.  The medium fixture's
+# canonical expected namespace is a local evidence file and is intentionally
+# allowed to be larger so the complete oracle remains one fixed manifest.
+ORACLE_MANIFEST_LIMIT = 16 * 1024 * 1024
 COMMAND_OUTPUT_LIMIT = 8 * 1024 * 1024
 DIRTY_SENTINEL = ".scorpiofs-worker-dirty-upper-sentinel"
 DIRTY_BYTES = b"workspace-v3-worker-dirty-upper\n"
@@ -59,6 +63,15 @@ class WorkerError(RuntimeError):
 def _check_deadline(deadline):
     if type(deadline) not in (int, float) or time.monotonic() >= deadline:
         raise TimeoutError("workspace update exceeded its absolute operation deadline")
+
+
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while recording owned evidence")
+        view = view[written:]
 
 
 def _canonical_uuid(value, label):
@@ -342,6 +355,7 @@ class WorkerSession:
         self._git_fetched = False
         self._git_index = 0
         self._oracle_index = 0
+        self._expected_path = None
         self._workspace_ids = []
         self._views = []
         self._git_worktrees = []
@@ -384,7 +398,7 @@ class WorkerSession:
             else:
                 os.chmod(self.receipt_path, 0o600)
             raw = json.dumps(payload, separators=(",", ":")).encode("ascii")
-            os.write(fd, raw)
+            _write_all(fd, raw)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -564,7 +578,7 @@ class WorkerSession:
         if path.is_symlink() or not path.is_file():
             raise WorkerError("expected manifest is not a regular file")
         raw = path.read_bytes()
-        if len(raw) > HTTP_BODY_LIMIT:
+        if len(raw) > ORACLE_MANIFEST_LIMIT:
             raise WorkerError("expected manifest is too large")
         try:
             value = json.loads(raw.decode("utf-8"), object_pairs_hook=_json_pairs)
@@ -575,9 +589,11 @@ class WorkerSession:
         # directory_sets performs the complete canonical-path check.
         from workspace_update_oracle import directory_sets
         directory_sets(value)
+        self._expected_digest = hashlib.sha256(raw).hexdigest()
         return value
 
-    def _oracle(self, root, expected, deadline, *, git_checkout=False):
+    def _oracle(self, root, expected, deadline, *, git_checkout=False, manifest_path=None,
+                manifest_digest=None):
         """Run the complete filesystem oracle through the owned anchor.
 
         The anchor's session/group is already fenced by ``_owned_command``.
@@ -586,26 +602,42 @@ class WorkerSession:
         absolute deadline and can terminate the entire anchor group.
         """
         _check_deadline(deadline)
-        self._oracle_index += 1
-        path = self.root / f".workspace-oracle-{self._oracle_index:04d}.json"
-        if path.exists() or path.is_symlink():
-            raise WorkerError("oracle manifest path already exists")
-        raw = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        if len(raw) > HTTP_BODY_LIMIT:
-            raise WorkerError("oracle manifest is too large")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags, 0o600)
-        try:
-            os.write(fd, raw)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        created = manifest_path is None
+        if created:
+            self._oracle_index += 1
+            path = self.root / f".workspace-oracle-{self._oracle_index:04d}.json"
+            if path.exists() or path.is_symlink():
+                raise WorkerError("oracle manifest path already exists")
+            raw = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if len(raw) > ORACLE_MANIFEST_LIMIT:
+                raise WorkerError("oracle manifest is too large")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags, 0o600)
+            try:
+                _write_all(fd, raw)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        else:
+            path = Path(manifest_path)
+            if path.is_symlink() or not path.is_file():
+                raise WorkerError("oracle manifest path is not a regular file")
+            path = path.resolve(strict=True)
+            raw = path.read_bytes()
+            if len(raw) > ORACLE_MANIFEST_LIMIT:
+                raise WorkerError("oracle manifest is too large")
+        if manifest_digest is None:
+            manifest_digest = hashlib.sha256(raw).hexdigest()
+        if type(manifest_digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", manifest_digest):
+            raise WorkerError("oracle manifest digest is invalid")
         code = (
-            "import json,sys\n"
+            "import hashlib,json,sys\n"
             "from pathlib import Path\n"
             "from workspace_update_oracle import verify_workspace\n"
             "try:\n"
-            " p=Path(sys.argv[1]); expected=json.loads(p.read_text(encoding='utf-8'))\n"
+            " p=Path(sys.argv[1]); raw=p.read_bytes()\n"
+            " if hashlib.sha256(raw).hexdigest()!=sys.argv[5]: raise RuntimeError('oracle manifest changed')\n"
+            " expected=json.loads(raw.decode('utf-8'))\n"
             " value=verify_workspace(sys.argv[2],expected,float(sys.argv[3]),git_checkout=sys.argv[4]=='1')\n"
             " print(json.dumps({'ok':True,'result':value},separators=(',',':')),flush=True)\n"
             "except BaseException as error:\n"
@@ -618,7 +650,7 @@ class WorkerSession:
         try:
             output = self._owned_command(
                 [sys.executable, "-c", code, str(path), str(root), str(deadline),
-                 "1" if git_checkout else "0"], deadline, env=env)
+                 "1" if git_checkout else "0", manifest_digest], deadline, env=env)
             response = _decode_anchor_json(output.rstrip(b"\n"))
             if type(response) is not dict or type(response.get("ok")) is not bool:
                 raise WorkerError("isolated oracle response shape is invalid")
@@ -631,10 +663,11 @@ class WorkerSession:
                 raise WorkerError("isolated oracle result shape is invalid")
             return result
         finally:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+            if created:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _create_workspace(self, deadline):
         raw = self.http.request("POST", "/v3/workspaces", deadline,
@@ -716,7 +749,7 @@ class WorkerSession:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         fd = os.open(sentinel, flags, 0o600)
         try:
-            os.write(fd, DIRTY_BYTES)
+            _write_all(fd, DIRTY_BYTES)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -762,7 +795,8 @@ class WorkerSession:
         mount = self._assert_status_path(status)
         mount_identity = _mount_record(mount, self.daemon_uid)
         verify_start = time.monotonic()
-        oracle = self._oracle(mount, expected, deadline)
+        oracle = self._oracle(mount, expected, deadline, manifest_path=self._expected_path,
+                              manifest_digest=self._expected_digest)
         verified_ms = (time.monotonic() - started) * 1000
         verification_endpoint_ms = (time.monotonic() - verify_start) * 1000
         # Retain the just-verified view before auditing earlier views. The
@@ -809,7 +843,9 @@ class WorkerSession:
         self._git(deadline, "--git-dir", str(self.git_store), "worktree", "add", "--detach",
                   str(path), commit)
         self._git_worktrees.append(path)
-        oracle = self._oracle(path, expected, deadline, git_checkout=True)
+        oracle = self._oracle(path, expected, deadline, git_checkout=True,
+                              manifest_path=self._expected_path,
+                              manifest_digest=self._expected_digest)
         verified_ms = (time.monotonic() - git_start) * 1000
         return {"commit": commit, "worktree": str(path), "fetch_ms": fetch_ms,
                 "verified_ms": verified_ms, "side_total_ms": verified_ms,
@@ -822,6 +858,7 @@ class WorkerSession:
             raise ValueError("invalid measurement side order")
         _check_deadline(deadline)
         expected = self._load_expected(expected_path)
+        self._expected_path = Path(expected_path).resolve(strict=True)
         if type(version) is not str or not version or type(round_number) is not int:
             raise ValueError("measurement labels are invalid")
         results = {}

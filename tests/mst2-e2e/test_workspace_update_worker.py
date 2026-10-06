@@ -10,6 +10,8 @@ from unittest import mock
 import uuid
 
 from workspace_update_worker import (
+    HTTP_BODY_LIMIT,
+    ORACLE_MANIFEST_LIMIT,
     STATUS_FIELDS,
     WorkerError,
     WorkerSession,
@@ -80,6 +82,18 @@ class WorkerReceiptTests(unittest.TestCase):
                                daemon_uid=os.getuid() if hasattr(os, "getuid") else 0)
         self.workers.append(worker)
         return worker
+
+    def test_medium_manifest_uses_local_oracle_budget(self):
+        worker = self.worker()
+        files = [{"rel_path": f"file-{index:06d}", "fs_kind": "regular", "size": 0,
+                  "content_digest": "sha256:" + "0" * 64} for index in range(40000)]
+        expected = {"files": files, "directories": [""]}
+        path = self.root / "medium-expected.json"
+        raw = json.dumps(expected, separators=(",", ":")).encode("utf-8")
+        self.assertGreater(len(raw), HTTP_BODY_LIMIT)
+        self.assertLess(len(raw), ORACLE_MANIFEST_LIMIT)
+        path.write_bytes(raw)
+        self.assertEqual(len(worker._load_expected(path)["files"]), len(files))
 
     def test_pending_receipt_is_written_before_any_child(self):
         worker = self.worker()
