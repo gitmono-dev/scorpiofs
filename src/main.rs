@@ -12,6 +12,14 @@ struct Cli {
     #[arg(short, long, default_value = "scorpio.toml", global = true)]
     config_path: String,
 
+    /// MST/2 snapshot service base URL. Overrides SCORPIO_MST2_BASE_URL and config.
+    #[arg(long, global = true)]
+    mst2_base_url: Option<String>,
+
+    /// Persistent store root. Workspace and cache roots derive from this path.
+    #[arg(long, global = true)]
+    store_path: Option<String>,
+
     /// HTTP bind address for the v3 workspace daemon.
     #[arg(long, default_value = "0.0.0.0:2725", global = true)]
     http_addr: SocketAddr,
@@ -21,16 +29,8 @@ struct Cli {
     #[arg(long, global = true)]
     log_level: Option<String>,
 
-    /// Override the MST/2 service URL for this invocation.
-    #[arg(long, global = true)]
-    mst2_base_url: Option<String>,
-
-    /// Override the v3 workspace store path for this invocation.
-    #[arg(long, global = true)]
-    store_path: Option<String>,
-
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
@@ -150,7 +150,7 @@ async fn main() {
     // local storage or construct a second lifecycle owner.
     let cli = match cli {
         Cli {
-            command: Some(Commands::Workspace { endpoint, action }),
+            command: Commands::Workspace { endpoint, action },
             ..
         } => {
             std::process::exit(cli::workspace_request(&endpoint, action.into_command()).await);
@@ -158,34 +158,37 @@ async fn main() {
         cli => cli,
     };
     let mut overrides = HashMap::new();
-    if let Some(value) = &cli.mst2_base_url {
-        overrides.insert("mst2_base_url".to_owned(), value.clone());
-    }
-    if let Some(value) = &cli.store_path {
-        overrides.insert("store_path".to_owned(), value.clone());
+    for (key, value) in [
+        ("mst2_base_url", &cli.mst2_base_url),
+        ("store_path", &cli.store_path),
+        ("log_level", &cli.log_level),
+    ] {
+        if let Some(value) = value {
+            overrides.insert(key.into(), value.clone());
+        }
     }
 
     // These commands need neither a loaded config nor logging; handle them
     // before `cli::init` so they work even when the config is missing/invalid.
     match &cli.command {
-        Some(Commands::Completions { shell }) => {
+        Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(*shell, &mut cmd, "scorpio", &mut std::io::stdout());
             return;
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::Init { path, force },
-        }) => {
+        } => {
             std::process::exit(cli::config_init(path, *force));
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::Validate,
-        }) => {
+        } => {
             std::process::exit(cli::config_validate(&cli.config_path, overrides.clone()));
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::InstallerPaths,
-        }) => {
+        } => {
             std::process::exit(cli::config_installer_paths(
                 &cli.config_path,
                 overrides.clone(),
@@ -199,32 +202,24 @@ async fn main() {
     }
 
     let code = match cli.command {
-        None => {
-            // Unconditional (not log-level gated) deprecation note for the
-            // legacy flag-only invocation form.
-            eprintln!(
-                "note: running `scorpio` without a subcommand is deprecated; use `scorpio serve`"
-            );
-            cli::serve(cli.http_addr).await
-        }
-        Some(Commands::Serve {
+        Commands::Serve {
             workspace_observation_jsonl,
             workspace_observation_run_id,
-        }) => {
+        } => {
             let observation = workspace_observation_jsonl
                 .zip(workspace_observation_run_id)
                 .map(|(path, run_id)| cli::ObservationFileOptions { path, run_id });
             cli::serve_with_observation(cli.http_addr, observation).await
         }
-        Some(Commands::Workspace { .. }) => unreachable!("workspace handled before config init"),
-        Some(Commands::Config {
+        Commands::Workspace { .. } => unreachable!("workspace handled before config init"),
+        Commands::Config {
             action: ConfigAction::Show,
-        }) => cli::config_show(),
-        Some(Commands::Config { .. }) => {
+        } => cli::config_show(),
+        Commands::Config { .. } => {
             unreachable!("config init/validate/installer-paths handled before config init")
         }
-        Some(Commands::Doctor) => doctor::run().await,
-        Some(Commands::Completions { .. }) => unreachable!("handled before config init"),
+        Commands::Doctor => doctor::run().await,
+        Commands::Completions { .. } => unreachable!("handled before config init"),
     };
 
     std::process::exit(code);
