@@ -820,7 +820,13 @@ class WorkerSession:
         with self._stage("create"):
             raw = self.http.request("POST", "/v3/workspaces", deadline,
                                     {"target": {"kind": "latest"}, "scope": "/project",
-                                     "delivery": "lazy", "upper_policy": "private"})
+                                     # The pinned Mega2 profile used by the
+                                     # shipped benchmark serves full resolve
+                                     # only. Keep this explicit so a backend
+                                     # capability mismatch fails at the
+                                     # contract boundary instead of appearing
+                                     # as an unrelated workspace 5xx.
+                                     "delivery": "full", "upper_policy": "private"})
             status = _status(raw)
             if status["snapshot_id"] is None:
                 raise WorkerError("workspace create omitted its fixed snapshot id")
