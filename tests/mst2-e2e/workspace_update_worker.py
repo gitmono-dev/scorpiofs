@@ -1013,14 +1013,27 @@ class WorkerSession:
             if upper_info.st_uid != self.daemon_uid:
                 raise WorkerError("workspace upper owner differs from daemon uid")
         with self._retention_substage("sentinel_write"):
+            # Create the marker through the mounted overlay.  Mutating the
+            # private upper directory directly bypasses OverlayFs' dentry
+            # cache, so an existing mount can miss the new entry during the
+            # retained-view oracle.  Keep the upper path for the durability
+            # check after the overlay has materialized it there.
+            mounted_sentinel = mount / DIRTY_SENTINEL
             sentinel = upper / DIRTY_SENTINEL
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-            fd = os.open(sentinel, flags, 0o600)
+            fd = os.open(mounted_sentinel, flags, 0o600)
             try:
                 _write_all(fd, DIRTY_BYTES)
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            try:
+                upper_info = sentinel.stat()
+            except OSError:
+                raise WorkerError("workspace upper sentinel was not materialized") from None
+            if sentinel.is_symlink() or not stat.S_ISREG(upper_info.st_mode) \
+                    or upper_info.st_uid != self.daemon_uid:
+                raise WorkerError("workspace upper sentinel identity is invalid")
             upper_fd = os.open(upper, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                                | getattr(os, "O_CLOEXEC", 0))
             try:
