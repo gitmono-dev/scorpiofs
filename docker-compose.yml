@@ -1,13 +1,12 @@
 # docker compose up — brings up a ScorpioFS daemon plus a mega2 backend.
 #
-# This is a self-contained local evaluation stack: the published
-# `genedna/mega2` image (trunk / storage-only, anonymous Git HTTP) with its
-# PostgreSQL / Redis / RustFS dependencies, and ScorpioFS built from this
-# checkout. It mirrors mega2's own `mega2-compose.yml` so the two stay in step.
+# This local evaluation stack builds an MST/2-capable mega2 checkout with its
+# PostgreSQL / Redis / RustFS dependencies and ScorpioFS from this checkout.
+# MEGA2_SOURCE selects the backend source directory (default ../monoengine).
 #
 #   docker compose up -d --build --wait
 #   curl -sS http://127.0.0.1:2725/health
-#   docker compose exec -T scorpiofs ls -la /var/lib/scorpiofs/mount
+#   curl -sS http://127.0.0.1:2725/v3/workspaces
 #   docker compose down -v          # discard all state
 #
 # IMPORTANT: FUSE in containers needs the host's /dev/fuse device and
@@ -18,9 +17,8 @@
 # (`docker-compose.test.yml`, compose project `mega2-it`) use the `scorpio`
 # profile registered there instead of this file; see deploy/README.md.
 #
-# Note: mega2 in trunk mode does not serve the Change List API
-# (`/api/v1/cl/*`), so Antares CL-layer mounts are unavailable here; plain
-# dicfuse browsing and Antares job mounts without `cl` work.
+# Workspaces are created explicitly through /v3/workspaces. The selected
+# backend must expose the MST/2 snapshot surface for workspace creation.
 
 services:
   postgres:
@@ -85,9 +83,12 @@ services:
       retries: 20
       start_period: 3s
 
-  # The monorepo backend. Override MEGA2_IMAGE to pin a tag or use a local build.
+  # Build from source so an unverified registry latest cannot silently omit MST/2.
   mega2:
-    image: ${MEGA2_IMAGE:-genedna/mega2:latest}
+    image: ${MEGA2_IMAGE:-mega2-mst2:local}
+    build:
+      context: ${MEGA2_SOURCE:-../monoengine}
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -113,6 +114,8 @@ services:
       MEGA_OBJECT_STORAGE__S3__SECRET_ACCESS_KEY: rustfs_secret
       MEGA_OBJECT_STORAGE__S3__ENDPOINT_URL: http://rustfs:9000
       MEGA_LOG__PRINT_STD: "true"
+      MEGA_MST2__ENABLED: "true"
+      MEGA_MST2__INSTANCE_UUID: "9f6c4e1a-7b2d-4c8e-a1f0-3d5b7c9e2a41"
     command: ["service", "http", "--host", "0.0.0.0", "-p", "8000"]
     volumes:
       - mega2-data:/var/lib/mega2
@@ -121,7 +124,7 @@ services:
     # ports:
     #   - "127.0.0.1:9000:8000"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/openapi.json"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v2/snapshots/capabilities"]
       interval: 3s
       timeout: 5s
       retries: 40
@@ -134,18 +137,11 @@ services:
       mega2:
         condition: service_healthy
     environment:
-      # base_url / lfs_url are required and point at the mega2 service above.
-      SCORPIO_BASE_URL: "http://mega2:8000"
-      SCORPIO_LFS_URL: "http://mega2:8000/api/v1/lfs"
+      # The v3 entrypoint requires the live MST/2 snapshot endpoint.
+      SCORPIO_MST2_BASE_URL: "http://mega2:8000"
       # Override any other key the same way, e.g.:
       # SCORPIO_LOG_LEVEL: "scorpio=debug"
       #
-      # To browse the FUSE mount on the HOST, move the mountpoints out of the
-      # named volume and bind them from an empty host dir with rshared
-      # propagation (see deploy/README.md, "Making the FUSE mount visible on
-      # the host"; also uncomment the two binds under `volumes:` below):
-      # SCORPIO_WORKSPACE: /mnt/scorpiofs/mount
-      # SCORPIO_ANTARES_MOUNT_ROOT: /mnt/scorpiofs/antares
     devices:
       - "/dev/fuse"
     cap_add:
@@ -160,19 +156,11 @@ services:
       - apparmor:unconfined
     volumes:
       - scorpiofs-data:/var/lib/scorpiofs
-      # Host-visible FUSE mounts (pair with the SCORPIO_WORKSPACE /
-      # SCORPIO_ANTARES_MOUNT_ROOT overrides above). Pre-create both host dirs
-      # as your user and keep `mount` empty; ScorpioFS refuses a non-empty
-      # mountpoint. Requires a rootful Docker on a host whose source path is a
-      # `shared` mount (systemd default).
+      # For host-visible v3 workspace mounts, replace the named volume with
+      # this store bind. Pre-create the source as your user on a shared mount.
       # - type: bind
-      #   source: ${SCORPIOFS_HOST_MOUNT_DIR:-/tmp/scorpiofs}/mount
-      #   target: /mnt/scorpiofs/mount
-      #   bind:
-      #     propagation: rshared
-      # - type: bind
-      #   source: ${SCORPIOFS_HOST_MOUNT_DIR:-/tmp/scorpiofs}/antares
-      #   target: /mnt/scorpiofs/antares
+      #   source: ${SCORPIOFS_HOST_STORE_DIR:-/tmp/scorpiofs}/store
+      #   target: /var/lib/scorpiofs/store
       #   bind:
       #     propagation: rshared
     ports:
@@ -180,7 +168,7 @@ services:
       # not expose it on all host interfaces. For remote access put it behind a
       # firewall / authenticating reverse proxy and change this mapping.
       - "127.0.0.1:2725:2725"
-    # The daemon unmounts on SIGTERM (~20s daemon join + 15s Antares cleanup);
+    # The owning daemon joins hydration and retires mounts on SIGTERM;
     # a SIGKILL would leave host-visible mountpoints stale.
     stop_grace_period: 45s
     # `scorpiofs` is the default CMD (`serve`); the HEALTHCHECK from the image

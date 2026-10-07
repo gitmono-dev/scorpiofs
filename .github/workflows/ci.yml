@@ -193,3 +193,44 @@ jobs:
             --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
             -e SCORPIO_MST2_BASE_URL=http://mega.example:8000 \
             scorpiofs:ci doctor
+
+      - name: Smoke the rendered compose workspace daemon
+        run: |
+          set -euo pipefail
+          docker compose --env-file /dev/null -f docker-compose.yml config --format json > "$RUNNER_TEMP/scorpiofs-compose.json"
+          python3 - "$RUNNER_TEMP/scorpiofs-compose.json" <<'PY'
+          import json
+          import subprocess
+          import sys
+          import time
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              service = json.load(source)["services"]["scorpiofs"]
+          environment = service["environment"]
+          assert environment.get("SCORPIO_MST2_BASE_URL"), "compose must supply the live MST/2 endpoint"
+          for retired in ("SCORPIO_BASE_URL", "SCORPIO_LFS_URL", "SCORPIO_WORKSPACE", "SCORPIO_ANTARES_MOUNT_ROOT"):
+              assert retired not in environment, "compose still selects a retired runtime setting"
+          arguments = ["docker", "run", "--detach", "--rm"]
+          for key, value in environment.items():
+              if key.startswith("SCORPIO_"):
+                  arguments.extend(["--env", f"{key}={value}"])
+          container = subprocess.check_output(arguments + ["scorpiofs:ci"], text=True).strip()
+          try:
+              for _ in range(30):
+                  health = subprocess.run(["docker", "exec", container, "curl", "-fsS",
+                                           "--max-time", "2", "http://127.0.0.1:2725/health"], capture_output=True, text=True)
+                  if health.returncode == 0:
+                      assert json.loads(health.stdout)["status"] == "ok"
+                      break
+                  time.sleep(1)
+              else:
+                  raise AssertionError("the actual compose environment did not start the v3 daemon")
+              listed = subprocess.check_output(["docker", "exec", container, "curl", "-fsS",
+                                                "--max-time", "2", "http://127.0.0.1:2725/v3/workspaces"], text=True)
+              assert json.loads(listed) == [], "startup must not create or mount a workspace"
+              retired = subprocess.check_output(["docker", "exec", container, "curl", "-sS", "-o", "/dev/null",
+                                                 "--max-time", "2", "-w", "%{http_code}", "http://127.0.0.1:2725/api/fs/mpoint"], text=True)
+              assert retired == "404", "the compose daemon must expose only the v3 control contract"
+          finally:
+              subprocess.run(["docker", "stop", "--time", "45", container], check=True)
+          PY
