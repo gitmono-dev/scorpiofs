@@ -13,6 +13,7 @@ use super::{
     cas_worker::CasReadScope,
     content::{BudgetClass, ContentBudget, Reservation},
     fuse_store::StoreContent,
+    online_file::OnlineSnapshotFile,
     OwnedChunkedFile, ProvenSnapshotFile, SnapshotError, SnapshotErrorCode, SnapshotReader,
     VerifiedContent, VerifiedRange,
 };
@@ -44,6 +45,53 @@ impl CacheEntry for ContentEntry {
 impl CacheEntry for RangeEntry {
     fn inode(&self) -> u64 {
         self.inode
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct OnlineContentEntry {
+    pub(crate) inode: u64,
+    pub(crate) content: StoreContent,
+}
+impl CacheEntry for OnlineContentEntry {
+    fn inode(&self) -> u64 {
+        self.inode
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct OnlineRangeEntry {
+    pub(crate) inode: u64,
+    pub(crate) file: Arc<OnlineSnapshotFile>,
+    pub(crate) range: Arc<OwnedChunkedFile>,
+}
+impl CacheEntry for OnlineRangeEntry {
+    fn inode(&self) -> u64 {
+        self.inode
+    }
+}
+
+/// No-pages online mounts retain path-specific owners and requests. Their
+/// fixed manifest continuity is not a cryptographic membership proof.
+pub(crate) struct OnlineFuseCache {
+    pub(crate) contents: FixedCache<OnlineContentEntry>,
+    pub(crate) ranges: FixedCache<OnlineRangeEntry>,
+    pub(crate) workers: Arc<CasReadScope>,
+    pub(crate) coordinator: Arc<super::FetchCoordinator>,
+    _reservation: Reservation,
+}
+impl OnlineFuseCache {
+    pub(crate) fn new(reader: &SnapshotReader) -> Result<Self, SnapshotError> {
+        let reservation = reader
+            .content_scope
+            .reserve(BudgetClass::Output, size_of::<Self>())?;
+        Ok(Self {
+            contents: FixedCache::new(),
+            ranges: FixedCache::new(),
+            workers: reader.content_scope.cas_workers(),
+            coordinator: super::FetchCoordinator::in_reader_content_scope(reader.clone(), 8),
+            _reservation: reservation,
+        })
     }
 }
 

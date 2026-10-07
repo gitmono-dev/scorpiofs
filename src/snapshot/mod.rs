@@ -29,6 +29,7 @@ pub mod incremental;
 pub mod layer;
 mod lease_wire;
 mod lookup;
+mod online_file;
 mod owned_range;
 mod owned_reader;
 mod owned_transport;

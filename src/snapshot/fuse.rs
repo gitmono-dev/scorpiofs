@@ -29,15 +29,18 @@ use futures::stream::iter;
 
 use crate::{
     snapshot::{
-        capabilities::CapabilityAdvertisement,
         cas_content::VerifiedCasContent,
         cas_range::VerifiedCasRange,
         cas_worker::{CasReadScope, LocalCasAccess, RequestMeters, WorkResult},
         closure::{verify_directory_pages, ValidatedSnapshotClosure},
         content::ContentBudget,
         durable::{DurableStore, LocalCasRangeMeters},
-        fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission, StoreRangeCache},
+        fuse_owned::{
+            ContentEntry, OnlineContentEntry, OnlineFuseCache, OnlineRangeEntry, OwnedFuseCache,
+            RangeEntry, ReplyAdmission, StoreRangeCache,
+        },
         fuse_store::{ContentKey, StoreContent, StoreSmallCache},
+        online_file::OnlineSnapshotFile,
         ContentBudgetLimits, FileMembershipError, MetadataProofLimits, OwnedChunkedFile,
         ProvenSnapshotFile, ScopeCache, SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode,
         SnapshotFile, SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
@@ -71,6 +74,7 @@ pub(crate) struct FileNode {
     fs_kind: String,
     size: u64,
     digest: String,
+    online_file: Option<Arc<OnlineSnapshotFile>>,
 }
 
 #[derive(Clone)]
@@ -82,12 +86,9 @@ pub(crate) enum Node {
 struct State {
     next_inode: u64,
     nodes: HashMap<u64, Node>,
-    /// Whole-file content cache (small files, hydrated CAS objects).
-    contents: HashMap<u64, Arc<Vec<u8>>>,
-    /// Large files opened through the verified chunk reader (range reads).
-    chunked: HashMap<u64, Arc<crate::snapshot::range::ChunkedFile>>,
     /// Modern online mounts retain paid payload/reply owners in fixed slots.
     owned: Option<OwnedFuseCache>,
+    online: Option<OnlineFuseCache>,
     /// Stored online/local mounts retain paid content independently of page hints.
     store_small: Option<StoreSmallCache>,
     store_ranges: Option<StoreRangeCache>,
@@ -120,14 +121,9 @@ fn stored_caches(
     (Option<StoreSmallCache>, Option<StoreRangeCache>),
     crate::snapshot::SnapshotError,
 > {
-    let Some(reader) = reader.filter(|reader| {
-        store.is_some()
-            && reader.capabilities().features.metadata_pages
-            && matches!(
-                reader.capability_advertisement(),
-                CapabilityAdvertisement::Canonical(_)
-            )
-    }) else {
+    let Some(reader) =
+        reader.filter(|reader| store.is_some() && reader.capabilities().features.metadata_pages)
+    else {
         return Ok((None, None));
     };
     Ok((
@@ -183,7 +179,7 @@ impl Mst2Fuse {
             return Self::build_snapshot_closure(Some(reader), None, &closure);
         }
         let manifest = reader.file_manifest().await?;
-        Self::build(Some(reader), None, manifest)
+        Self::build(Some(reader), None, manifest)?.with_online_paths()
     }
 
     /// Build over a reader *and* a durable store: content is served from the
@@ -193,17 +189,12 @@ impl Mst2Fuse {
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         store.bind_reader(&reader)?;
-        if reader.capabilities().features.metadata_pages
-            && matches!(
-                reader.capability_advertisement(),
-                CapabilityAdvertisement::Canonical(_)
-            )
-        {
+        if reader.capabilities().features.metadata_pages {
             let closure = reader.snapshot_closure().await?;
             return Self::from_snapshot_manifest(reader, store, closure);
         }
         let manifest = reader.file_manifest().await?;
-        Self::build(Some(reader), Some(store), manifest)
+        Self::build(Some(reader), Some(store), manifest)?.with_online_paths()
     }
 
     /// Reopen a completed, pinned hydration with no server contact at all.
@@ -290,6 +281,50 @@ impl Mst2Fuse {
         Ok(self)
     }
 
+    // Called only after a public constructor's completed fixed-SID JSON
+    // manifest walk. Raw metadata builders cannot mint this online binding.
+    fn with_online_paths(mut self) -> std::result::Result<Self, SnapshotError> {
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "online manifest needs a reader",
+            )
+        })?;
+        if reader.capabilities().features.metadata_pages {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "metadata-pages readers require the real fixed-root owner path",
+            ));
+        }
+        reader.local_lease_status()?;
+        let cache = OnlineFuseCache::new(reader)?;
+        let state = self.state.get_mut().unwrap();
+        for node in state.nodes.values_mut() {
+            if let Node::File(file) = node {
+                file.online_file = Some(OnlineSnapshotFile::from_manifest_file(
+                    reader,
+                    SnapshotFile {
+                        rel_path: file.path.clone(),
+                        fs_kind: file.fs_kind.clone(),
+                        size: file.size,
+                        content_digest: file.digest.clone(),
+                    },
+                )?);
+            }
+        }
+        reader.local_lease_status()?;
+        state.online = Some(cache);
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(super) fn online_file_for_test(&self, inode: Inode) -> Option<Arc<OnlineSnapshotFile>> {
+        match self.state.lock().unwrap().nodes.get(&inode) {
+            Some(Node::File(file)) => file.online_file.clone(),
+            _ => None,
+        }
+    }
+
     /// Lazy mount: the tree starts at the scope root's verified page tree,
     /// and child directory pages are fetched on first
     /// readdir/lookup. File content materializes on open through the existing
@@ -338,9 +373,8 @@ impl Mst2Fuse {
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
-            contents: HashMap::new(),
-            chunked: HashMap::new(),
             owned: owned_cache(Some(&reader), store.as_ref())?,
+            online: None,
             store_small,
             store_ranges,
             lazy: true,
@@ -632,6 +666,7 @@ impl Mst2Fuse {
                         fs_kind: fs_kind.to_string(),
                         size: e.size,
                         digest: format!("sha256:{}", crate::snapshot::frames::hex32(&e.content_id)),
+                        online_file: None,
                     })
                 }
             };
@@ -678,9 +713,8 @@ impl Mst2Fuse {
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
-            contents: HashMap::new(),
-            chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
+            online: None,
             store_small: None,
             store_ranges: None,
             lazy: false,
@@ -733,9 +767,8 @@ impl Mst2Fuse {
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
-            contents: HashMap::new(),
-            chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
+            online: None,
             store_small,
             store_ranges,
             lazy: false,
@@ -808,6 +841,7 @@ impl Mst2Fuse {
                     fs_kind: file.fs_kind.clone(),
                     size: file.size,
                     digest: file.content_digest.clone(),
+                    online_file: None,
                 }),
             );
         }
@@ -879,19 +913,6 @@ impl Mst2Fuse {
             }
         }
         Ok(out)
-    }
-
-    /// Content for one file: the verified local CAS when it holds it, the
-    /// live reader otherwise. Both paths end in a SHA-256 check against the
-    /// digest the fixed view advertised.
-    async fn fetch_content(&self, f: &FileNode) -> Result<Vec<u8>> {
-        if let Some(store) = &self.store {
-            if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
-                return Ok(bytes);
-            }
-        }
-        let reader = self.reader.as_ref().ok_or_else(|| Errno::from(libc::EIO))?;
-        reader.read_file(&f.path, &f.digest).await.map_err(io_err)
     }
 
     async fn read_local(
@@ -1050,6 +1071,243 @@ impl Mst2Fuse {
             .filter(|reader| self.store.is_none() && reader.capabilities().features.metadata_pages)
     }
 
+    async fn online_node(
+        reader: &SnapshotReader,
+        node: &FileNode,
+    ) -> Result<Arc<OnlineSnapshotFile>> {
+        let file = node
+            .online_file
+            .as_ref()
+            .ok_or_else(|| Errno::from(libc::EIO))?;
+        let fixed = file.file();
+        if fixed.rel_path != node.path
+            || fixed.fs_kind != node.fs_kind
+            || fixed.size != node.size
+            || fixed.content_digest != node.digest
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        file.validate(reader).await.map_err(io_err)?;
+        Ok(file.clone())
+    }
+
+    async fn read_online(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        offset: u64,
+        requested: u64,
+    ) -> Result<ReplyData> {
+        let file = Self::online_node(reader, node).await?;
+        if node.fs_kind == "symlink" && !(1..=4095).contains(&node.size) {
+            return Err(Errno::from(libc::EIO));
+        }
+        if requested == 0 || offset >= node.size {
+            file.validate(reader).await.map_err(io_err)?;
+            return Ok(ReplyData { data: Bytes::new() });
+        }
+        let wanted = requested.min(node.size - offset);
+        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        if node.size <= crate::snapshot::OBJECT_CAP {
+            return self
+                .read_online_small(reader, inode, node, file, offset, wanted, admission)
+                .await;
+        }
+        self.read_online_range(reader, inode, node, file, offset, wanted, admission)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_online_small(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        file: Arc<OnlineSnapshotFile>,
+        offset: u64,
+        wanted: u64,
+        admission: ReplyAdmission,
+    ) -> Result<ReplyData> {
+        let (cached, workers, coordinator) = {
+            let mut state = self.state.lock().unwrap();
+            let cache = state
+                .online
+                .as_mut()
+                .ok_or_else(|| Errno::from(libc::EIO))?;
+            (
+                cache.contents.get(inode),
+                cache.workers.clone(),
+                cache.coordinator.clone(),
+            )
+        };
+        let (content, admission) = match cached {
+            Some(entry) => (entry.content, admission),
+            None => {
+                let (local, admission) = match &self.store {
+                    Some(store) => {
+                        let store = store.clone();
+                        let digest = node.digest.clone();
+                        let size = node.size;
+                        let budget = reader.content_scope.clone();
+                        let completion = workers
+                            .run(
+                                reader.clone(),
+                                admission,
+                                RequestMeters {
+                                    kind: "small_whole",
+                                    wanted: size,
+                                },
+                                move || {
+                                    WorkResult::local(
+                                        VerifiedCasContent::read(&store, &digest, size, &budget),
+                                        None,
+                                    )
+                                },
+                            )
+                            .await
+                            .map_err(io_err)?;
+                        (completion.result.map_err(io_err)?, completion.admission)
+                    }
+                    None => (None, admission),
+                };
+                file.validate(reader).await.map_err(io_err)?;
+                let content = match local {
+                    Some(owner) => StoreContent::Cas(owner),
+                    None => StoreContent::Wire(
+                        coordinator
+                            .fetch_owned(
+                                file.file().clone(),
+                                reader.capabilities().features.objects,
+                            )
+                            .await
+                            .map_err(io_err)?,
+                    ),
+                };
+                (content, admission)
+            }
+        };
+        if content.len() as u64 != node.size
+            || (node.fs_kind == "symlink" && content.as_bytes().contains(&0))
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        file.validate(reader).await.map_err(io_err)?;
+        let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
+        let end = usize::try_from(offset + wanted).map_err(|_| Errno::from(libc::EIO))?;
+        let data = admission
+            .store_content(content.clone(), start, end)
+            .map_err(io_err)?;
+        let mut state = self.state.lock().unwrap();
+        reader.local_lease_status().map_err(io_err)?;
+        state
+            .online
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .contents
+            .insert(OnlineContentEntry { inode, content });
+        Ok(ReplyData { data })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_online_range(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        file: Arc<OnlineSnapshotFile>,
+        offset: u64,
+        wanted: u64,
+        admission: ReplyAdmission,
+    ) -> Result<ReplyData> {
+        let (cached, workers) = {
+            let mut state = self.state.lock().unwrap();
+            let cache = state
+                .online
+                .as_mut()
+                .ok_or_else(|| Errno::from(libc::EIO))?;
+            (cache.ranges.get(inode), cache.workers.clone())
+        };
+        if cached
+            .as_ref()
+            .is_some_and(|entry| !Arc::ptr_eq(&entry.file, &file))
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        // Always try real stored CAS before the path-specific wire handle.
+        // The primitive returns None only for a verified true missing object.
+        let (local, admission) = match &self.store {
+            Some(store) => {
+                let store = store.clone();
+                let digest = node.digest.clone();
+                let size = node.size;
+                let budget = reader.content_scope.clone();
+                let completion = workers
+                    .run(
+                        reader.clone(),
+                        admission,
+                        RequestMeters {
+                            kind: "large_range",
+                            wanted,
+                        },
+                        move || {
+                            let mut meters = LocalCasRangeMeters::default();
+                            let result = VerifiedCasRange::read(
+                                &store,
+                                &digest,
+                                size,
+                                offset,
+                                wanted,
+                                &budget,
+                                &mut meters,
+                            );
+                            WorkResult::local(result, Some(meters))
+                        },
+                    )
+                    .await
+                    .map_err(io_err)?;
+                (completion.result.map_err(io_err)?, completion.admission)
+            }
+            None => (None, admission),
+        };
+        file.validate(reader).await.map_err(io_err)?;
+        if let Some(owner) = local {
+            if owner.len() as u64 != wanted {
+                return Err(Errno::from(libc::EIO));
+            }
+            reader.local_lease_status().map_err(io_err)?;
+            return Ok(ReplyData {
+                data: admission.cas_range(owner).map_err(io_err)?,
+            });
+        }
+        let range = match cached {
+            Some(entry) => entry.range,
+            None => Arc::new(
+                OwnedChunkedFile::open_online_path(reader, file.clone())
+                    .await
+                    .map_err(io_err)?,
+            ),
+        };
+        let owner = range
+            .read_range_owned(offset, wanted)
+            .await
+            .map_err(io_err)?;
+        if owner.len() as u64 != wanted {
+            return Err(Errno::from(libc::EIO));
+        }
+        file.validate(reader).await.map_err(io_err)?;
+        let data = admission.range(owner).map_err(io_err)?;
+        let mut state = self.state.lock().unwrap();
+        reader.local_lease_status().map_err(io_err)?;
+        state
+            .online
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .ranges
+            .insert(OnlineRangeEntry { inode, file, range });
+        Ok(ReplyData { data })
+    }
+
     fn store_reader(&self) -> Option<&SnapshotReader> {
         if self.state.lock().unwrap().store_small.is_some() {
             self.reader.as_ref()
@@ -1071,7 +1329,7 @@ impl Mst2Fuse {
     // This observes the current local grant and any latched terminal failure;
     // it is not a fresh remote authorization decision or a metadata fetch.
     fn check_metadata_lease(&self) -> std::result::Result<(), SnapshotError> {
-        match self.store_reader() {
+        match self.reader.as_ref() {
             Some(reader) => reader.local_lease_status(),
             None => Ok(()),
         }
@@ -1158,9 +1416,9 @@ impl Mst2Fuse {
         let data = admission
             .store_content(content.clone(), start, stop)
             .map_err(io_err)?;
-        self.state
-            .lock()
-            .unwrap()
+        let mut state = self.state.lock().unwrap();
+        reader.local_lease_status().map_err(io_err)?;
+        state
             .store_small
             .as_mut()
             .ok_or_else(|| Errno::from(libc::EIO))?
@@ -1169,8 +1427,8 @@ impl Mst2Fuse {
         Ok(ReplyData { data })
     }
 
-    /// Every large read in the authorized canonical v3 store path returns
-    /// here. Errors cannot re-enter the legacy Vec/chunk-reader branch.
+    /// Every metadata-pages stored read uses actual fixed-root membership.
+    /// CAS errors are terminal; only a true missing object permits wire I/O.
     async fn read_store_large(
         &self,
         reader: &SnapshotReader,
@@ -1242,6 +1500,7 @@ impl Mst2Fuse {
             if owner.len() as u64 != wanted {
                 return Err(Errno::from(libc::EIO));
             }
+            reader.local_lease_status().map_err(io_err)?;
             return Ok(ReplyData {
                 data: admission.cas_range(owner).map_err(io_err)?,
             });
@@ -1263,9 +1522,9 @@ impl Mst2Fuse {
         }
         proven.validate(reader).await.map_err(io_err)?;
         let data = admission.range(owner).map_err(io_err)?;
-        self.state
-            .lock()
-            .unwrap()
+        let mut state = self.state.lock().unwrap();
+        reader.local_lease_status().map_err(io_err)?;
+        state
             .store_ranges
             .as_mut()
             .ok_or_else(|| Errno::from(libc::EIO))?
@@ -1302,8 +1561,8 @@ impl Mst2Fuse {
         Ok(proven)
     }
 
-    /// The modern branch runs before legacy empty/EOF/cache paths. It cannot
-    /// fall back after a proof, authority, quota or body validation failure.
+    /// Fixed-root authority gates cached content, empty reads and EOF.
+    /// Proof, quota and body validation failures are terminal.
     async fn read_owned(
         &self,
         reader: &SnapshotReader,
@@ -1326,6 +1585,9 @@ impl Mst2Fuse {
             .map(|entry| entry.proven.clone())
             .or_else(|| range.as_ref().map(|entry| entry.proven.clone()));
         let proven = Self::proven_node(reader, node, cached).await?;
+        if node.fs_kind == "symlink" && !(1..=4095).contains(&node.size) {
+            return Err(Errno::from(libc::EIO));
+        }
         if size == 0 || offset >= node.size {
             return Ok(ReplyData { data: Bytes::new() });
         }
@@ -1339,25 +1601,22 @@ impl Mst2Fuse {
                     .await
                     .map_err(io_err)?,
             };
-            if owner.len() as u64 != node.size {
+            if owner.len() as u64 != node.size
+                || (node.fs_kind == "symlink" && owner.as_bytes().contains(&0))
+            {
                 return Err(Errno::from(libc::EIO));
             }
             proven.validate(reader).await.map_err(io_err)?;
             let data = admission
                 .content(owner.clone(), offset as usize, end as usize)
                 .map_err(io_err)?;
-            self.state
-                .lock()
-                .unwrap()
-                .owned
-                .as_mut()
-                .unwrap()
-                .contents
-                .insert(ContentEntry {
-                    inode,
-                    proven,
-                    content: owner,
-                });
+            let mut state = self.state.lock().unwrap();
+            reader.local_lease_status().map_err(io_err)?;
+            state.owned.as_mut().unwrap().contents.insert(ContentEntry {
+                inode,
+                proven,
+                content: owner,
+            });
             Ok(ReplyData { data })
         } else {
             let chunked = match range {
@@ -1377,18 +1636,13 @@ impl Mst2Fuse {
             }
             proven.validate(reader).await.map_err(io_err)?;
             let data = admission.range(owner).map_err(io_err)?;
-            self.state
-                .lock()
-                .unwrap()
-                .owned
-                .as_mut()
-                .unwrap()
-                .ranges
-                .insert(RangeEntry {
-                    inode,
-                    proven,
-                    range: chunked,
-                });
+            let mut state = self.state.lock().unwrap();
+            reader.local_lease_status().map_err(io_err)?;
+            state.owned.as_mut().unwrap().ranges.insert(RangeEntry {
+                inode,
+                proven,
+                range: chunked,
+            });
             Ok(ReplyData { data })
         }
     }
@@ -1505,7 +1759,7 @@ impl Mst2Fuse {
                 return Err(SnapshotError::new(
                     SnapshotErrorCode::NotDirectory,
                     "fixed path is not a directory",
-                ))
+                ));
             }
         };
         let mut entries = Vec::with_capacity(directory.children.len());
@@ -1596,7 +1850,7 @@ impl Mst2Fuse {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::NotDirectory,
                         "fixed ancestor is not a directory",
-                    ))
+                    ));
                 }
             }
         }
@@ -1649,7 +1903,7 @@ fn ensure_child(
             return Err(crate::snapshot::SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
                 format!("manifest parent inode {parent_inode} missing"),
-            ))
+            ));
         }
         // A manifest where one path is a file and another uses that file as a
         // directory (`a` and `a/b`) is contradictory; that is a server/manifest
@@ -1659,7 +1913,7 @@ fn ensure_child(
             return Err(crate::snapshot::SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
                 format!("manifest uses file {parent_inode} as a directory (entry {name:?})"),
-            ))
+            ));
         }
         Some(Node::Dir(_)) => {}
     }
@@ -1676,7 +1930,7 @@ fn ensure_child(
             return Err(crate::snapshot::SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
                 format!("manifest parent inode {parent_inode} vanished"),
-            ))
+            ));
         }
     };
     let full = if parent_path.is_empty() {
@@ -1691,6 +1945,7 @@ fn ensure_child(
             fs_kind: f.fs_kind.clone(),
             size: f.size,
             digest: f.content_digest.clone(),
+            online_file: None,
         })
     } else {
         Node::Dir(DirNode {
@@ -2005,104 +2260,13 @@ impl Filesystem for Mst2Fuse {
                 .read_store_large(reader, inode, &f, offset, size as u64)
                 .await;
         }
-        // Unvalidated readerless metadata fixtures cannot acquire the old
-        // copying content path merely by attaching a store or cache entry.
-        if self.reader.is_none() {
-            return Err(Errno::from(libc::EIO));
+        if let Some(reader) = self.reader.as_ref() {
+            return self
+                .read_online(reader, inode, &f, offset, size as u64)
+                .await;
         }
-        let reply = async {
-            if size == 0 || offset >= f.size {
-                return Ok(ReplyData { data: Bytes::new() });
-            }
-            let end = offset.saturating_add(size as u64).min(f.size);
-
-            // 1. Whole content already in memory (verified when it was read).
-            if let Some(bytes) = self.state.lock().unwrap().contents.get(&inode).cloned() {
-                return Ok(ReplyData {
-                    data: verified_slice(&bytes, f.size, offset, end)?,
-                });
-            }
-
-            // 2. Small file: whole content (CAS when hydrated, OBJECT frames
-            //    otherwise), cached in memory — a small file's whole bytes are
-            //    cheap and repeats are common.
-            if f.size <= crate::snapshot::range::OBJECT_CAP {
-                if let Some(store) = &self.store {
-                    if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
-                        let arc = Arc::new(bytes);
-                        let out = verified_slice(&arc, f.size, offset, end)?;
-                        self.state.lock().unwrap().contents.insert(inode, arc);
-                        return Ok(ReplyData { data: out });
-                    }
-                }
-                let bytes = Arc::new(self.fetch_content(&f).await?);
-                let out = verified_slice(&bytes, f.size, offset, end)?;
-                self.state.lock().unwrap().contents.insert(inode, bytes);
-                return Ok(ReplyData { data: out });
-            }
-
-            // 3. Large file: serve the requested range only (spec 07 §6, BODY-12).
-            //    Local CAS builds private chunk facts with a cold whole scan,
-            //    then verifies complete covering chunks from the returned buffers.
-            //    Uncovered mutations are detected when read or by a strict audit.
-            //    The verified chunk reader is the live-transport path when the
-            //    CAS does not hold the file.
-            if let Some(store) = &self.store {
-                if let Some(bytes) = store
-                    .read_indexed_blob_range(&f.digest, f.size, offset, (end - offset) as usize)
-                    .map_err(io_err)?
-                {
-                    if bytes.len() as u64 != end - offset {
-                        return Err(Errno::from(libc::EIO));
-                    }
-                    return Ok(ReplyData {
-                        data: Bytes::from(bytes),
-                    });
-                }
-            }
-
-            // 4. Large file online: verified chunk reader, transferred range only.
-            let reader = self
-                .reader
-                .as_ref()
-                .ok_or_else(|| Errno::from(libc::EIO))?
-                .clone();
-            let chunked = {
-                let cached = self.state.lock().unwrap().chunked.get(&inode).cloned();
-                match cached {
-                    Some(c) => c,
-                    None => {
-                        let path = format!("/{}", f.path);
-                        let c = Arc::new(
-                            crate::snapshot::range::ChunkedFile::open(
-                                &reader, &path, &f.digest, f.size,
-                            )
-                            .await
-                            .map_err(io_err)?,
-                        );
-                        self.state.lock().unwrap().chunked.insert(inode, c.clone());
-                        c
-                    }
-                }
-            };
-            let data = chunked
-                .read_range(offset, end - offset)
-                .await
-                .map_err(io_err)?;
-            if data.len() as u64 != end - offset {
-                return Err(Errno::from(libc::EIO));
-            }
-            Ok(ReplyData {
-                data: Bytes::from(data),
-            })
-        }
-        .await?;
-        if let Some(reader) = store_reader {
-            reader.ensure_lease().await.map_err(io_err)?;
-        }
-        Ok(reply)
+        Err(Errno::from(libc::EIO))
     }
-
     /// Return the symlink target recorded in the fixed view. The content is
     /// the target bytes (git symlink blobs have no NUL terminator), verified
     /// against the digest the view advertised.
@@ -2123,27 +2287,11 @@ impl Filesystem for Mst2Fuse {
             reader.ensure_lease().await.map_err(io_err)?;
             return self.read_store_small(reader, &f, 0, f.size).await;
         }
-        if self.reader.is_none() {
-            return Err(Errno::from(libc::EIO));
+        if let Some(reader) = self.reader.as_ref() {
+            return self.read_online(reader, inode, &f, 0, f.size).await;
         }
-        let cached = self.state.lock().unwrap().contents.get(&inode).cloned();
-        let target = match cached {
-            Some(b) => b,
-            None => {
-                let arc = Arc::new(self.fetch_content(&f).await?);
-                self.state
-                    .lock()
-                    .unwrap()
-                    .contents
-                    .insert(inode, arc.clone());
-                arc
-            }
-        };
-        Ok(ReplyData {
-            data: Bytes::copy_from_slice(target.as_slice()),
-        })
+        Err(Errno::from(libc::EIO))
     }
-
     async fn getlk(
         &self,
         _req: Request,
@@ -2334,18 +2482,6 @@ impl Filesystem for Mst2Fuse {
     async fn removexattr(&self, _req: Request, _inode: Inode, _name: &OsStr) -> Result<()> {
         Err(Errno::from(libc::EROFS))
     }
-}
-
-fn verified_slice(bytes: &[u8], file_size: u64, offset: u64, end: u64) -> Result<Bytes> {
-    if bytes.len() as u64 != file_size {
-        return Err(Errno::from(libc::EIO));
-    }
-    let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
-    let stop = usize::try_from(end).map_err(|_| Errno::from(libc::EIO))?;
-    bytes
-        .get(start..stop)
-        .map(Bytes::copy_from_slice)
-        .ok_or_else(|| Errno::from(libc::EIO))
 }
 
 fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
@@ -2596,7 +2732,7 @@ mod tests {
             assert_eq!(reply.data.as_ptr(), owner.as_bytes().as_ptr());
             drop(owner);
             let state = fs.state.lock().unwrap();
-            assert!(state.contents.is_empty() && state.chunked.is_empty());
+            assert!(state.owned.is_none() && state.online.is_none());
             assert!(state.store_ranges.is_none());
             drop(state);
             let last = reply.data.clone().slice(17..31);
@@ -2689,7 +2825,7 @@ mod tests {
                         assert_eq!(budget.usage(), baseline);
                     }
                     assert!(fs.reader.is_none());
-                    assert!(fs.state.lock().unwrap().contents.is_empty());
+                    assert!(fs.state.lock().unwrap().online.is_none());
                 }
             }
         }
