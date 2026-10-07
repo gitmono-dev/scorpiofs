@@ -54,6 +54,168 @@ async fn offline_grant_is_bound_to_complete_pin_and_actor_domain() {
     assert!(!store.is_complete().unwrap());
 }
 
+#[tokio::test]
+async fn local_grant_mount_checks_exact_reopen_binding_without_new_per_read_expiry() {
+    use std::{ffi::OsStr, sync::Arc};
+
+    use asyncfuse::raw::prelude::*;
+
+    let (closure, raw, view) = fixture(2);
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(DurableStore::open(temp.path()).unwrap());
+    store
+        .hydrate_snapshot_with(&view, &closure, |file| {
+            std::future::ready(Ok(raw[&file.content_digest].clone()))
+        })
+        .await
+        .unwrap();
+    let mut grant = OfflineGrant {
+        grant_id: "export-local-owners".into(),
+        snapshot_id: view.snapshot_id.clone(),
+        actor_domain_id: "mount-domain".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        policy: "trusted_local_export_v1".into(),
+    };
+    let reopen = |grant: &OfflineGrant, actor: &str| {
+        crate::snapshot::fuse::Mst2Fuse::from_snapshot_store_with_grant(store.clone(), grant, actor)
+    };
+    assert_eq!(
+        reopen(&grant, "mount-domain").err().unwrap().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    {
+        let _transaction = store.transaction().unwrap();
+        store
+            .finish_hydration_commit(
+                &view,
+                closure.files(),
+                Some(&closure),
+                Some(&grant),
+                (0, 2, 0),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        reopen(&grant, "different-domain").err().unwrap().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    let mut wrong = grant.clone();
+    wrong.snapshot_id = "sha256:different-snapshot".into();
+    assert_eq!(
+        reopen(&wrong, "mount-domain").err().unwrap().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    wrong = grant.clone();
+    wrong.grant_id.push_str("-different");
+    assert_eq!(
+        reopen(&wrong, "mount-domain").err().unwrap().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    let mounted = reopen(&grant, "mount-domain").unwrap();
+    let req = Request::default();
+    let directory = mounted
+        .lookup(req, 1, OsStr::new("alias-a"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let inode = mounted
+        .lookup(req, directory, OsStr::new("f0000"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let file = closure
+        .files()
+        .iter()
+        .find(|file| file.rel_path == "alias-a/f0000")
+        .unwrap();
+    let reply = mounted.read(req, inode, inode, 0, 1024).await.unwrap();
+    assert_eq!(reply.data.as_ref(), raw[&file.content_digest].as_slice());
+    let alias_directory = mounted
+        .lookup(req, 1, OsStr::new("alias-b"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let alias = mounted
+        .lookup(req, alias_directory, OsStr::new("f0000"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    assert_ne!(inode, alias);
+    let alias_reply = mounted.read(req, alias, alias, 0, 1024).await.unwrap();
+    assert_eq!(alias_reply.data.as_ptr(), reply.data.as_ptr());
+
+    // Commit an expired grant into the fixture after a legitimate open. The
+    // existing mount intentionally retains reopen-established access; this
+    // byte-owner migration must not introduce a per-read expiry policy.
+    grant.expires_at = "2000-01-01T00:00:00Z".into();
+    {
+        let _transaction = store.transaction().unwrap();
+        store
+            .finish_hydration_commit(
+                &view,
+                closure.files(),
+                Some(&closure),
+                Some(&grant),
+                (0, 2, 0),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        reopen(&grant, "mount-domain").err().unwrap().code,
+        SnapshotErrorCode::LeaseExpired
+    );
+    assert_eq!(
+        mounted
+            .getattr(req, inode, None, 0)
+            .await
+            .unwrap()
+            .attr
+            .size,
+        file.size
+    );
+    assert_eq!(
+        mounted
+            .read(req, inode, inode, 0, 1024)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        reply.data.as_ref()
+    );
+    let second = mounted
+        .lookup(req, directory, OsStr::new("f0001"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let second_file = closure
+        .files()
+        .iter()
+        .find(|file| file.rel_path == "alias-a/f0001")
+        .unwrap();
+    assert_eq!(
+        mounted
+            .read(req, second, second, 0, 1024)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        raw[&second_file.content_digest].as_slice()
+    );
+    for (offset, wanted) in [(file.size, 1024), (u64::MAX, u32::MAX), (0, 0)] {
+        assert!(mounted
+            .read(req, inode, inode, offset, wanted)
+            .await
+            .unwrap()
+            .data
+            .is_empty());
+    }
+}
+
 fn add_directory_pages(entries: &[Entry], pages: &mut BTreeMap<String, Vec<u8>>) -> [u8; 32] {
     let root = Page::build(entries).unwrap();
     let id = page_id(&root);

@@ -50,6 +50,30 @@ pub(crate) struct CasReadScope {
     process: Arc<ProcessAdmission>,
 }
 
+/// Local constructors establish access before enabling byte reads. This is
+/// not an online lease or a grant that expires again on each local read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalCasAccess {
+    CallerEstablished,
+    GrantCheckedOnReopen,
+}
+
+enum AccessCheck<F> {
+    Online(F),
+    Local(LocalCasAccess),
+}
+
+impl<F: Fn() -> Result<(), SnapshotError>> AccessCheck<F> {
+    fn check(&self) -> Result<(), SnapshotError> {
+        match self {
+            Self::Online(lease) => lease(),
+            Self::Local(
+                LocalCasAccess::CallerEstablished | LocalCasAccess::GrantCheckedOnReopen,
+            ) => Ok(()),
+        }
+    }
+}
+
 pub(crate) struct WorkResult<T> {
     pub(crate) result: Result<T, SnapshotError>,
     // Small-object work has no range meters; never report it as zero I/O.
@@ -184,6 +208,37 @@ impl CasReadScope {
         request: RequestMeters,
         work: impl FnOnce() -> WorkResult<T> + Send + 'static,
     ) -> Result<Completion<T>, SnapshotError> {
+        self.run_admitted(AccessCheck::Online(lease), admission, request, work)
+            .await
+    }
+
+    pub(crate) async fn run_local<T: Send + 'static>(
+        &self,
+        access: LocalCasAccess,
+        admission: ReplyAdmission,
+        request: RequestMeters,
+        work: impl FnOnce() -> WorkResult<T> + Send + 'static,
+    ) -> Result<Completion<T>, SnapshotError> {
+        tracing::debug!(
+            target: "scorpiofs::workspace::performance", mode = ?access,
+            "local CAS uses constructor-established access"
+        );
+        self.run_admitted(
+            AccessCheck::<fn() -> Result<(), SnapshotError>>::Local(access),
+            admission,
+            request,
+            work,
+        )
+        .await
+    }
+
+    async fn run_admitted<T: Send + 'static>(
+        &self,
+        access: AccessCheck<impl Fn() -> Result<(), SnapshotError> + Send + Sync + 'static>,
+        admission: ReplyAdmission,
+        request: RequestMeters,
+        work: impl FnOnce() -> WorkResult<T> + Send + 'static,
+    ) -> Result<Completion<T>, SnapshotError> {
         let local_outstanding = try_admit(&self.outstanding)?;
         let process_outstanding = try_admit(&self.process.outstanding)?;
         let enabled =
@@ -213,7 +268,7 @@ impl CasReadScope {
                 state.store(FINISHED, Ordering::Release);
                 closed()
             })?;
-        if let Err(error) = lease() {
+        if let Err(error) = access.check() {
             state.store(FINISHED, Ordering::Release);
             tracing::debug!(
                 target: "scorpiofs::workspace::performance",
@@ -252,7 +307,7 @@ impl CasReadScope {
                             SnapshotErrorCode::Internal,
                             "local CAS waiter cancelled before worker start",
                         ))
-                    } else if let Err(error) = lease() {
+                    } else if let Err(error) = access.check() {
                         trace.outcome = "lease_error";
                         Err(error)
                     } else {
