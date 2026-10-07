@@ -22,6 +22,8 @@ STAGES = {"server-build": 35 * 60, "client-build": 20 * 60,
           "fences": 10 * 60, "setup": 10 * 60}
 STAGE_MINIMUM = {"server-build": 5 * 60, "client-build": 5 * 60,
                  "fences": 60, "setup": 60}
+PAIRED_STAGES = {"server-build": 35 * 60, "client-a-build": 20 * 60,
+                 "client-b-build": 20 * 60, "fences": 10 * 60, "setup": 10 * 60}
 
 
 def recovery_flag(value):
@@ -45,10 +47,24 @@ def utc(value):
     return parsed
 
 
+def require_external_time(deadline_utc, reserve_seconds=0):
+    """Use the original absolute D for staging/upload, without a new anchor."""
+    if (isinstance(reserve_seconds, bool) or not math.isfinite(reserve_seconds)
+            or not 0 <= reserve_seconds <= EXTERNAL_RESERVE):
+        raise ValueError("invalid external-stage reserve")
+    remaining = utc(deadline_utc).timestamp() - time.time()
+    if remaining <= reserve_seconds:
+        raise TimeoutError("external evidence cannot finish within the original session deadline")
+    return remaining
+
+
 class SessionBudget:
-    def __init__(self, deadline_utc, rounds, cleanup_deadline=None, recover_original_window=False):
+    def __init__(self, deadline_utc, rounds, cleanup_deadline=None, recover_original_window=False,
+                 paired=False):
         if type(recover_original_window) is not bool:
             raise ValueError("session recovery requires an explicit boolean")
+        if type(paired) is not bool or paired and rounds != 3:
+            raise ValueError("paired measurement requires exactly three complete paired rounds")
         absolute = utc(deadline_utc)
         if isinstance(rounds, bool) or not 3 <= rounds <= 10:
             raise ValueError("at least three complete rounds are required")
@@ -70,21 +86,26 @@ class SessionBudget:
         self.measurement_deadline = cleanup_deadline - CLEANUP_RESERVE - REPORT_RESERVE
         self.rounds = rounds
         self.recover_original_window = recover_original_window
+        self.paired = paired
+        self.stages = PAIRED_STAGES if paired else STAGES
 
     def require(self, seconds):
         if self.cleanup_deadline - time.monotonic() < seconds:
             raise TimeoutError("insufficient complete-stage session budget")
 
     def stage_deadline(self, stage):
-        if stage not in STAGES:
+        if stage not in self.stages:
             raise ValueError("unknown session stage")
-        names = tuple(STAGES)
-        later = sum(STAGES[name] for name in names[names.index(stage) + 1:])
+        names = tuple(self.stages)
+        later = sum(self.stages[name] for name in names[names.index(stage) + 1:])
         reserve = later + self.rounds * ROUND_SECONDS + REPORT_RESERVE + CLEANUP_RESERVE + MARGIN
-        required = STAGE_MINIMUM[stage] if self.recover_original_window else STAGES[stage]
+        # Paired recovery retains both complete builds and the full matrix;
+        # it cannot use the single-client minimum to reclaim elapsed time.
+        required = (STAGE_MINIMUM[stage] if self.recover_original_window and not self.paired
+                    else self.stages[stage])
         self.require(required + reserve)
         now = time.monotonic()
-        cap = min(STAGES[stage], self.cleanup_deadline - now - reserve)
+        cap = min(self.stages[stage], self.cleanup_deadline - now - reserve)
         if cap < required:
             raise TimeoutError("insufficient current-stage session budget")
         print(json.dumps({"record": "session_stage_budget", "stage": stage,
@@ -112,9 +133,12 @@ def from_options(options):
                                     os.environ.get("RECOVERY_INPUT", "false")))
     existing = getattr(options, "budget", None)
     if existing is not None:
+        if getattr(existing, "paired", False) != getattr(options, "paired", False):
+            raise ValueError("measurement mode differs from the admitted budget")
         return existing
     return SessionBudget(options.session_deadline_utc, options.rounds,
-                         getattr(options, "work_cleanup_deadline_monotonic", None), recovery)
+                         getattr(options, "work_cleanup_deadline_monotonic", None), recovery,
+                         getattr(options, "paired", False))
 
 
 def group_members(pgid, started):
@@ -354,7 +378,8 @@ def main():
     parser.add_argument("--work-cleanup-deadline-monotonic", type=float,
                         default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     parser.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
-    parser.add_argument("--stage", choices=tuple(STAGES), required=True)
+    parser.add_argument("--stage", choices=tuple(dict.fromkeys((*STAGES, *PAIRED_STAGES))), required=True)
+    parser.add_argument("--paired", action="store_true")
     add_recovery_argument(parser)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     options = parser.parse_args()
@@ -366,7 +391,11 @@ def main():
     if not args:
         raise ValueError("a stage command is required")
     deadline = from_options(options).stage_deadline(options.stage)
-    status, _, _ = run_process(args, deadline, capture=False)
+    if options.paired and options.stage in ("client-a-build", "client-b-build"):
+        env = dict(os.environ, MST2_BUILD_DEADLINE_MONOTONIC=repr(deadline))
+        status, _, _ = run_process(args, deadline, env=env, capture=False)
+    else:
+        status, _, _ = run_process(args, deadline, capture=False)
     return status
 
 

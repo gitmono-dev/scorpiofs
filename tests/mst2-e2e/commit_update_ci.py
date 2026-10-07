@@ -223,7 +223,7 @@ def dependencies(source, project, ports, deadline):
     return {"services": selected, "networks": {"default": {"name": project + "-network"}}}
 
 
-def verify_workspace_cleanup(measurements, deadline):
+def verify_workspace_cleanup(measurements, deadline, paired=False):
     # Normal execution owns and joins the worker/daemon children before this
     # server cleanup. A fallback must not claim PASS if abrupt interruption
     # bypassed those owners; persisted PID text is not signal authority.
@@ -236,11 +236,16 @@ def verify_workspace_cleanup(measurements, deadline):
                 continue
             if round_root.is_symlink() or not round_root.is_dir():
                 raise AssertionError("owned round cleanup path changed")
-            for name in ("owned-workspace-daemon.json", "owned-workspace-worker.json"):
-                receipt = round_root / name
-                if not receipt.exists():
-                    raise AssertionError("owned workspace cleanup receipt is missing")
-                if receipt.exists():
+            leaves = [round_root / "client-a", round_root / "client-b"] if paired else [round_root]
+            if paired and {p.name for p in round_root.iterdir() if p.name.startswith("client-")} != {"client-a", "client-b"}:
+                raise AssertionError("owned paired cleanup matrix changed")
+            for leaf in leaves:
+                if leaf.is_symlink() or not leaf.is_dir():
+                    raise AssertionError("owned client cleanup path changed")
+                for name in ("owned-workspace-daemon.json", "owned-workspace-worker.json"):
+                    receipt = leaf / name
+                    if not receipt.exists():
+                        raise AssertionError("owned workspace cleanup receipt is missing")
                     if receipt.is_symlink() or not receipt.is_file() or receipt.stat().st_size > 4096:
                         raise AssertionError("owned workspace cleanup receipt changed")
                     record = json.loads(receipt.read_text())
@@ -266,7 +271,7 @@ def stop_owned(root, project, deadline, process=None):
         raise AssertionError("cleanup Compose configuration differs from owned startup")
     workspace_error = None
     try:
-        verify_workspace_cleanup(root / "measurements", deadline)
+        verify_workspace_cleanup(root / "measurements", deadline, state.get("workspace_layout") == "paired")
     except Exception as error:
         workspace_error = error
     service = state.get("service")
@@ -314,6 +319,15 @@ def owned_service_exit(process):
     if observed is None:
         return None
     return observed.si_status if observed.si_code == os.CLD_EXITED else -observed.si_status
+
+
+def finalize_owned_campaign(root, project, deadline, process, log):
+    """Finish every outer owner before measurement evidence may claim PASS."""
+    stop_owned(root, project, deadline, process)
+    if log is not None:
+        log.close()
+    if time.monotonic() >= deadline:
+        raise TimeoutError("owned campaign finalization exceeded original deadline")
 
 
 def graceful_owned(root, project, deadline, process):
@@ -400,6 +414,9 @@ def execute(options):
         if budget.cleanup_deadline > original + 1:
             raise ValueError("projection work deadline exceeds its original dispatch anchor")
     deadline = budget.stage_deadline("setup")
+    import workspace_update_build as builds
+    clients = builds.clients(options, deadline)
+    options.driver, options.driver_sha256 = clients[0].driver, clients[0].driver_sha256
     source = options.mega_source.resolve(strict=True)
     source_sha = bench.git(source, deadline, "rev-parse", "HEAD").decode().strip()
     if source_sha != options.mega_sha or bench.git(source, deadline, "status", "--porcelain").strip():
@@ -420,11 +437,13 @@ def execute(options):
     compose_path = root / "dependencies.json"
     compose_path.write_text(json.dumps(compose))
     state = {"project": project, "binary": str(binary), "mega_source_sha": source_sha,
-             "compose_sha256": hashlib.sha256(compose_path.read_bytes()).hexdigest()}
+             "compose_sha256": hashlib.sha256(compose_path.read_bytes()).hexdigest(),
+             "workspace_layout": "paired" if getattr(options, "paired", False) else "single"}
     state_path = root / "owned.json"
     state_path.write_text(json.dumps(state))
     process = None
     log = None
+    campaign_finalized = False
     try:
         with bench.phase("dependency_startup"):
             bench.command(["docker", "compose", "-p", project, "-f", str(compose_path),
@@ -545,16 +564,28 @@ def execute(options):
             "--profile", options.profile, "--rounds", str(options.rounds),
             "--session-deadline-utc", options.session_deadline_utc])
         args.budget = budget
+        args.paired = getattr(options, "paired", False)
+        args.build_a = getattr(options, "build_a", None)
+        args.build_b = getattr(options, "build_b", None)
         if getattr(options, "projection_traces", False):
             args.projection_traces = True
             args.finalize_projection = lambda original_deadline: graceful_owned(root, project, original_deadline, process)
+        def finalize_campaign(original_deadline):
+            nonlocal campaign_finalized, log
+            if original_deadline != budget.cleanup_deadline:
+                raise AssertionError("campaign cleanup differs from its original admitted deadline")
+            finalize_owned_campaign(root, project, original_deadline, process, log)
+            log = None
+            campaign_finalized = True
+        args.finalize_campaign = finalize_campaign
         if time.monotonic() >= deadline:
             raise TimeoutError("owned setup exceeded its fixed stage budget")
         with bench.phase("commit_update_benchmark"):
             bench.execute(args)
     finally:
         try:
-            stop_owned(root, project, budget.cleanup_deadline, process)
+            if not campaign_finalized:
+                stop_owned(root, project, budget.cleanup_deadline, process)
         finally:
             if log:
                 log.close()
@@ -571,6 +602,8 @@ if __name__ == "__main__":
     parser.add_argument("--mega-binary", type=Path)
     parser.add_argument("--driver", type=Path)
     parser.add_argument("--driver-sha256")
+    from workspace_update_build import add_arguments
+    add_arguments(parser)
     parser.add_argument("--session-deadline-utc")
     parser.add_argument("--session-started-utc")
     budget_module.add_recovery_argument(parser)
@@ -591,8 +624,8 @@ if __name__ == "__main__":
                               "resources": "one unique disposable hosted-runner Compose project; no cloud resources",
                               "max_session_seconds": 14400, "persistent_service_changes": False}))
         else:
-            required = (opts.mega_source, opts.mega_sha, opts.mega_binary, opts.driver,
-                        opts.driver_sha256, opts.session_deadline_utc)
+            required = (opts.mega_source, opts.mega_sha, opts.mega_binary, opts.session_deadline_utc)
+            required += ((opts.build_a, opts.build_b) if opts.paired else (opts.driver, opts.driver_sha256))
             if not all(required):
                 raise ValueError("all immutable build and shared deadline arguments are required")
             def interrupted(signum, frame):

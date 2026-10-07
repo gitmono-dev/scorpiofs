@@ -1208,12 +1208,12 @@ class WorkerSession:
         if type(version) is not str or not version or type(round_number) is not int:
             raise ValueError("measurement labels are invalid")
         results = {}
-        if side_order == "scorpio-first":
-            results["scorpio"] = self._measure_scorpio(expected, deadline)
-            results["git"] = self._measure_git(expected, commit, deadline)
-        else:
-            results["git"] = self._measure_git(expected, commit, deadline)
-            results["scorpio"] = self._measure_scorpio(expected, deadline)
+        for side in (("scorpio", "git") if side_order == "scorpio-first" else ("git", "scorpio")):
+            started = time.monotonic()
+            results[side] = (self._measure_scorpio(expected, deadline) if side == "scorpio"
+                             else self._measure_git(expected, commit, deadline))
+            results[side]["operation_started_monotonic"] = started
+            results[side]["operation_finished_monotonic"] = time.monotonic()
         _check_deadline(deadline)
         return {"actual_status": results["scorpio"]["actual_status"],
                 "complete_status": results["scorpio"]["complete_status"],
