@@ -250,6 +250,7 @@ struct Fixture {
     advertised: [u8; 32],
     chunk_reads: bool,
     chunks: AtomicUsize,
+    chunk_arrived: Notify,
     maps: AtomicUsize,
     raw: AtomicUsize,
     objects: AtomicUsize,
@@ -311,6 +312,7 @@ impl Fixture {
             advertised,
             chunk_reads: true,
             chunks: AtomicUsize::new(0),
+            chunk_arrived: Notify::new(),
             maps: AtomicUsize::new(0),
             raw: AtomicUsize::new(0),
             objects: AtomicUsize::new(0),
@@ -463,6 +465,7 @@ async fn chunks(
     assert_eq!(items[0]["map_id"], id(&fixture.map.map_id()));
     assert_eq!(items[0]["expected_digest"], id(&fixture.advertised));
     fixture.chunks.fetch_add(1, Ordering::SeqCst);
+    fixture.chunk_arrived.notify_one();
     if fixture.block.load(Ordering::SeqCst) == index {
         fixture.blocked.notify_one();
         fixture.release.notified().await;
@@ -838,24 +841,50 @@ async fn parallel_stream_cancellation_removes_temp_releases_transaction_and_can_
     for core in ["batch", "concurrent"] {
         let temp = tempfile::tempdir().unwrap();
         let (_server, fixture, reader, store) = open(6 * 1024 * 1024 + 7, false, temp.path()).await;
+        let (previous, marker, old_digest) = previous_complete(&store, temp.path()).await;
         let closure = reader.snapshot_closure().await.unwrap();
         fixture.block.store(3, Ordering::SeqCst);
         let mut hydrate = Box::pin(hydrate_parallel(&store, &reader, &closure, core));
         tokio::select! {
             result = &mut hydrate => panic!("{core} unexpectedly completed: {result:?}"),
-            _ = fixture.blocked.notified() => {}
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => panic!("{core} never reached blocked chunk"),
+            _ = async {
+                fixture.blocked.notified().await;
+                loop {
+                    let arrived = fixture.chunk_arrived.notified();
+                    tokio::pin!(arrived);
+                    arrived.as_mut().enable();
+                    if fixture.chunks.load(Ordering::SeqCst) >= 4 {
+                        break;
+                    }
+                    arrived.await;
+                }
+            } => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => panic!(
+                "{core} did not receive all four requests with chunk 3 blocked: {} arrived",
+                fixture.chunks.load(Ordering::SeqCst)
+            ),
         }
         assert_eq!(fixture.chunks.load(Ordering::SeqCst), 4, "{core}");
         drop(hydrate);
         unpublished(&store, &fixture.advertised);
+        assert_eq!(reader.content_usage().output_bytes, 0, "{core}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while reader.content_usage().construction_bytes != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{core} retained cancelled request construction credits"));
+        assert_eq!(reader.content_usage().construction_bytes, 0, "{core}");
         assert!(store.try_transaction().unwrap().is_some(), "{core}");
+        previous_unchanged(&previous, &marker, &old_digest);
         fixture.block.store(NONE, Ordering::SeqCst);
         fixture.release.notify_one();
         hydrate_parallel(&store, &reader, &closure, core)
             .await
             .unwrap();
         assert!(store.is_snapshot_complete().unwrap(), "{core}");
+        previous_unchanged(&previous, &marker, &old_digest);
     }
 }
 
