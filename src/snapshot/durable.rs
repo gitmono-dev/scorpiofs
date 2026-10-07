@@ -1716,6 +1716,13 @@ impl DurableStore {
         const BATCH_MAX_BYTES: u64 = 7 * 1024 * 1024;
         let (mut small, mut large): (Vec<SnapshotFile>, Vec<SnapshotFile>) =
             need.into_iter().partition(|f| f.size <= OBJECT_CAP);
+        let overlap_lanes = !large.is_empty()
+            && batch_concurrency.max(1) <= 2
+            && large_concurrency.max(1) <= 2
+            && stream_reader.is_some_and(|reader| {
+                reader.capabilities().features.chunk_reads
+                    && reader.content_scope.can_overlap_hydration()
+            });
         // Deduplicate small files by digest: one fetch unit per content.
         small.sort_by(|a, b| a.content_digest.cmp(&b.content_digest));
         small.dedup_by(|a, b| a.content_digest == b.content_digest);
@@ -1738,10 +1745,11 @@ impl DurableStore {
             batches.push(cur);
         }
 
-        // Phase 3: fetch batches concurrently; verify + write + journal.
+        // Both bounded lanes share this transaction and the same charged
+        // content scope. A slow OBJECT batch must not delay chunked files.
         let fetched_b = &fetched;
         let bytes_b = &bytes_total;
-        super::stage::trace_async(
+        let small_lane = super::stage::trace_async(
             "small_object_fetch_write",
             futures::stream::iter(batches)
                 .map(Ok::<_, SnapshotError>)
@@ -1797,14 +1805,12 @@ impl DurableStore {
                         Ok(())
                     }
                 }),
-        )
-        .await
-        .map_err(|error| tag_hydration_error(error, HydrationSubstage::SmallObjectFetch))?;
+        );
 
-        // Phase 4: large files, one chunked fetch per file, concurrent.
+        // Large files retain their independent file-concurrency bound.
         let fetched_l = &fetched;
         let bytes_l = &bytes_total;
-        super::stage::trace_async(
+        let large_lane = super::stage::trace_async(
             "large_content_fetch_write",
             futures::stream::iter(large)
                 .map(Ok::<_, SnapshotError>)
@@ -1857,9 +1863,27 @@ impl DurableStore {
                         Ok(())
                     }
                 }),
-        )
-        .await
-        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeContentFetch))?;
+        );
+        // An error drops the other lane's pending work. Neither cancellation
+        // nor one successful lane can reach the durable completion commit.
+        let small_lane = async {
+            small_lane
+                .await
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::SmallObjectFetch))
+        };
+        let large_lane = async {
+            large_lane
+                .await
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeContentFetch))
+        };
+        if overlap_lanes {
+            futures::try_join!(small_lane, large_lane)?;
+        } else {
+            // Higher fanout, occupied/lowered budgets and whole-file
+            // callbacks retain their original serial working sets.
+            small_lane.await?;
+            large_lane.await?;
+        }
 
         journal
             .flush()
