@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn complete_sync_reuses_pins_without_copying_cached_manifests() {
+async fn complete_sync_uses_page_hints_without_copying_cached_manifests() {
     let first = HttpFixture::start(complete_fixture("a", b"target-one")).await;
     let old = first.reader().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -20,6 +20,9 @@ async fn complete_sync_reuses_pins_without_copying_cached_manifests() {
     assert_manifest(unchanged.files(), &first.fixture.expected);
     assert_eq!(warm.meters().reused_file_entries_copied, 0);
     assert_eq!(warm.meters().traversal_nodes, 0);
+    assert_eq!(warm.meters().reused_subtrees, 0);
+    assert_eq!(warm.meters().pin_set_reads, 0);
+    assert!(warm.meters().reused_pages > 0);
     assert_eq!(warm.meters().closure_index_writes, 0);
     assert_eq!(first.fixture.requested_ids(), before);
     assert_eq!(
@@ -38,7 +41,9 @@ async fn complete_sync_reuses_pins_without_copying_cached_manifests() {
     let mut changed = IncrementalSync::new(&reader, &cache);
     let updated = changed.sync_snapshot().await.unwrap();
     assert_manifest(updated.files(), &next.fixture.expected);
-    assert!(changed.meters().reused_subtrees > 0);
+    assert_eq!(changed.meters().reused_subtrees, 0);
+    assert!(changed.meters().reused_pages > 0);
+    assert_eq!(changed.meters().pin_set_reads, 0);
     assert_eq!(changed.meters().reused_file_entries_copied, 0);
     assert_eq!(
         changed.closure_meters().proof_page_hashes,

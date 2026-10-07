@@ -24,6 +24,10 @@
 //! network, pages reused from the record, and page nodes actually visited.
 //! "Did not download again" and "did not traverse everything" are different
 //! claims and are asserted separately.
+//!
+//! Full snapshot sync uses cached pages as hints and independently proves its
+//! complete fixed root. It does not reuse record file lists or audit old pins.
+//! The pin-backed record reuse rules above apply to the file-only `sync` API.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -79,10 +83,10 @@ impl ClosureRecord {
 pub struct SyncMeters {
     /// Pages fetched from the network.
     pub fetched_pages: u64,
-    /// Pages skipped because a record covered them locally.
+    /// Verified cached pages used by acquisition or the full root collector.
     pub reused_pages: u64,
-    /// Page nodes actually visited (including the branch pages examined to
-    /// make a reuse decision).
+    /// Acquisition page nodes visited, including reuse-decision branches.
+    /// Full snapshot collector/proof work is recorded in closure_meters.
     pub traversal_nodes: u64,
     /// File rows constructed from acquired pages for the file-only API.
     /// Full snapshot acquisition leaves this at zero: its final independent
@@ -140,6 +144,30 @@ struct ClosureTransaction {
     records: HashMap<String, ClosureRecord>,
     live_pins: HashSet<String>,
     dirty: bool,
+}
+
+// This transaction publishes hints derived from a complete fixed-root proof.
+// It cannot supply the live-pin evidence required by file-only record reuse.
+struct FullProofTransaction {
+    _lock: IndexLock,
+    records: HashMap<String, ClosureRecord>,
+    dirty: bool,
+}
+
+impl FullProofTransaction {
+    fn put_record(&mut self, record: ClosureRecord) {
+        if self.records.get(&record.root_page_id) != Some(&record) {
+            self.records.insert(record.root_page_id.clone(), record);
+            self.dirty = true;
+        }
+    }
+
+    fn commit(&self, cache: &ScopeCache, meters: &mut SyncMeters) -> Result<(), SnapshotError> {
+        if self.dirty {
+            cache.store_records_counted(&self.records, meters)?;
+        }
+        Ok(())
+    }
 }
 
 struct ReusedSubtree {
@@ -261,6 +289,26 @@ impl ScopeCache {
         meters: &mut SyncMeters,
     ) -> Result<ClosureTransaction, SnapshotError> {
         self.sync_transaction_with_pin_meters(meters, None).await
+    }
+
+    async fn full_proof_transaction(
+        &self,
+        meters: &mut SyncMeters,
+    ) -> Result<FullProofTransaction, SnapshotError> {
+        let lock = loop {
+            if let Some(lock) = self.try_index_lock()? {
+                break lock;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let records = self.load_records_counted(meters)?;
+        // Page bytes are only hints. The caller must prove the complete current
+        // descriptor root, so old owners and their content are not audited here.
+        Ok(FullProofTransaction {
+            _lock: lock,
+            records,
+            dirty: false,
+        })
     }
 
     async fn sync_transaction_with_pin_meters(
@@ -538,7 +586,6 @@ pub struct IncrementalSync<'a> {
     page_pool: BTreeMap<String, Vec<u8>>,
     closure_meters: SnapshotClosureMeters,
     collect_snapshot_pages: bool,
-    pin_verification_meters: Option<super::durable::CasVerificationMeters>,
 }
 
 impl<'a> IncrementalSync<'a> {
@@ -554,7 +601,6 @@ impl<'a> IncrementalSync<'a> {
             page_pool: BTreeMap::new(),
             closure_meters: SnapshotClosureMeters::default(),
             collect_snapshot_pages: false,
-            pin_verification_meters: None,
         }
     }
 
@@ -565,14 +611,6 @@ impl<'a> IncrementalSync<'a> {
     /// Root-proof work is additional to acquisition's `traversal_nodes`.
     pub fn closure_meters(&self) -> SnapshotClosureMeters {
         self.closure_meters
-    }
-
-    pub(crate) fn with_pin_verification_meters(
-        mut self,
-        meters: Option<super::durable::CasVerificationMeters>,
-    ) -> Self {
-        self.pin_verification_meters = meters;
-        self
     }
 
     fn reset(&mut self) -> Result<(), SnapshotError> {
@@ -601,23 +639,17 @@ impl<'a> IncrementalSync<'a> {
             ));
         }
         self.reader.ensure_lease().await?;
-        let mut transaction = self
-            .cache
-            .sync_transaction_with_pin_meters(
-                &mut self.meters,
-                self.pin_verification_meters.as_ref(),
-            )
-            .await?;
+        let mut transaction = self.cache.full_proof_transaction(&mut self.meters).await?;
         self.reader.ensure_lease().await?;
-        self.acquire(&mut transaction, true).await?;
         let reader = self.reader;
         let (pages, route_visits, collector_decodes) = reader.snapshot_pages_with(self).await?;
         let (closure, facts, mut meters) =
             ValidatedSnapshotClosure::with_subtree_facts(reader.descriptor(), pages)?;
+        reader.validate_snapshot_files(closure.files())?;
         meters.collector_route_visits = route_visits;
         meters.collector_page_decodes = collector_decodes;
         // Publish current reachable records only from the final root proof.
-        // Acquisition uses records as page hints, never as file-list truth.
+        // Cached page bytes are hints, never record file-list truth.
         // Unrelated old roots never enter this snapshot's dependency set.
         for fact in facts {
             let record = ClosureRecord {
@@ -1539,6 +1571,89 @@ mod tests {
             meters.closure_index_writes, 0,
             "no dirty records to publish"
         );
+    }
+
+    #[tokio::test]
+    async fn full_proof_index_wait_yields_and_cancellation_discards_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        cache.put_record(&rec("existing", "old")).unwrap();
+        let original = fs::read(cache.closures_path()).unwrap();
+        let blocker = cache.index_lock().unwrap();
+        let mut meters = SyncMeters::default();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(30),
+            cache.full_proof_transaction(&mut meters),
+        )
+        .await
+        .is_err());
+        assert_eq!(meters.closure_index_reads, 0);
+        assert_eq!(meters.pin_set_reads, 0);
+        drop(blocker);
+
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task_dir = tmp.path().to_path_buf();
+        let writer = tokio::spawn(async move {
+            let cache = ScopeCache::open(task_dir).unwrap();
+            let mut meters = SyncMeters::default();
+            let mut transaction = cache.full_proof_transaction(&mut meters).await.unwrap();
+            assert_eq!(meters.closure_index_reads, 1);
+            assert_eq!(meters.pin_set_reads, 0);
+            transaction.put_record(rec("cancelled", "new"));
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(transaction);
+        });
+        started.await.unwrap();
+        assert!(cache.try_index_lock().unwrap().is_none());
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        assert_eq!(fs::read(cache.closures_path()).unwrap(), original);
+        let transaction = tokio::time::timeout(
+            Duration::from_secs(2),
+            cache.full_proof_transaction(&mut SyncMeters::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(transaction.records.contains_key("existing"));
+        assert!(!transaction.records.contains_key("cancelled"));
+        assert!(!transaction.dirty);
+    }
+
+    #[tokio::test]
+    async fn full_proof_failed_publication_keeps_old_index_and_allows_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        cache.put_record(&rec("existing", "old")).unwrap();
+        let original = fs::read(cache.closures_path()).unwrap();
+        let mut meters = SyncMeters::default();
+        let mut transaction = cache.full_proof_transaction(&mut meters).await.unwrap();
+        transaction.put_record(rec("existing", "new"));
+        transaction.put_record(rec("fresh", "new"));
+        let fault = RenameFailure::install(tmp.path());
+        assert_eq!(
+            transaction.commit(&cache, &mut meters).unwrap_err().code,
+            SnapshotErrorCode::Internal
+        );
+        drop(fault);
+        drop(transaction);
+        assert_eq!(fs::read(cache.closures_path()).unwrap(), original);
+        assert_eq!(meters.closure_index_writes, 0);
+        assert_eq!(meters.closure_index_write_bytes, 0);
+        assert_eq!(meters.pin_set_reads, 0);
+        let mut transaction = cache
+            .full_proof_transaction(&mut SyncMeters::default())
+            .await
+            .unwrap();
+        assert_eq!(transaction.records["existing"].pin_ref, "old");
+        assert!(!transaction.records.contains_key("fresh"));
+        transaction.put_record(rec("fresh", "retry"));
+        transaction
+            .commit(&cache, &mut SyncMeters::default())
+            .unwrap();
+        drop(transaction);
+        assert_eq!(cache.record_for("fresh").unwrap().pin_ref, "retry");
     }
 
     #[tokio::test]

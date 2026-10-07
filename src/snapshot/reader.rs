@@ -746,11 +746,19 @@ impl SnapshotReader {
     pub async fn snapshot_closure(&self) -> Result<ValidatedSnapshotClosure, SnapshotError> {
         let (pages, _, _) = self.snapshot_pages_with(&mut NetworkPages).await?;
         let closure = ValidatedSnapshotClosure::from_pages(self.descriptor(), pages)?;
-        for file in closure.files() {
+        self.validate_snapshot_files(closure.files())?;
+        Ok(closure)
+    }
+
+    pub(crate) fn validate_snapshot_files(
+        &self,
+        files: &[SnapshotFile],
+    ) -> Result<(), SnapshotError> {
+        for file in files {
             self.client.validate_path(&file.rel_path)?;
             self.client.validate_file_size(file.size)?;
         }
-        Ok(closure)
+        Ok(())
     }
 
     /// Collect only dependencies reached from this reader's fixed root.
