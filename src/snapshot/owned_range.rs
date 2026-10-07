@@ -154,25 +154,45 @@ impl ChunkCache {
 type LeafEntry = (u64, Arc<Vec<[u8; 32]>>);
 struct LeafCache {
     entries: [Option<LeafEntry>; CACHED_LEAVES],
-    next: usize,
+    len: usize,
 }
 impl LeafCache {
     fn new() -> Self {
         Self {
             entries: std::array::from_fn(|_| None),
-            next: 0,
+            len: 0,
         }
     }
-    fn get(&self, index: u64) -> Option<Arc<Vec<[u8; 32]>>> {
-        self.entries
+    fn remove(&mut self, slot: usize) -> LeafEntry {
+        let entry = self.entries[slot].take().unwrap();
+        for position in slot..self.len - 1 {
+            self.entries[position] = self.entries[position + 1].take();
+        }
+        self.len -= 1;
+        entry
+    }
+    fn get(&mut self, index: u64) -> Option<Arc<Vec<[u8; 32]>>> {
+        let slot = self.entries[..self.len]
             .iter()
-            .flatten()
-            .find(|entry| entry.0 == index)
-            .map(|entry| entry.1.clone())
+            .position(|entry| entry.as_ref().unwrap().0 == index)?;
+        let entry = self.remove(slot);
+        let digests = entry.1.clone();
+        self.entries[self.len] = Some(entry);
+        self.len += 1;
+        Some(digests)
     }
     fn insert(&mut self, index: u64, digests: Arc<Vec<[u8; 32]>>) {
-        self.entries[self.next] = Some((index, digests));
-        self.next = (self.next + 1) % CACHED_LEAVES;
+        if let Some(slot) = self.entries[..self.len]
+            .iter()
+            .position(|entry| entry.as_ref().unwrap().0 == index)
+        {
+            drop(self.remove(slot));
+        }
+        if self.len == CACHED_LEAVES {
+            drop(self.remove(0));
+        }
+        self.entries[self.len] = Some((index, digests));
+        self.len += 1;
     }
 }
 
@@ -232,7 +252,7 @@ impl OwnedChunkedFile {
     ) -> Result<Self, SnapshotError> {
         reader.authorized_context().validate_relative_path(path)?;
         reader.client().validate_file_size(size)?;
-        if !(OBJECT_CAP + 1..=super::range::MAX_FILE_SIZE).contains(&size) {
+        if !(OBJECT_CAP + 1..=super::content_profile::MAX_FILE_SIZE).contains(&size) {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
                 "owned chunk range requires a large file within 8 TiB",
@@ -278,7 +298,7 @@ impl OwnedChunkedFile {
         file: SnapshotFile,
         authority: FileAuthority,
     ) -> Result<Self, SnapshotError> {
-        if !(OBJECT_CAP + 1..=super::range::MAX_FILE_SIZE).contains(&file.size) {
+        if !(OBJECT_CAP + 1..=super::content_profile::MAX_FILE_SIZE).contains(&file.size) {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
                 "owned chunk range requires a large file within 8 TiB",
@@ -491,7 +511,7 @@ impl OwnedChunkedFile {
     async fn ensure_leaf(&self, page: u64) -> Result<Arc<Vec<[u8; 32]>>, SnapshotError> {
         self.validate_file().await?;
         {
-            let cache = self.leaves.lock().await;
+            let mut cache = self.leaves.lock().await;
             self.reader.local_lease_status()?;
             if let Some(digests) = cache.get(page) {
                 return Ok(digests);

@@ -406,7 +406,7 @@ impl SnapshotReader {
                 if entry.kind == EntryKind::Directory {
                     return Err(not_file("selected path is a directory"));
                 }
-                if entry.size > super::range::MAX_FILE_SIZE
+                if entry.size > super::content_profile::MAX_FILE_SIZE
                     || entry.kind == EntryKind::Symlink && !(1..=4095).contains(&entry.size)
                 {
                     return Err(limit().into());

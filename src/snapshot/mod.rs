@@ -16,6 +16,7 @@ mod chunk_wire;
 pub mod client;
 pub mod closure;
 mod content;
+mod content_profile;
 pub mod coordinator;
 mod descriptor_wire;
 mod directory;
@@ -35,7 +36,6 @@ mod owned_reader;
 mod owned_transport;
 mod path_state;
 mod proven_file;
-pub mod range;
 pub mod reader;
 mod resolve_receipt;
 mod resolve_wire;
@@ -49,6 +49,7 @@ pub use auth::{AuthorizedSnapshotContext, CacheDomain};
 pub use client::Mst2Client;
 pub use closure::{SnapshotClosureMeters, SnapshotDirectory, ValidatedSnapshotClosure};
 pub use content::{ContentBudgetLimits, ContentBudgetUsage, VerifiedContent, VerifiedContentBatch};
+pub use content_profile::OBJECT_CAP;
 pub use coordinator::{FetchCoordinator, FetchCoordinatorCounts, FetchCoordinatorLimits};
 pub use durable::{CompletionKind, DurableStore, HydrateReport, LocalCasRangeMeters, ViewMeta};
 pub use frames::LeaseReleaseOutcome;
@@ -59,7 +60,6 @@ pub use path_state::{
     SnapshotPathState,
 };
 pub use proven_file::{FileMembershipError, ProvenSnapshotFile};
-pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use resolve_receipt::ResolveTraceReceipt;
 pub use types::{

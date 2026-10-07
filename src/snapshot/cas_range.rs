@@ -7,9 +7,9 @@ use std::{fmt, mem::size_of, sync::Arc};
 use super::{
     cas_index::{self, LocalCasRangeMeters, CHUNK_SIZE},
     content::{AccountedBuffer, BudgetClass, ContentBudget, Reservation},
+    content_profile::{MAX_FILE_SIZE, OBJECT_CAP},
     durable::DurableStore,
     frames::parse_digest,
-    range::{MAX_FILE_SIZE, OBJECT_CAP},
     SnapshotError, SnapshotErrorCode,
 };
 
