@@ -87,7 +87,7 @@ struct State {
     chunked: HashMap<u64, Arc<crate::snapshot::range::ChunkedFile>>,
     /// Modern online mounts retain paid payload/reply owners in fixed slots.
     owned: Option<OwnedFuseCache>,
-    /// Only a canonical, authorized online v3 workspace owns this cache.
+    /// Canonical online stores retain paid content independently of page hints.
     store_small: Option<StoreSmallCache>,
     store_ranges: Option<StoreRangeCache>,
     /// Lazy mounts: directory pages are fetched on first readdir/lookup.
@@ -104,6 +104,29 @@ fn owned_cache(
         .filter(|reader| store.is_none() && reader.capabilities().features.metadata_pages)
         .map(OwnedFuseCache::new)
         .transpose()
+}
+
+fn stored_caches(
+    reader: Option<&SnapshotReader>,
+    store: Option<&Arc<DurableStore>>,
+) -> std::result::Result<
+    (Option<StoreSmallCache>, Option<StoreRangeCache>),
+    crate::snapshot::SnapshotError,
+> {
+    let Some(reader) = reader.filter(|reader| {
+        store.is_some()
+            && reader.capabilities().features.metadata_pages
+            && matches!(
+                reader.capability_advertisement(),
+                CapabilityAdvertisement::Canonical(_)
+            )
+    }) else {
+        return Ok((None, None));
+    };
+    Ok((
+        Some(StoreSmallCache::new(&reader.content_scope)?),
+        Some(StoreRangeCache::new(reader)?),
+    ))
 }
 
 /// Kernel file type for one view entry. Symlinks are their own type, not
@@ -161,6 +184,15 @@ impl Mst2Fuse {
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         store.bind_reader(&reader)?;
+        if reader.capabilities().features.metadata_pages
+            && matches!(
+                reader.capability_advertisement(),
+                CapabilityAdvertisement::Canonical(_)
+            )
+        {
+            let closure = reader.snapshot_closure().await?;
+            return Self::from_snapshot_manifest(reader, store, closure);
+        }
         let manifest = reader.file_manifest().await?;
         Self::build(Some(reader), Some(store), manifest)
     }
@@ -267,19 +299,7 @@ impl Mst2Fuse {
             _ => None,
         };
         let root_page_id = reader.descriptor().metadata_root.clone();
-        let store_small = if scope_pages.is_some()
-            && matches!(
-                reader.capability_advertisement(),
-                CapabilityAdvertisement::Canonical(_)
-            ) {
-            Some(StoreSmallCache::new(&reader.content_scope)?)
-        } else {
-            None
-        };
-        let store_ranges = store_small
-            .as_ref()
-            .map(|_| StoreRangeCache::new(&reader))
-            .transpose()?;
+        let (store_small, store_ranges) = stored_caches(Some(&reader), store.as_ref())?;
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
@@ -672,14 +692,15 @@ impl Mst2Fuse {
 
         let invalid =
             |message: String| SnapshotError::new(SnapshotErrorCode::IntegrityError, message);
+        let (store_small, store_ranges) = stored_caches(reader.as_ref(), store.as_ref())?;
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
             contents: HashMap::new(),
             chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
-            store_small: None,
-            store_ranges: None,
+            store_small,
+            store_ranges,
             lazy: false,
             namespace_scope: Some(closure.descriptor().scope.clone()),
         };
