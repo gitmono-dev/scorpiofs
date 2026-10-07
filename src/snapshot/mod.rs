@@ -34,6 +34,7 @@ pub mod range;
 pub mod reader;
 mod resolve_receipt;
 mod resolve_wire;
+mod secure_fs;
 pub(crate) mod stage;
 pub mod types;
 pub mod upper_diff;

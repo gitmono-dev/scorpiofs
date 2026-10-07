@@ -27,7 +27,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     future::Future,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -45,7 +45,7 @@ use tokio::io::AsyncWriteExt;
 pub use super::cas_index::LocalCasRangeMeters;
 use crate::snapshot::{
     closure::{SnapshotDirectory, ValidatedSnapshotClosure},
-    SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
+    secure_fs, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
 };
 
 trait BorrowedBatch {
@@ -706,7 +706,7 @@ impl DurableStore {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&path).map_err(io_err)?;
+        let bytes = secure_fs::read(&path).map_err(io_err)?;
         let meta = serde_json::from_slice(&bytes).map_err(|e| {
             SnapshotError::new(
                 SnapshotErrorCode::Internal,
@@ -1820,13 +1820,7 @@ impl DurableStore {
     // a short critical-section lock held by a downloading task. Dropping the
     // handle (including after process exit) releases the OS lock.
     pub(super) fn try_transaction(&self) -> Result<Option<TransactionGuard>, SnapshotError> {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join(TRANSACTION_LOCK))
-            .map_err(io_err)?;
+        let lock = secure_fs::open_rw_create(&self.root.join(TRANSACTION_LOCK)).map_err(io_err)?;
         match lock.try_lock() {
             Ok(()) => Ok(Some(TransactionGuard(lock))),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
@@ -2482,7 +2476,7 @@ impl DurableStore {
         len: usize,
     ) -> Result<Option<Vec<u8>>, SnapshotError> {
         let path = self.blob_path(digest)?;
-        let mut f = match fs::File::open(&path) {
+        let mut f = match secure_fs::open_regular(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(e)),
@@ -2623,7 +2617,7 @@ impl DurableStore {
     pub fn read_blob(&self, digest: &str, expected_size: u64) -> Result<Vec<u8>, SnapshotError> {
         let capacity = buffered_size(expected_size)?;
         let path = self.blob_path(digest)?;
-        let mut input = File::open(&path).map_err(|e| {
+        let mut input = secure_fs::open_regular(&path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 SnapshotError::new(
                     SnapshotErrorCode::PathNotFound,
@@ -2700,7 +2694,7 @@ impl DurableStore {
         // Completion and resume must not collect a potentially 8 TiB CAS
         // object into memory. Read at most one byte beyond its advertised
         // size so growth cannot turn verification into an unbounded stream.
-        let mut input = File::open(&path)
+        let mut input = secure_fs::open_regular(&path)
             .map_err(io_err)?
             .take(expected_size.saturating_add(1));
         let mut hash = Context::new(&SHA256);
@@ -2736,7 +2730,7 @@ impl DurableStore {
     /// rather than a silently smaller set of hydrated files.
     fn read_journal(&self) -> Result<HashMap<String, FileRecord>, SnapshotError> {
         let path = self.root.join(JOURNAL_FILE);
-        let bytes = match fs::read(&path) {
+        let bytes = match secure_fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(io_err(e)),
@@ -2775,11 +2769,7 @@ impl DurableStore {
         if bytes.is_empty() {
             return Ok(());
         }
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join(JOURNAL_FILE))
-            .map_err(io_err)?;
+        let mut f = secure_fs::open_append_create(&self.root.join(JOURNAL_FILE)).map_err(io_err)?;
         durability_checkpoint(&self.root, "journal-write")?;
         f.write_all(bytes).map_err(io_err)?;
         durability_checkpoint(&self.root, "journal-written")?;
@@ -2798,11 +2788,7 @@ impl DurableStore {
             uuid::Uuid::new_v4()
         ));
         let result = (|| {
-            let file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp)
-                .map_err(io_err)?;
+            let file = secure_fs::open_create_new(&tmp).map_err(io_err)?;
             let mut output = io::BufWriter::with_capacity(256 * 1024, &file);
             durability_checkpoint(&self.root, "journal-compact-write")?;
             for file in manifest {
@@ -2846,7 +2832,7 @@ impl DurableStore {
             .iter()
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |idx| idx + 1);
-        let file = OpenOptions::new().write(true).open(&path).map_err(io_err)?;
+        let file = secure_fs::open_write(&path).map_err(io_err)?;
         file.set_len(end as u64).map_err(io_err)?;
         file.sync_all().map_err(io_err)?;
         sync_dir(&self.root)
@@ -2876,7 +2862,7 @@ pub(super) fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), Sn
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
-        let mut f = File::create(&tmp).map_err(io_err)?;
+        let mut f = secure_fs::open_create_new(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
         durability_checkpoint(dir, "object-file-sync")?;
         f.sync_all().map_err(io_err)?;
@@ -2954,10 +2940,7 @@ where
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let handle = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary_path)
+    let handle = secure_fs::open_create_new(&temporary_path)
         .map_err(io_err)
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     let temporary = PendingBlob(temporary_path);
@@ -3060,7 +3043,7 @@ fn buffered_allocation_error() -> SnapshotError {
 
 fn sync_file(path: &Path) -> Result<(), SnapshotError> {
     durability_checkpoint(path, "file-sync")?;
-    File::open(path)
+    secure_fs::open_regular(path)
         .map_err(io_err)?
         .sync_all()
         .map_err(io_err)?;
@@ -3095,7 +3078,7 @@ pub(super) fn create_dirs_durable(path: &Path) -> Result<(), SnapshotError> {
             Err(e) => return Err(io_err(e)),
         }
     }
-    fs::create_dir_all(path).map_err(io_err)?;
+    secure_fs::create_dir_all_no_symlink(path).map_err(io_err)?;
     for directory in missing.iter().rev() {
         sync_dir(directory)?;
         sync_dir(parent_dir(directory))?;
@@ -3110,7 +3093,7 @@ fn parent_dir(path: &Path) -> &Path {
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SnapshotError> {
-    match fs::read(path) {
+    match secure_fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(io_err(e)),
@@ -3308,7 +3291,7 @@ mod streaming_durability_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, fs::OpenOptions};
 
     use super::*;
 
@@ -3764,6 +3747,46 @@ mod tests {
             .read_blob(&digest, body.len() as u64)
             .expect_err("tampered blob must not be served");
         assert_eq!(err.code, SnapshotErrorCode::DigestMismatch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_blob_rejects_a_final_symlink_even_when_target_matches() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(tmp.path()).unwrap();
+        let body = b"symlink target must not be trusted";
+        let digest = digest_of(body);
+        let blob = store.blob_path(&digest).unwrap();
+        let target = tmp.path().join("outside");
+        std::fs::write(&target, body).unwrap();
+        symlink(&target, &blob).unwrap();
+
+        let err = store
+            .read_blob(&digest, body.len() as u64)
+            .expect_err("CAS reads must not follow a final symlink");
+        assert!(matches!(
+            err.code,
+            SnapshotErrorCode::Internal | SnapshotErrorCode::DigestMismatch
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_creation_rejects_an_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        symlink(&outside, root.join("redirect")).unwrap();
+
+        let err = create_dirs_durable(&root.join("redirect").join("child")).unwrap_err();
+        assert_eq!(err.code, SnapshotErrorCode::Internal);
+        assert!(!outside.join("child").exists());
     }
 
     #[test]
