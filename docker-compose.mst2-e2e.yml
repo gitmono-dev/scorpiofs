@@ -22,9 +22,9 @@ services:
   mega2:
     image: ${MEGA2_IMAGE:-mega2-mst2:local}
     build:
-      # monoengine is the sibling checkout; this file lives in scorpiofs.
-      context: ../monoengine
-      dockerfile: Dockerfile.mst2
+      # Use the same backend source selection as the base stack.
+      context: ${MEGA2_SOURCE:-../monoengine}
+      dockerfile: Dockerfile
     environment:
       # The MST/2 surface stays off unless explicitly enabled, and every
       # capability is only advertised once it has been accepted.
@@ -52,13 +52,14 @@ services:
       retries: 60
       start_period: 30s
 
-  # The base stack's ScorpioFS service (Antares daemon mount) is not part of
-  # the MST/2 acceptance and its image build expects the codec to be
-  # resolvable from the context alone; park it behind a profile so the default
-  # run neither builds nor starts it. Enable it with:
-  #   docker compose ... --profile antares-mount up
+  # The v3 workspace daemon is independent of the one-shot MST/2 acceptance.
+  # Park it behind a profile so the default run neither builds nor starts it.
+  # Enable it with: docker compose ... --profile workspace-daemon up
   scorpiofs:
-    profiles: ["antares-mount"]
+    profiles: ["workspace-daemon"]
+    environment:
+      # Public local acceptance fixture; the optional daemon uses the same actor.
+      SCORPIO_MST2_AUTH_TOKEN: "mst2-e2e-acceptance-token"
 
   mst2-e2e:
     build:
