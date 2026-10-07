@@ -435,6 +435,53 @@ class CommitUpdateBenchTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 BENCH.verify_worktree(root, expected)
 
+    def test_batch_publication_rewrites_many_existing_blobs_and_preserves_old_commit(self):
+        for smoke, blob_count, directory_count, file_size in ((True, 16, 8, 1024),
+                                                             (False, 128, 32, 8192)):
+            with self.subTest(smoke=smoke), tempfile.TemporaryDirectory() as temp:
+                repo = Path(temp) / "fixture"
+                deadline = time.monotonic() + 120
+                subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+                env = BENCH.clean_env({"GIT_AUTHOR_NAME": "test", "GIT_COMMITTER_NAME": "test",
+                                       "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                                       "GIT_COMMITTER_EMAIL": "test@example.invalid"})
+                BENCH.git(repo, deadline, "commit", "--allow-empty", "-qm", "seed", env=env)
+                for version in ("v1", "v2", "v3"):
+                    old_commit, _ = BENCH.create_version(repo, 1, version, smoke, deadline)
+                before = BENCH.expected_manifest(repo, old_commit, deadline)
+                commit, _ = BENCH.create_version(repo, 1, "v4", smoke, deadline)
+                after = BENCH.expected_manifest(repo, commit, deadline)
+                old = {file["rel_path"]: file for file in before["files"]}
+                new = {file["rel_path"]: file for file in after["files"]}
+                self.assertEqual(old.keys(), new.keys())
+                self.assertEqual(before["directories"], after["directories"])
+                changed = {path for path in old if old[path] != new[path]}
+                sources = {path for path in changed if path.startswith("r01/")}
+                aliases = changed - sources
+                self.assertEqual(len(sources), blob_count)
+                self.assertEqual(len({path.split("/")[1] for path in sources}), 8)
+                self.assertEqual(len({str(Path(path).parent) for path in sources}), directory_count)
+                self.assertEqual(len({new[path]["content_digest"] for path in changed}), blob_count)
+                self.assertEqual(sum(new[path]["size"] for path in sources), blob_count * file_size)
+                self.assertTrue(any(path.startswith("r01/renamed-m001/") for path in sources))
+                self.assertTrue(aliases)
+                for path in changed:
+                    self.assertEqual(old[path]["fs_kind"], new[path]["fs_kind"])
+                    self.assertEqual(old[path]["size"], new[path]["size"])
+                for path in aliases:
+                    self.assertTrue(path.startswith("alias-r01-m007/"))
+                    source = "r01/m007/" + path.split("/", 1)[1]
+                    self.assertEqual(new[path]["content_digest"], new[source]["content_digest"])
+                self.assertEqual(new["r01/large.bin"], old["r01/large.bin"])
+                self.assertEqual(new["r01/wide/f000"], old["r01/wide/f000"])
+                # Independently inspect Git changes: no additions, deletions,
+                # renames or mode changes may turn this into another workload.
+                diff = BENCH.git(repo, deadline, "diff-tree", "--no-commit-id", "--name-status",
+                                 "-r", old_commit, commit).decode().splitlines()
+                self.assertEqual({line.split("\t", 1)[1] for line in diff}, changed)
+                self.assertTrue(all(line.startswith("M\t") for line in diff))
+                self.assertEqual(BENCH.expected_manifest(repo, old_commit, deadline), before)
+
     def test_timeout_terminates_whole_child_group_then_kills_if_term_is_ignored(self):
         class Hung:
             pid = 12345

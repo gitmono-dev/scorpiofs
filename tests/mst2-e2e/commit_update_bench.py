@@ -31,6 +31,10 @@ except ModuleNotFoundError:
     from pip._vendor import tomli as tomllib
 
 
+SCENARIOS = {"v1": "cold", "v2": "single-file", "v3": "subtree-rename",
+             "v4": "batch-file-update"}
+
+
 # Duplicated deliberately at this boundary: the benchmark must remain able
 # to serialize a safe record even when the worker module failed to import.
 # Unknown values are discarded rather than copied from an exception object.
@@ -503,6 +507,8 @@ def verify_worktree(worktree, expected, deadline=None):
 
 
 def create_version(repo, round_number, version, smoke, deadline):
+    if version not in SCENARIOS:
+        raise ValueError("unknown fixed commit-update scenario")
     prefix = f"r{round_number:02}"
     user = clean_env({"GIT_AUTHOR_NAME": "MST2 benchmark", "GIT_COMMITTER_NAME": "MST2 benchmark",
                       "GIT_AUTHOR_EMAIL": "benchmark@example.invalid", "GIT_COMMITTER_EMAIL": "benchmark@example.invalid"})
@@ -540,8 +546,28 @@ def create_version(repo, round_number, version, smoke, deadline):
         body[0] ^= 1
         path.write_bytes(body)
         git(repo, deadline, "add", "--", f"{prefix}/m000/d00/f000")
-    else:
+    elif version == "v3":
         git(repo, deadline, "mv", "--", f"{prefix}/m001", f"{prefix}/renamed-m001")
+    elif version == "v4":
+        # Rewrite existing bodies across module and directory boundaries.
+        # Medium adds 128 distinct 8 KiB blobs, without growing the checkout;
+        # smoke rewrites 16 1 KiB blobs. The renamed subtree and m007 alias
+        # participate, so retained views must preserve both their old paths
+        # and old bytes after this publication.
+        changed = []
+        for module in range(8):
+            name = "renamed-m001" if module == 1 else f"m{module:03}"
+            for bucket in range(1 if smoke else 4):
+                for number in range(2 if smoke else 4):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("batch fixture generation exceeded the shared deadline")
+                    rel = f"{prefix}/{name}/d{bucket:02}/f{number:03}"
+                    path = repo / rel
+                    size = path.stat().st_size
+                    block = hashlib.sha256(("batch:" + rel).encode()).digest()
+                    path.write_bytes(block * (size // len(block)))
+                    changed.append(rel)
+        git(repo, deadline, "add", "--", *changed)
     parent = git(repo, deadline, "rev-parse", "HEAD").decode().strip()
     tree = git(repo, deadline, "write-tree").decode().strip()
     # Preserve raw empty directories and a logical directory alias in every
@@ -617,7 +643,7 @@ if __name__ == "__main__":
     if not opts.execute:
         endpoint_pair(opts.base_url, opts.git_url)
         print(json.dumps({"execute": False, "profile": opts.profile, "rounds": opts.rounds,
-                          "scenarios": ["v1-cold", "v2-single-file", "v3-subtree-rename"],
+                          "scenarios": [version + "-" + scenario for version, scenario in SCENARIOS.items()],
                           "max_wall_seconds": min(opts.deadline_seconds, 14400),
                           "service_or_resource_changes": False,
                           "git_baseline": "cold depth=1 fetch, incremental shared bare ODB fetch, new detached worktree per fixed commit, retained old worktrees, shared streamed oracle",
