@@ -59,6 +59,14 @@ pub async fn serve_with_observation(
     http_addr: SocketAddr,
     observation: Option<ObservationFileOptions>,
 ) -> i32 {
+    serve_with_diagnostics(http_addr, observation, false).await
+}
+
+pub async fn serve_with_diagnostics(
+    http_addr: SocketAddr,
+    observation: Option<ObservationFileOptions>,
+    read_profile: bool,
+) -> i32 {
     // Bind the HTTP listener up-front so a bind failure is a clean exit (code 4)
     // rather than a panic inside the daemon task.
     let listener = match tokio::net::TcpListener::bind(http_addr).await {
@@ -87,8 +95,9 @@ pub async fn serve_with_observation(
         config::mst2_base_url(),
         (!token.is_empty()).then(|| token.to_owned()),
     );
-    let workspace_config =
+    let mut workspace_config =
         WorkspaceConfig::new(paths.workspace_root.into(), paths.cache_root.into());
+    workspace_config.read_profile = read_profile;
     let initialized = match &observer {
         Some(observer) => {
             WorkspaceService::new_with_observer(client, workspace_config, observer.clone())

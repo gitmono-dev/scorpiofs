@@ -49,7 +49,9 @@ def mounts_under(root):
 
 class WorkspaceDaemon:
     def __init__(self, binary, binary_sha256, round_root, upstream, token, run_id,
-                 env, deadline):
+                 env, deadline, *, read_profile=False):
+        if type(read_profile) is not bool:
+            raise ValueError("read profiling requires an explicit boolean opt-in")
         self.process = None
         self.log = None
         self.started = None
@@ -84,6 +86,8 @@ class WorkspaceDaemon:
         self.argv = [str(self.binary), "--config-path", str(config), "--http-addr",
                      f"127.0.0.1:{self.port}", "serve", "--workspace-observation-jsonl",
                      str(self.sink), "--workspace-observation-run-id", run_id]
+        if read_profile:
+            self.argv.append("--workspace-read-profile")
         self.collector = WorkspaceObservationCollector(self.sink, self.cache_root, run_id, self.uid)
         child_env = dict(env, SCORPIO_MST2_AUTH_TOKEN=token)
         try:

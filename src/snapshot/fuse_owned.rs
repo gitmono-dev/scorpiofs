@@ -214,8 +214,18 @@ impl AsRef<[u8]> for ReplyOwner {
 }
 
 /// Admission precedes body I/O; transferring it creates the actual Bytes owner.
-pub(crate) struct ReplyAdmission(Reservation);
+pub(crate) struct ReplyAdmission(
+    Reservation,
+    Option<Arc<crate::util::read_profile::ReadProfile>>,
+);
 impl ReplyAdmission {
+    pub(crate) fn with_read_profile(
+        mut self,
+        profile: Option<Arc<crate::util::read_profile::ReadProfile>>,
+    ) -> Self {
+        self.1 = profile;
+        self
+    }
     pub(crate) fn new(reader: &SnapshotReader) -> Result<Self, SnapshotError> {
         Self::reserve(&reader.content_scope)
     }
@@ -224,7 +234,9 @@ impl ReplyAdmission {
         // alignment gaps conservatively; clones/slices share that same box.
         let charge =
             size_of::<ReplyOwner>() + size_of::<AtomicUsize>() + 2 * align_of::<ReplyOwner>();
-        budget.reserve(BudgetClass::Output, charge).map(Self)
+        budget
+            .reserve(BudgetClass::Output, charge)
+            .map(|reservation| Self(reservation, None))
     }
     pub(crate) fn content(
         self,
@@ -251,18 +263,32 @@ impl ReplyAdmission {
         self.publish(Payload::Store(owner), start, end)
     }
     fn publish(self, payload: Payload, start: usize, end: usize) -> Result<Bytes, SnapshotError> {
+        let _phase = crate::util::read_profile::phase(
+            self.1.as_ref(),
+            crate::util::read_profile::Phase::ReplyOwner,
+        );
         if start >= end || payload.as_ref().get(start..end).is_none() {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::IntegrityError,
                 "owned FUSE reply is not a nonempty verified slice",
             ));
         }
-        Ok(Bytes::from_owner(ReplyOwner {
+        let bytes = Bytes::from_owner(ReplyOwner {
             payload,
             start,
             end,
             _reservation: self.0,
-        }))
+        });
+        if let Some(profile) = &self.1 {
+            profile.add_many(&[
+                (crate::util::read_profile::Metric::ReplyOwners, 1),
+                (
+                    crate::util::read_profile::Metric::ReplyOwnerBytes,
+                    bytes.len() as u64,
+                ),
+            ]);
+        }
+        Ok(bytes)
     }
 }
 

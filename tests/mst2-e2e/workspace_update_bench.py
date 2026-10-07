@@ -19,6 +19,7 @@ from commit_update_projection import ProjectionCollector, WORK_FIELDS
 from workspace_update_daemon import WorkspaceDaemon, file_digest
 from workspace_update_worker import WorkerSession
 import workspace_update_build as builds
+import workspace_update_profile as read_profile
 
 
 def sample_summary(values, paired):
@@ -101,6 +102,11 @@ def execute(options):
         raise ValueError("v3 measurement requires a fixed isolated native identity")
     budget = budget_module.from_options(options)
     clients = builds.clients(options, budget.measurement_deadline)
+    diagnostic = getattr(options, "workspace_read_profile", False)
+    if type(diagnostic) is not bool:
+        raise ValueError("read profiling requires an explicit boolean opt-in")
+    profile_modes = ({client.label: builds.read_profile_mode(client, True, budget.measurement_deadline)
+                      for client in clients} if diagnostic else {})
     paired = len(clients) == 2
     started = time.monotonic()
     measurement_limit = min(budget.measurement_deadline, started + options.deadline_seconds)
@@ -145,6 +151,8 @@ def execute(options):
     def emit(record):
         if time.monotonic() >= deadline:
             raise TimeoutError("benchmark evidence exceeded its original stage deadline")
+        if diagnostic and record.get("record") == "round":
+            read_profile.validate_evidence(record["scorpio"]["read_profile"])
         payload = json.dumps(record, sort_keys=True)
         with output.open("a", encoding="utf-8") as stream:
             previous_size = stream.tell()
@@ -163,7 +171,7 @@ def execute(options):
                 stream.flush()
                 raise
 
-    emit({"record": "environment", "profile": options.profile, "rounds": options.rounds,
+    environment = {"record": "environment", "profile": options.profile, "rounds": options.rounds,
           "runner_os": platform.system(), "runner_kernel_release": platform.release(),
           "runner_machine": platform.machine(), "runner_logical_cpus": os.cpu_count(),
           "scenarios": common.SCENARIOS,
@@ -187,7 +195,16 @@ def execute(options):
           "unexposed_measurements": ["transport_request_counts", "transport_body_bytes", "weighted_byte_budget",
                                      "worker_oracle_group_RSS", "active_process_count", "PSS", "idle_sampled_RSS_intervals",
                                      "CAS_disk_breakdown", "stage_RSS"] + ([] if paired else ["daemon_RSS", "disk_growth"]),
-          "started_utc": datetime.now(timezone.utc).isoformat()})
+          "started_utc": datetime.now(timezone.utc).isoformat()}
+    if diagnostic:
+        environment.update(
+            measurement_interpretation="INSTRUMENTED_DIAGNOSTIC_NOT_FREE_PERFORMANCE_BASELINE",
+            performance_comparison_allowed=False,
+            workspace_read_profile_modes=profile_modes,
+            read_profile_scope="current full oracle only; excludes create, hydration, retain_view and old-view audits; checkpoint interval may include boundary-active work; cumulative phases and workers overlap across threads",
+            read_profile_timing_scope="before checkpoint precedes oracle timer, after checkpoint follows verified endpoint; original cumulative wall timers are raw and are not reduced by checkpoint overhead; profiler cost remains in reads; instrumented A/B and Git ratios cannot establish uninstrumented performance",
+        )
+    emit(environment)
 
     for round_number in range(1, options.rounds + 1):
         deadline = min(budget.round_deadline(round_number), measurement_limit)
@@ -206,10 +223,12 @@ def execute(options):
                 git_store = lane_root / "git.git"
                 common.command(["git", "init", "--bare", str(git_store)], deadline)
                 lane.daemon = WorkspaceDaemon(client.driver, client.driver_sha256, lane_root, options.base_url,
-                                             token, str(uuid.uuid4()), common.clean_env(), deadline)
+                                             token, str(uuid.uuid4()), common.clean_env(), deadline,
+                                             **({"read_profile": True} if profile_modes.get(client.label) == "enabled" else {}))
                 lane.worker = WorkerSession(lane_root, lane.daemon.url, lane.daemon.workspace_root, git_store,
                                             options.git_url, git_env, deadline=deadline,
-                                            env=common.clean_env(), daemon_uid=lane.daemon.uid)
+                                            env=common.clean_env(), daemon_uid=lane.daemon.uid,
+                                            **({"read_profile_mode": profile_modes[client.label]} if diagnostic else {}))
                 if paired:
                     from workspace_update_resources import ProcessResources
                     lane.resources = ProcessResources(lane.daemon.process.pid, lane.daemon.started,
@@ -250,6 +269,13 @@ def execute(options):
                     operation_start = time.monotonic()
                     with common.phase("shipped_workspace_and_git_measurement"):
                         result = lane.worker.measure(expected_path, commit, side_order, version, round_number, deadline)
+                        if diagnostic:
+                            evidence = result["scorpio"].get("read_profile")
+                            read_profile.validate_evidence(evidence)
+                            if ((profile_modes[lane.client.label] == "enabled" and evidence["status"] != "MEASURED")
+                                    or (profile_modes[lane.client.label] == "unsupported"
+                                        and evidence != read_profile.not_measured("unsupported"))):
+                                raise read_profile.ProfileError()
                     operation_end = time.monotonic()
                     resources = resources_after(lane, before, deadline)
                     builds.validate(lane.client, deadline)
@@ -303,6 +329,9 @@ def execute(options):
                           "workspace_binding": binding, "server_projection": trace,
                           "old_views": result["old_views"], "fuse_mount": "PASS",
                           "correctness": "PROVISIONAL_PENDING_BOTH_SINK_FINALIZATION"}
+                    if diagnostic:
+                        record["measurement_interpretation"] = "INSTRUMENTED_DIAGNOSTIC_NOT_FREE_PERFORMANCE_BASELINE"
+                        record["performance_comparison_allowed"] = False
                     round_records.append(record)
             for lane in active:
                 old_proof = lane.worker.stop(deadline)
@@ -335,6 +364,9 @@ def execute(options):
         samples = [record for record in records if record["version"] == version and record["client"] == client.label]
         summary = {"record": "summary", "version": version,
                    "client": client.label, "scenario": common.SCENARIOS[version], "samples": len(samples)}
+        if diagnostic:
+            summary["measurement_interpretation"] = "INSTRUMENTED_DIAGNOSTIC_NOT_FREE_PERFORMANCE_BASELINE"
+            summary["performance_comparison_allowed"] = False
         metrics = {
             "publication_visible_ms": [r["publication_visible_ms"] for r in samples],
             "scorpio_metadata_ready_ms": [r["scorpio"]["metadata_ready_ms"] for r in samples],
@@ -361,9 +393,13 @@ def execute(options):
                 pairs.append({"round": number, "client_order": pair["a"]["client_order"],
                               "a_verified_ms": a, "b_verified_ms": b, "b_minus_a_ms": b - a,
                               "b_over_a": b / a if a > 0 else None})
-            evidence.append({"record": "paired_summary", "version": version, "samples": len(pairs), "pairs": pairs,
+            pair_summary = {"record": "paired_summary", "version": version, "samples": len(pairs), "pairs": pairs,
                              "b_minus_a_ms": sample_summary([p["b_minus_a_ms"] for p in pairs], True),
-                             "sample_limit": "three paired samples; report median/range, no reliable p95 or general Git superiority"})
+                             "sample_limit": "three paired samples; report median/range, no reliable p95 or general Git superiority"}
+            if diagnostic:
+                pair_summary["measurement_interpretation"] = "INSTRUMENTED_DIAGNOSTIC_NOT_FREE_PERFORMANCE_BASELINE"
+                pair_summary["performance_comparison_allowed"] = False
+            evidence.append(pair_summary)
     if time.monotonic() >= deadline:
         raise TimeoutError("campaign report exceeded its original report deadline")
     options.finalize_campaign(budget.cleanup_deadline)
@@ -376,6 +412,10 @@ def execute(options):
         record["correctness"] = "PASS"
     for record in evidence:
         emit(record)
-    emit({"record": "complete", "round_scenarios": len(records), "workspace_daemons": daemon_statuses,
+    completion = {"record": "complete", "round_scenarios": len(records), "workspace_daemons": daemon_statuses,
           "projection_writer_status": projection_status, "elapsed_seconds": time.monotonic() - started,
-          "campaign_cleanup_complete": True, "correctness": "PASS"})
+          "campaign_cleanup_complete": True, "correctness": "PASS"}
+    if diagnostic:
+        completion.update(measurement_interpretation=read_profile.DIAGNOSTIC_INTERPRETATION,
+                          performance_comparison_allowed=False)
+    emit(completion)

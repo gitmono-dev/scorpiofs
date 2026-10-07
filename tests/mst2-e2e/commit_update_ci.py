@@ -567,6 +567,7 @@ def execute(options):
         args.paired = getattr(options, "paired", False)
         args.build_a = getattr(options, "build_a", None)
         args.build_b = getattr(options, "build_b", None)
+        args.workspace_read_profile = getattr(options, "workspace_read_profile", False)
         if getattr(options, "projection_traces", False):
             args.projection_traces = True
             args.finalize_projection = lambda original_deadline: graceful_owned(root, project, original_deadline, process)

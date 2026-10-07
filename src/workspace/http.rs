@@ -42,6 +42,7 @@ pub fn router(service: Arc<WorkspaceService>) -> Router {
     Router::new()
         .route("/v3/workspaces", post(create).get(list))
         .route("/v3/workspaces/{id}", get(status))
+        .route("/v3/workspaces/{id}/read-profile", get(read_profile))
         .route("/v3/workspaces/{id}/hydrate", post(hydrate))
         .route("/v3/workspaces/{id}/hydrate/cancel", post(cancel))
         .route("/v3/workspaces/{id}/local-pin/release", post(release))
@@ -79,6 +80,13 @@ async fn hydrate(
     Path(id): Path<String>,
 ) -> Result<Json<WorkspaceStatus>, WorkspaceError> {
     Ok(Json(service.start_hydrate(&id).await?))
+}
+
+async fn read_profile(
+    State(service): State<Arc<WorkspaceService>>,
+    Path(id): Path<String>,
+) -> Result<Json<super::service::WorkspaceReadProfile>, WorkspaceError> {
+    Ok(Json(service.read_profile(&id).await?))
 }
 
 async fn cancel(

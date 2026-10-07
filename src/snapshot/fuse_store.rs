@@ -9,6 +9,7 @@ use super::{
     frames::parse_digest,
     SnapshotError, SnapshotErrorCode, VerifiedContent, OBJECT_CAP,
 };
+use crate::util::read_profile::{Metric, ReadProfile};
 
 const CACHE_ENTRIES: usize = 2048;
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -108,8 +109,34 @@ impl StoreSmallCache {
         entry
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&mut self, key: ContentKey) -> Option<StoreContent> {
-        let index = self.entries.iter().position(|entry| entry.key == key)?;
+        self.get_profiled(key, None)
+    }
+
+    pub(crate) fn get_profiled(
+        &mut self,
+        key: ContentKey,
+        profile: Option<&ReadProfile>,
+    ) -> Option<StoreContent> {
+        let index = self.entries.iter().position(|entry| entry.key == key);
+        if let Some(profile) = profile {
+            profile.add_many(&[
+                (
+                    Metric::CacheGetProbes,
+                    index.map_or(self.entries.len(), |i| i + 1) as u64,
+                ),
+                (
+                    if index.is_some() {
+                        Metric::OwnerCacheHit
+                    } else {
+                        Metric::OwnerCacheMiss
+                    },
+                    1,
+                ),
+            ]);
+        }
+        let index = index?;
         let stamp = self.tick();
         let entry = &mut self.entries[index];
         entry.last_use = stamp;
@@ -129,10 +156,20 @@ impl StoreSmallCache {
         self.clock
     }
 
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         key: ContentKey,
         content: StoreContent,
+    ) -> Result<(), SnapshotError> {
+        self.insert_profiled(key, content, None)
+    }
+
+    pub(crate) fn insert_profiled(
+        &mut self,
+        key: ContentKey,
+        content: StoreContent,
+        profile: Option<&ReadProfile>,
     ) -> Result<(), SnapshotError> {
         if content.len() as u64 != key.size {
             return Err(SnapshotError::new(
@@ -140,7 +177,14 @@ impl StoreSmallCache {
                 "workspace content owner differs from its fixed cache key",
             ));
         }
-        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+        let found = self.entries.iter().position(|entry| entry.key == key);
+        if let Some(profile) = profile {
+            profile.add(
+                Metric::CacheInsertProbes,
+                found.map_or(self.entries.len(), |i| i + 1) as u64,
+            );
+        }
+        if let Some(index) = found {
             drop(self.remove(index));
         }
         if content.len() > self.max_bytes {
@@ -157,6 +201,9 @@ impl StoreSmallCache {
                 .map(|(index, _)| index)
                 .unwrap();
             drop(self.remove(oldest));
+            if let Some(profile) = profile {
+                profile.add(Metric::CacheEvictions, 1);
+            }
         }
         self.retained_bytes += content.len();
         let last_use = self.tick();

@@ -993,3 +993,76 @@ async fn awaited_dispatch_denial_and_closed_gates_do_not_report_waiter_cancellat
             && line.contains("detached_running=false")));
     assert!(!log.contains("local CAS worker finished"));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn profiled_detached_and_pending_jobs_keep_actual_work_and_payload_ownership() {
+    use crate::util::read_profile::{Metric, ReadProfile};
+    let (_temp, store, digest, budget, size) = fixture();
+    let scope = scope(2, 1, 2, 1);
+    let profile = ReadProfile::new();
+    let gate = Controller::new();
+    let work = operation(store, digest, size, budget.clone(), Some(gate.0.clone()));
+    let working = scope.clone();
+    let worker_profile = profile.clone();
+    let admission = ReplyAdmission::reserve(&budget).unwrap();
+    let task = tokio::spawn(async move {
+        working
+            .run_local_profiled(
+                LocalCasAccess::CallerEstablished,
+                admission,
+                REQUEST,
+                Some(worker_profile),
+                work,
+            )
+            .await
+    });
+    gate.entered().await;
+    let held = budget.usage();
+    assert!(held.output_bytes > 4096 && held.construction_bytes > 1024 * 1024);
+    let waiting = scope.clone();
+    let pending_profile = profile.clone();
+    let pending_admission = ReplyAdmission::reserve(&budget).unwrap();
+    let pending = tokio::spawn(async move {
+        waiting
+            .run_local_profiled(
+                LocalCasAccess::CallerEstablished,
+                pending_admission,
+                REQUEST,
+                Some(pending_profile),
+                || -> WorkResult<Owner> {
+                    panic!("cancelled pending profiler job performed CAS work")
+                },
+            )
+            .await
+    });
+    until(|| scope.outstanding.available_permits() == 0).await;
+    assert_eq!(profile.snapshot().workers_active, 2);
+    pending.abort();
+    assert!(pending.await.err().unwrap().is_cancelled());
+    assert_eq!(budget.usage(), held);
+    task.abort();
+    assert!(task.await.err().unwrap().is_cancelled());
+    let detached = profile.snapshot();
+    assert_eq!(detached.workers_active, 1);
+    assert_eq!(detached.metric(Metric::WorkerCancelledPending), 1);
+    assert_eq!(detached.metric(Metric::WorkerDetached), 1);
+    assert_eq!(detached.metric(Metric::LargeCasReadBytes), 0);
+    assert_eq!(budget.usage(), held);
+    gate.0.release();
+    until(|| scope.outstanding.available_permits() == 2 && budget.usage() == unused()).await;
+    let finished = profile.snapshot();
+    assert!(!finished.overflow);
+    assert_eq!(finished.workers_active, 0);
+    assert_eq!(finished.metric(Metric::WorkerAdmitted), 2);
+    assert_eq!(finished.metric(Metric::WorkerBackingHit), 1);
+    assert_eq!(finished.metric(Metric::WorkerError), 0);
+    assert_eq!(finished.metric(Metric::LargeCasReadBytes), size);
+    assert_eq!(finished.metric(Metric::LargeWholeHashBytes), size);
+    assert_eq!(finished.metric(Metric::LargeChunkHashBytes), size);
+    assert_eq!(finished.metric(Metric::LargeCasAppendBytes), REQUEST.wanted);
+    assert_eq!(finished.metric(Metric::LargeIndexBuilt), 1);
+    assert_eq!(finished.metric(Metric::WorkerCancelledPending), 1);
+    assert_eq!(finished.metric(Metric::WorkerDetached), 1);
+    assert_eq!(scope.running.available_permits(), 1);
+    assert_eq!(scope.process.running.available_permits(), 1);
+}

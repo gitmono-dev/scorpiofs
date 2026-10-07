@@ -61,6 +61,10 @@ impl Layer for Mst2Fuse {
         _handle: Option<u64>,
         _mapping: bool,
     ) -> std::io::Result<(Stat64, std::time::Duration)> {
+        let _phase = crate::util::read_profile::phase(
+            self.read_profile(),
+            crate::util::read_profile::Phase::LowerGetattrMapping,
+        );
         let node = self.metadata_node(inode).map_err(|e| {
             let raw = i32::from(e);
             tracing::warn!(

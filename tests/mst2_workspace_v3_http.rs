@@ -251,6 +251,17 @@ impl Harness {
         operations: usize,
         observer: Option<Arc<WorkspaceObserver>>,
     ) -> Self {
+        Self::new_options(failure, gated, workspaces, operations, observer, false).await
+    }
+
+    async fn new_options(
+        failure: RootFailure,
+        gated: bool,
+        workspaces: usize,
+        operations: usize,
+        observer: Option<Arc<WorkspaceObserver>>,
+        read_profile: bool,
+    ) -> Self {
         let fixture = Fixture::new(failure, gated);
         let upstream = Server::start(
             Router::new()
@@ -270,6 +281,7 @@ impl Harness {
             WorkspaceConfig::new(temp.path().join("workspaces"), temp.path().join("cache"));
         config.max_workspaces = workspaces;
         config.max_operations = operations;
+        config.read_profile = read_profile;
         let client = Mst2Client::new(&upstream.url);
         let service = match observer {
             Some(observer) => WorkspaceService::new_with_observer(client, config, observer),
@@ -463,6 +475,100 @@ fn assert_observed_binding(
     let mut unknown_receipt = value;
     unknown_receipt["resolve_trace_receipt"]["lease_id"] = "not-authority".into();
     assert!(serde_json::from_value::<WorkspaceResolveBinding>(unknown_receipt).is_err());
+}
+
+#[tokio::test]
+async fn opted_in_read_checkpoints_are_bounded_owner_specific_and_do_not_change_strict_status() {
+    for enabled in [false, true] {
+        let h = Harness::new_options(RootFailure::Denied, false, 2, 2, None, enabled).await;
+        let response = h.create(request("lazy")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let statuses = h.list().await;
+        let status = &statuses.as_array().unwrap()[0];
+        assert_failed(status, &h.fixture);
+        let id = status["workspace_id"].as_str().unwrap();
+        let before = h.fixture.requests.lock().unwrap().clone();
+        let mut previous_sequence = 0;
+        for _ in 0..2 {
+            let response = h
+                .client
+                .get(format!("{}/v3/workspaces/{id}/read-profile", h.api.url))
+                .send()
+                .await
+                .unwrap();
+            if !enabled {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                let value: Value = response.json().await.unwrap();
+                assert_eq!(value["code"], "WORKSPACE_NOT_FOUND");
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.bytes().await.unwrap();
+            assert!(bytes.len() < 16 * 1024);
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value.as_object().unwrap().len(), 3);
+            assert_eq!(value["workspace_id"], status["workspace_id"]);
+            assert_eq!(value["generation"], status["generation"]);
+            let profile = &value["profile"];
+            assert_eq!(profile["revision"], 1);
+            assert_eq!(profile["overflow"], false);
+            assert_eq!(profile["workers_active"], 0);
+            let sequence = profile["sequence"].as_u64().unwrap();
+            assert_eq!(sequence, previous_sequence + 1);
+            previous_sequence = sequence;
+            assert!(
+                profile["sample_finished_ns"].as_u64().unwrap()
+                    >= profile["sample_started_ns"].as_u64().unwrap()
+            );
+            for boundary in [
+                "native_kernel_copy_measured",
+                "upper_reply_copy_measured",
+                "directory_stream_delivery_measured",
+            ] {
+                assert_eq!(profile[boundary], false);
+            }
+            for counter in profile["metrics"].as_array().unwrap() {
+                assert_eq!(counter.as_object().unwrap().len(), 2);
+                assert!(counter["metric"].is_string());
+                assert_eq!(counter["value"], 0);
+            }
+            for operation in profile["operations"].as_array().unwrap() {
+                assert_eq!(operation.as_object().unwrap().len(), 2);
+                assert!(operation["operation"].is_string());
+                assert!(operation["times"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|v| v.as_u64() == Some(0)));
+            }
+            for absent in [
+                "scope",
+                "snapshot_id",
+                "lease_id",
+                "token",
+                "path",
+                "mountpoint",
+                "last_error",
+                "mount_state",
+                "metadata_ready",
+            ] {
+                assert!(value.get(absent).is_none());
+                assert!(profile.get(absent).is_none());
+            }
+        }
+        assert_eq!(*h.fixture.requests.lock().unwrap(), before);
+        assert_eq!(h.list().await, statuses);
+        h.fixture.assert_only_canonical_requests();
+        h.assert_no_mount_directory();
+        h.destroy(id).await;
+        let response = h
+            .client
+            .get(format!("{}/v3/workspaces/{id}/read-profile", h.api.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]
