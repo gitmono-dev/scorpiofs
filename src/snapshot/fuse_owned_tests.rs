@@ -259,6 +259,35 @@ impl Fixture {
         self.nested_page = Some(nested);
         self
     }
+    fn with_many_small_files(mut self) -> Self {
+        for index in 17..80 {
+            self.bodies
+                .insert(format!("file{index:03}"), vec![index as u8; 8192]);
+        }
+        let entries: Vec<_> = self
+            .bodies
+            .iter()
+            .map(|(name, body)| {
+                Entry::file(
+                    match name.as_str() {
+                        "exec" => EntryKind::Executable,
+                        "link" => EntryKind::Symlink,
+                        _ => EntryKind::Regular,
+                    },
+                    name.as_bytes(),
+                    body.len() as u64,
+                    hash(body),
+                )
+            })
+            .collect();
+        self.page = Page::build(&entries).unwrap();
+        assert!(matches!(
+            crate::snapshot::closure::decode_page(&self.page).unwrap(),
+            Page::Leaf { .. }
+        ));
+        self.descriptor.metadata_root = page_id(&self.page);
+        self
+    }
     fn response(&self, request: &[u8], wire: Vec<u8>, pending: bool) -> Response {
         use futures::StreamExt;
         let body = if pending {
@@ -753,10 +782,10 @@ async fn no_pages_raw_builder_tuple_changes_and_foreign_tokens_never_authorize_c
             panic!("file")
         };
         match mutation {
-            0 => node.path = "file001".into(),
-            1 => node.fs_kind = "symlink".into(),
-            2 => node.size = 0,
-            3 => node.digest = id(&[0x99; 32]),
+            0 => Arc::make_mut(&mut node.file).rel_path = "file001".into(),
+            1 => Arc::make_mut(&mut node.file).fs_kind = "symlink".into(),
+            2 => Arc::make_mut(&mut node.file).size = 0,
+            3 => Arc::make_mut(&mut node.file).content_digest = id(&[0x99; 32]),
             _ => node.online_file = Some(foreign_file.clone()),
         }
         fs.state
@@ -1648,18 +1677,15 @@ async fn actual_reply_clones_survive_small_cache_eviction_mount_drop_and_keep_qu
 }
 
 #[tokio::test]
-async fn lazy_actual_read_proves_only_target_and_eager_seed_avoids_repeat_metadata() {
+async fn lazy_actual_read_reuses_verified_directory_and_eager_seed_avoids_repeat_metadata() {
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::new(true, true), 1024 * 1024).await;
     let fs = server.view(true).await;
     assert_eq!(read(&fs, "file000", 0, 4).await.data.as_ref(), [0; 4]);
     assert!(server.reader.content_membership.get().is_none());
-    assert_eq!(
-        server.fixture.metadata.lock().unwrap().as_slice(),
-        ["/", "/"]
-    );
+    assert_eq!(server.fixture.metadata.lock().unwrap().as_slice(), ["/"]);
     drop(read(&fs, "file000", 0, 1).await);
-    assert_eq!(server.fixture.metadata.lock().unwrap().len(), 2);
+    assert_eq!(server.fixture.metadata.lock().unwrap().len(), 1);
     let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
     let fs = server.view(false).await;
     for name in ["file000", "exec", "link"] {
@@ -1823,10 +1849,10 @@ async fn inode_tuple_and_unproven_public_manifest_cannot_authorize_a_body_or_emp
                 panic!("file fixture");
             };
             match case {
-                0 => node.path = "file001".into(),
-                1 => node.fs_kind = "symlink".into(),
-                2 => node.size = 0,
-                _ => node.digest = id(&[0x99; 32]),
+                0 => Arc::make_mut(&mut node.file).rel_path = "file001".into(),
+                1 => Arc::make_mut(&mut node.file).fs_kind = "symlink".into(),
+                2 => Arc::make_mut(&mut node.file).size = 0,
+                _ => Arc::make_mut(&mut node.file).content_digest = id(&[0x99; 32]),
             }
         }
         let before = server.fixture.requests.load(Ordering::SeqCst);
@@ -2181,10 +2207,10 @@ async fn cached_actual_range_tuple_and_revoked_lease_reject_before_http_includin
     for case in 0..4 {
         let mut node = original.clone();
         match case {
-            0 => node.path = "range001".into(),
-            1 => node.fs_kind = "executable".into(),
-            2 => node.size += 1,
-            _ => node.digest = id(&[0x99; 32]),
+            0 => Arc::make_mut(&mut node.file).rel_path = "range001".into(),
+            1 => Arc::make_mut(&mut node.file).fs_kind = "executable".into(),
+            2 => Arc::make_mut(&mut node.file).size += 1,
+            _ => Arc::make_mut(&mut node.file).content_digest = id(&[0x99; 32]),
         }
         fs.state
             .lock()
@@ -2288,7 +2314,7 @@ async fn actual_lazy_nested_read_uses_selected_ancestors_without_unrelated_closu
     assert!(server.reader.content_membership.get().is_none());
     assert_eq!(
         server.fixture.metadata.lock().unwrap().as_slice(),
-        ["/", "/nested", "/", "/nested"]
+        ["/", "/nested"]
     );
     let before = server.fixture.metadata.lock().unwrap().len();
     assert_eq!(
@@ -2301,4 +2327,44 @@ async fn actual_lazy_nested_read_uses_selected_ancestors_without_unrelated_closu
     );
     assert_eq!(server.fixture.metadata.lock().unwrap().len(), before);
     assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn lazy_stored_directory_membership_survives_content_and_path_cell_eviction() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(
+        Fixture::new(false, true).with_many_small_files(),
+        8 * 1024 * 1024,
+    )
+    .await;
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableStore::open_for_reader(
+            temp.path().join("view"),
+            temp.path().join("cas"),
+            &server.reader,
+        )
+        .unwrap(),
+    );
+    let fs = Mst2Fuse::from_reader_lazy(server.reader.clone(), Some(store))
+        .await
+        .unwrap();
+    for index in 0..80 {
+        let name = format!("file{index:03}");
+        assert_eq!(read(&fs, &name, 7, 4).await.data.as_ref(), [index as u8; 4]);
+    }
+    assert!(server.reader.content_membership.get().is_none());
+    assert_eq!(server.fixture.metadata.lock().unwrap().as_slice(), ["/"]);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 80);
+    for index in [0, 16, 63, 79] {
+        assert_eq!(
+            read(&fs, &format!("file{index:03}"), 0, 1)
+                .await
+                .data
+                .as_ref(),
+            [index as u8]
+        );
+    }
+    assert_eq!(server.fixture.metadata.lock().unwrap().as_slice(), ["/"]);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 80);
 }

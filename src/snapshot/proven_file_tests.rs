@@ -994,6 +994,106 @@ async fn same_deployment_changed_credential_or_epoch_cannot_consume_an_existing_
 }
 
 #[tokio::test]
+async fn complete_directory_tokens_keep_current_authority_and_canonical_page_validation() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::flat(1)).await;
+    let directory = ProvenSnapshotDirectory::scope_root(&server.reader);
+    let proved = directory
+        .verify(&server.reader, &server.fixture.pages, 16)
+        .await
+        .unwrap();
+    let token = proved.file(0).unwrap();
+    assert_eq!(token.file().rel_path, "file000");
+    assert!(proved.directory(0).is_err());
+    assert!(proved.file(1).is_err());
+    let mut corrupt = server.fixture.pages.clone();
+    corrupt.values_mut().next().unwrap()[0] ^= 1;
+    assert!(directory
+        .verify(&server.reader, &corrupt, 16)
+        .await
+        .is_err());
+    let credential_reader = SnapshotReader::resolve(
+        super::super::Mst2Client::with_token(
+            server.reader.client().base(),
+            Some("different-credential".into()),
+        ),
+        "/project",
+        600,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        directory.validate(&credential_reader).unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(
+        token.validate(&credential_reader).await.unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    server.fixture.epoch.store(2, Ordering::SeqCst);
+    let changed_epoch = SnapshotReader::resolve(
+        super::super::Mst2Client::new(server.reader.client().base()),
+        "/project",
+        600,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        directory.validate(&changed_epoch).unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(
+        token.validate(&changed_epoch).await.unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert!(server.fixture.requests.lock().unwrap().is_empty());
+    assert_eq!(server.fixture.bodies.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn child_directory_tokens_derive_from_the_fixed_root_and_complete_radix_partition() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::wide()).await;
+    let directory = ProvenSnapshotDirectory::scope_root(&server.reader);
+    let root_pages: BTreeMap<_, _> = server.fixture.witnesses[&("/".into(), Vec::new())]
+        .iter()
+        .map(|bytes| (id(&page_id(bytes)), bytes.clone()))
+        .collect();
+    let root = directory
+        .verify(&server.reader, &root_pages, 16)
+        .await
+        .unwrap();
+    assert!(root.file(1).is_err());
+    let wanted = root.directory(1).unwrap();
+    assert_eq!(wanted.path(), "wanted");
+    let child_pages: BTreeMap<_, _> = server
+        .fixture
+        .witnesses
+        .iter()
+        .filter(|((path, _), _)| path == "/wanted")
+        .flat_map(|(_, pages)| {
+            pages
+                .iter()
+                .map(|bytes| (id(&page_id(bytes)), bytes.clone()))
+        })
+        .collect();
+    assert!(directory
+        .verify(&server.reader, &child_pages, 256)
+        .await
+        .is_err());
+    let child = wanted
+        .verify(&server.reader, &child_pages, 256)
+        .await
+        .unwrap();
+    let token = child.file(0).unwrap();
+    assert_eq!(token.file().rel_path, "wanted/abc");
+    assert_eq!(token.file().fs_kind, "executable");
+    token.validate(&server.reader).await.unwrap();
+    assert!(server.fixture.requests.lock().unwrap().is_empty());
+    assert_eq!(server.fixture.bodies.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn actual_waiters_at_local_caller_limit_reject_before_a_second_metadata_request() {
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::flat(1)).await;

@@ -32,7 +32,7 @@ use crate::{
         cas_content::VerifiedCasContent,
         cas_range::VerifiedCasRange,
         cas_worker::{CasReadScope, LocalCasAccess, RequestMeters, WorkResult},
-        closure::{verify_directory_pages, ValidatedSnapshotClosure},
+        closure::ValidatedSnapshotClosure,
         content::ContentBudget,
         durable::{DurableStore, LocalCasRangeMeters},
         fixed_directory_index::{DirectoryEntries, FixedDirectoryIndex},
@@ -42,6 +42,7 @@ use crate::{
         },
         fuse_store::{ContentKey, StoreContent, StoreSmallCache},
         online_file::OnlineSnapshotFile,
+        proven_file::{ProvenDirectoryEntries, ProvenSnapshotDirectory},
         ContentBudgetLimits, FileMembershipError, MetadataProofLimits, OwnedChunkedFile,
         ProvenSnapshotFile, ScopeCache, SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode,
         SnapshotFile, SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
@@ -71,15 +72,21 @@ pub(crate) struct DirNode {
     /// The directory's own MTP2 page id (the parent entry commits to it) —
     /// the lazy fetch target. Eager dirs carry it too (cheap, useful).
     page_id: Option<String>,
+    membership: Option<Arc<ProvenSnapshotDirectory>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct FileNode {
-    path: String,
-    fs_kind: String,
-    size: u64,
-    digest: String,
+    file: Arc<SnapshotFile>,
+    proven: Option<Arc<ProvenSnapshotFile>>,
     online_file: Option<Arc<OnlineSnapshotFile>>,
+}
+
+impl std::ops::Deref for FileNode {
+    type Target = SnapshotFile;
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
 }
 
 #[derive(Clone)]
@@ -401,10 +408,10 @@ impl Mst2Fuse {
                 file.online_file = Some(OnlineSnapshotFile::from_manifest_file(
                     reader,
                     SnapshotFile {
-                        rel_path: file.path.clone(),
+                        rel_path: file.rel_path.clone(),
                         fs_kind: file.fs_kind.clone(),
                         size: file.size,
-                        content_digest: file.digest.clone(),
+                        content_digest: file.content_digest.clone(),
                     },
                 )?);
             }
@@ -466,6 +473,7 @@ impl Mst2Fuse {
             _ => None,
         };
         let root_page_id = reader.descriptor().metadata_root.clone();
+        let root_membership = ProvenSnapshotDirectory::scope_root(&reader);
         let (store_small, store_ranges) = stored_caches(Some(&reader), store.as_ref())?;
         let mut state = State {
             next_inode: ROOT_INODE,
@@ -485,6 +493,7 @@ impl Mst2Fuse {
                 parent: ROOT_INODE,
                 loaded: false,
                 page_id: Some(root_page_id.clone()),
+                membership: Some(root_membership),
             }),
         );
         let view = Mst2Fuse {
@@ -521,10 +530,12 @@ impl Mst2Fuse {
         &self,
         inode: Inode,
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
-        let (path, page_id) = {
+        let (path, page_id, membership) = {
             let state = self.state.lock().unwrap();
             match state.nodes.get(&inode) {
-                Some(Node::Dir(d)) if !d.loaded => (d.path.clone(), d.page_id.clone()),
+                Some(Node::Dir(d)) if !d.loaded => {
+                    (d.path.clone(), d.page_id.clone(), d.membership.clone())
+                }
                 _ => {
                     if let Some(profile) = &self.read_profile {
                         profile.add(Metric::DirectoryLoadSkipped, 1);
@@ -549,6 +560,19 @@ impl Mst2Fuse {
                 "directory page id missing",
             )
         })?;
+        let membership = membership.ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "lazy directory proof missing",
+            )
+        })?;
+        if membership.path() != path || membership.root() != page_id {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "lazy directory differs from its fixed-root membership",
+            ));
+        }
+        membership.validate(reader)?;
         reader.ensure_lease().await?;
         let sid = reader.snapshot_id().to_string();
         let dir_path = format!("/{path}");
@@ -665,38 +689,13 @@ impl Mst2Fuse {
             }
         }
 
-        let all_entries = verify_directory_pages(
-            &page_id,
-            &proof_pages,
-            self.metadata_limits.max_directory_entries,
-        )?;
-        let max_file_bytes = match reader.capability_advertisement() {
-            crate::snapshot::capabilities::CapabilityAdvertisement::Canonical(caps) => {
-                caps.limits().max_file_bytes
-            }
-            _ => 8 * 1024 * 1024 * 1024 * 1024,
-        };
-        for entry in all_entries.iter() {
-            let name = std::str::from_utf8(&entry.name).map_err(|_| {
-                SnapshotError::new(SnapshotErrorCode::IntegrityError, "non-UTF-8 MTP2 name")
-            })?;
-            let full = if path.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{path}/{name}")
-            };
-            reader.authorized_context().validate_relative_path(&full)?;
-            reader.client.validate_path(&full)?;
-            if entry.size > max_file_bytes
-                || (entry.kind == mst2_codec::metapage::EntryKind::Symlink
-                    && !(1..=4095).contains(&entry.size))
-            {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::LimitExceeded,
-                    "lazy directory file size exceeds serving profile",
-                ));
-            }
-        }
+        let all_entries = membership
+            .verify(
+                reader,
+                &proof_pages,
+                self.metadata_limits.max_directory_entries,
+            )
+            .await?;
 
         // Local hints retain the same live fixed-view authority as wire pages.
         reader.ensure_lease().await?;
@@ -707,7 +706,7 @@ impl Mst2Fuse {
         if state
             .nodes
             .len()
-            .checked_add(all_entries.len())
+            .checked_add(all_entries.entries().len())
             .is_none_or(|count| count > self.metadata_limits.max_cached_nodes)
         {
             return Err(SnapshotError::new(
@@ -727,9 +726,9 @@ impl Mst2Fuse {
         state: &mut State,
         parent_inode: Inode,
         parent_path: &str,
-        entries: &[mst2_codec::metapage::Entry],
+        entries: &ProvenDirectoryEntries,
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
-        for e in entries {
+        for (index, e) in entries.entries().iter().enumerate() {
             let name = std::str::from_utf8(&e.name)
                 .map_err(|_| {
                     crate::snapshot::SnapshotError::new(
@@ -767,19 +766,13 @@ impl Mst2Fuse {
                         "sha256:{}",
                         crate::snapshot::frames::hex32(&e.child_root)
                     )),
+                    membership: Some(entries.directory(index)?),
                 }),
-                kind => {
-                    let fs_kind = match kind {
-                        mst2_codec::metapage::EntryKind::Regular => "regular",
-                        mst2_codec::metapage::EntryKind::Executable => "executable",
-                        mst2_codec::metapage::EntryKind::Symlink => "symlink",
-                        mst2_codec::metapage::EntryKind::Directory => unreachable!(),
-                    };
+                _ => {
+                    let proven = entries.file(index)?;
                     Node::File(FileNode {
-                        path: full,
-                        fs_kind: fs_kind.to_string(),
-                        size: e.size,
-                        digest: format!("sha256:{}", crate::snapshot::frames::hex32(&e.content_id)),
+                        file: proven.shared_file(),
+                        proven: Some(proven),
                         online_file: None,
                     })
                 }
@@ -845,6 +838,7 @@ impl Mst2Fuse {
                 parent: ROOT_INODE,
                 loaded: true,
                 page_id: None,
+                membership: None,
             }),
         );
         for f in manifest {
@@ -919,6 +913,7 @@ impl Mst2Fuse {
                     parent,
                     loaded: true,
                     page_id: Some(directory.directory_root.clone()),
+                    membership: None,
                 }),
             );
             if !path.is_empty() {
@@ -956,10 +951,8 @@ impl Mst2Fuse {
             state.nodes.insert(
                 inode,
                 Node::File(FileNode {
-                    path: path.to_string(),
-                    fs_kind: file.fs_kind.clone(),
-                    size: file.size,
-                    digest: file.content_digest.clone(),
+                    file: Arc::new(file.clone()),
+                    proven: None,
                     online_file: None,
                 }),
             );
@@ -1034,7 +1027,7 @@ impl Mst2Fuse {
         offset: u64,
         wanted: u64,
     ) -> Result<ReplyData> {
-        let key = ContentKey::new(&node.digest, node.size).map_err(io_err)?;
+        let key = ContentKey::new(&node.content_digest, node.size).map_err(io_err)?;
         let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
         let stop = usize::try_from(offset + wanted).map_err(|_| Errno::from(libc::EIO))?;
         let admission = ReplyAdmission::reserve(&scope.budget)
@@ -1058,7 +1051,7 @@ impl Mst2Fuse {
                     .as_ref()
                     .ok_or_else(|| Errno::from(libc::EIO))?
                     .clone();
-                let digest = node.digest.clone();
+                let digest = node.content_digest.clone();
                 let size = node.size;
                 let budget = scope.budget.clone();
                 let work_profile = self.read_profile.clone();
@@ -1131,7 +1124,7 @@ impl Mst2Fuse {
             .as_ref()
             .ok_or_else(|| Errno::from(libc::EIO))?
             .clone();
-        let digest = node.digest.clone();
+        let digest = node.content_digest.clone();
         let size = node.size;
         let budget = scope.budget.clone();
         let work_profile = self.read_profile.clone();
@@ -1193,10 +1186,10 @@ impl Mst2Fuse {
             .as_ref()
             .ok_or_else(|| Errno::from(libc::EIO))?;
         let fixed = file.file();
-        if fixed.rel_path != node.path
+        if fixed.rel_path != node.rel_path
             || fixed.fs_kind != node.fs_kind
             || fixed.size != node.size
-            || fixed.content_digest != node.digest
+            || fixed.content_digest != node.content_digest
         {
             return Err(Errno::from(libc::EIO));
         }
@@ -1262,7 +1255,7 @@ impl Mst2Fuse {
                 let (local, admission) = match &self.store {
                     Some(store) => {
                         let store = store.clone();
-                        let digest = node.digest.clone();
+                        let digest = node.content_digest.clone();
                         let size = node.size;
                         let budget = reader.content_scope.clone();
                         let work_profile = self.read_profile.clone();
@@ -1362,7 +1355,7 @@ impl Mst2Fuse {
         let (local, admission) = match &self.store {
             Some(store) => {
                 let store = store.clone();
-                let digest = node.digest.clone();
+                let digest = node.content_digest.clone();
                 let size = node.size;
                 let budget = reader.content_scope.clone();
                 let work_profile = self.read_profile.clone();
@@ -1478,7 +1471,7 @@ impl Mst2Fuse {
             self.validate_proven(&proven, reader).await?;
             return Ok(ReplyData { data: Bytes::new() });
         }
-        let key = ContentKey::new(&node.digest, node.size).map_err(io_err)?;
+        let key = ContentKey::new(&node.content_digest, node.size).map_err(io_err)?;
         let end = offset.saturating_add(requested).min(node.size);
         let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
         let stop = usize::try_from(end).map_err(|_| Errno::from(libc::EIO))?;
@@ -1503,7 +1496,7 @@ impl Mst2Fuse {
                     .as_ref()
                     .ok_or_else(|| Errno::from(libc::EIO))?
                     .clone();
-                let digest = node.digest.clone();
+                let digest = node.content_digest.clone();
                 let size = node.size;
                 let budget = reader.content_scope.clone();
                 let work_profile = self.read_profile.clone();
@@ -1608,7 +1601,7 @@ impl Mst2Fuse {
             .as_ref()
             .ok_or_else(|| Errno::from(libc::EIO))?
             .clone();
-        let digest = node.digest.clone();
+        let digest = node.content_digest.clone();
         let size = node.size;
         let budget = reader.content_scope.clone();
         let work_profile = self.read_profile.clone();
@@ -1695,19 +1688,19 @@ impl Mst2Fuse {
         cached: Option<Arc<ProvenSnapshotFile>>,
     ) -> Result<Arc<ProvenSnapshotFile>> {
         let _phase = phase(self.read_profile.as_ref(), Phase::MembershipAndLease);
-        let proven = match cached {
+        let proven = match cached.or_else(|| node.proven.clone()) {
             Some(proven) => proven,
             None => reader
-                .prove_file(&node.path)
+                .prove_file(&node.rel_path)
                 .await
                 .map_err(membership_io_err)?,
         };
         self.validate_proven(&proven, reader).await?;
         let file = proven.file();
-        if file.rel_path != node.path
+        if file.rel_path != node.rel_path
             || file.fs_kind != node.fs_kind
             || file.size != node.size
-            || file.content_digest != node.digest
+            || file.content_digest != node.content_digest
         {
             return Err(Errno::from(libc::EIO));
         }
@@ -2046,15 +2039,15 @@ fn node_identity(node: &Node) -> std::result::Result<SnapshotNodeIdentity, Snaps
         Node::File(file) => match file.fs_kind.as_str() {
             "regular" => Ok(SnapshotNodeIdentity::Regular {
                 size: file.size,
-                content_digest: file.digest.clone(),
+                content_digest: file.content_digest.clone(),
             }),
             "executable" => Ok(SnapshotNodeIdentity::Executable {
                 size: file.size,
-                content_digest: file.digest.clone(),
+                content_digest: file.content_digest.clone(),
             }),
             "symlink" => Ok(SnapshotNodeIdentity::Symlink {
                 size: file.size,
-                content_digest: file.digest.clone(),
+                content_digest: file.content_digest.clone(),
             }),
             _ => Err(SnapshotError::new(
                 SnapshotErrorCode::UnsupportedEntry,
@@ -2116,10 +2109,11 @@ fn ensure_child(
     let node = if is_file {
         let f = file.expect("file node needs manifest entry");
         Node::File(FileNode {
-            path: full,
-            fs_kind: f.fs_kind.clone(),
-            size: f.size,
-            digest: f.content_digest.clone(),
+            file: Arc::new(SnapshotFile {
+                rel_path: full,
+                ..f.clone()
+            }),
+            proven: None,
             online_file: None,
         })
     } else {
@@ -2129,6 +2123,7 @@ fn ensure_child(
             parent: parent_inode,
             loaded: true,
             page_id: None,
+            membership: None,
         })
     };
     state.nodes.insert(inode, node);
