@@ -39,7 +39,7 @@ use crate::{
         SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode, SnapshotFile,
         SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
     },
-    util::file_attr::make_file_attr,
+    util::{file_attr::make_file_attr, mutation_fence::MutationPause},
 };
 
 pub(crate) const ROOT_INODE: u64 = 1;
@@ -313,6 +313,18 @@ impl Mst2Fuse {
         &self,
         inode: Inode,
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
+        self.check_metadata_lease()?;
+        let result = self.load_directory(inode).await;
+        self.check_metadata_lease()?;
+        result
+    }
+
+    // Recorded nodes remain usable by a paused local upper scan. Loading a
+    // missing directory still requires the existing live lease at both ends.
+    async fn load_directory(
+        &self,
+        inode: Inode,
+    ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
         let (path, page_id) = {
             let state = self.state.lock().unwrap();
             match state.nodes.get(&inode) {
@@ -570,6 +582,7 @@ impl Mst2Fuse {
     /// Ensure a directory's children exist before lookup/readdir. No-op for
     /// eager mounts and already-loaded directories.
     async fn ensure_loaded(&self, inode: Inode) -> Result<()> {
+        self.check_metadata_lease().map_err(io_err)?;
         let need = {
             let state = self.state.lock().unwrap();
             state.lazy
@@ -578,12 +591,19 @@ impl Mst2Fuse {
                     _ => false,
                 }
         };
-        if need {
-            self.ensure_dir_loaded(inode)
-                .await
-                .map_err(|_| Errno::from(libc::EIO))?;
-        }
-        Ok(())
+        let result = if need {
+            self.ensure_dir_loaded(inode).await.map_err(|error| {
+                if self.store_reader().is_some() {
+                    io_err(error)
+                } else {
+                    Errno::from(libc::EIO)
+                }
+            })
+        } else {
+            Ok(())
+        };
+        self.check_metadata_lease().map_err(io_err)?;
+        result
     }
 
     pub(crate) fn build(
@@ -824,6 +844,15 @@ impl Mst2Fuse {
         }
     }
 
+    // This observes the current local grant and any latched terminal failure;
+    // it is not a fresh remote authorization decision or a metadata fetch.
+    fn check_metadata_lease(&self) -> std::result::Result<(), SnapshotError> {
+        match self.store_reader() {
+            Some(reader) => reader.local_lease_status(),
+            None => Ok(()),
+        }
+    }
+
     /// Each logical path proves its own fixed membership before sharing bytes.
     /// A CAS miss alone may reach the existing sized, accounted transport.
     async fn read_store_small(
@@ -1019,6 +1048,13 @@ impl Mst2Fuse {
             .ok_or_else(|| Errno::from(libc::ENOENT))
     }
 
+    pub(crate) fn metadata_node(&self, inode: u64) -> Result<Node> {
+        self.check_metadata_lease().map_err(io_err)?;
+        let node = self.node(inode)?;
+        self.check_metadata_lease().map_err(io_err)?;
+        Ok(node)
+    }
+
     /// Query fixed metadata without reading content or following a symlink.
     /// A missing child is proven only after its parent's entire canonical
     /// radix is verified. Legacy file-only manifests cannot prove namespace.
@@ -1026,7 +1062,36 @@ impl Mst2Fuse {
         &self,
         rel_path: &str,
     ) -> std::result::Result<SnapshotPathState, SnapshotError> {
-        match self.path_inode(rel_path).await? {
+        self.check_metadata_lease()?;
+        let result = self.recorded_path_state(rel_path).await;
+        self.check_metadata_lease()?;
+        result
+    }
+
+    // Only paused upper-diff inspection may reuse already recorded facts after
+    // revocation. Unloaded directory pages still go through load_directory.
+    pub(crate) async fn path_state_for_diff(
+        &self,
+        rel_path: &str,
+        pause: &MutationPause,
+    ) -> std::result::Result<SnapshotPathState, SnapshotError> {
+        Self::check_diff_pause(pause)?;
+        let result = self.recorded_path_state(rel_path).await;
+        Self::check_diff_pause(pause)?;
+        result
+    }
+
+    fn check_diff_pause(pause: &MutationPause) -> std::result::Result<(), SnapshotError> {
+        pause.ensure_certain().map_err(|error| {
+            SnapshotError::new(SnapshotErrorCode::IntegrityError, error.to_string())
+        })
+    }
+
+    async fn recorded_path_state(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<SnapshotPathState, SnapshotError> {
+        match self.recorded_path_inode(rel_path).await? {
             Some(inode) => {
                 let state = self.state.lock().unwrap();
                 let node = state.nodes.get(&inode).ok_or_else(|| {
@@ -1047,10 +1112,31 @@ impl Mst2Fuse {
         &self,
         rel_path: &str,
     ) -> std::result::Result<Vec<SnapshotDirectoryEntry>, SnapshotError> {
-        let inode = self.path_inode(rel_path).await?.ok_or_else(|| {
+        self.check_metadata_lease()?;
+        let result = self.recorded_directory_entries(rel_path).await;
+        self.check_metadata_lease()?;
+        result
+    }
+
+    pub(crate) async fn directory_entries_for_diff(
+        &self,
+        rel_path: &str,
+        pause: &MutationPause,
+    ) -> std::result::Result<Vec<SnapshotDirectoryEntry>, SnapshotError> {
+        Self::check_diff_pause(pause)?;
+        let result = self.recorded_directory_entries(rel_path).await;
+        Self::check_diff_pause(pause)?;
+        result
+    }
+
+    async fn recorded_directory_entries(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<Vec<SnapshotDirectoryEntry>, SnapshotError> {
+        let inode = self.recorded_path_inode(rel_path).await?.ok_or_else(|| {
             SnapshotError::new(SnapshotErrorCode::PathNotFound, "fixed directory is absent")
         })?;
-        self.ensure_dir_loaded(inode).await?;
+        self.load_directory(inode).await?;
         let state = self.state.lock().unwrap();
         let directory = match state.nodes.get(&inode) {
             Some(Node::Dir(directory)) => directory,
@@ -1128,14 +1214,17 @@ impl Mst2Fuse {
         Ok(relative)
     }
 
-    async fn path_inode(&self, rel_path: &str) -> std::result::Result<Option<u64>, SnapshotError> {
+    async fn recorded_path_inode(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<Option<u64>, SnapshotError> {
         let relative = self.metadata_path(rel_path)?;
         let mut inode = ROOT_INODE;
         if relative == "/" {
             return Ok(Some(inode));
         }
         for name in relative.trim_start_matches('/').split('/') {
-            self.ensure_dir_loaded(inode).await?;
+            self.load_directory(inode).await?;
             let state = self.state.lock().unwrap();
             match state.nodes.get(&inode) {
                 Some(Node::Dir(directory)) => match directory.children.get(name) {
@@ -1332,11 +1421,13 @@ impl Filesystem for Mst2Fuse {
         _fh: Option<u64>,
         _flags: u32,
     ) -> Result<ReplyAttr> {
+        self.check_metadata_lease().map_err(io_err)?;
         let node = self.node(inode)?;
         let attr = match &node {
             Node::Dir(_) => dir_attr(inode),
             Node::File(f) => file_attr(inode, f),
         };
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyAttr { attr, ttl: TTL })
     }
 
@@ -1350,12 +1441,14 @@ impl Filesystem for Mst2Fuse {
                 _ => None,
             }
         };
+        self.check_metadata_lease().map_err(io_err)?;
         let inode = child.ok_or_else(|| Errno::from(libc::ENOENT))?;
         let node = self.node(inode)?;
         let attr = match &node {
             Node::Dir(_) => dir_attr(inode),
             Node::File(f) => file_attr(inode, f),
         };
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyEntry {
             attr,
             ttl: TTL,
@@ -1384,6 +1477,7 @@ impl Filesystem for Mst2Fuse {
                 })
             })
             .collect();
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyDirectory {
             entries: iter(entries),
         })
@@ -1424,6 +1518,7 @@ impl Filesystem for Mst2Fuse {
                 attr_ttl: TTL,
             }));
         }
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyDirectoryPlus {
             entries: iter(entries),
         })
@@ -1433,6 +1528,7 @@ impl Filesystem for Mst2Fuse {
         // Handle needed only so the kernel's directory-open round trip
         // succeeds; the read-only tree needs no per-handle state.
         self.ensure_loaded(inode).await?;
+        self.check_metadata_lease().map_err(io_err)?;
         match self.node(inode)? {
             Node::Dir(_) => Ok(ReplyOpen {
                 fh: inode,
@@ -1448,12 +1544,16 @@ impl Filesystem for Mst2Fuse {
 
     async fn statfs(&self, _req: Request, _inode: Inode) -> Result<ReplyStatFs> {
         // Read-only view: report the snapshot's shape, not a device's usage.
-        let state = self.state.lock().unwrap();
-        let files = state
-            .nodes
-            .values()
-            .filter(|n| matches!(n, Node::File(_)))
-            .count() as u64;
+        self.check_metadata_lease().map_err(io_err)?;
+        let files = {
+            let state = self.state.lock().unwrap();
+            state
+                .nodes
+                .values()
+                .filter(|n| matches!(n, Node::File(_)))
+                .count() as u64
+        };
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyStatFs {
             blocks: 0,
             bfree: 0,
