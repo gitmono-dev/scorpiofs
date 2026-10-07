@@ -332,6 +332,7 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
 
 fn recoverable_renewal_error(error: &SnapshotError) -> bool {
     match error.code {
+        SnapshotErrorCode::MetadataNotReady => error.http_status == 503,
         SnapshotErrorCode::TemporaryUnavailable if error.http_status == 0 => true,
         SnapshotErrorCode::TemporaryUnavailable
         | SnapshotErrorCode::Internal
@@ -1753,6 +1754,9 @@ mod tests {
             (SnapshotErrorCode::Internal, 503, true),
             (SnapshotErrorCode::Internal, 429, true),
             (SnapshotErrorCode::SnapshotNotReady, 503, true),
+            (SnapshotErrorCode::MetadataNotReady, 503, true),
+            (SnapshotErrorCode::MetadataNotReady, 0, false),
+            (SnapshotErrorCode::MetadataNotReady, 403, false),
             (SnapshotErrorCode::Internal, 0, false),
             (SnapshotErrorCode::TemporaryUnavailable, 403, false),
             (SnapshotErrorCode::IntegrityError, 503, false),
