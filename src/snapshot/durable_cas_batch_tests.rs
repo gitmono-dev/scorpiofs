@@ -9,11 +9,9 @@ use super::{
     *,
 };
 
-fn fixture() -> (
-    ViewMeta,
-    Vec<SnapshotFile>,
-    Arc<HashMap<String, Arc<Vec<u8>>>>,
-) {
+type FixtureContent = Arc<HashMap<String, Arc<Vec<u8>>>>;
+
+fn fixture() -> (ViewMeta, Vec<SnapshotFile>, FixtureContent) {
     let view = ViewMeta {
         snapshot_id: "sha256:cas-batch-snapshot".into(),
         namespace_view_id: "sha256:cas-batch-namespace".into(),
@@ -41,7 +39,7 @@ async fn hydrate(
     store: &DurableStore,
     view: &ViewMeta,
     files: &[SnapshotFile],
-    raw: Arc<HashMap<String, Arc<Vec<u8>>>>,
+    raw: FixtureContent,
 ) -> Result<HydrateReport, SnapshotError> {
     store
         .hydrate_batches_with_body(
