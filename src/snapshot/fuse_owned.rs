@@ -9,7 +9,8 @@ use std::{
 use bytes::Bytes;
 
 use super::{
-    content::{BudgetClass, Reservation},
+    cas_range::VerifiedCasRange,
+    content::{BudgetClass, ContentBudget, Reservation},
     fuse_store::StoreContent,
     OwnedChunkedFile, ProvenSnapshotFile, SnapshotError, SnapshotErrorCode, SnapshotReader,
     VerifiedContent, VerifiedRange,
@@ -112,9 +113,29 @@ impl OwnedFuseCache {
     }
 }
 
+/// The store path retains only bounded wire handles and path proofs. Local
+/// range payloads live in actual replies, not in an inode payload cache.
+pub(crate) struct StoreRangeCache {
+    pub(crate) ranges: FixedCache<RangeEntry>,
+    _reservation: Reservation,
+}
+
+impl StoreRangeCache {
+    pub(crate) fn new(reader: &SnapshotReader) -> Result<Self, SnapshotError> {
+        let reservation = reader
+            .content_scope
+            .reserve(BudgetClass::Output, size_of::<Self>())?;
+        Ok(Self {
+            ranges: FixedCache::new(),
+            _reservation: reservation,
+        })
+    }
+}
+
 enum Payload {
     Content(Arc<VerifiedContent>),
     Range(Arc<VerifiedRange>),
+    CasRange(Arc<VerifiedCasRange>),
     Store(StoreContent),
 }
 impl AsRef<[u8]> for Payload {
@@ -122,6 +143,7 @@ impl AsRef<[u8]> for Payload {
         match self {
             Self::Content(owner) => owner.as_bytes(),
             Self::Range(owner) => owner.as_bytes(),
+            Self::CasRange(owner) => owner.as_bytes(),
             Self::Store(owner) => owner.as_bytes(),
         }
     }
@@ -144,14 +166,14 @@ impl AsRef<[u8]> for ReplyOwner {
 pub(crate) struct ReplyAdmission(Reservation);
 impl ReplyAdmission {
     pub(crate) fn new(reader: &SnapshotReader) -> Result<Self, SnapshotError> {
+        Self::reserve(&reader.content_scope)
+    }
+    fn reserve(budget: &ContentBudget) -> Result<Self, SnapshotError> {
         // bytes1.12.1 boxes repr(C) Owned<T> = AtomicUsize + T. Include both
         // alignment gaps conservatively; clones/slices share that same box.
         let charge =
             size_of::<ReplyOwner>() + size_of::<AtomicUsize>() + 2 * align_of::<ReplyOwner>();
-        reader
-            .content_scope
-            .reserve(BudgetClass::Output, charge)
-            .map(Self)
+        budget.reserve(BudgetClass::Output, charge).map(Self)
     }
     pub(crate) fn content(
         self,
@@ -164,6 +186,10 @@ impl ReplyAdmission {
     pub(crate) fn range(self, owner: Arc<VerifiedRange>) -> Result<Bytes, SnapshotError> {
         let end = owner.len();
         self.publish(Payload::Range(owner), 0, end)
+    }
+    pub(crate) fn cas_range(self, owner: Arc<VerifiedCasRange>) -> Result<Bytes, SnapshotError> {
+        let end = owner.len();
+        self.publish(Payload::CasRange(owner), 0, end)
     }
     pub(crate) fn store_content(
         self,
@@ -186,5 +212,68 @@ impl ReplyAdmission {
             end,
             _reservation: self.0,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{
+        cas_index::LocalCasRangeMeters,
+        content::{ContentBudgetLimits, ContentBudgetUsage},
+        durable::{digest_of, DurableStore},
+        frames::parse_digest,
+        OBJECT_CAP,
+    };
+
+    #[test]
+    fn cas_reply_uses_the_actual_allocation_and_last_bytes_hold_payload_and_reply_credit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(temp.path()).unwrap();
+        let body = vec![0x91; OBJECT_CAP as usize + 1];
+        let digest = digest_of(&body);
+        let path = store
+            .content_dir()
+            .join(hex::encode(parse_digest(&digest).unwrap()));
+        std::fs::write(path, &body).unwrap();
+        let budget = ContentBudget::new(ContentBudgetLimits::default());
+        let owner = VerifiedCasRange::read(
+            &store,
+            &digest,
+            body.len() as u64,
+            0,
+            4096,
+            &budget,
+            &mut LocalCasRangeMeters::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let payload_charge = budget.usage().output_bytes;
+        let pointer = owner.as_bytes().as_ptr();
+        let reply = ReplyAdmission::reserve(&budget)
+            .unwrap()
+            .cas_range(owner.clone())
+            .unwrap();
+        assert_eq!(reply.as_ptr(), pointer);
+        let paid = budget.usage();
+        assert!(paid.output_bytes > payload_charge);
+        assert_eq!(paid.construction_bytes, 0);
+        drop(owner);
+        drop(store);
+        let clone = reply.clone();
+        let last = clone.slice(17..31);
+        drop(reply);
+        drop(clone);
+        assert_eq!(last.as_ptr(), pointer.wrapping_add(17));
+        assert_eq!(last.as_ref(), &[0x91; 14]);
+        assert_eq!(budget.usage(), paid);
+        drop(last);
+        assert_eq!(
+            budget.usage(),
+            ContentBudgetUsage {
+                output_bytes: 0,
+                construction_bytes: 0
+            }
+        );
     }
 }
