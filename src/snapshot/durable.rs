@@ -1750,6 +1750,7 @@ impl DurableStore {
                     let journal = &journal;
                     async move {
                         let bytes = fetch_batch(batch.clone()).await?;
+                        let writer = CasBatchWriter::new(&store.content)?;
                         for f in &batch {
                             let data = bytes.content_bytes(&f.content_digest).ok_or_else(|| {
                                 SnapshotError::new(
@@ -1781,9 +1782,10 @@ impl DurableStore {
                                     ),
                                 ));
                             }
-                            // The journal cannot make another file's data durable.
-                            // Each CAS object is synced before the batch journal.
-                            write_atomic(&store.content, &blob_name(&f.content_digest), data)?;
+                            writer.write(&blob_name(&f.content_digest), data)?;
+                        }
+                        writer.finish()?;
+                        for f in &batch {
                             journal.append(&FileRecord {
                                 rel_path: f.rel_path.clone(),
                                 digest: f.content_digest.clone(),
@@ -1792,7 +1794,6 @@ impl DurableStore {
                             fetched_b.fetch_add(1, Relaxed);
                             bytes_b.fetch_add(f.size, Relaxed);
                         }
-                        sync_dir(store.content_dir())?;
                         Ok(())
                     }
                 }),
@@ -2932,6 +2933,44 @@ fn blob_name(digest: &str) -> String {
     digest.strip_prefix("sha256:").unwrap_or(digest).to_string()
 }
 
+struct CasBatchWriter<'a> {
+    dir: &'a Path,
+}
+
+impl<'a> CasBatchWriter<'a> {
+    fn new(dir: &'a Path) -> Result<Self, SnapshotError> {
+        create_dirs_durable(dir)?;
+        Ok(Self { dir })
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let temporary = PendingBlob(self.dir.join(format!(
+            ".{name}.tmp.{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
+        let mut file = secure_fs::open_create_new(&temporary.0).map_err(io_err)?;
+        file.write_all(bytes).map_err(io_err)?;
+        durability_checkpoint(self.dir, "object-file-sync")?;
+        file.sync_all().map_err(io_err)?;
+        #[cfg(test)]
+        durability_tests::record_cas_object_sync(&self.dir.join(name));
+        durability_checkpoint(self.dir, "object-rename")?;
+        fs::rename(&temporary.0, self.dir.join(name)).map_err(io_err)?;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), SnapshotError> {
+        // Journal records may be appended only after every renamed CAS entry
+        // is durable. Interrupted batches remain untrusted resume candidates.
+        durability_checkpoint(self.dir, "object-batch-directory-sync")?;
+        sync_dir(self.dir)?;
+        #[cfg(test)]
+        durability_tests::record_cas_batch_sync(self.dir);
+        Ok(())
+    }
+}
+
 /// Content digest in the view's wire form (`sha256:<hex>`).
 pub fn digest_of(bytes: &[u8]) -> String {
     let mut cx = Context::new(&SHA256);
@@ -3102,7 +3141,13 @@ fn sync_file(path: &Path) -> Result<(), SnapshotError> {
 
 pub(super) fn sync_dir(path: &Path) -> Result<(), SnapshotError> {
     durability_checkpoint(path, "directory-sync")?;
-    File::open(path).map_err(io_err)?.sync_all().map_err(io_err)
+    File::open(path)
+        .map_err(io_err)?
+        .sync_all()
+        .map_err(io_err)?;
+    #[cfg(test)]
+    durability_tests::record_directory_sync(path);
+    Ok(())
 }
 
 // New directory names also need their parents persisted. Existing directory
@@ -3336,6 +3381,10 @@ mod snapshot_durability_tests;
 #[cfg(all(test, unix))]
 #[path = "durable_stream_tests.rs"]
 mod streaming_durability_tests;
+
+#[cfg(all(test, unix))]
+#[path = "durable_cas_batch_tests.rs"]
+mod cas_batch_durability_tests;
 
 #[cfg(test)]
 mod tests {
