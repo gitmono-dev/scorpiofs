@@ -34,6 +34,8 @@ pub struct LocalCasRangeMeters {
     pub bytes_read: u64,
     pub whole_sha256_bytes: u64,
     pub chunk_sha256_bytes: u64,
+    /// Actual successful copies into the requested output, not kernel transfer.
+    pub output_append_bytes: u64,
     pub index_hit: bool,
     pub index_built: bool,
     pub strict_fallback: bool,
@@ -289,11 +291,13 @@ fn copy_intersection(
     start: u64,
     offset: u64,
     end: u64,
+    meters: &mut LocalCasRangeMeters,
 ) -> Result<(), SnapshotError> {
     let from = start.max(offset);
     let to = (start + buffer.len() as u64).min(end);
     if from < to {
         output.append(&buffer[(from - start) as usize..(to - start) as usize])?;
+        meters.output_append_bytes += to - from;
     }
     Ok(())
 }
@@ -370,7 +374,7 @@ fn scan_body(
                     }
                 }
             }
-            copy_intersection(output, &buffer[..count], read, offset, end)?;
+            copy_intersection(output, &buffer[..count], read, offset, end, meters)?;
             read = next;
         }
     }
@@ -709,7 +713,7 @@ fn read_chunks(
                     "local CAS covering chunk does not match its verified digest",
                 ));
             }
-            copy_intersection(output, buffer, start, offset, end)?;
+            copy_intersection(output, buffer, start, offset, end, meters)?;
         }
     }
     if output.len() as u64 != end.saturating_sub(offset) {

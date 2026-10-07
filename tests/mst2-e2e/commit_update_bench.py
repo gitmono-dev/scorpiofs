@@ -49,11 +49,12 @@ SAFE_WORKER_ERROR_CODES = frozenset({
     "workspace_status_invalid", "workspace_mount_invalid",
     "workspace_identity_invalid", "workspace_hydration_failed",
     "workspace_retention_invalid", "workspace_oracle_failed",
+    "workspace_read_profile_invalid",
     "worker_process_invalid", "worker_command_failed",
     "worker_receipt_invalid", "worker_cleanup_invalid", "git_baseline_invalid",
 })
 SAFE_WORKER_STAGES = frozenset({
-    "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
+    "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup", "read_profile",
 })
 SAFE_RETENTION_SUBSTAGES = frozenset({
     "retain_path", "upper_check", "sentinel_write", "retained_fd",

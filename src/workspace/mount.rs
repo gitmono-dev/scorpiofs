@@ -55,6 +55,7 @@ impl WorkspaceMount {
         })?;
         #[cfg(target_os = "linux")]
         fs.import().await?;
+        let read_profile = lower.read_profile().cloned();
         let overlay = OverlayFs::new(
             Some(Arc::new(fs)),
             vec![lower as Arc<dyn Layer>],
@@ -67,7 +68,7 @@ impl WorkspaceMount {
         )?;
         Ok(Self {
             mountpoint,
-            overlay: FencedFilesystem::new(overlay),
+            overlay: FencedFilesystem::with_read_profile(overlay, read_profile),
             handle: None,
             mounted_identity: None,
             plain_identity,

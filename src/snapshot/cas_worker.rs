@@ -15,6 +15,7 @@ use super::{
     cas_index::LocalCasRangeMeters, fuse_owned::ReplyAdmission, SnapshotError, SnapshotErrorCode,
     SnapshotReader,
 };
+use crate::util::read_profile::{Metric, ReadProfile};
 
 const LOCAL_OUTSTANDING: usize = 16;
 const LOCAL_RUNNING: usize = 2;
@@ -123,6 +124,7 @@ struct CancelOnDrop {
     state: Arc<AtomicU8>,
     id: u64,
     kind: &'static str,
+    profile: Option<Arc<ReadProfile>>,
 }
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -130,6 +132,16 @@ impl Drop for CancelOnDrop {
             self.state
                 .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
         if result.is_ok() || result == Err(RUNNING) {
+            if let Some(profile) = &self.profile {
+                profile.add(
+                    if result.is_ok() {
+                        Metric::WorkerCancelledPending
+                    } else {
+                        Metric::WorkerDetached
+                    },
+                    1,
+                );
+            }
             tracing::debug!(
                 target: "scorpiofs::workspace::performance",
                 job_id = self.id, kind = self.kind,
@@ -149,10 +161,58 @@ struct JobTrace {
     started: Option<Instant>,
     outcome: &'static str,
     meters: Option<LocalCasRangeMeters>,
+    profile_work: ProfileWork,
+}
+
+// Moved into the actual blocking job. A detached waiter cannot finish it.
+struct ProfileWork(Option<Arc<ReadProfile>>);
+impl Drop for ProfileWork {
+    fn drop(&mut self) {
+        if let Some(profile) = &self.0 {
+            profile.worker_leave();
+        }
+    }
 }
 impl Drop for JobTrace {
     fn drop(&mut self) {
         self.state.store(FINISHED, Ordering::Release);
+        if let Some(profile) = &self.profile_work.0 {
+            let outcome = if std::thread::panicking() {
+                Some(Metric::WorkerPanic)
+            } else {
+                match self.outcome {
+                    "hit" => Some(Metric::WorkerBackingHit),
+                    "miss" => Some(Metric::WorkerBackingMiss),
+                    "lease_error" => Some(Metric::WorkerLeaseRejected),
+                    // The waiter owns the pending-cancellation counter.
+                    "cancelled_before_start" => None,
+                    _ => Some(Metric::WorkerError),
+                }
+            };
+            if let Some(outcome) = outcome {
+                profile.add(outcome, 1);
+            }
+            if let (Some(queued), Some(started)) = (self.queued, self.started) {
+                profile.add_durations(&[
+                    (Metric::WorkerQueueNs, started.duration_since(queued)),
+                    (Metric::WorkerWallNs, started.elapsed()),
+                ]);
+            }
+            if let Some(meters) = self.meters {
+                profile.add_many(&[
+                    (Metric::LargeCasReadBytes, meters.bytes_read),
+                    (Metric::LargeWholeHashBytes, meters.whole_sha256_bytes),
+                    (Metric::LargeChunkHashBytes, meters.chunk_sha256_bytes),
+                    (Metric::LargeCasAppendBytes, meters.output_append_bytes),
+                    (Metric::LargeIndexHit, u64::from(meters.index_hit)),
+                    (Metric::LargeIndexBuilt, u64::from(meters.index_built)),
+                    (
+                        Metric::LargeStrictFallback,
+                        u64::from(meters.strict_fallback),
+                    ),
+                ]);
+            }
+        }
         if let (Some(queued), Some(started)) = (self.queued, self.started) {
             let meters = self.meters.unwrap_or_default();
             tracing::debug!(
@@ -185,22 +245,7 @@ impl CasReadScope {
         })
     }
 
-    pub(crate) async fn run<T: Send + 'static>(
-        &self,
-        reader: SnapshotReader,
-        admission: ReplyAdmission,
-        request: RequestMeters,
-        work: impl FnOnce() -> WorkResult<T> + Send + 'static,
-    ) -> Result<Completion<T>, SnapshotError> {
-        self.run_checked(
-            move || reader.local_lease_status(),
-            admission,
-            request,
-            work,
-        )
-        .await
-    }
-
+    #[cfg(test)]
     async fn run_checked<T: Send + 'static>(
         &self,
         lease: impl Fn() -> Result<(), SnapshotError> + Send + Sync + 'static,
@@ -208,10 +253,11 @@ impl CasReadScope {
         request: RequestMeters,
         work: impl FnOnce() -> WorkResult<T> + Send + 'static,
     ) -> Result<Completion<T>, SnapshotError> {
-        self.run_admitted(AccessCheck::Online(lease), admission, request, work)
+        self.run_admitted(AccessCheck::Online(lease), admission, request, None, work)
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_local<T: Send + 'static>(
         &self,
         access: LocalCasAccess,
@@ -227,6 +273,45 @@ impl CasReadScope {
             AccessCheck::<fn() -> Result<(), SnapshotError>>::Local(access),
             admission,
             request,
+            None,
+            work,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_profiled<T: Send + 'static>(
+        &self,
+        reader: SnapshotReader,
+        admission: ReplyAdmission,
+        request: RequestMeters,
+        profile: Option<Arc<ReadProfile>>,
+        work: impl FnOnce() -> WorkResult<T> + Send + 'static,
+    ) -> Result<Completion<T>, SnapshotError> {
+        self.run_admitted(
+            AccessCheck::Online(move || reader.local_lease_status()),
+            admission,
+            request,
+            profile,
+            work,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_local_profiled<T: Send + 'static>(
+        &self,
+        access: LocalCasAccess,
+        admission: ReplyAdmission,
+        request: RequestMeters,
+        profile: Option<Arc<ReadProfile>>,
+        work: impl FnOnce() -> WorkResult<T> + Send + 'static,
+    ) -> Result<Completion<T>, SnapshotError> {
+        tracing::debug!(target: "scorpiofs::workspace::performance", mode = ?access,
+            "local CAS uses constructor-established access");
+        self.run_admitted(
+            AccessCheck::<fn() -> Result<(), SnapshotError>>::Local(access),
+            admission,
+            request,
+            profile,
             work,
         )
         .await
@@ -237,13 +322,27 @@ impl CasReadScope {
         access: AccessCheck<impl Fn() -> Result<(), SnapshotError> + Send + Sync + 'static>,
         admission: ReplyAdmission,
         request: RequestMeters,
+        profile: Option<Arc<ReadProfile>>,
         work: impl FnOnce() -> WorkResult<T> + Send + 'static,
     ) -> Result<Completion<T>, SnapshotError> {
-        let local_outstanding = try_admit(&self.outstanding)?;
-        let process_outstanding = try_admit(&self.process.outstanding)?;
+        let local_outstanding = try_admit(&self.outstanding).inspect_err(|_| {
+            if let Some(profile) = &profile {
+                profile.add(Metric::WorkerRejected, 1);
+            }
+        })?;
+        let process_outstanding = try_admit(&self.process.outstanding).inspect_err(|_| {
+            if let Some(profile) = &profile {
+                profile.add(Metric::WorkerRejected, 1);
+            }
+        })?;
+        if let Some(profile) = &profile {
+            profile.worker_enter();
+        }
+        let profile_work = ProfileWork(profile.clone());
         let enabled =
             tracing::enabled!(target: "scorpiofs::workspace::performance", tracing::Level::DEBUG);
-        let queued = enabled.then(Instant::now);
+        let timed = enabled || profile.is_some();
+        let queued = timed.then(Instant::now);
         let state = Arc::new(AtomicU8::new(PENDING));
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -251,11 +350,15 @@ impl CasReadScope {
             state: state.clone(),
             id,
             kind: request.kind,
+            profile: profile.clone(),
         };
         // No component can occupy global execution while awaiting its local
         // execution slot. Waiting futures are already count-admitted.
         let local_running = self.running.clone().acquire_owned().await.map_err(|_| {
             state.store(FINISHED, Ordering::Release);
+            if let Some(profile) = &profile {
+                profile.add(Metric::WorkerError, 1);
+            }
             closed()
         })?;
         let process_running = self
@@ -266,9 +369,15 @@ impl CasReadScope {
             .await
             .map_err(|_| {
                 state.store(FINISHED, Ordering::Release);
+                if let Some(profile) = &profile {
+                    profile.add(Metric::WorkerError, 1);
+                }
                 closed()
             })?;
         if let Err(error) = access.check() {
+            if let Some(profile) = &profile {
+                profile.add(Metric::WorkerLeaseRejected, 1);
+            }
             state.store(FINISHED, Ordering::Release);
             tracing::debug!(
                 target: "scorpiofs::workspace::performance",
@@ -294,9 +403,10 @@ impl CasReadScope {
                         request,
                         id,
                         queued,
-                        started: enabled.then(Instant::now),
+                        started: timed.then(Instant::now),
                         outcome: "not_started",
                         meters: None,
+                        profile_work,
                     };
                     let result = if state
                         .compare_exchange(PENDING, RUNNING, Ordering::AcqRel, Ordering::Acquire)

@@ -27,6 +27,7 @@ import uuid
 
 import commit_update_budget as budget
 from workspace_update_daemon import mounts_under
+import workspace_update_profile as read_profile
 
 
 STATUS_FIELDS = frozenset({
@@ -72,6 +73,7 @@ WORKER_ERROR_CODES = frozenset({
     "workspace_hydration_failed",
     "workspace_retention_invalid",
     "workspace_oracle_failed",
+    "workspace_read_profile_invalid",
     "worker_process_invalid",
     "worker_command_failed",
     "worker_receipt_invalid",
@@ -83,7 +85,7 @@ WORKER_ERROR_CODES = frozenset({
 # deliberately describe only the operation class; they never contain a URL,
 # path, status code, response body, or exception text.
 WORKER_STAGES = frozenset({
-    "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
+    "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup", "read_profile",
 })
 
 # Retention failures cross the hosted-runner boundary through a closed,
@@ -593,7 +595,10 @@ class WorkerSession:
     """Own one daemon round's workspace mounts and Git comparison checkouts."""
 
     def __init__(self, round_root, daemon_url, workspace_root, git_store, git_url,
-                 git_env, *, deadline, env, daemon_uid):
+                 git_env, *, deadline, env, daemon_uid, read_profile_mode="disabled"):
+        if type(read_profile_mode) is not str or read_profile_mode not in read_profile.MODES:
+            raise ValueError("read profile mode is invalid")
+        self.read_profile_mode = read_profile_mode
         self.root = Path(round_root).resolve(strict=True)
         self.workspace_root = Path(workspace_root).resolve(strict=True)
         self.git_store = Path(git_store).resolve(strict=True)
@@ -1128,6 +1133,15 @@ class WorkerSession:
                 "generation": view["status"]["generation"], "snapshot_id": view["status"]["snapshot_id"],
                 "fd_verified": True, "dirty_upper_verified": True, "oracle": oracle}
 
+    def _read_profile_checkpoint(self, status, deadline):
+        with self._stage("read_profile"):
+            started_ns = time.monotonic_ns()
+            raw = self.http.request("GET", "/v3/workspaces/" + quote(status["workspace_id"], safe="")
+                                    + "/read-profile", deadline)
+            checkpoint = read_profile.parse_checkpoint(raw, status["workspace_id"], status["generation"])
+            _check_deadline(deadline)
+            return checkpoint, time.monotonic_ns() - started_ns
+
     def _measure_scorpio(self, expected, deadline):
         started = time.monotonic()
         first = self._create_workspace(deadline)
@@ -1136,13 +1150,31 @@ class WorkerSession:
         status, metadata_ms, complete_ms = self._hydrate(first, deadline, started, initial_metadata_ms)
         mount = self._assert_status_path(status)
         mount_identity = _mount_record(mount, self.daemon_uid)
+        mode = getattr(self, "read_profile_mode", "disabled")
+        before_duration_ns = after_duration_ns = 0
+        # Checkpoint requests are outside the complete current oracle's timer.
+        # Keep raw cumulative wall timers: do not deduct instrumentation and
+        # relabel the result as an uninstrumented product performance baseline.
+        if mode == "enabled":
+            before, before_duration_ns = self._read_profile_checkpoint(status, deadline)
         verify_start = time.monotonic()
+        if mode == "enabled":
+            oracle_start_ns = time.monotonic_ns()
         with self._stage("oracle"):
             with self._retention_substage("final_view_oracle"):
                 oracle = self._oracle(mount, expected, deadline, manifest_path=self._expected_path,
                                       manifest_digest=self._expected_digest)
+        if mode == "enabled":
+            oracle_elapsed_ns = time.monotonic_ns() - oracle_start_ns
         verified_ms = (time.monotonic() - started) * 1000
         verification_endpoint_ms = (time.monotonic() - verify_start) * 1000
+        if mode == "enabled":
+            after, after_duration_ns = self._read_profile_checkpoint(status, deadline)
+            with self._stage("read_profile"):
+                profile_evidence = read_profile.measured(before, after, before_duration_ns, after_duration_ns,
+                                                         oracle_elapsed_ns)
+        elif mode == "unsupported":
+            profile_evidence = read_profile.not_measured(mode)
         # Retain the just-verified view before auditing earlier views. The
         # current side's durable timer ends at its own complete byte oracle;
         # retention setup and retained-view audits remain visible as separate
@@ -1155,7 +1187,7 @@ class WorkerSession:
             old = [self._audit_view(view, deadline) for view in self._views[:-1]]
             old_audit_ms = (time.monotonic() - old_audit_start) * 1000
         side_total_ms = (time.monotonic() - started) * 1000
-        return {
+        result = {
             "actual_status": dict(status), "complete_status": dict(status),
             "metadata_ready_ms": metadata_ms, "durable_complete_ms": complete_ms,
             "durable_verified_ms": verified_ms, "oracle": oracle,
@@ -1163,6 +1195,9 @@ class WorkerSession:
             "retain_view_ms": retain_view_ms, "old_views": old,
             "old_view_audit_ms": old_audit_ms, "side_total_ms": side_total_ms,
         }
+        if mode != "disabled":
+            result["read_profile"] = profile_evidence
+        return result
 
     def _measure_git(self, expected, commit, deadline):
         with self._stage("git"):

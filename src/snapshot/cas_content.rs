@@ -8,6 +8,7 @@ use std::{
     io::{self, Read},
     mem::size_of,
     sync::Arc,
+    time::Instant,
 };
 
 use super::{
@@ -19,6 +20,41 @@ use super::{
 };
 
 const READ_SCRATCH_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SmallCasWorkMeters {
+    pub primitive_wall_ns: u64,
+    pub safe_open_wall_ns: u64,
+    pub fstat_wall_ns: u64,
+    pub read_loop_wall_ns: u64,
+    pub whole_hash_wall_ns: u64,
+    pub read_calls: u64,
+    pub read_returned_bytes: u64,
+    pub interrupted_reads: u64,
+    pub eof_reads: u64,
+    pub scratch_append_bytes: u64,
+    pub whole_sha256_bytes: u64,
+    pub overflow: bool,
+}
+
+fn add_meter(value: &mut u64, overflow: &mut bool, amount: u64) {
+    match value.checked_add(amount) {
+        Some(total) => *value = total,
+        None => {
+            *value = u64::MAX;
+            *overflow = true;
+        }
+    }
+}
+
+fn elapsed_meter(start: Instant, value: &mut u64, overflow: &mut bool) {
+    let nanos = start.elapsed().as_nanos();
+    let amount = u64::try_from(nanos).unwrap_or_else(|_| {
+        *overflow = true;
+        u64::MAX
+    });
+    add_meter(value, overflow, amount);
+}
 
 /// A local CAS owner, distinct from content carrying an HTTP EOF receipt.
 /// Output credits survive cache eviction while a reply retains this Arc.
@@ -32,6 +68,30 @@ impl VerifiedCasContent {
         digest: &str,
         expected_size: u64,
         budget: &ContentBudget,
+    ) -> Result<Option<Arc<Self>>, SnapshotError> {
+        Self::read_with_meters(store, digest, expected_size, budget, None)
+    }
+
+    pub(crate) fn read_profiled(
+        store: &DurableStore,
+        digest: &str,
+        expected_size: u64,
+        budget: &ContentBudget,
+        meters: &mut SmallCasWorkMeters,
+    ) -> Result<Option<Arc<Self>>, SnapshotError> {
+        *meters = SmallCasWorkMeters::default();
+        let start = Instant::now();
+        let result = Self::read_with_meters(store, digest, expected_size, budget, Some(meters));
+        elapsed_meter(start, &mut meters.primitive_wall_ns, &mut meters.overflow);
+        result
+    }
+
+    fn read_with_meters(
+        store: &DurableStore,
+        digest: &str,
+        expected_size: u64,
+        budget: &ContentBudget,
+        mut meters: Option<&mut SmallCasWorkMeters>,
     ) -> Result<Option<Arc<Self>>, SnapshotError> {
         if expected_size > OBJECT_CAP {
             return Err(SnapshotError::new(
@@ -53,18 +113,46 @@ impl VerifiedCasContent {
         let _scratch_reservation = budget.reserve(BudgetClass::Construction, READ_SCRATCH_BYTES)?;
         let mut scratch = [0u8; READ_SCRATCH_BYTES];
         let path = store.content_dir().join(hex::encode(expected_digest));
-        let mut input = match secure_fs::open_regular_nonblocking(&path) {
+        let start = meters.as_ref().map(|_| Instant::now());
+        let opened = secure_fs::open_regular_nonblocking(&path);
+        if let (Some(start), Some(meters)) = (start, meters.as_deref_mut()) {
+            elapsed_meter(start, &mut meters.safe_open_wall_ns, &mut meters.overflow);
+        }
+        let mut input = match opened {
             Ok(input) => input,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error(error)),
         };
-        if input.metadata().map_err(io_error)?.len() != expected_size {
+        let start = meters.as_ref().map(|_| Instant::now());
+        let metadata = input.metadata();
+        if let (Some(start), Some(meters)) = (start, meters.as_deref_mut()) {
+            elapsed_meter(start, &mut meters.fstat_wall_ns, &mut meters.overflow);
+        }
+        if metadata.map_err(io_error)?.len() != expected_size {
             return Err(size_mismatch());
         }
-        read_bounded(&mut input, &mut buffer, &mut scratch)?;
-        if ring::digest::digest(&ring::digest::SHA256, buffer.as_bytes()).as_ref()
-            != expected_digest.as_slice()
-        {
+        let start = meters.as_ref().map(|_| Instant::now());
+        let read = match meters.as_deref_mut() {
+            Some(meters) => {
+                read_bounded_with_meters(&mut input, &mut buffer, &mut scratch, Some(meters))
+            }
+            None => read_bounded(&mut input, &mut buffer, &mut scratch),
+        };
+        if let (Some(start), Some(meters)) = (start, meters.as_deref_mut()) {
+            elapsed_meter(start, &mut meters.read_loop_wall_ns, &mut meters.overflow);
+        }
+        read?;
+        let start = meters.as_ref().map(|_| Instant::now());
+        let actual_digest = ring::digest::digest(&ring::digest::SHA256, buffer.as_bytes());
+        if let (Some(start), Some(meters)) = (start, meters) {
+            elapsed_meter(start, &mut meters.whole_hash_wall_ns, &mut meters.overflow);
+            add_meter(
+                &mut meters.whole_sha256_bytes,
+                &mut meters.overflow,
+                buffer.len() as u64,
+            );
+        }
+        if actual_digest.as_ref() != expected_digest.as_slice() {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::DigestMismatch,
                 "local CAS bytes do not match their whole digest",
@@ -95,22 +183,56 @@ fn read_bounded(
     buffer: &mut AccountedBuffer,
     scratch: &mut [u8],
 ) -> Result<(), SnapshotError> {
+    read_bounded_with_meters(input, buffer, scratch, None)
+}
+
+fn read_bounded_with_meters(
+    input: &mut impl Read,
+    buffer: &mut AccountedBuffer,
+    scratch: &mut [u8],
+    mut meters: Option<&mut SmallCasWorkMeters>,
+) -> Result<(), SnapshotError> {
     // The extra byte detects growth after fstat without allocating or reading
     // an unbounded object. Only exact bytes enter the admitted output buffer.
     let mut input = input.take(buffer.capacity() as u64 + 1);
     loop {
+        if let Some(meters) = meters.as_deref_mut() {
+            add_meter(&mut meters.read_calls, &mut meters.overflow, 1);
+        }
         let count = match input.read(scratch) {
             Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if let Some(meters) = meters.as_deref_mut() {
+                    add_meter(&mut meters.interrupted_reads, &mut meters.overflow, 1);
+                }
+                continue;
+            }
             Err(error) => return Err(io_error(error)),
         };
+        if let Some(meters) = meters.as_deref_mut() {
+            add_meter(
+                &mut meters.read_returned_bytes,
+                &mut meters.overflow,
+                count as u64,
+            );
+        }
         if count == 0 {
+            if let Some(meters) = meters.as_deref_mut() {
+                add_meter(&mut meters.eof_reads, &mut meters.overflow, 1);
+            }
             break;
         }
         if count > buffer.capacity() - buffer.len() {
             return Err(size_mismatch());
         }
         buffer.append(&scratch[..count])?;
+        if let Some(meters) = meters.as_deref_mut() {
+            add_meter(
+                &mut meters.scratch_append_bytes,
+                &mut meters.overflow,
+                count as u64,
+            );
+        }
     }
     if buffer.len() != buffer.capacity() {
         return Err(size_mismatch());
@@ -442,6 +564,192 @@ mod tests {
         let mut scratch = [0u8; READ_SCRATCH_BYTES];
         read_bounded(&mut input, &mut buffer, &mut scratch).unwrap();
         assert_eq!(buffer.as_bytes(), b"trusted");
+        drop(buffer);
+        assert_unused(&budget);
+    }
+
+    #[test]
+    fn profiled_cas_counts_actual_bytes_and_keeps_the_same_paid_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(temp.path()).unwrap();
+        let body = vec![0x79; 2 * READ_SCRATCH_BYTES + 3];
+        let digest = digest(&body);
+        fs::write(path(&store, &digest), &body).unwrap();
+        let budget = budget();
+        let mut meters = SmallCasWorkMeters::default();
+        let owner = VerifiedCasContent::read_profiled(
+            &store,
+            &digest,
+            body.len() as u64,
+            &budget,
+            &mut meters,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(owner.as_bytes(), body);
+        assert_eq!(meters.read_returned_bytes, body.len() as u64);
+        assert_eq!(meters.scratch_append_bytes, body.len() as u64);
+        assert_eq!(meters.whole_sha256_bytes, body.len() as u64);
+        assert!(meters.read_calls >= 4);
+        assert_eq!(meters.eof_reads, 1);
+        assert_eq!(meters.interrupted_reads, 0);
+        assert!(!meters.overflow);
+        let retained = budget.usage();
+        assert!(retained.output_bytes > body.len());
+        assert_eq!(retained.construction_bytes, 0);
+        let last = owner.clone();
+        drop(owner);
+        assert_eq!(budget.usage(), retained);
+        drop(last);
+        assert_unused(&budget);
+        let ordinary = VerifiedCasContent::read(&store, &digest, body.len() as u64, &budget)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ordinary.as_bytes(), body);
+        assert_eq!(budget.usage(), retained);
+        drop(ordinary);
+        assert_unused(&budget);
+    }
+
+    #[test]
+    fn profiled_cas_errors_keep_work_bytes_and_never_publish_or_leak() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(temp.path()).unwrap();
+        let body = b"expected fixed bytes";
+        let digest = digest(body);
+        let budget = budget();
+        let mut meters = SmallCasWorkMeters::default();
+        assert!(VerifiedCasContent::read_profiled(
+            &store,
+            &digest,
+            body.len() as u64,
+            &budget,
+            &mut meters,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(meters.read_calls, 0);
+        assert_eq!(meters.read_returned_bytes, 0);
+        assert_eq!(meters.scratch_append_bytes, 0);
+        assert_eq!(meters.whole_sha256_bytes, 0);
+        assert_unused(&budget);
+
+        fs::write(path(&store, &digest), b"short").unwrap();
+        assert_eq!(
+            VerifiedCasContent::read_profiled(
+                &store,
+                &digest,
+                body.len() as u64,
+                &budget,
+                &mut meters,
+            )
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::DigestMismatch
+        );
+        assert_eq!(meters.read_calls, 0);
+        assert_eq!(meters.read_returned_bytes, 0);
+        assert_eq!(meters.whole_sha256_bytes, 0);
+        assert_unused(&budget);
+
+        fs::write(path(&store, &digest), vec![0x33; body.len()]).unwrap();
+        assert_eq!(
+            VerifiedCasContent::read_profiled(
+                &store,
+                &digest,
+                body.len() as u64,
+                &budget,
+                &mut meters,
+            )
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::DigestMismatch
+        );
+        assert_eq!(meters.read_returned_bytes, body.len() as u64);
+        assert_eq!(meters.scratch_append_bytes, body.len() as u64);
+        assert_eq!(meters.whole_sha256_bytes, body.len() as u64);
+        assert_eq!(meters.eof_reads, 1);
+        assert_unused(&budget);
+
+        // A rejected admission neither opens nor reads an existing corrupt body.
+        let denied = ContentBudget::new(ContentBudgetLimits::new(1024, 1024).unwrap());
+        assert_eq!(
+            VerifiedCasContent::read_profiled(
+                &store,
+                &digest,
+                body.len() as u64,
+                &denied,
+                &mut meters,
+            )
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::LimitExceeded
+        );
+        assert_eq!(meters.safe_open_wall_ns, 0);
+        assert_eq!(meters.fstat_wall_ns, 0);
+        assert_eq!(meters.read_calls, 0);
+        assert_eq!(meters.read_returned_bytes, 0);
+        assert_eq!(meters.whole_sha256_bytes, 0);
+        assert_unused(&denied);
+    }
+
+    #[test]
+    fn profiled_bounded_read_counts_rejected_growth_and_partial_error_work() {
+        struct InterruptedThenShort {
+            stage: usize,
+        }
+        impl Read for InterruptedThenShort {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.stage += 1;
+                match self.stage {
+                    1 => Err(io::ErrorKind::Interrupted.into()),
+                    2 => {
+                        output[..2].copy_from_slice(b"ok");
+                        Ok(2)
+                    }
+                    _ => Err(io::ErrorKind::Other.into()),
+                }
+            }
+        }
+        let budget = budget();
+        let mut scratch = [0u8; READ_SCRATCH_BYTES];
+        let mut buffer = AccountedBuffer::new(&budget, BudgetClass::Output, 3, 0).unwrap();
+        let mut input = Cursor::new(b"grew beyond the expected size");
+        let mut meters = SmallCasWorkMeters::default();
+        assert_eq!(
+            read_bounded_with_meters(&mut input, &mut buffer, &mut scratch, Some(&mut meters))
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::DigestMismatch
+        );
+        assert_eq!(input.position(), 4);
+        assert_eq!(meters.read_returned_bytes, 4);
+        assert_eq!(meters.scratch_append_bytes, 0);
+        assert_eq!(meters.whole_sha256_bytes, 0);
+        assert_eq!(meters.eof_reads, 0);
+        drop(buffer);
+        assert_unused(&budget);
+
+        let mut buffer = AccountedBuffer::new(&budget, BudgetClass::Output, 7, 0).unwrap();
+        let mut meters = SmallCasWorkMeters::default();
+        assert_eq!(
+            read_bounded_with_meters(
+                &mut InterruptedThenShort { stage: 0 },
+                &mut buffer,
+                &mut scratch,
+                Some(&mut meters),
+            )
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::Internal
+        );
+        assert_eq!(meters.read_calls, 3);
+        assert_eq!(meters.interrupted_reads, 1);
+        assert_eq!(meters.read_returned_bytes, 2);
+        assert_eq!(meters.scratch_append_bytes, 2);
+        assert_eq!(meters.whole_sha256_bytes, 0);
+        assert_eq!(meters.eof_reads, 0);
+        assert_eq!(buffer.as_bytes(), b"ok");
         drop(buffer);
         assert_unused(&budget);
     }

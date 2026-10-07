@@ -45,7 +45,11 @@ use crate::{
         ProvenSnapshotFile, ScopeCache, SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode,
         SnapshotFile, SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
     },
-    util::{file_attr::make_file_attr, mutation_fence::MutationPause},
+    util::{
+        file_attr::make_file_attr,
+        mutation_fence::MutationPause,
+        read_profile::{phase, Metric, Phase, ReadProfile},
+    },
 };
 
 pub(crate) const ROOT_INODE: u64 = 1;
@@ -157,6 +161,7 @@ struct ListEntry {
 
 /// Read-only FUSE filesystem over one resolved snapshot.
 pub struct Mst2Fuse {
+    read_profile: Option<Arc<ReadProfile>>,
     reader: Option<SnapshotReader>,
     store: Option<Arc<DurableStore>>,
     /// Hints only, in the real owned workspace's authorized scope directory.
@@ -168,6 +173,62 @@ pub struct Mst2Fuse {
 }
 
 impl Mst2Fuse {
+    pub(crate) fn with_read_profile(mut self, profile: Option<Arc<ReadProfile>>) -> Self {
+        self.read_profile = profile;
+        self
+    }
+
+    pub(crate) fn read_profile(&self) -> Option<&Arc<ReadProfile>> {
+        self.read_profile.as_ref()
+    }
+
+    fn read_small_cas(
+        store: &DurableStore,
+        digest: &str,
+        size: u64,
+        budget: &ContentBudget,
+        profile: Option<&Arc<ReadProfile>>,
+    ) -> std::result::Result<Option<Arc<VerifiedCasContent>>, SnapshotError> {
+        let Some(profile) = profile else {
+            return VerifiedCasContent::read(store, digest, size, budget);
+        };
+        let mut meters = super::cas_content::SmallCasWorkMeters::default();
+        let result = VerifiedCasContent::read_profiled(store, digest, size, budget, &mut meters);
+        profile.add_many(&[
+            (Metric::SmallCasCalls, 1),
+            (Metric::SmallCasReadAttempts, meters.read_calls),
+            (Metric::SmallCasReadBytes, meters.read_returned_bytes),
+            (Metric::SmallCasReadEof, meters.eof_reads),
+            (Metric::SmallCasReadInterrupted, meters.interrupted_reads),
+            (Metric::SmallCasWholeHashBytes, meters.whole_sha256_bytes),
+            (Metric::SmallCasAppendBytes, meters.scratch_append_bytes),
+        ]);
+        profile.record_phase(Phase::SmallCas, meters.primitive_wall_ns);
+        // Positive subphase samples are recorded only when that timed work ran.
+        for (phase, duration) in [
+            (Phase::SmallCasOpen, meters.safe_open_wall_ns),
+            (Phase::SmallCasFstat, meters.fstat_wall_ns),
+            (Phase::SmallCasRead, meters.read_loop_wall_ns),
+            (Phase::SmallCasHash, meters.whole_hash_wall_ns),
+        ] {
+            if duration > 0 {
+                profile.record_phase(phase, duration);
+            }
+        }
+        if meters.overflow {
+            profile.mark_overflow();
+        }
+        result
+    }
+
+    async fn validate_proven(
+        &self,
+        proven: &ProvenSnapshotFile,
+        reader: &SnapshotReader,
+    ) -> Result<()> {
+        let _phase = phase(self.read_profile.as_ref(), Phase::ValidateProvenFile);
+        proven.validate(reader).await.map_err(io_err)
+    }
     /// Build the FUSE view eagerly from the full file manifest. The view is
     /// fixed, so the inode tree never goes stale.
     pub async fn from_reader(
@@ -391,6 +452,7 @@ impl Mst2Fuse {
             }),
         );
         let view = Mst2Fuse {
+            read_profile: None,
             reader: Some(reader),
             store,
             scope_pages,
@@ -427,9 +489,18 @@ impl Mst2Fuse {
             let state = self.state.lock().unwrap();
             match state.nodes.get(&inode) {
                 Some(Node::Dir(d)) if !d.loaded => (d.path.clone(), d.page_id.clone()),
-                _ => return Ok(()), // loaded, or not a lazily-fetchable dir
+                _ => {
+                    if let Some(profile) = &self.read_profile {
+                        profile.add(Metric::DirectoryLoadSkipped, 1);
+                    }
+                    return Ok(());
+                } // loaded, or not a lazily-fetchable dir
             }
         };
+        let _phase = phase(self.read_profile.as_ref(), Phase::DirectoryLoad);
+        if let Some(profile) = &self.read_profile {
+            profile.add(Metric::DirectoryLoad, 1);
+        }
         let reader = self.reader.as_ref().ok_or_else(|| {
             crate::snapshot::SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
@@ -481,6 +552,9 @@ impl Mst2Fuse {
                 let expected = item.expected_digest.as_ref().expect("fixed page digest");
                 if let Some(cache) = &self.scope_pages {
                     if let Some(bytes) = cache.read_page_verified_bounded(expected)? {
+                        if let Some(profile) = &self.read_profile {
+                            profile.add(Metric::MetadataLocalPages, 1);
+                        }
                         pages.push((crate::snapshot::frames::parse_digest(expected)?, bytes));
                         continue;
                     }
@@ -488,12 +562,14 @@ impl Mst2Fuse {
                 missing.push(item);
             }
             if !missing.is_empty() {
-                pages.extend(
-                    reader
-                        .client
-                        .metadata_pages(&sid, &missing, reader.encoding_hint())
-                        .await?,
-                );
+                let wire = reader
+                    .client
+                    .metadata_pages(&sid, &missing, reader.encoding_hint())
+                    .await?;
+                if let Some(profile) = &self.read_profile {
+                    profile.add(Metric::MetadataWirePages, wire.len() as u64);
+                }
+                pages.extend(wire);
             }
             let mut allowed = HashSet::new();
             for (route, _) in &batch {
@@ -699,6 +775,9 @@ impl Mst2Fuse {
                 }
             })
         } else {
+            if let Some(profile) = &self.read_profile {
+                profile.add(Metric::DirectoryLoadSkipped, 1);
+            }
             Ok(())
         };
         self.check_metadata_lease().map_err(io_err)?;
@@ -745,6 +824,7 @@ impl Mst2Fuse {
             }
         }
         Ok(Mst2Fuse {
+            read_profile: None,
             reader,
             store,
             scope_pages: None,
@@ -846,6 +926,7 @@ impl Mst2Fuse {
             );
         }
         Ok(Mst2Fuse {
+            read_profile: None,
             reader,
             store,
             scope_pages: None,
@@ -945,7 +1026,10 @@ impl Mst2Fuse {
         let key = ContentKey::new(&node.digest, node.size).map_err(io_err)?;
         let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
         let stop = usize::try_from(offset + wanted).map_err(|_| Errno::from(libc::EIO))?;
-        let admission = ReplyAdmission::reserve(&scope.budget).map_err(io_err)?;
+        let admission = ReplyAdmission::reserve(&scope.budget)
+            .map_err(io_err)?
+            .with_read_profile(self.read_profile.clone());
+        let cache_timer = phase(self.read_profile.as_ref(), Phase::CacheGet);
         let cached = self
             .state
             .lock()
@@ -953,7 +1037,8 @@ impl Mst2Fuse {
             .store_small
             .as_mut()
             .ok_or_else(|| Errno::from(libc::EIO))?
-            .get(key);
+            .get_profiled(key, self.read_profile.as_deref());
+        drop(cache_timer);
         let (content, admission) = match cached {
             Some(content) => (content, admission),
             None => {
@@ -965,18 +1050,26 @@ impl Mst2Fuse {
                 let digest = node.digest.clone();
                 let size = node.size;
                 let budget = scope.budget.clone();
+                let work_profile = self.read_profile.clone();
                 let completion = scope
                     .workers
-                    .run_local(
+                    .run_local_profiled(
                         scope.access,
                         admission,
                         RequestMeters {
                             kind: "small_whole",
                             wanted: size,
                         },
+                        self.read_profile.clone(),
                         move || {
                             WorkResult::local(
-                                VerifiedCasContent::read(&store, &digest, size, &budget),
+                                Self::read_small_cas(
+                                    &store,
+                                    &digest,
+                                    size,
+                                    &budget,
+                                    work_profile.as_ref(),
+                                ),
                                 None,
                             )
                         },
@@ -1000,13 +1093,14 @@ impl Mst2Fuse {
         let data = admission
             .store_content(content.clone(), start, stop)
             .map_err(io_err)?;
+        let _insert_timer = phase(self.read_profile.as_ref(), Phase::CacheInsert);
         self.state
             .lock()
             .unwrap()
             .store_small
             .as_mut()
             .ok_or_else(|| Errno::from(libc::EIO))?
-            .insert(key, content)
+            .insert_profiled(key, content, self.read_profile.as_deref())
             .map_err(io_err)?;
         Ok(ReplyData { data })
     }
@@ -1018,7 +1112,9 @@ impl Mst2Fuse {
         offset: u64,
         wanted: u64,
     ) -> Result<ReplyData> {
-        let admission = ReplyAdmission::reserve(&scope.budget).map_err(io_err)?;
+        let admission = ReplyAdmission::reserve(&scope.budget)
+            .map_err(io_err)?
+            .with_read_profile(self.read_profile.clone());
         let store = self
             .store
             .as_ref()
@@ -1027,17 +1123,23 @@ impl Mst2Fuse {
         let digest = node.digest.clone();
         let size = node.size;
         let budget = scope.budget.clone();
+        let work_profile = self.read_profile.clone();
         let completion = scope
             .workers
-            .run_local(
+            .run_local_profiled(
                 scope.access,
                 admission,
                 RequestMeters {
                     kind: "large_range",
                     wanted,
                 },
+                self.read_profile.clone(),
                 move || {
                     let mut meters = LocalCasRangeMeters::default();
+                    let _phase = phase(work_profile.as_ref(), Phase::LargeCas);
+                    if let Some(profile) = &work_profile {
+                        profile.add(Metric::LargeCasCalls, 1);
+                    }
                     let result = VerifiedCasRange::read(
                         &store,
                         &digest,
@@ -1108,7 +1210,9 @@ impl Mst2Fuse {
             return Ok(ReplyData { data: Bytes::new() });
         }
         let wanted = requested.min(node.size - offset);
-        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        let admission = ReplyAdmission::new(reader)
+            .map_err(io_err)?
+            .with_read_profile(self.read_profile.clone());
         if node.size <= crate::snapshot::OBJECT_CAP {
             return self
                 .read_online_small(reader, inode, node, file, offset, wanted, admission)
@@ -1150,17 +1254,25 @@ impl Mst2Fuse {
                         let digest = node.digest.clone();
                         let size = node.size;
                         let budget = reader.content_scope.clone();
+                        let work_profile = self.read_profile.clone();
                         let completion = workers
-                            .run(
+                            .run_profiled(
                                 reader.clone(),
                                 admission,
                                 RequestMeters {
                                     kind: "small_whole",
                                     wanted: size,
                                 },
+                                self.read_profile.clone(),
                                 move || {
                                     WorkResult::local(
-                                        VerifiedCasContent::read(&store, &digest, size, &budget),
+                                        Self::read_small_cas(
+                                            &store,
+                                            &digest,
+                                            size,
+                                            &budget,
+                                            work_profile.as_ref(),
+                                        ),
                                         None,
                                     )
                                 },
@@ -1242,16 +1354,22 @@ impl Mst2Fuse {
                 let digest = node.digest.clone();
                 let size = node.size;
                 let budget = reader.content_scope.clone();
+                let work_profile = self.read_profile.clone();
                 let completion = workers
-                    .run(
+                    .run_profiled(
                         reader.clone(),
                         admission,
                         RequestMeters {
                             kind: "large_range",
                             wanted,
                         },
+                        self.read_profile.clone(),
                         move || {
                             let mut meters = LocalCasRangeMeters::default();
+                            let _phase = phase(work_profile.as_ref(), Phase::LargeCas);
+                            if let Some(profile) = &work_profile {
+                                profile.add(Metric::LargeCasCalls, 1);
+                            }
                             let result = VerifiedCasRange::read(
                                 &store,
                                 &digest,
@@ -1344,16 +1462,19 @@ impl Mst2Fuse {
         offset: u64,
         requested: u64,
     ) -> Result<ReplyData> {
-        let proven = Self::proven_node(reader, node, None).await?;
+        let proven = self.proven_node(reader, node, None).await?;
         if requested == 0 || offset >= node.size {
-            proven.validate(reader).await.map_err(io_err)?;
+            self.validate_proven(&proven, reader).await?;
             return Ok(ReplyData { data: Bytes::new() });
         }
         let key = ContentKey::new(&node.digest, node.size).map_err(io_err)?;
         let end = offset.saturating_add(requested).min(node.size);
         let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
         let stop = usize::try_from(end).map_err(|_| Errno::from(libc::EIO))?;
-        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        let admission = ReplyAdmission::new(reader)
+            .map_err(io_err)?
+            .with_read_profile(self.read_profile.clone());
+        let cache_timer = phase(self.read_profile.as_ref(), Phase::CacheGet);
         let cached = self
             .state
             .lock()
@@ -1361,7 +1482,8 @@ impl Mst2Fuse {
             .store_small
             .as_mut()
             .ok_or_else(|| Errno::from(libc::EIO))?
-            .get(key);
+            .get_profiled(key, self.read_profile.as_deref());
+        drop(cache_timer);
         let (content, admission) = match cached {
             Some(content) => (content, admission),
             None => {
@@ -1373,18 +1495,26 @@ impl Mst2Fuse {
                 let digest = node.digest.clone();
                 let size = node.size;
                 let budget = reader.content_scope.clone();
+                let work_profile = self.read_profile.clone();
                 let completion = self
                     .store_workers()?
-                    .run(
+                    .run_profiled(
                         reader.clone(),
                         admission,
                         RequestMeters {
                             kind: "small_whole",
                             wanted: size,
                         },
+                        self.read_profile.clone(),
                         move || {
                             WorkResult::local(
-                                VerifiedCasContent::read(&store, &digest, size, &budget),
+                                Self::read_small_cas(
+                                    &store,
+                                    &digest,
+                                    size,
+                                    &budget,
+                                    work_profile.as_ref(),
+                                ),
                                 None,
                             )
                         },
@@ -1393,7 +1523,7 @@ impl Mst2Fuse {
                     .map_err(io_err)?;
                 let local = completion.result.map_err(io_err)?;
                 // The queue and local read may outlive the original lease.
-                proven.validate(reader).await.map_err(io_err)?;
+                self.validate_proven(&proven, reader).await?;
                 let content = match local {
                     Some(content) => StoreContent::Cas(content),
                     None => StoreContent::Wire(
@@ -1412,17 +1542,18 @@ impl Mst2Fuse {
         {
             return Err(Errno::from(libc::EIO));
         }
-        proven.validate(reader).await.map_err(io_err)?;
+        self.validate_proven(&proven, reader).await?;
         let data = admission
             .store_content(content.clone(), start, stop)
             .map_err(io_err)?;
+        let _insert_timer = phase(self.read_profile.as_ref(), Phase::CacheInsert);
         let mut state = self.state.lock().unwrap();
         reader.local_lease_status().map_err(io_err)?;
         state
             .store_small
             .as_mut()
             .ok_or_else(|| Errno::from(libc::EIO))?
-            .insert(key, content)
+            .insert_profiled(key, content, self.read_profile.as_deref())
             .map_err(io_err)?;
         Ok(ReplyData { data })
     }
@@ -1446,18 +1577,21 @@ impl Mst2Fuse {
             .ok_or_else(|| Errno::from(libc::EIO))?
             .ranges
             .get(inode);
-        let proven = Self::proven_node(
-            reader,
-            node,
-            cached.as_ref().map(|entry| entry.proven.clone()),
-        )
-        .await?;
+        let proven = self
+            .proven_node(
+                reader,
+                node,
+                cached.as_ref().map(|entry| entry.proven.clone()),
+            )
+            .await?;
         if requested == 0 || offset >= node.size {
-            proven.validate(reader).await.map_err(io_err)?;
+            self.validate_proven(&proven, reader).await?;
             return Ok(ReplyData { data: Bytes::new() });
         }
         let wanted = requested.min(node.size - offset);
-        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        let admission = ReplyAdmission::new(reader)
+            .map_err(io_err)?
+            .with_read_profile(self.read_profile.clone());
         let store = self
             .store
             .as_ref()
@@ -1466,19 +1600,25 @@ impl Mst2Fuse {
         let digest = node.digest.clone();
         let size = node.size;
         let budget = reader.content_scope.clone();
+        let work_profile = self.read_profile.clone();
         // Always prefer local CAS, including when a wire handle is cached.
         // Only the primitive's safe-open NotFound permits wire fallback.
         let completion = self
             .store_workers()?
-            .run(
+            .run_profiled(
                 reader.clone(),
                 admission,
                 RequestMeters {
                     kind: "large_range",
                     wanted,
                 },
+                self.read_profile.clone(),
                 move || {
                     let mut meters = LocalCasRangeMeters::default();
+                    let _phase = phase(work_profile.as_ref(), Phase::LargeCas);
+                    if let Some(profile) = &work_profile {
+                        profile.add(Metric::LargeCasCalls, 1);
+                    }
                     let result = VerifiedCasRange::read(
                         &store,
                         &digest,
@@ -1494,7 +1634,7 @@ impl Mst2Fuse {
             .await
             .map_err(io_err)?;
         let local = completion.result.map_err(io_err)?;
-        proven.validate(reader).await.map_err(io_err)?;
+        self.validate_proven(&proven, reader).await?;
         let admission = completion.admission;
         if let Some(owner) = local {
             if owner.len() as u64 != wanted {
@@ -1520,7 +1660,7 @@ impl Mst2Fuse {
         if owner.len() as u64 != wanted {
             return Err(Errno::from(libc::EIO));
         }
-        proven.validate(reader).await.map_err(io_err)?;
+        self.validate_proven(&proven, reader).await?;
         let data = admission.range(owner).map_err(io_err)?;
         let mut state = self.state.lock().unwrap();
         reader.local_lease_status().map_err(io_err)?;
@@ -1538,10 +1678,12 @@ impl Mst2Fuse {
     }
 
     async fn proven_node(
+        &self,
         reader: &SnapshotReader,
         node: &FileNode,
         cached: Option<Arc<ProvenSnapshotFile>>,
     ) -> Result<Arc<ProvenSnapshotFile>> {
+        let _phase = phase(self.read_profile.as_ref(), Phase::MembershipAndLease);
         let proven = match cached {
             Some(proven) => proven,
             None => reader
@@ -1549,7 +1691,7 @@ impl Mst2Fuse {
                 .await
                 .map_err(membership_io_err)?,
         };
-        proven.validate(reader).await.map_err(io_err)?;
+        self.validate_proven(&proven, reader).await?;
         let file = proven.file();
         if file.rel_path != node.path
             || file.fs_kind != node.fs_kind
@@ -1584,7 +1726,7 @@ impl Mst2Fuse {
             .as_ref()
             .map(|entry| entry.proven.clone())
             .or_else(|| range.as_ref().map(|entry| entry.proven.clone()));
-        let proven = Self::proven_node(reader, node, cached).await?;
+        let proven = self.proven_node(reader, node, cached).await?;
         if node.fs_kind == "symlink" && !(1..=4095).contains(&node.size) {
             return Err(Errno::from(libc::EIO));
         }
@@ -1592,7 +1734,9 @@ impl Mst2Fuse {
             return Ok(ReplyData { data: Bytes::new() });
         }
         let end = offset.saturating_add(size).min(node.size);
-        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        let admission = ReplyAdmission::new(reader)
+            .map_err(io_err)?
+            .with_read_profile(self.read_profile.clone());
         if node.size <= crate::snapshot::OBJECT_CAP {
             let owner = match content {
                 Some(entry) => entry.content,
@@ -1606,7 +1750,7 @@ impl Mst2Fuse {
             {
                 return Err(Errno::from(libc::EIO));
             }
-            proven.validate(reader).await.map_err(io_err)?;
+            self.validate_proven(&proven, reader).await?;
             let data = admission
                 .content(owner.clone(), offset as usize, end as usize)
                 .map_err(io_err)?;
@@ -1634,7 +1778,7 @@ impl Mst2Fuse {
             if owner.len() as u64 != end - offset {
                 return Err(Errno::from(libc::EIO));
             }
-            proven.validate(reader).await.map_err(io_err)?;
+            self.validate_proven(&proven, reader).await?;
             let data = admission.range(owner).map_err(io_err)?;
             let mut state = self.state.lock().unwrap();
             reader.local_lease_status().map_err(io_err)?;
@@ -1648,13 +1792,24 @@ impl Mst2Fuse {
     }
 
     pub(crate) fn node(&self, inode: u64) -> Result<Node> {
-        self.state
+        let node = self
+            .state
             .lock()
             .unwrap()
             .nodes
             .get(&inode)
             .cloned()
-            .ok_or_else(|| Errno::from(libc::ENOENT))
+            .ok_or_else(|| Errno::from(libc::ENOENT))?;
+        if let Some(profile) = &self.read_profile {
+            profile.add(
+                match &node {
+                    Node::Dir(_) => Metric::NodeDirectoryClones,
+                    Node::File(_) => Metric::NodeFileClones,
+                },
+                1,
+            );
+        }
+        Ok(node)
     }
 
     pub(crate) fn metadata_node(&self, inode: u64) -> Result<Node> {
@@ -2179,6 +2334,7 @@ impl Filesystem for Mst2Fuse {
     async fn open(&self, _req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
         let node = self.node(inode)?;
         if let Some(reader) = self.store_reader() {
+            let _phase = phase(self.read_profile.as_ref(), Phase::LeaseBeforeRead);
             reader.ensure_lease().await.map_err(io_err)?;
         }
         if is_symlink(&node) {
@@ -2237,6 +2393,7 @@ impl Filesystem for Mst2Fuse {
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
+        let _phase = phase(self.read_profile.as_ref(), Phase::LowerRead);
         let _ = fh;
         let f = match self.node(inode)? {
             Node::File(f) => f,
@@ -2252,7 +2409,10 @@ impl Filesystem for Mst2Fuse {
         }
         let store_reader = self.store_reader();
         if let Some(reader) = store_reader {
-            reader.ensure_lease().await.map_err(io_err)?;
+            {
+                let _phase = phase(self.read_profile.as_ref(), Phase::LeaseBeforeRead);
+                reader.ensure_lease().await.map_err(io_err)?;
+            }
             if f.size <= crate::snapshot::OBJECT_CAP {
                 return self.read_store_small(reader, &f, offset, size as u64).await;
             }
@@ -2657,6 +2817,151 @@ mod tests {
                 .strip_prefix("sha256:")
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn opted_in_actual_overlay_wrapper_profiles_cas_aliases_without_copying_or_changing_owners(
+    ) {
+        use libfuse_fs::{
+            passthrough::{config::Config as UpperConfig, PassthroughFs},
+            unionfs::{config::Config as OverlayConfig, OverlayFs},
+            util::whiteout::WhiteoutFormat,
+        };
+
+        use crate::util::{fenced_fs::FencedFilesystem, read_profile::Operation};
+        let body = vec![0x51; 8192];
+        for enabled in [false, true] {
+            let (temp, _store, lower) = local_content_view(&body, "regular", true).await;
+            let budget = lower.local_cas.as_ref().unwrap().budget.clone();
+            let profile = enabled.then(ReadProfile::new);
+            let weak_profile = profile.as_ref().map(Arc::downgrade);
+            let lower = Arc::new(lower.with_read_profile(profile.clone()));
+            let weak_lower = Arc::downgrade(&lower);
+            let upper_path = temp.path().join("profile-upper");
+            std::fs::create_dir(&upper_path).unwrap();
+            let upper = PassthroughFs::<()>::new(UpperConfig {
+                root_dir: upper_path,
+                do_import: true,
+                writeback: false,
+                whiteout_format: WhiteoutFormat::OciWhiteout,
+                ..Default::default()
+            })
+            .unwrap();
+            upper.import().await.unwrap();
+            let overlay = OverlayFs::new(
+                Some(Arc::new(upper)),
+                vec![lower.clone()],
+                OverlayConfig {
+                    do_import: true,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+            let fs = FencedFilesystem::with_read_profile(overlay, profile.clone());
+            let req = Request::default();
+            fs.init(req).await.unwrap();
+            let inode = fs
+                .lookup(req, 1, OsStr::new("file"))
+                .await
+                .unwrap()
+                .attr
+                .ino;
+            let alias = fs
+                .lookup(req, 1, OsStr::new("alias"))
+                .await
+                .unwrap()
+                .attr
+                .ino;
+            assert_ne!(inode, alias);
+            fs.getattr(req, inode, None, 0).await.unwrap();
+            let file = fs.open(req, inode, libc::O_RDONLY as u32).await.unwrap();
+            let twin = fs.open(req, alias, libc::O_RDONLY as u32).await.unwrap();
+            let first = fs
+                .read(req, inode, file.fh, 0, body.len() as u32)
+                .await
+                .unwrap();
+            let second = fs
+                .read(req, alias, twin.fh, 0, body.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(first.data.as_ref(), body);
+            assert_eq!(second.data.as_ref(), body);
+            assert_eq!(first.data.as_ptr(), second.data.as_ptr());
+            fs.release(req, inode, file.fh, 0, 0, false).await.unwrap();
+            fs.release(req, alias, twin.fh, 0, 0, false).await.unwrap();
+            if let Some(profile) = &profile {
+                let snapshot = profile.snapshot();
+                assert!(!snapshot.overflow);
+                assert_eq!(snapshot.workers_active, 0);
+                assert_eq!(snapshot.metric(Metric::SmallCasCalls), 1);
+                assert_eq!(
+                    snapshot.metric(Metric::SmallCasReadBytes),
+                    body.len() as u64
+                );
+                assert_eq!(
+                    snapshot.metric(Metric::SmallCasWholeHashBytes),
+                    body.len() as u64
+                );
+                assert_eq!(
+                    snapshot.metric(Metric::SmallCasAppendBytes),
+                    body.len() as u64
+                );
+                assert_eq!(snapshot.metric(Metric::OwnerCacheMiss), 1);
+                assert_eq!(snapshot.metric(Metric::OwnerCacheHit), 1);
+                assert_eq!(snapshot.metric(Metric::ReplyOwners), 2);
+                assert_eq!(
+                    snapshot.metric(Metric::ReplyOwnerBytes),
+                    2 * body.len() as u64
+                );
+                assert_eq!(snapshot.metric(Metric::ReplyPayloadCopyBytes), 0);
+                assert_eq!(
+                    snapshot.operations[Operation::Read as usize]
+                        .times
+                        .completed,
+                    2
+                );
+                assert_eq!(
+                    snapshot.operations[Operation::Read as usize]
+                        .times
+                        .returned_bytes,
+                    2 * body.len() as u64
+                );
+                let getattr = snapshot.operations[Operation::Getattr as usize].times;
+                assert_eq!(getattr.calls, 1);
+                assert_eq!(getattr.completed, 1);
+                assert_eq!(getattr.errors, 0);
+                assert!(snapshot.operations.iter().all(|op| op.times.active == 0));
+                assert!(
+                    !snapshot.native_kernel_copy_measured && !snapshot.upper_reply_copy_measured
+                );
+            }
+            let held = first.data.clone().slice(17..31);
+            drop(first);
+            drop(second);
+            drop(fs);
+            drop(lower);
+            drop(profile);
+            // Overlay inode drops schedule lower.forget futures that retain
+            // the lower layer. Wait for those owners to retire before checking
+            // that profiling did not extend their lifetime.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while weak_lower.strong_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if let Some(profile) = weak_profile {
+                assert!(profile.upgrade().is_none());
+            }
+            assert!(budget.usage().output_bytes > 0);
+            assert_eq!(held.as_ref(), &body[17..31]);
+            drop(held);
+            assert_eq!(budget.usage().output_bytes, 0);
+            assert_eq!(budget.usage().construction_bytes, 0);
+        }
     }
 
     #[tokio::test]

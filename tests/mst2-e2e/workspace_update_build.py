@@ -148,10 +148,33 @@ def validate(lane, deadline):
         raise AssertionError("client build receipt changed after admission")
 
 
+def read_profile_mode(lane, requested, deadline):
+    """Probe only an explicitly requested diagnostic, outside all side timers.
+
+    A pinned older v3 binary remains runnable without the new optional flag;
+    its profiling data is explicitly absent, never inferred to be zero.
+    """
+    if type(requested) is not bool:
+        raise ValueError("read profiling requires an explicit boolean opt-in")
+    if not requested:
+        return "disabled"
+    validate(lane, deadline)
+    help_text = common.command([str(lane.driver), "serve", "--help"],
+                               min(deadline, time.monotonic() + 30))
+    if len(help_text) > 65536:
+        raise ValueError("client diagnostic capability response is too large")
+    validate(lane, deadline)
+    # Match a clap option line, not prose mentioning some other capability.
+    supported = re.search(rb"(?m)^\s+--workspace-read-profile(?:\s|$)", help_text) is not None
+    return "enabled" if supported else "unsupported"
+
+
 def add_arguments(parser):
     parser.add_argument("--paired", action="store_true")
     parser.add_argument("--build-a", type=Path)
     parser.add_argument("--build-b", type=Path)
+    parser.add_argument("--workspace-read-profile", action="store_true",
+                        help="Opt into read diagnostics; instrumented timings are diagnostic only")
 
 
 def main():

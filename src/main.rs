@@ -37,6 +37,9 @@ struct Cli {
 enum Commands {
     /// Run the workspace HTTP control daemon. Mounts are created by explicit requests.
     Serve {
+        /// Aggregate actual mount/CAS work as numeric checkpoints; no paths or bodies.
+        #[arg(long)]
+        workspace_read_profile: bool,
         /// Write bounded workspace binding evidence to a new absolute JSONL file.
         #[arg(long, requires = "workspace_observation_run_id")]
         workspace_observation_jsonl: Option<PathBuf>,
@@ -205,13 +208,14 @@ async fn main() {
 
     let code = match cli.command {
         Commands::Serve {
+            workspace_read_profile,
             workspace_observation_jsonl,
             workspace_observation_run_id,
         } => {
             let observation = workspace_observation_jsonl
                 .zip(workspace_observation_run_id)
                 .map(|(path, run_id)| cli::ObservationFileOptions { path, run_id });
-            cli::serve_with_observation(cli.http_addr, observation).await
+            cli::serve_with_diagnostics(cli.http_addr, observation, workspace_read_profile).await
         }
         Commands::Workspace { .. } => unreachable!("workspace handled before config init"),
         Commands::Config {
@@ -225,4 +229,32 @@ async fn main() {
     };
 
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_profiling_requires_its_explicit_serve_flag_and_no_observation_file() {
+        for (args, expected) in [
+            (vec!["scorpio", "serve"], false),
+            (vec!["scorpio", "serve", "--workspace-read-profile"], true),
+        ] {
+            let parsed = Cli::try_parse_from(args).unwrap();
+            match parsed.command {
+                Commands::Serve {
+                    workspace_read_profile,
+                    workspace_observation_jsonl,
+                    workspace_observation_run_id,
+                } => {
+                    assert_eq!(workspace_read_profile, expected);
+                    assert!(workspace_observation_jsonl.is_none());
+                    assert!(workspace_observation_run_id.is_none());
+                }
+                _ => panic!("serve flag selected a different command"),
+            }
+        }
+        assert!(Cli::try_parse_from(["scorpio", "doctor", "--workspace-read-profile"]).is_err());
+    }
 }

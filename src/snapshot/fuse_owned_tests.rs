@@ -831,6 +831,95 @@ async fn no_pages_held_replies_survive_actual_small_and_range_cache_eviction() {
 }
 
 #[tokio::test]
+async fn profiled_canonical_store_cache_still_proves_aliases_and_rejects_revoked_lease() {
+    use crate::util::read_profile::{Metric, Phase, ReadProfile};
+
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, true);
+    fixture
+        .bodies
+        .insert("file001".into(), fixture.bodies["file000"].clone());
+    fixture = fixture.with_large();
+    let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(4);
+    fixture.expiry = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        expiry.year(),
+        u8::from(expiry.month()),
+        expiry.day(),
+        expiry.hour(),
+        expiry.minute(),
+        expiry.second()
+    );
+    let server = Server::start(fixture, 8 * 1024 * 1024).await;
+    let (_temp, store, fs) = server.stored_view().await;
+    let body = &server.fixture.bodies["file000"];
+    std::fs::write(store.content_dir().join(hex::encode(hash(body))), body).unwrap();
+    let profile = ReadProfile::new();
+    let fs = fs.with_read_profile(Some(profile.clone()));
+    let file = inode(&fs, "file000").await;
+    let alias = inode(&fs, "file001").await;
+    let prior = fs
+        .read(Request::default(), file, file, 17, 31)
+        .await
+        .unwrap();
+    let twin = fs
+        .read(Request::default(), alias, alias, 17, 31)
+        .await
+        .unwrap();
+    assert_eq!(prior.data.as_ref(), &body[17..48]);
+    assert_eq!(prior.data.as_ptr(), twin.data.as_ptr());
+    let warm = profile.snapshot();
+    assert!(!warm.overflow);
+    assert_eq!(warm.metric(Metric::SmallCasCalls), 1);
+    assert_eq!(warm.metric(Metric::SmallCasReadBytes), body.len() as u64);
+    assert_eq!(
+        warm.metric(Metric::SmallCasWholeHashBytes),
+        body.len() as u64
+    );
+    assert_eq!(warm.metric(Metric::SmallCasAppendBytes), body.len() as u64);
+    assert_eq!(warm.metric(Metric::OwnerCacheMiss), 1);
+    assert_eq!(warm.metric(Metric::OwnerCacheHit), 1);
+    assert_eq!(warm.phases[Phase::MembershipAndLease as usize].calls, 2);
+    assert_eq!(warm.phases[Phase::CacheGet as usize].calls, 2);
+    assert_eq!(warm.phases[Phase::CacheInsert as usize].calls, 2);
+    assert!(warm.phases[Phase::ValidateProvenFile as usize].calls >= 3);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while server.fixture.renewals.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        server.reader.ensure_lease().await.unwrap_err().code,
+        crate::snapshot::SnapshotErrorCode::ScopeForbidden
+    );
+    for (offset, size) in [(0, 1), (0, 0), (8192, 1), (u64::MAX, u32::MAX)] {
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), alias, alias, offset, size)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EACCES
+        );
+    }
+    let denied = profile.snapshot();
+    assert_eq!(denied.metric(Metric::OwnerCacheHit), 1);
+    assert_eq!(denied.metric(Metric::SmallCasCalls), 1);
+    assert_eq!(denied.metric(Metric::ReplyOwners), 2);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(prior.data.as_ref(), &body[17..48]);
+    drop(twin);
+    drop(fs);
+    assert!(server.reader.content_usage().output_bytes > 0);
+    drop(prior);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+    assert_eq!(server.reader.content_usage().construction_bytes, 0);
+}
+
+#[tokio::test]
 async fn online_stored_profiles_use_real_cas_owners_and_only_missing_objects_reach_wire() {
     let _serial = TEST_LOCK.lock().await;
     for metadata_pages in [false, true] {

@@ -263,6 +263,7 @@ mod tests {
         assert_eq!(meters.bytes_read, body.len() as u64);
         assert_eq!(meters.whole_sha256_bytes, body.len() as u64);
         assert_eq!(meters.chunk_sha256_bytes, body.len() as u64);
+        assert_eq!(meters.output_append_bytes, 4096);
         let retained = budget.usage();
         assert_eq!(retained.construction_bytes, baseline.construction_bytes);
         assert!(retained.output_bytes > baseline.output_bytes + 4096);
@@ -295,6 +296,7 @@ mod tests {
             assert_eq!(meters.bytes_read, work);
             assert_eq!(meters.chunk_sha256_bytes, work);
             assert_eq!(meters.whole_sha256_bytes, 0);
+            assert_eq!(meters.output_append_bytes, wanted as u64);
             assert_eq!(
                 budget.usage().construction_bytes,
                 baseline.construction_bytes

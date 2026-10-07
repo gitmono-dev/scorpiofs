@@ -16,13 +16,17 @@ use asyncfuse::{
 use bytes::Bytes;
 use futures::Stream;
 
-use super::mutation_fence::{AdmittedMutation, MutationFence};
+use super::{
+    mutation_fence::{AdmittedMutation, MutationFence},
+    read_profile::{native, Operation, ReadProfile},
+};
 
 /// The mounted filesystem and its control-plane owner share this exact fence.
 /// Reads delegate directly; at most 64 mutation futures retain request data.
 pub struct FencedFilesystem<FS> {
     inner: Arc<FS>,
     fence: MutationFence,
+    read_profile: Option<Arc<ReadProfile>>,
 }
 
 impl<FS> Clone for FencedFilesystem<FS> {
@@ -30,15 +34,21 @@ impl<FS> Clone for FencedFilesystem<FS> {
         Self {
             inner: self.inner.clone(),
             fence: self.fence.clone(),
+            read_profile: self.read_profile.clone(),
         }
     }
 }
 
 impl<FS> FencedFilesystem<FS> {
     pub fn new(inner: FS) -> Self {
+        Self::with_read_profile(inner, None)
+    }
+
+    pub(crate) fn with_read_profile(inner: FS, read_profile: Option<Arc<ReadProfile>>) -> Self {
         Self {
             inner: Arc::new(inner),
             fence: MutationFence::new(64),
+            read_profile,
         }
     }
 
@@ -230,7 +240,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
     }
 
     async fn lookup(&self, req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
-        self.inner.lookup(req, parent, name).await
+        native(
+            self.read_profile.as_ref(),
+            Operation::Lookup,
+            self.inner.lookup(req, parent, name),
+            |_| 0,
+        )
+        .await
     }
 
     async fn forget(&self, req: Request, inode: Inode, nlookup: u64) {
@@ -244,7 +260,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
         fh: Option<u64>,
         flags: u32,
     ) -> Result<ReplyAttr> {
-        self.inner.getattr(req, inode, fh, flags).await
+        native(
+            self.read_profile.as_ref(),
+            Operation::Getattr,
+            self.inner.getattr(req, inode, fh, flags),
+            |_| 0,
+        )
+        .await
     }
 
     async fn setattr(
@@ -262,7 +284,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
     }
 
     async fn readlink(&self, req: Request, inode: Inode) -> Result<ReplyData> {
-        self.inner.readlink(req, inode).await
+        native(
+            self.read_profile.as_ref(),
+            Operation::Readlink,
+            self.inner.readlink(req, inode),
+            |reply| reply.data.len() as u64,
+        )
+        .await
     }
 
     async fn symlink(
@@ -366,16 +394,24 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
     }
 
     async fn open(&self, req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
-        let admission = self.fence.admit(false).await.map_err(native_error)?;
-        self.run_with_cleanup(
-            admission,
-            move |inner| async move { inner.open(req, inode, flags).await },
-            move |inner, result| async move {
-                match result {
-                    Ok(reply) => inner.release(req, inode, reply.fh, flags, 0, false).await,
-                    Err(_) => Ok(()),
-                }
+        native(
+            self.read_profile.as_ref(),
+            Operation::Open,
+            async {
+                let admission = self.fence.admit(false).await.map_err(native_error)?;
+                self.run_with_cleanup(
+                    admission,
+                    move |inner| async move { inner.open(req, inode, flags).await },
+                    move |inner, result| async move {
+                        match result {
+                            Ok(reply) => inner.release(req, inode, reply.fh, flags, 0, false).await,
+                            Err(_) => Ok(()),
+                        }
+                    },
+                )
+                .await
             },
+            |_| 0,
         )
         .await
     }
@@ -388,7 +424,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        self.inner.read(req, inode, fh, offset, size).await
+        native(
+            self.read_profile.as_ref(),
+            Operation::Read,
+            self.inner.read(req, inode, fh, offset, size),
+            |reply| reply.data.len() as u64,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -425,17 +467,25 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
         lock_owner: u64,
         flush: bool,
     ) -> Result<()> {
-        let admission = self.admit_cleanup().await?;
-        let fence = self.fence.clone();
-        self.run(admission, move |inner| async move {
-            let result = inner
-                .release(req, inode, fh, flags, lock_owner, flush)
-                .await;
-            if result.is_err() {
-                fence.mark_uncertain();
-            }
-            result
-        })
+        native(
+            self.read_profile.as_ref(),
+            Operation::Release,
+            async {
+                let admission = self.admit_cleanup().await?;
+                let fence = self.fence.clone();
+                self.run(admission, move |inner| async move {
+                    let result = inner
+                        .release(req, inode, fh, flags, lock_owner, flush)
+                        .await;
+                    if result.is_err() {
+                        fence.mark_uncertain();
+                    }
+                    result
+                })
+                .await
+            },
+            |_| 0,
+        )
         .await
     }
 
@@ -499,16 +549,24 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
     }
 
     async fn opendir(&self, req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
-        let admission = self.fence.admit(false).await.map_err(native_error)?;
-        self.run_with_cleanup(
-            admission,
-            move |inner| async move { inner.opendir(req, inode, flags).await },
-            move |inner, result| async move {
-                match result {
-                    Ok(reply) => inner.releasedir(req, inode, reply.fh, flags).await,
-                    Err(_) => Ok(()),
-                }
+        native(
+            self.read_profile.as_ref(),
+            Operation::Opendir,
+            async {
+                let admission = self.fence.admit(false).await.map_err(native_error)?;
+                self.run_with_cleanup(
+                    admission,
+                    move |inner| async move { inner.opendir(req, inode, flags).await },
+                    move |inner, result| async move {
+                        match result {
+                            Ok(reply) => inner.releasedir(req, inode, reply.fh, flags).await,
+                            Err(_) => Ok(()),
+                        }
+                    },
+                )
+                .await
             },
+            |_| 0,
         )
         .await
     }
@@ -520,19 +578,33 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
         fh: u64,
         offset: i64,
     ) -> Result<ReplyDirectory<impl Stream<Item = Result<DirectoryEntry>> + Send + 'a>> {
-        self.inner.readdir(req, parent, fh, offset).await
+        native(
+            self.read_profile.as_ref(),
+            Operation::Readdir,
+            self.inner.readdir(req, parent, fh, offset),
+            |_| 0,
+        )
+        .await
     }
 
     async fn releasedir(&self, req: Request, inode: Inode, fh: u64, flags: u32) -> Result<()> {
-        let admission = self.admit_cleanup().await?;
-        let fence = self.fence.clone();
-        self.run(admission, move |inner| async move {
-            let result = inner.releasedir(req, inode, fh, flags).await;
-            if result.is_err() {
-                fence.mark_uncertain();
-            }
-            result
-        })
+        native(
+            self.read_profile.as_ref(),
+            Operation::Releasedir,
+            async {
+                let admission = self.admit_cleanup().await?;
+                let fence = self.fence.clone();
+                self.run(admission, move |inner| async move {
+                    let result = inner.releasedir(req, inode, fh, flags).await;
+                    if result.is_err() {
+                        fence.mark_uncertain();
+                    }
+                    result
+                })
+                .await
+            },
+            |_| 0,
+        )
         .await
     }
 
@@ -705,9 +777,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Filesystem for FencedFilesystem<FS>
         lock_owner: u64,
     ) -> Result<ReplyDirectoryPlus<impl Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>>
     {
-        self.inner
-            .readdirplus(req, parent, fh, offset, lock_owner)
-            .await
+        native(
+            self.read_profile.as_ref(),
+            Operation::Readdirplus,
+            self.inner.readdirplus(req, parent, fh, offset, lock_owner),
+            |_| 0,
+        )
+        .await
     }
 
     async fn rename2(
@@ -1050,6 +1126,62 @@ mod tests {
                 .data
                 .as_ref(),
             b"dirty"
+        );
+    }
+
+    #[tokio::test]
+    async fn profiled_cancelled_native_open_keeps_cleanup_fenced_after_waiter_timer_drops() {
+        let profile = ReadProfile::new();
+        let fs = FencedFilesystem::with_read_profile(ControlledFs::new(), Some(profile.clone()));
+        let other = fs.clone();
+        let caller = tokio::spawn(async move {
+            other
+                .open(Request::default(), 2, libc::O_TRUNC as u32)
+                .await
+        });
+        fs.inner.wait_started().await;
+        assert_eq!(
+            profile.snapshot().operations[Operation::Open as usize]
+                .times
+                .active,
+            1
+        );
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let dropped = profile.snapshot().operations[Operation::Open as usize].times;
+        assert_eq!(dropped.calls, 1);
+        assert_eq!(dropped.active, 0);
+        assert_eq!(dropped.dropped, 1);
+        assert_eq!(dropped.completed, 0);
+        fs.inner.proceed.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), fs.inner.release_started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let pause = fs.fence.pause();
+        tokio::pin!(pause);
+        assert!(futures::poll!(pause.as_mut()).is_pending());
+        assert!(fs.inner.content.lock().unwrap().is_empty());
+        fs.inner.release_proceed.add_permits(1);
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), pause)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(fs.inner.release_count.load(Ordering::Acquire), 1);
+        assert!(!fs.fence.is_uncertain());
+        let retired = profile.snapshot().operations[Operation::Open as usize].times;
+        assert_eq!(retired.dropped, 1);
+        assert_eq!(retired.completed, 0);
+        // Orphan release executes inside the original inner owner, without
+        // inventing a second native entry or completion for the dropped caller.
+        assert_eq!(
+            profile.snapshot().operations[Operation::Release as usize]
+                .times
+                .calls,
+            0
         );
     }
 

@@ -33,6 +33,8 @@ pub struct WorkspaceConfig {
     pub lease_seconds: u64,
     pub metadata_limits: MetadataProofLimits,
     pub diff_limits: DiffLimits,
+    /// Explicit local diagnostic switch; ordinary serving allocates no profiler.
+    pub read_profile: bool,
 }
 
 impl WorkspaceConfig {
@@ -46,11 +48,20 @@ impl WorkspaceConfig {
             lease_seconds: 300,
             metadata_limits: MetadataProofLimits::default(),
             diff_limits: DiffLimits::default(),
+            read_profile: false,
         }
     }
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct WorkspaceReadProfile {
+    pub workspace_id: String,
+    pub generation: String,
+    pub profile: crate::util::read_profile::ProfileSnapshot,
+}
+
 struct Runtime {
+    read_profile: Option<Arc<crate::util::read_profile::ReadProfile>>,
     reader: Option<SnapshotReader>,
     store: Option<Arc<DurableStore>>,
     lower: Option<Arc<Mst2Fuse>>,
@@ -69,6 +80,7 @@ struct Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self {
+            read_profile: None,
             reader: None,
             store: None,
             lower: None,
@@ -154,6 +166,28 @@ impl WorkspaceService {
         }))
     }
 
+    pub(crate) async fn read_profile(
+        &self,
+        id: &str,
+    ) -> Result<WorkspaceReadProfile, WorkspaceError> {
+        if !self.config.read_profile {
+            return Err(WorkspaceError::new(
+                "WORKSPACE_NOT_FOUND",
+                "read profiling is disabled",
+            ));
+        }
+        let workspace = self.find(id)?;
+        let runtime = workspace.runtime.lock().await;
+        let profile = runtime.read_profile.as_ref().ok_or_else(|| {
+            WorkspaceError::new("WORKSPACE_NOT_READY", "read profiler is not initialized")
+        })?;
+        Ok(WorkspaceReadProfile {
+            workspace_id: workspace.id.clone(),
+            generation: workspace.generation.clone(),
+            profile: profile.snapshot(),
+        })
+    }
+
     fn find(&self, id: &str) -> Result<Arc<Workspace>, WorkspaceError> {
         self.entries
             .lock()
@@ -226,6 +260,10 @@ impl WorkspaceService {
                 .unwrap()
                 .insert(id, workspace.clone());
             let mut runtime = workspace.runtime.lock().await;
+            runtime.read_profile = service
+                .config
+                .read_profile
+                .then(crate::util::read_profile::ReadProfile::new);
             let result = service.prepare(&workspace, &mut runtime, &request).await;
             if let Err(error) = result {
                 runtime.mount_state = MountState::Failed;
@@ -332,7 +370,8 @@ impl WorkspaceService {
                     self.config.metadata_limits,
                 ),
             )
-            .await?,
+            .await?
+            .with_read_profile(runtime.read_profile.clone()),
         );
         runtime.lower = Some(lower.clone());
         trace_sync("private_paths_prepare", || {

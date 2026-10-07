@@ -35,6 +35,10 @@ on:
         type: boolean
         description: Retry a failed measurement using its original start and deadline
         default: false
+      workspace_read_profile:
+        type: boolean
+        description: Opt into read diagnostics; timings cannot establish uninstrumented A/B or Git performance
+        default: false
 
 permissions:
   contents: read
@@ -58,6 +62,7 @@ jobs:
       STARTED_INPUT: ${{ inputs.session_started_utc }}
       DEADLINE_INPUT: ${{ inputs.session_deadline_utc }}
       RECOVERY_INPUT: ${{ inputs.recover_original_window }}
+      READ_PROFILE_INPUT: ${{ inputs.workspace_read_profile }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -188,6 +193,12 @@ jobs:
         run: |
           set -euo pipefail
           client_args=()
+          diagnostic_args=()
+          if test "${READ_PROFILE_INPUT:-false}" = true; then
+            diagnostic_args=(--workspace-read-profile)
+          elif test "${READ_PROFILE_INPUT:-false}" != false; then
+            exit 1
+          fi
           if test "$COMPARISON" = paired; then
             client_args=(--paired --build-a "$MST2_BUILD_A" --build-b "$MST2_BUILD_B")
           else
@@ -198,7 +209,7 @@ jobs:
           python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --execute --projection-traces \
             --run-root "$MST2_OWNED_ROOT" --mega-source "$GITHUB_WORKSPACE/mega2" \
             --mega-sha "$MEGA_SHA" --mega-binary "$GITHUB_WORKSPACE/mega2/target/release/mega2" \
-            "${client_args[@]}" --profile "$PROFILE" --rounds "$ROUNDS" \
+            "${client_args[@]}" "${diagnostic_args[@]}" --profile "$PROFILE" --rounds "$ROUNDS" \
             --session-started-utc "$MST2_SESSION_STARTED" --session-deadline-utc "$MST2_SESSION_DEADLINE"
 
       - name: Verify cleanup within the original deadline
@@ -213,6 +224,7 @@ jobs:
           fi
 
       - name: Stage safe benchmark evidence
+        id: safe_evidence
         if: always()
         timeout-minutes: 4
         shell: bash
@@ -238,6 +250,9 @@ jobs:
               'session_started_utc': os.environ['STARTED_INPUT'],
               'session_deadline_utc': os.environ['DEADLINE_INPUT'],
           }
+          if os.environ.get('READ_PROFILE_INPUT', 'false') == 'true':
+              record['measurement_interpretation'] = 'INSTRUMENTED_DIAGNOSTIC_NOT_FREE_PERFORMANCE_BASELINE'
+              record['performance_comparison_allowed'] = False
           Path(sys.argv[1]).write_text(json.dumps(record, sort_keys=True) + '\n', encoding='utf-8')
           PY
           if test "$COMPARISON" = paired; then
@@ -273,6 +288,15 @@ jobs:
               esac
             done < <(find "$root" -type f -print0)
           fi
+          python3 -B - "$safe/measurements" <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
+          from workspace_update_profile import validate_artifact_tree
+          path = Path(sys.argv[1])
+          if path.exists():
+              validate_artifact_tree(path, diagnostic_required=os.environ.get('READ_PROFILE_INPUT', 'false') == 'true')
+          PY
           find "$safe" -type f -printf '%P\n' | sort
           python3 -B - <<'PY'
           import os, sys
@@ -296,7 +320,7 @@ jobs:
           PY
 
       - name: Upload safe benchmark evidence
-        if: always() && steps.upload_admission.outcome == 'success'
+        if: always() && steps.safe_evidence.outcome == 'success' && steps.upload_admission.outcome == 'success'
         id: evidence_upload
         timeout-minutes: 9
         uses: actions/upload-artifact@v4

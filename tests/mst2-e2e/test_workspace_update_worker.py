@@ -124,6 +124,7 @@ class WorkerShapeTests(unittest.TestCase):
         worker = WorkerSession.__new__(WorkerSession)
         self.assertEqual(WORKER_STAGES, {
             "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
+            "read_profile",
         })
         with self.assertRaises(WorkerError) as failed:
             with worker._stage("hydrate"):

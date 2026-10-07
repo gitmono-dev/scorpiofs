@@ -12,11 +12,13 @@ from unittest.mock import Mock, patch
 
 import workspace_update_bench as bench
 import commit_update_ci as ci
+import workspace_update_profile as read_profile
 
 
 class WorkspaceUpdateBenchTests(unittest.TestCase):
     def run_matrix(self, fail_batch=False, paired=False, sink_failure=False, startup_failure=False,
-                   campaign_failure=False, campaign_expiry=False, final_emit_delay=None):
+                   campaign_failure=False, campaign_expiry=False, final_emit_delay=None,
+                   diagnostic=False, missing_profile=False):
         with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
             root = Path(temp)
             options = SimpleNamespace(
@@ -27,6 +29,8 @@ class WorkspaceUpdateBenchTests(unittest.TestCase):
                 expect_initial_commit="a" * 40, run_root=root / "measurements",
                 driver=root / "scorpio", driver_sha256="b" * 64, profile="medium", rounds=3,
                 deadline_seconds=14400, paired=paired)
+            if diagnostic:
+                options.workspace_read_profile = True
             now = time.monotonic()
             deadlines = [now + 100, now + 200, now + 300]
             budget = SimpleNamespace(measurement_deadline=now + 1000,
@@ -110,16 +114,22 @@ class WorkspaceUpdateBenchTests(unittest.TestCase):
                 measured.append((round_number, version, deadline) + ((label, side_order, commit) if paired else ()))
                 if fail_batch and version == "v4":
                     raise TimeoutError("fourth scenario exhausted the original round deadline")
-                return {"actual_status": {}, "old_views": [],
+                result = {"actual_status": {}, "old_views": [],
                         "scorpio": {key: 1 for key in ("metadata_ready_ms", "durable_complete_ms",
                                     "durable_verified_ms", "retain_view_ms", "old_view_audit_ms", "side_total_ms")},
                         "git": {"verified_ms": 1, "checkout_verified_ms": 1}}
+                if diagnostic and not missing_profile:
+                    from test_workspace_update_profile import evidence
+                    result["scorpio"]["read_profile"] = (read_profile.not_measured("unsupported")
+                                                          if label == "a" else evidence())
+                return result
 
-            def daemon_factory(binary, _digest, lane_root, *_args):
+            def daemon_factory(binary, _digest, lane_root, *_args, **kwargs):
                 label = lane_root.name.removeprefix("client-")
                 if startup_failure and label == "b":
                     raise TimeoutError("second client startup exhausted the admitted deadline")
                 obj = Mock()
+                obj.read_profile_enabled = kwargs.get("read_profile", False)
                 obj.url, obj.workspace_root, obj.uid = "http://127.0.0.1:9001", lane_root, 1000
                 obj.store = lane_root / "scorpio-store"
                 obj.process.pid, obj.started = 123 + len(daemon_instances), "456"
@@ -131,6 +141,7 @@ class WorkspaceUpdateBenchTests(unittest.TestCase):
 
             def worker_factory(lane_root, *_args, **_kwargs):
                 obj = Mock()
+                obj.read_profile_mode = _kwargs.get("read_profile_mode", "disabled")
                 label = lane_root.name.removeprefix("client-")
                 obj.measure.side_effect = lambda *args: measure(*args, label=label)
                 obj.stop.return_value = {"retained": 4, "verified": True, "final_retained_view_audit_ms": 1}
@@ -199,19 +210,22 @@ class WorkspaceUpdateBenchTests(unittest.TestCase):
                                   patch("workspace_update_resources.ProcessResources", side_effect=resource_factory),
                                   patch("workspace_update_resources.disk_usage", return_value={"allocated_bytes": 1}),
                                   patch("workspace_update_resources.io_delta", return_value={"rchar": 1})]
+            capability_probe = Mock(side_effect=lambda lane, *_args: "unsupported" if lane.label == "a" else "enabled")
+            patches[-1:-1] = [patch.object(bench.builds, "read_profile_mode", capability_probe)]
             entered = [stack.enter_context(item) for item in patches]
             if final_emit_delay:
                 with self.assertRaisesRegex(TimeoutError, "evidence (write|output) exceeded") as failed:
                     bench.execute(options)
                 ci.persist_failure_record(root, failed.exception)
-            elif fail_batch or startup_failure or sink_failure or campaign_failure or campaign_expiry:
+            elif fail_batch or startup_failure or sink_failure or campaign_failure or campaign_expiry or missing_profile:
                 if startup_failure or sink_failure or campaign_failure or campaign_expiry:
                     with self.assertRaises((TimeoutError, AssertionError)):
                         bench.execute(options)
                 else:
                     with self.assertRaises(bench.common.PhaseFailure) as failed:
                         bench.execute(options)
-                    self.assertEqual(bench.common.failure_record(failed.exception)["error_type"], "TimeoutError")
+                    self.assertEqual(bench.common.failure_record(failed.exception)["error_type"],
+                                     "ProfileError" if missing_profile else "TimeoutError")
             else:
                 bench.execute(options)
             return SimpleNamespace(options=options, budget=budget, deadlines=deadlines,
@@ -219,6 +233,7 @@ class WorkspaceUpdateBenchTests(unittest.TestCase):
                                    projection=projection,
                                    daemon_instances=daemon_instances, worker_instances=worker_instances,
                                    collectors=collectors,
+                                   capability_probe=capability_probe,
                                    file_records=[json.loads(line) for line in (options.run_root / "measurements.jsonl").read_text().splitlines()],
                                    failure=json.loads((options.run_root / "failure.json").read_text()) if final_emit_delay else None,
                                    records=[json.loads(line) for line in entered[-1].getvalue().splitlines()])
@@ -244,6 +259,42 @@ class WorkspaceUpdateBenchTests(unittest.TestCase):
                          [("v1", 3), ("v2", 3), ("v3", 3), ("v4", 3)])
         self.assertEqual(run.records[-1]["round_scenarios"], 12)
         self.assertTrue(run.records[-1]["campaign_cleanup_complete"])
+
+    def test_default_off_preserves_unprofiled_records_and_never_probes_client_capabilities(self):
+        run = self.run_matrix(paired=True)
+        run.capability_probe.assert_not_called()
+        for record in run.records:
+            self.assertNotIn("measurement_interpretation", record)
+            self.assertNotIn("performance_comparison_allowed", record)
+            if record["record"] == "round":
+                self.assertNotIn("read_profile", record["scorpio"])
+        self.assertTrue(all(not daemon.read_profile_enabled for daemon in run.daemon_instances))
+        self.assertTrue(all(worker.read_profile_mode == "disabled" for worker in run.worker_instances))
+
+    def test_explicit_diagnostic_matrix_never_labels_unsupported_baseline_as_zero_measurement(self):
+        run = self.run_matrix(paired=True, diagnostic=True)
+        self.assertEqual(run.capability_probe.call_count, 2)
+        self.assertEqual(run.records[0]["workspace_read_profile_modes"], {"a": "unsupported", "b": "enabled"})
+        for record in run.records:
+            self.assertEqual(record["measurement_interpretation"], read_profile.DIAGNOSTIC_INTERPRETATION)
+            self.assertIs(record["performance_comparison_allowed"], False)
+            if record["record"] == "round":
+                value = record["scorpio"]["read_profile"]
+                self.assertEqual(value["status"], "NOT_MEASURED" if record["client"] == "a" else "MEASURED")
+                if record["client"] == "a":
+                    self.assertNotIn("delta", value)
+        self.assertEqual([daemon.read_profile_enabled for daemon in run.daemon_instances], [False, True] * 3)
+        self.assertEqual([worker.read_profile_mode for worker in run.worker_instances], ["unsupported", "enabled"] * 3)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "measurements.jsonl"
+            path.write_text("".join(json.dumps(record) + "\n" for record in run.records))
+            self.assertEqual(read_profile.validate_artifact(path, diagnostic_required=True), 24)
+
+    def test_missing_requested_diagnostics_fail_the_matrix_before_any_round_is_published(self):
+        run = self.run_matrix(paired=True, diagnostic=True, missing_profile=True)
+        self.assertEqual([record["record"] for record in run.records], ["environment"])
+        run.projection.finish.assert_not_called()
+        run.options.finalize_campaign.assert_not_called()
 
     def test_batch_timeout_cleans_both_owners_and_cannot_publish_partial_success(self):
         run = self.run_matrix(fail_batch=True)
