@@ -19,8 +19,7 @@ use crate::snapshot::{
     closure::{decode_page, ValidatedSnapshotClosure},
     frames::MetadataPageItem,
     types::{
-        Capabilities, Descriptor, LookupResult, OfflineGrant, SnapshotError,
-        SnapshotErrorCode,
+        Capabilities, Descriptor, LookupResult, OfflineGrant, SnapshotError, SnapshotErrorCode,
     },
 };
 

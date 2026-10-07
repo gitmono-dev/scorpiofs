@@ -35,9 +35,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{
-    closure::decode_page, frames::MetadataPageItem, reader::SnapshotPageSource,
-    secure_fs, SnapshotClosureMeters, SnapshotError, SnapshotErrorCode, SnapshotFile,
-    SnapshotReader, ValidatedSnapshotClosure,
+    closure::decode_page, frames::MetadataPageItem, reader::SnapshotPageSource, secure_fs,
+    SnapshotClosureMeters, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
+    ValidatedSnapshotClosure,
 };
 
 /// Local cache-policy revision; bump when the reuse rules change so older
