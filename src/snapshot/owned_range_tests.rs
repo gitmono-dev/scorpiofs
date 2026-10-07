@@ -357,7 +357,7 @@ impl Server {
         .unwrap()
     }
     async fn online_tokens(&self) -> BTreeMap<String, Arc<OnlineSnapshotFile>> {
-        let fs = super::super::Mst2Fuse::from_reader(self.reader.clone())
+        let fs = crate::snapshot::fuse::Mst2Fuse::from_reader(self.reader.clone())
             .await
             .unwrap();
         let names: &[&str] = if self.fixture.aliases {
