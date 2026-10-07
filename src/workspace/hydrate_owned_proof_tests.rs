@@ -193,6 +193,10 @@ async fn verified_owner_directory_sync_failure_cannot_journal_or_complete_and_re
 
 #[tokio::test]
 async fn raw_callback_keeps_full_hash_even_when_its_bytes_come_from_an_actual_verified_owner() {
+    async fn unexpected_large_fetch() -> Result<Arc<Vec<u8>>, SnapshotError> {
+        panic!("small fixture cannot fetch large content")
+    }
+
     let server = Server::new(Fixture::new(true, false, false)).await;
     let reader = server.reader().await;
     let (file, owner) = one_owner(&reader).await;
@@ -219,7 +223,7 @@ async fn raw_callback_keeps_full_hash_even_when_its_bytes_come_from_an_actual_ve
                 )
             },
             |_| {
-                Box::pin(async { panic!("small fixture cannot fetch large content") })
+                Box::pin(unexpected_large_fetch())
                     as futures::future::BoxFuture<'static, Result<Arc<Vec<u8>>, SnapshotError>>
             },
         )
