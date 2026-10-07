@@ -107,6 +107,7 @@ async fn run_workspace_kernel_checked(vm: &mut qlean::Machine, command: &str) ->
         "SHIPPED_DAEMON_STAGE_METERS_RUN:",
         "SHIPPED_DAEMON_METERS_RUN:",
         "SHIPPED_DAEMON_RELEASE_METERS_RUN:",
+        "SHIPPED_DAEMON_OBSERVATION_SINK_RUN:",
     ];
     let diagnostics: Vec<_> = markers
         .iter()

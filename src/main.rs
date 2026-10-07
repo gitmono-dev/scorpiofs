@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -36,7 +36,14 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run the workspace HTTP control daemon. Mounts are created by explicit requests.
-    Serve,
+    Serve {
+        /// Write bounded workspace binding evidence to a new absolute JSONL file.
+        #[arg(long, requires = "workspace_observation_run_id")]
+        workspace_observation_jsonl: Option<PathBuf>,
+        /// Canonical non-nil UUID identifying this observation run.
+        #[arg(long, requires = "workspace_observation_jsonl")]
+        workspace_observation_run_id: Option<String>,
+    },
     /// Control workspaces through the daemon that owns their mounts.
     Workspace {
         /// Daemon base URL.
@@ -200,7 +207,15 @@ async fn main() {
             );
             cli::serve(cli.http_addr).await
         }
-        Some(Commands::Serve) => cli::serve(cli.http_addr).await,
+        Some(Commands::Serve {
+            workspace_observation_jsonl,
+            workspace_observation_run_id,
+        }) => {
+            let observation = workspace_observation_jsonl
+                .zip(workspace_observation_run_id)
+                .map(|(path, run_id)| cli::ObservationFileOptions { path, run_id });
+            cli::serve_with_observation(cli.http_addr, observation).await
+        }
         Some(Commands::Workspace { .. }) => unreachable!("workspace handled before config init"),
         Some(Commands::Config {
             action: ConfigAction::Show,
