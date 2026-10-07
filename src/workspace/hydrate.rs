@@ -1501,12 +1501,13 @@ mod tests {
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .create(true)
+            .truncate(false)
             .open(scope.join("closures.lock"))
             .unwrap();
-        assert!(matches!(
-            lock.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
+        lock.try_lock()
+            .expect("actual metadata HTTP must not hold the scope index lock");
+        lock.unlock().unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         lock.try_lock()
