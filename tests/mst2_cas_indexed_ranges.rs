@@ -319,8 +319,8 @@ fn indexed_large_file_preserves_the_fixed_output_cap() {
             .code,
         SnapshotErrorCode::LimitExceeded
     );
-    assert!(meters.index_hit);
-    assert_eq!(meters.bytes_read, 0);
+    // Output admission now precedes index lookup as well as body work.
+    assert_eq!(meters, LocalCasRangeMeters::default());
     assert_eq!(
         store
             .read_indexed_blob_range_with_meters(&digest, size, size - 5, usize::MAX, &mut meters)
@@ -328,6 +328,10 @@ fn indexed_large_file_preserves_the_fixed_output_cap() {
             .unwrap(),
         [0x62; 5]
     );
+    assert!(meters.index_hit);
+    assert!(!meters.index_built);
+    assert!(!meters.strict_fallback);
+    assert!(meters.index_fact_charge_bytes >= 66 * 32);
     assert_eq!(meters.bytes_read, 7);
     assert_eq!(meters.chunk_sha256_bytes, 7);
     assert_eq!(meters.whole_sha256_bytes, 0);
