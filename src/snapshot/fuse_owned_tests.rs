@@ -546,7 +546,14 @@ impl Server {
 
     async fn stored_view(&self) -> (tempfile::TempDir, Arc<DurableStore>, Mst2Fuse) {
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(DurableStore::open(temp.path()).unwrap());
+        let store = Arc::new(
+            DurableStore::open_for_reader(
+                temp.path().join("view"),
+                temp.path().join("cas"),
+                &self.reader,
+            )
+            .unwrap(),
+        );
         let view = Mst2Fuse::from_reader_with_store(self.reader.clone(), store.clone())
             .await
             .unwrap();
