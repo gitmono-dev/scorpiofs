@@ -217,6 +217,9 @@ class CommitUpdateBenchTests(unittest.TestCase):
             self.assertIsNone(BENCH.query(BENCH.NATIVE_SQL, time.monotonic() + 30))
 
     def test_workflow_recovery_preserves_deadline_and_rejects_extension_before_setup(self):
+        self._assert_shared_admission_preserves_deadline()
+
+    def _assert_shared_admission_preserves_deadline(self):
         workflow = SOURCE.parents[2] / ".github/workflows/mst2-real-update.yml"
         script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
         started = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -226,7 +229,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
             env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
                        GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
                        STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
-                       PYTHONPATH=str(SOURCE.parent), RECOVERY_INPUT="false")
+                       PYTHONPATH=str(SOURCE.parent), COMPARISON="single", RECOVERY_INPUT="false")
             for _ in range(2):
                 subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
                 self.assertIn("MST2_SESSION_STARTED=" + started.isoformat(), output.read_text())
@@ -245,6 +248,14 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 self.assertFalse(output.exists())
 
     def test_explicit_recovery_keeps_the_original_window_after_queue_freshness_expires(self):
+        self._assert_shared_recovery_keeps_original_window()
+
+    def test_shared_recovery_fixture_ignores_inherited_isolated_environment(self):
+        with patch.dict(os.environ, {"COMPARISON": "isolated"}):
+            self._assert_shared_admission_preserves_deadline()
+            self._assert_shared_recovery_keeps_original_window()
+
+    def _assert_shared_recovery_keeps_original_window(self):
         started = datetime.now(timezone.utc) - timedelta(minutes=20)
         deadline = (started + timedelta(minutes=235)).isoformat()
         for name in ("mst2-real-update.yml",):
@@ -255,7 +266,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
                            GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
                            STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
-                           PYTHONPATH=str(SOURCE.parent), RECOVERY_INPUT="true")
+                           PYTHONPATH=str(SOURCE.parent), COMPARISON="single", RECOVERY_INPUT="true")
                 for _ in range(2):
                     subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
                     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
@@ -273,6 +284,33 @@ class CommitUpdateBenchTests(unittest.TestCase):
                     result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(output.exists())
+
+    def test_isolated_workflow_admission_rejects_recovery_before_writing_anchor(self):
+        from workspace_update_campaign import BASELINE, CANDIDATE
+
+        workflow = SOURCE.parents[2] / ".github/workflows/mst2-real-update.yml"
+        script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+        started = datetime.now(timezone.utc) - timedelta(minutes=1)
+        deadline = (started + timedelta(minutes=235)).isoformat()
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "github-env"
+            env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
+                       GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                       STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
+                       PYTHONPATH=str(SOURCE.parent), COMPARISON="isolated", ROUNDS="3",
+                       BASELINE_SHA=BASELINE, CANDIDATE_SHA=CANDIDATE,
+                       READ_PROFILE_INPUT="false", BOOTSTRAP_COMMIT_TIME="1700000000")
+            subprocess.run([os.sys.executable, "-c", script], check=True,
+                           env=dict(env, RECOVERY_INPUT="false"), capture_output=True)
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(values["MST2_SESSION_STARTED"], started.isoformat())
+            self.assertEqual(values["MST2_SESSION_DEADLINE"], deadline)
+            output.unlink()
+            result = subprocess.run([os.sys.executable, "-c", script],
+                                    env=dict(env, RECOVERY_INPUT="true"), capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"isolated campaign requires the fixed fair sources, no recovery", result.stderr)
+            self.assertFalse(output.exists())
 
     def test_ci_setup_plan_cannot_create_local_resources(self):
         with tempfile.TemporaryDirectory() as temp:
