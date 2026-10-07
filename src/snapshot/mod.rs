@@ -22,6 +22,7 @@ mod descriptor_wire;
 mod directory;
 pub mod durable;
 pub mod error_wire;
+mod fixed_directory_index;
 pub mod frames;
 pub mod fuse;
 mod fuse_owned;

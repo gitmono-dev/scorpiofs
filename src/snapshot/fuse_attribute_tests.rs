@@ -28,6 +28,106 @@ fn view() -> (Mst2Fuse, Arc<ReadProfile>) {
 }
 
 #[tokio::test]
+async fn directory_reply_consumption_and_drop_share_one_fixed_index_without_building_suffixes() {
+    let (view, profile) = view();
+    let req = Request::default();
+    let inode = view
+        .lookup(req, ROOT_INODE, OsStr::new("wide"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let index = {
+        let state = view.state.lock().unwrap();
+        let Node::Dir(directory) = &state.nodes[&inode] else {
+            panic!("wide must remain a fixed directory");
+        };
+        directory.children.snapshot().unwrap()
+    };
+    assert_eq!(index.len(), 258);
+    assert_eq!(Arc::strong_count(&index), 2);
+    {
+        let reply = view.readdir(req, inode, inode, 0).await.unwrap();
+        assert_eq!(Arc::strong_count(&index), 3);
+        let before = profile.snapshot();
+        assert_eq!(before.metric(Metric::DirectoryReplyEntriesBuilt), 0);
+        assert_eq!(before.metric(Metric::DirectoryReplyNameBytes), 0);
+        drop(reply);
+    }
+    assert_eq!(Arc::strong_count(&index), 2);
+    {
+        let reply = view.readdirplus(req, inode, inode, 0, 0).await.unwrap();
+        assert_eq!(
+            profile
+                .snapshot()
+                .metric(Metric::DirectoryReplyEntriesBuilt),
+            0
+        );
+        let mut entries = Box::pin(reply.entries);
+        for (name, offset) in [(".", 1), ("..", 2), ("exec", 3)] {
+            let entry = entries.next().await.unwrap().unwrap();
+            assert_eq!(entry.name.to_str(), Some(name));
+            assert_eq!(entry.offset, offset);
+            assert_eq!(entry.inode, entry.attr.ino);
+            if name == "exec" {
+                assert_eq!(entry.attr.size, 7);
+                assert_eq!(entry.attr.perm, 0o755);
+            }
+        }
+        let partial = profile.snapshot();
+        assert_eq!(partial.metric(Metric::DirectoryReplyEntriesBuilt), 3);
+        assert_eq!(partial.metric(Metric::DirectoryReplyNameBytes), 7);
+        assert!(!partial.directory_stream_delivery_measured);
+        drop(entries);
+    }
+    assert_eq!(Arc::strong_count(&index), 2);
+    assert_eq!(
+        profile
+            .snapshot()
+            .metric(Metric::DirectoryReplyEntriesBuilt),
+        3
+    );
+    {
+        let reply = view.readdirplus(req, inode, inode, 259, 0).await.unwrap();
+        assert_eq!(
+            profile
+                .snapshot()
+                .metric(Metric::DirectoryReplyEntriesBuilt),
+            3
+        );
+        let mut entries = Box::pin(reply.entries);
+        let last = entries.next().await.unwrap().unwrap();
+        assert_eq!(last.name.to_str(), Some("link"));
+        assert_eq!(last.offset, 260);
+        assert_eq!(last.attr.kind, FileType::Symlink);
+        assert_eq!(last.attr.size, 6);
+        assert!(entries.next().await.is_none());
+    }
+    assert_eq!(Arc::strong_count(&index), 2);
+    assert_eq!(
+        profile
+            .snapshot()
+            .metric(Metric::DirectoryReplyEntriesBuilt),
+        4
+    );
+    {
+        let reply = view.readdir(req, inode, inode, i64::MIN).await.unwrap();
+        let mut entries = Box::pin(reply.entries);
+        let dot = entries.next().await.unwrap().unwrap();
+        assert_eq!(dot.name.to_str(), Some("."));
+        assert_eq!(dot.offset, 1);
+        assert_eq!(dot.kind, FileType::Directory);
+    }
+    assert_eq!(Arc::strong_count(&index), 2);
+    assert_eq!(
+        profile
+            .snapshot()
+            .metric(Metric::DirectoryReplyEntriesBuilt),
+        5
+    );
+}
+
+#[tokio::test]
 async fn wide_directory_attributes_and_resume_cookies_keep_fixed_metadata_without_node_copies() {
     let (view, profile) = view();
     let req = Request::default();

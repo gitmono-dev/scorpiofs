@@ -859,6 +859,38 @@ async fn profiled_canonical_store_cache_still_proves_aliases_and_rejects_revoked
     let fs = fs.with_read_profile(Some(profile.clone()));
     let file = inode(&fs, "file000").await;
     let alias = inode(&fs, "file001").await;
+    let mut held_directory = Box::pin(
+        fs.readdir(Request::default(), ROOT_INODE, ROOT_INODE, 0)
+            .await
+            .unwrap()
+            .entries,
+    );
+    let mut held_directory_plus = Box::pin(
+        fs.readdirplus(Request::default(), ROOT_INODE, ROOT_INODE, 0, 0)
+            .await
+            .unwrap()
+            .entries,
+    );
+    assert_eq!(
+        held_directory.next().await.unwrap().unwrap().name.to_str(),
+        Some(".")
+    );
+    assert_eq!(
+        held_directory_plus
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .name
+            .to_str(),
+        Some(".")
+    );
+    assert_eq!(
+        profile
+            .snapshot()
+            .metric(Metric::DirectoryReplyEntriesBuilt),
+        2
+    );
     let prior = fs
         .read(Request::default(), file, file, 17, 31)
         .await
@@ -896,6 +928,24 @@ async fn profiled_canonical_store_cache_still_proves_aliases_and_rejects_revoked
         server.reader.ensure_lease().await.unwrap_err().code,
         crate::snapshot::SnapshotErrorCode::ScopeForbidden
     );
+    assert_eq!(
+        i32::from(held_directory.next().await.unwrap().unwrap_err()),
+        -libc::EACCES
+    );
+    assert!(held_directory.next().await.is_none());
+    assert_eq!(
+        i32::from(held_directory_plus.next().await.unwrap().unwrap_err()),
+        -libc::EACCES
+    );
+    assert!(held_directory_plus.next().await.is_none());
+    assert_eq!(
+        profile
+            .snapshot()
+            .metric(Metric::DirectoryReplyEntriesBuilt),
+        2
+    );
+    drop(held_directory);
+    drop(held_directory_plus);
     for (offset, size) in [(0, 1), (0, 0), (8192, 1), (u64::MAX, u32::MAX)] {
         assert_eq!(
             i32::from(
