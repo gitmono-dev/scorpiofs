@@ -23,6 +23,7 @@ async fn resolve_walk_and_read_verified() {
     // capabilities gate
     let caps = client.capabilities().await.expect("capabilities");
     assert!(caps.features.resolve && caps.features.directory);
+    assert!(caps.features.metadata_pages);
 
     // resolve once; the view is pinned
     let reader = SnapshotReader::resolve(client, SCOPE, 600)
@@ -33,17 +34,16 @@ async fn resolve_walk_and_read_verified() {
     let snapshot_id = reader.snapshot_id().to_string();
 
     // manifest walk
-    let files = reader.file_manifest().await.expect("manifest");
+    let closure = reader.snapshot_closure().await.expect("manifest");
+    reader.seed_content_membership(&closure).unwrap();
+    let files = closure.files();
     assert!(files.len() >= 3, "scope must contain seeded files");
     let hashes: std::collections::HashSet<_> = files.iter().map(|f| &f.content_digest).collect();
     assert_eq!(hashes.len(), files.len(), "duplicate file paths");
 
     // read one file with server + local digest verification
     let f = files.first().expect("at least one file").clone();
-    let bytes = reader
-        .read_file(&f.rel_path, &f.content_digest)
-        .await
-        .expect("verified blob");
+    let bytes = reader.read_content(&f, false).await.expect("verified blob");
     assert_eq!(bytes.len() as u64, f.size);
 
     // lookup four-state outcomes
@@ -57,13 +57,20 @@ async fn resolve_walk_and_read_verified() {
     assert_eq!(results[1].status, "absent");
 
     // digest tampering is rejected (server-side enforcement)
-    let tampered = reader
-        .read_file(&f.rel_path, &("sha256:".to_string() + &"0".repeat(64)))
-        .await;
-    assert!(matches!(
-        tampered.map_err(|e| e.code),
-        Err(scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch)
-    ));
+    let error = reader
+        .client()
+        .blob_verified(
+            reader.snapshot_id(),
+            &format!("/{}", f.rel_path),
+            &("sha256:".to_string() + &"0".repeat(64)),
+        )
+        .await
+        .expect_err("server must reject the wrong expected digest");
+    assert_eq!(
+        error.code,
+        scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch
+    );
+    assert_eq!(error.http_status, 409);
 
     // unknown snapshot id -> typed error, not a hang. A client with no
     // lease bound is refused up front (spec 04 §1: credentials first, so a

@@ -612,17 +612,14 @@ async fn hydrate_parallel(
     let fetch = move |file: SnapshotFile| {
         let source = source.clone();
         Box::pin(async move {
-            let bytes = if source.capabilities().features.chunk_reads {
-                source
-                    .read_file_frames(&file.rel_path, &file.content_digest, file.size)
-                    .await?
-            } else {
-                source
-                    .read_file(&file.rel_path, &file.content_digest)
-                    .await?
-            };
-            Ok(Arc::new(bytes))
-        }) as futures::future::BoxFuture<'static, Result<Arc<Vec<u8>>, SnapshotError>>
+            source
+                .read_content(&file, source.capabilities().features.chunk_reads)
+                .await
+        })
+            as futures::future::BoxFuture<
+                'static,
+                Result<Arc<crate::snapshot::VerifiedContent>, SnapshotError>,
+            >
     };
     match core {
         "concurrent" => {
@@ -633,37 +630,14 @@ async fn hydrate_parallel(
         "batch" => {
             let source = reader.clone();
             store
-                .hydrate_snapshot_batches_with_body(
+                .hydrate_snapshot_content_batches(
                     reader,
                     closure,
                     2,
                     2,
                     move |files| {
                         let source = source.clone();
-                        Box::pin(async move {
-                            let items: Vec<_> = files
-                                .iter()
-                                .map(|file| {
-                                    (format!("/{}", file.rel_path), file.content_digest.clone())
-                                })
-                                .collect();
-                            let objects = source
-                                .client()
-                                .objects(source.snapshot_id(), &items, source.encoding_hint())
-                                .await?;
-                            files
-                                .into_iter()
-                                .map(|file| {
-                                    let digest = crate::snapshot::frames::parse_digest(
-                                        &file.content_digest,
-                                    )?;
-                                    Ok((
-                                        file.content_digest,
-                                        Arc::new(objects.get(&digest).unwrap().clone()),
-                                    ))
-                                })
-                                .collect()
-                        })
+                        Box::pin(async move { source.read_content_batch(&files).await })
                     },
                     fetch,
                 )

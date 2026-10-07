@@ -10,13 +10,21 @@ use std::{
 };
 
 use axum::{
+    body::{Body, Bytes},
     extract::{Path, Query, State},
+    http::HeaderMap,
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
-use mst2_codec::{chunkmap::ChunkMap, descriptor::ServingDescriptor};
+use mst2_codec::{
+    chunkmap::ChunkMap,
+    descriptor::ServingDescriptor,
+    metapage::{page_id, Entry, EntryKind, Page},
+    treeframe::{EndPayload, MetaPayload},
+};
 use scorpiofs::snapshot::{
-    client::MAX_BUFFERED_FILE_BYTES, Mst2Client, SnapshotErrorCode, SnapshotReader,
+    client::MAX_BUFFERED_FILE_BYTES, Mst2Client, SnapshotErrorCode, SnapshotFile, SnapshotReader,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,17 +36,12 @@ async fn capabilities() -> Json<Value> {
     Json(json!({
         "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
         "features": {"resolve": true, "directory": true, "leases": true,
-                     "raw_blob": true, "objects": true, "chunk_reads": true}
+                     "metadata_pages": true, "raw_blob": true, "objects": true, "chunk_reads": true}
     }))
 }
 
-async fn resolve() -> Json<Value> {
-    let descriptor = ServingDescriptor {
-        instance_uuid: *uuid::Uuid::parse_str(INSTANCE).unwrap().as_bytes(),
-        namespace_view_id: [0x22; 32],
-        scope: "/project".into(),
-        metadata_root: [0x01; 32],
-    };
+async fn resolve(State(counters): State<Arc<Counters>>) -> Json<Value> {
+    let descriptor = &counters.descriptor;
     Json(json!({
         "descriptor": {
             "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE,
@@ -52,18 +55,108 @@ async fn resolve() -> Json<Value> {
     }))
 }
 
-#[derive(Default)]
 struct Counters {
+    descriptor: ServingDescriptor,
+    metadata_page: Vec<u8>,
+    metadata: AtomicUsize,
     maps: AtomicUsize,
     leaves: AtomicUsize,
     objects: AtomicUsize,
+}
+
+impl Counters {
+    fn new() -> Self {
+        let metadata_page = Page::build(&[Entry::file(
+            EntryKind::Regular,
+            b"file",
+            1024 * 1024,
+            [0xaa; 32],
+        )])
+        .unwrap();
+        Self {
+            descriptor: ServingDescriptor {
+                instance_uuid: *uuid::Uuid::parse_str(INSTANCE).unwrap().as_bytes(),
+                namespace_view_id: [0x22; 32],
+                scope: "/project".into(),
+                metadata_root: page_id(&metadata_page),
+            },
+            metadata_page,
+            metadata: AtomicUsize::new(0),
+            maps: AtomicUsize::new(0),
+            leaves: AtomicUsize::new(0),
+            objects: AtomicUsize::new(0),
+        }
+    }
+}
+
+fn hash(bytes: &[u8]) -> [u8; 32] {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .try_into()
+        .unwrap()
+}
+
+async fn metadata(
+    State(counters): State<Arc<Counters>>,
+    Path(snapshot): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    assert_eq!(headers["x-mega-snapshot-lease"], "budget-lease");
+    assert_eq!(
+        snapshot,
+        format!(
+            "sha256:{}",
+            hex::encode(counters.descriptor.snapshot_id().unwrap())
+        )
+    );
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let items = request["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["directory_path"], "/");
+    assert_eq!(items[0]["route"], json!([]));
+    assert_eq!(
+        items[0]["expected_digest"],
+        format!("sha256:{}", hex::encode(counters.descriptor.metadata_root))
+    );
+    counters.metadata.fetch_add(1, Ordering::SeqCst);
+    let mut wire = MetaPayload {
+        pages: vec![(
+            counters.descriptor.metadata_root,
+            counters.metadata_page.clone(),
+        )],
+    }
+    .encode(17, 0)
+    .unwrap();
+    wire.extend(
+        EndPayload {
+            request_item_count: 1,
+            unique_unit_count: 1,
+            logical_bytes: counters.metadata_page.len() as u64,
+            request_body_sha256: hash(&body),
+        }
+        .encode(17, 1),
+    );
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", snapshot)
+        .header(
+            "x-mega-request-digest",
+            format!("sha256:{}", hex::encode(hash(&body))),
+        )
+        .body(Body::from(wire))
+        .unwrap()
 }
 
 async fn wrong_map(
     State(counters): State<Arc<Counters>>,
     Path(snapshot): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Json<Value> {
+    assert_eq!(headers["x-mega-snapshot-lease"], "budget-lease");
+    assert_eq!(query["path"], "/file");
+    assert_eq!(query["expected_digest"], DIGEST);
     counters.maps.fetch_add(1, Ordering::SeqCst);
     let map = ChunkMap::new([0xaa; 32], 8 * 1024 * 1024 * 1024 * 1024, [0x11; 32]).unwrap();
     Json(json!({
@@ -88,10 +181,14 @@ async fn objects(State(counters): State<Arc<Counters>>) -> Json<Value> {
 #[tokio::test]
 async fn buffered_frame_limit_rejects_before_content_request_and_wrong_map_before_leaf_allocation()
 {
-    let counters = Arc::new(Counters::default());
+    let counters = Arc::new(Counters::new());
     let app = Router::new()
         .route("/api/v2/snapshots/capabilities", get(capabilities))
         .route("/api/v2/snapshots/resolve", post(resolve))
+        .route(
+            "/api/v2/snapshots/{snapshot}/metadata/pages",
+            post(metadata),
+        )
         .route("/api/v2/snapshots/{snapshot}/chunk-map", get(wrong_map))
         .route("/api/v2/snapshots/{snapshot}/chunk-map/pages", get(leaf))
         .route("/api/v2/snapshots/{snapshot}/objects", post(objects))
@@ -113,7 +210,15 @@ async fn buffered_frame_limit_rejects_before_content_request_and_wrong_map_befor
     ] {
         assert_eq!(
             reader
-                .read_file_frames("file", DIGEST, size)
+                .read_content(
+                    &SnapshotFile {
+                        rel_path: "file".into(),
+                        fs_kind: "regular".into(),
+                        content_digest: DIGEST.into(),
+                        size,
+                    },
+                    true,
+                )
                 .await
                 .unwrap_err()
                 .code,
@@ -122,16 +227,28 @@ async fn buffered_frame_limit_rejects_before_content_request_and_wrong_map_befor
     }
     assert_eq!(counters.maps.load(Ordering::SeqCst), 0);
     assert_eq!(counters.objects.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.metadata.load(Ordering::SeqCst), 0);
     assert_eq!(
         reader
-            .read_file_frames("file", DIGEST, 1024 * 1024)
+            .read_content(
+                &SnapshotFile {
+                    rel_path: "file".into(),
+                    fs_kind: "regular".into(),
+                    content_digest: DIGEST.into(),
+                    size: 1024 * 1024,
+                },
+                true,
+            )
             .await
             .unwrap_err()
             .code,
         SnapshotErrorCode::DigestMismatch
     );
     assert_eq!(counters.maps.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.metadata.load(Ordering::SeqCst), 1);
     assert_eq!(counters.leaves.load(Ordering::SeqCst), 0);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+    assert_eq!(reader.content_usage().construction_bytes, 0);
     server.abort();
     let _ = server.await;
 }

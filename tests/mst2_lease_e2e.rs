@@ -32,17 +32,20 @@ async fn short_lease_is_renewed_proactively_and_revocation_is_typed() {
     let reader = SnapshotReader::resolve(client.clone(), "/project", 3)
         .await
         .expect("resolve");
+    assert!(reader.capabilities().features.metadata_pages);
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    let manifest = reader
-        .file_manifest()
+    let closure = reader
+        .snapshot_closure()
         .await
         .expect("manifest after the initial lease window (renewal must have happened)");
+    reader.seed_content_membership(&closure).unwrap();
+    let manifest = closure.files();
     assert!(!manifest.is_empty());
     let f = manifest.first().unwrap().clone();
     let bytes = reader
-        .read_file(&f.rel_path, &f.content_digest)
+        .read_content(&f, false)
         .await
         .expect("content read after the initial lease window");
     assert_eq!(bytes.len() as u64, f.size);

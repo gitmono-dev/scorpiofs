@@ -721,15 +721,6 @@ async fn discovered_features_paths_files_and_lookup_counts_fail_before_body_http
     let reader = s.reader().await;
     assert_eq!(
         reader
-            .read_file("/a", &digest_of(&s.f.bodies["/a"]))
-            .await
-            .err()
-            .unwrap()
-            .code,
-        SnapshotErrorCode::SnapshotNotReady
-    );
-    assert_eq!(
-        reader
             .lookup(&["/a".into(), "/b".into(), "/c".into()])
             .await
             .err()
@@ -749,10 +740,17 @@ async fn discovered_features_paths_files_and_lookup_counts_fail_before_body_http
     let closure = reader.snapshot_closure().await.unwrap();
     reader.seed_content_membership(&closure).unwrap();
     let file = closure.files().iter().find(|f| f.rel_path == "a").unwrap();
-    assert_eq!(
-        reader.read_content(file, true).await.err().unwrap().code,
-        SnapshotErrorCode::SnapshotNotReady
-    );
+    for use_frames in [false, true] {
+        assert_eq!(
+            reader
+                .read_content(file, use_frames)
+                .await
+                .err()
+                .unwrap()
+                .code,
+            SnapshotErrorCode::SnapshotNotReady
+        );
+    }
     assert!(s.calls("objects").is_empty());
     assert!(s.calls("blob").is_empty());
     assert!(s.calls("directory").is_empty());
