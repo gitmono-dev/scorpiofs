@@ -22,6 +22,30 @@ const REQUEST: RequestMeters = RequestMeters {
     wanted: 4096,
 };
 
+#[derive(Clone)]
+struct LogOutput(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for LogOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn capture_logs() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
+    let output = LogOutput(Arc::new(Mutex::new(Vec::new())));
+    let sink = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || sink.clone())
+        .finish();
+    (tracing::subscriber::set_default(subscriber), output.0)
+}
+
 struct Gate {
     entered: Notify,
     released: Mutex<bool>,
@@ -304,6 +328,111 @@ async fn execution_queue_is_bounded_cancel_refunds_only_the_waiter_and_admitted_
     assert_eq!(budget.usage(), unused());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn distinct_scopes_share_process_execution_and_cancel_only_the_waiting_scopes_owners() {
+    let (_temp, store, digest, budget, size) = fixture();
+    let first_scope = scope(2, 1, 3, 1);
+    let second_scope = Arc::new(CasReadScope {
+        outstanding: Arc::new(Semaphore::new(2)),
+        running: Arc::new(Semaphore::new(1)),
+        process: first_scope.process.clone(),
+    });
+    let gate = Controller::new();
+    let first_work = operation(
+        store.clone(),
+        digest.clone(),
+        size,
+        budget.clone(),
+        Some(gate.0.clone()),
+    );
+    let first = first_scope.clone();
+    let admission = ReplyAdmission::reserve(&budget).unwrap();
+    let task = tokio::spawn(async move {
+        first
+            .run_checked(|| Ok(()), admission, REQUEST, first_work)
+            .await
+    });
+    gate.entered().await;
+    let held = budget.usage();
+    assert!(held.output_bytes > REQUEST.wanted as usize);
+    assert!(held.construction_bytes > 1024 * 1024);
+    let called = Arc::new(AtomicBool::new(false));
+    let flag = called.clone();
+    let second = second_scope.clone();
+    let admission = ReplyAdmission::reserve(&budget).unwrap();
+    let work = operation(store.clone(), digest.clone(), size, budget.clone(), None);
+    let waiting = tokio::spawn(async move {
+        second
+            .run_checked(
+                || Ok(()),
+                admission,
+                REQUEST,
+                move || {
+                    flag.store(true, Ordering::Release);
+                    work()
+                },
+            )
+            .await
+    });
+    until(|| {
+        second_scope.running.available_permits() == 0
+            && second_scope.outstanding.available_permits() == 1
+            && first_scope.process.outstanding.available_permits() == 1
+    })
+    .await;
+    assert!(!called.load(Ordering::Acquire));
+    assert_eq!(budget.usage().construction_bytes, held.construction_bytes);
+    assert!(budget.usage().output_bytes > held.output_bytes);
+    assert_eq!(first_scope.process.running.available_permits(), 0);
+    waiting.abort();
+    assert!(waiting.await.err().unwrap().is_cancelled());
+    assert!(!called.load(Ordering::Acquire));
+    assert_eq!(second_scope.running.available_permits(), 1);
+    assert_eq!(second_scope.outstanding.available_permits(), 2);
+    assert_eq!(first_scope.process.outstanding.available_permits(), 2);
+    assert_eq!(first_scope.process.running.available_permits(), 0);
+    assert_eq!(first_scope.running.available_permits(), 0);
+    assert_eq!(budget.usage(), held);
+
+    let second = second_scope.clone();
+    let admission = ReplyAdmission::reserve(&budget).unwrap();
+    let work = operation(store, digest, size, budget.clone(), None);
+    let retry = tokio::spawn(async move {
+        second
+            .run_checked(|| Ok(()), admission, REQUEST, work)
+            .await
+    });
+    until(|| {
+        second_scope.running.available_permits() == 0
+            && first_scope.process.outstanding.available_permits() == 1
+    })
+    .await;
+    assert_eq!(budget.usage().construction_bytes, held.construction_bytes);
+    gate.0.release();
+    let first = task.await.unwrap().unwrap();
+    let second = retry.await.unwrap().unwrap();
+    for completion in [&first, &second] {
+        assert_eq!(
+            completion
+                .result
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_bytes(),
+            &[0x71; 4096]
+        );
+    }
+    assert_eq!(first_scope.running.available_permits(), 1);
+    assert_eq!(second_scope.running.available_permits(), 1);
+    assert_eq!(first_scope.process.running.available_permits(), 1);
+    assert_eq!(first_scope.process.outstanding.available_permits(), 3);
+    assert_eq!(budget.usage().construction_bytes, 0);
+    drop(first);
+    drop(second);
+    assert_eq!(budget.usage(), unused());
+}
+
 #[test]
 fn cancelled_spawned_pool_queue_holds_actual_count_and_reply_until_skipped_worker_is_destroyed() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -553,26 +682,7 @@ fn reader_budget_clones_share_the_same_local_scope_and_distinct_readers_share_pr
 
 #[tokio::test(flavor = "current_thread")]
 async fn detached_worker_records_its_actual_finished_io_and_hash_work_in_the_captured_dispatcher() {
-    #[derive(Clone)]
-    struct Output(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Output {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let output = Output(Arc::new(Mutex::new(Vec::new())));
-    let sink = output.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(move || sink.clone())
-        .finish();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let (_subscriber, output) = capture_logs();
     let (_temp, store, digest, budget, size) = fixture();
     let scope = scope(1, 1, 1, 1);
     let gate = Controller::new();
@@ -589,7 +699,7 @@ async fn detached_worker_records_its_actual_finished_io_and_hash_work_in_the_cap
     assert!(task.await.err().unwrap().is_cancelled());
     gate.0.release();
     until(|| scope.outstanding.available_permits() == 1 && budget.usage() == unused()).await;
-    let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     assert!(log
         .lines()
         .any(|line| line.contains("local CAS waiter dropped")
@@ -604,4 +714,87 @@ async fn detached_worker_records_its_actual_finished_io_and_hash_work_in_the_cap
     assert!(finished.contains(&format!("chunk_sha256_bytes={size}")));
     assert!(finished.contains("queue_wait_us=") && finished.contains("worker_wall_us="));
     assert!(finished.contains("index_built=true"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn awaited_dispatch_denial_and_closed_gates_do_not_report_waiter_cancellation() {
+    let (_subscriber, output) = capture_logs();
+    let budget = ContentBudget::new(ContentBudgetLimits::default());
+    let denied = scope(1, 1, 1, 1);
+    let error = denied
+        .run_checked(
+            || {
+                Err(SnapshotError::new(
+                    SnapshotErrorCode::LeaseExpired,
+                    "dispatch expired",
+                ))
+            },
+            ReplyAdmission::reserve(&budget).unwrap(),
+            REQUEST,
+            || -> WorkResult<Owner> { panic!("dispatch denial ran primitive") },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, SnapshotErrorCode::LeaseExpired);
+    assert_eq!(denied.outstanding.available_permits(), 1);
+    assert_eq!(denied.process.outstanding.available_permits(), 1);
+    assert_eq!(budget.usage(), unused());
+    for process in [false, true] {
+        let closed_scope = scope(1, 1, 1, 1);
+        if process {
+            closed_scope.process.running.close();
+        } else {
+            closed_scope.running.close();
+        }
+        let error = closed_scope
+            .run_checked(
+                || Ok(()),
+                ReplyAdmission::reserve(&budget).unwrap(),
+                REQUEST,
+                || -> WorkResult<Owner> { panic!("closed gate ran primitive") },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, SnapshotErrorCode::Internal);
+        assert_eq!(closed_scope.outstanding.available_permits(), 1);
+        assert_eq!(closed_scope.process.outstanding.available_permits(), 1);
+        assert_eq!(budget.usage(), unused());
+    }
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("local CAS dispatch lease rejected"));
+    assert!(!log.contains("local CAS waiter dropped"));
+    assert!(!log.contains("local CAS worker finished"));
+
+    // A real pending future drop still records cancellation, and refunds only
+    // its own admission without starting the synchronous primitive.
+    output.lock().unwrap().clear();
+    let pending = scope(1, 1, 1, 1);
+    let running = pending.running.clone().try_acquire_owned().unwrap();
+    let waiting = pending.clone();
+    let admission = ReplyAdmission::reserve(&budget).unwrap();
+    let task = tokio::spawn(async move {
+        waiting
+            .run_checked(
+                || Ok(()),
+                admission,
+                REQUEST,
+                || -> WorkResult<Owner> { panic!("cancelled execution waiter ran primitive") },
+            )
+            .await
+    });
+    until(|| pending.outstanding.available_permits() == 0).await;
+    task.abort();
+    assert!(task.await.err().unwrap().is_cancelled());
+    assert_eq!(budget.usage(), unused());
+    assert_eq!(pending.outstanding.available_permits(), 1);
+    drop(running);
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(log
+        .lines()
+        .any(|line| line.contains("local CAS waiter dropped")
+            && line.contains("cancelled_before_start=true")
+            && line.contains("detached_running=false")));
+    assert!(!log.contains("local CAS worker finished"));
 }

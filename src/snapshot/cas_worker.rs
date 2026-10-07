@@ -199,20 +199,29 @@ impl CasReadScope {
         };
         // No component can occupy global execution while awaiting its local
         // execution slot. Waiting futures are already count-admitted.
-        let local_running = self
-            .running
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| closed())?;
+        let local_running = self.running.clone().acquire_owned().await.map_err(|_| {
+            state.store(FINISHED, Ordering::Release);
+            closed()
+        })?;
         let process_running = self
             .process
             .running
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| closed())?;
-        lease()?;
+            .map_err(|_| {
+                state.store(FINISHED, Ordering::Release);
+                closed()
+            })?;
+        if let Err(error) = lease() {
+            state.store(FINISHED, Ordering::Release);
+            tracing::debug!(
+                target: "scorpiofs::workspace::performance",
+                job_id = id, kind = request.kind, wanted = request.wanted,
+                code = ?error.code, "local CAS dispatch lease rejected"
+            );
+            return Err(error);
+        }
         let permits = JobPermits {
             _local_outstanding: local_outstanding,
             _process_outstanding: process_outstanding,
