@@ -11,6 +11,7 @@ use serde::Serialize;
 use super::{
     content::{AccountedBuffer, BudgetClass, Reservation},
     frames::{parse_digest, VerifiedChunkMap},
+    online_file::OnlineSnapshotFile,
     owned_transport::{consume_frames, request_body, FrameRequest, SuccessfulEndReceipt},
     SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader, OBJECT_CAP,
 };
@@ -175,15 +176,51 @@ impl LeafCache {
     }
 }
 
-/// Strict fixed-root range reader. Its payload cache and returned range owners
-/// share the reader's retained-output scope. Metadata/proof heaps are separate.
+/// Public opens require fixed-root membership. Payload caches and returned
+/// range owners share retained-output credits; metadata/proof heaps are separate.
 pub struct OwnedChunkedFile {
     reader: SnapshotReader,
     file: SnapshotFile,
-    proven: Option<Arc<super::ProvenSnapshotFile>>,
+    authority: FileAuthority,
     map: VerifiedChunkMap,
     leaves: tokio::sync::Mutex<LeafCache>,
     chunks: tokio::sync::Mutex<ChunkCache>,
+}
+
+// All modes use the same paid buffers, frame collector and authenticated
+// chunk cache. The private online mode makes no fixed-root proof claim.
+enum FileAuthority {
+    FullRootMember,
+    ProvenPath(Arc<super::ProvenSnapshotFile>),
+    OnlinePath(Arc<OnlineSnapshotFile>),
+}
+
+impl FileAuthority {
+    async fn validate(
+        &self,
+        reader: &SnapshotReader,
+        file: &SnapshotFile,
+    ) -> Result<(), SnapshotError> {
+        match self {
+            Self::FullRootMember => reader.validate_content_member(file).await,
+            Self::ProvenPath(proven) => {
+                if proven.file() != file {
+                    return Err(invalid(
+                        "range tuple differs from its retained file authority",
+                    ));
+                }
+                proven.validate(reader).await
+            }
+            Self::OnlinePath(online) => {
+                if online.file() != file {
+                    return Err(invalid(
+                        "range tuple differs from its retained file authority",
+                    ));
+                }
+                online.validate(reader).await
+            }
+        }
+    }
 }
 
 impl OwnedChunkedFile {
@@ -206,7 +243,7 @@ impl OwnedChunkedFile {
             return Err(invalid("range tuple differs from the fixed-root file"));
         }
         file.rel_path = path.into();
-        Self::open_file(reader, file, None).await
+        Self::open_file(reader, file, FileAuthority::FullRootMember).await
     }
 
     /// Open using selective fixed-root membership without a full closure walk.
@@ -215,13 +252,31 @@ impl OwnedChunkedFile {
         proven: Arc<super::ProvenSnapshotFile>,
     ) -> Result<Self, SnapshotError> {
         proven.validate(reader).await?;
-        Self::open_file(reader, proven.file().clone(), Some(proven)).await
+        Self::open_file(
+            reader,
+            proven.file().clone(),
+            FileAuthority::ProvenPath(proven),
+        )
+        .await
+    }
+
+    pub(super) async fn open_online_path(
+        reader: &SnapshotReader,
+        online: Arc<OnlineSnapshotFile>,
+    ) -> Result<Self, SnapshotError> {
+        online.validate(reader).await?;
+        Self::open_file(
+            reader,
+            online.file().clone(),
+            FileAuthority::OnlinePath(online),
+        )
+        .await
     }
 
     async fn open_file(
         reader: &SnapshotReader,
         file: SnapshotFile,
-        proven: Option<Arc<super::ProvenSnapshotFile>>,
+        authority: FileAuthority,
     ) -> Result<Self, SnapshotError> {
         if !(OBJECT_CAP + 1..=super::range::MAX_FILE_SIZE).contains(&file.size) {
             return Err(SnapshotError::new(
@@ -240,22 +295,20 @@ impl OwnedChunkedFile {
             .chunk_map(reader.snapshot_id(), &request_path, &file.content_digest)
             .await?;
         if map.file_size != file.size {
-            return Err(invalid("chunk map differs from fixed-root size"));
+            return Err(invalid("chunk map differs from fixed file size"));
         }
+        authority.validate(reader, &file).await?;
         Ok(Self {
             reader: reader.clone(),
             file,
-            proven,
+            authority,
             map,
             leaves: tokio::sync::Mutex::new(LeafCache::new()),
             chunks: tokio::sync::Mutex::new(chunks),
         })
     }
     async fn validate_file(&self) -> Result<(), SnapshotError> {
-        match &self.proven {
-            Some(proven) => proven.validate(&self.reader).await,
-            None => self.reader.validate_content_member(&self.file).await,
-        }
+        self.authority.validate(&self.reader, &self.file).await
     }
     pub fn size(&self) -> u64 {
         self.file.size
@@ -288,6 +341,7 @@ impl OwnedChunkedFile {
             .admit_output(returned as usize, size_of::<VerifiedRange>())
             .await?;
         if returned == 0 {
+            self.validate_file().await?;
             return VerifiedRange::publish(output, 0);
         }
         let end = offset + returned; // returned <= file.size-offset, hence no overflow.
@@ -305,6 +359,7 @@ impl OwnedChunkedFile {
                 .ok_or_else(|| invalid("verified chunk does not cover requested range"))?;
             output.append(bytes)?;
         }
+        self.validate_file().await?;
         VerifiedRange::publish(output, returned as usize)
     }
 
@@ -332,8 +387,12 @@ impl OwnedChunkedFile {
 
     async fn ensure_chunk(&self, index: u64) -> Result<Arc<VerifiedChunk>, SnapshotError> {
         self.validate_file().await?;
-        if let Some(owner) = self.chunks.lock().await.get(index) {
-            return Ok(owner);
+        {
+            let mut cache = self.chunks.lock().await;
+            self.reader.local_lease_status()?;
+            if let Some(owner) = cache.get(index) {
+                return Ok(owner);
+            }
         }
         let page = index / CHUNKS_PER_PAGE as u64;
         let digests = self.ensure_leaf(page).await?;
@@ -416,19 +475,27 @@ impl OwnedChunkedFile {
         if !seen {
             return Err(invalid("range response omitted requested chunk"));
         }
+        self.validate_file().await?;
         let owner = VerifiedChunk::publish(output, map, index, want, expected, receipt)?;
         // Recheck the immutable identity used for the cache key before insert.
         if owner.map != map || owner.digest != want {
             return Err(invalid("verified chunk cache identity changed"));
         }
-        self.chunks.lock().await.insert(owner.clone());
+        self.validate_file().await?;
+        let mut cache = self.chunks.lock().await;
+        self.reader.local_lease_status()?;
+        cache.insert(owner.clone());
         Ok(owner)
     }
 
     async fn ensure_leaf(&self, page: u64) -> Result<Arc<Vec<[u8; 32]>>, SnapshotError> {
         self.validate_file().await?;
-        if let Some(digests) = self.leaves.lock().await.get(page) {
-            return Ok(digests);
+        {
+            let cache = self.leaves.lock().await;
+            self.reader.local_lease_status()?;
+            if let Some(digests) = cache.get(page) {
+                return Ok(digests);
+            }
         }
         self.reader.ensure_lease().await?;
         let request_path = super::reader::ScopeRequestPath(&self.file.rel_path).to_string();
@@ -443,8 +510,11 @@ impl OwnedChunkedFile {
                 page,
             )
             .await?;
+        self.validate_file().await?;
         let digests = Arc::new(leaf.chunk_sha256);
-        self.leaves.lock().await.insert(page, digests.clone());
+        let mut cache = self.leaves.lock().await;
+        self.reader.local_lease_status()?;
+        cache.insert(page, digests.clone());
         Ok(digests)
     }
 }
