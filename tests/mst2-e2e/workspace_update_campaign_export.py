@@ -377,7 +377,7 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None):
                           "measurement_deadline_monotonic", "backends", "closed"})
     proofs.exact(owners["revision"], 1)
     proofs.exact(owners["project"], f"m2perf-{metadata['run_id']}-{metadata['attempt']}")
-    proofs.exact(owners["session_deadline_utc"], value["session_deadline_utc"])
+    proofs.exact(budgets.utc(owners["session_deadline_utc"]), budgets.utc(value["session_deadline_utc"]))
     proofs.exact(owners["cleanup_deadline_monotonic"], value["cleanup_deadline_monotonic"])
     proofs.exact(owners["measurement_deadline_monotonic"], value["cleanup_deadline_monotonic"]
                  - budgets.CAMPAIGN_REPORT - budgets.CLEANUP_RESERVE - budgets.CAMPAIGN_MARGIN)

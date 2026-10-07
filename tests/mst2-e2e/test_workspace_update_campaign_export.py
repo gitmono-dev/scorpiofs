@@ -268,7 +268,7 @@ class CampaignExportTests(unittest.TestCase):
                     with self.assertRaises(export_module.proofs.ProofRejected):
                         export_module.proofs.validate_lane_values(altered["lane"], altered["capture"])
 
-    def test_full_28_record_seven_owner_export_replays_and_rejects_single_field_tampering(self):
+    def test_full_28_record_export_accepts_z_deadline_with_normalized_owners_and_rejects_tampering(self):
         fixture = self.proof_fixture()
         sources = deepcopy(fixture.sources)
         server = {"revision": 1, "label": "server", "source": "/immutable/server", "source_sha": "1" * 40,
@@ -295,7 +295,7 @@ class CampaignExportTests(unittest.TestCase):
         owners, inventory = [], []
         phase_rows = {"fair": [], "diagnostic": []}
         start = datetime.now(timezone.utc)
-        deadline = (start + timedelta(minutes=235)).isoformat()
+        deadline = (start + timedelta(minutes=235)).isoformat().replace("+00:00", "Z")
         self.fixture_owned_root = "/tmp/mst2-real-123-1"
         self.fixture_project = "m2perf-123-1"
         metadata = {"revision": 1, "run_id": "123", "attempt": "1", "harness_sha": sources["a"]["harness_source_sha"],
@@ -330,7 +330,9 @@ class CampaignExportTests(unittest.TestCase):
             phase_rows[phase].append(complete)
             path = self.root / "measurements" / phase / "measurements.jsonl"
             path.write_bytes(b"".join((export_module.proofs.canonical(row) + "\n").encode() for row in phase_rows[phase]))
-        owned = {"revision": 1, "project": self.fixture_project, "session_deadline_utc": deadline,
+        # Producer stores normalized UTC; dispatch/run/environment retain Z.
+        owned = {"revision": 1, "project": self.fixture_project,
+            "session_deadline_utc": (start + timedelta(minutes=235)).isoformat(),
             "cleanup_deadline_monotonic": 999999., "measurement_deadline_monotonic": 999999.
             - export_module.budgets.CAMPAIGN_REPORT - export_module.budgets.CLEANUP_RESERVE
             - export_module.budgets.CAMPAIGN_MARGIN, "backends": owners, "closed": True}
