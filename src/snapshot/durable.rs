@@ -27,7 +27,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     future::Future,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -45,7 +45,7 @@ use tokio::io::AsyncWriteExt;
 pub use super::cas_index::LocalCasRangeMeters;
 use crate::snapshot::{
     closure::{SnapshotDirectory, ValidatedSnapshotClosure},
-    SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
+    secure_fs, OfflineGrant, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
 };
 
 trait BorrowedBatch {
@@ -69,6 +69,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 const JOURNAL_FILE: &str = "journal.log";
 const COMPLETE_MARKER: &str = "DURABLE_COMPLETE";
 const PIN_FILE: &str = "pin.json";
+const OFFLINE_GRANT_FILE: &str = "offline_grant.json";
 const BLOB_DIR: &str = "blobs";
 const TRANSACTION_LOCK: &str = ".hydrate.lock";
 const REPAIR_FILE: &str = "NEEDS_REPAIR";
@@ -278,6 +279,8 @@ struct CompleteMarker {
     manifest_digest: String,
     #[serde(default)]
     pin_digest: String,
+    #[serde(default)]
+    offline_grant_digest: String,
     files: u64,
     bytes: u64,
     hydrated_at_unix: u64,
@@ -301,6 +304,8 @@ struct PinRecord {
     manifest_digest: String,
     #[serde(default)]
     blobs: Vec<BlobDependency>,
+    #[serde(default)]
+    offline_grant_digest: String,
     pinned_at_unix: u64,
 }
 
@@ -347,6 +352,8 @@ struct SnapshotPinRecord {
     metadata_index_digest: String,
     pages: Vec<PageDependency>,
     blobs: Vec<BlobDependency>,
+    #[serde(default)]
+    offline_grant_digest: String,
     pinned_at_unix: u64,
 }
 
@@ -362,6 +369,8 @@ struct SnapshotCompleteMarker {
     descriptor_digest: String,
     metadata_index_digest: String,
     pin_digest: String,
+    #[serde(default)]
+    offline_grant_digest: String,
     files: u64,
     directories: u64,
     pages: u64,
@@ -706,7 +715,7 @@ impl DurableStore {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&path).map_err(io_err)?;
+        let bytes = secure_fs::read(&path).map_err(io_err)?;
         let meta = serde_json::from_slice(&bytes).map_err(|e| {
             SnapshotError::new(
                 SnapshotErrorCode::Internal,
@@ -714,6 +723,87 @@ impl DurableStore {
             )
         })?;
         Ok(Some(meta))
+    }
+
+    /// Return the grant bound to the currently committed full snapshot, if
+    /// one was issued by canonical resolve. A loose JSON file is never a
+    /// capability: completion validates its digest and fixed-view binding.
+    pub fn offline_grant(&self) -> Result<Option<OfflineGrant>, SnapshotError> {
+        let Some(_transaction) = self.try_transaction()? else {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "offline grant is busy during local hydration",
+            ));
+        };
+        self.offline_grant_locked()
+    }
+
+    fn offline_grant_locked(&self) -> Result<Option<OfflineGrant>, SnapshotError> {
+        if self.completed_manifest_locked()?.is_none() {
+            return Ok(None);
+        }
+        let marker_bytes = required_dependency(&self.root.join(COMPLETE_MARKER))?;
+        let digest = if completion_revision(&marker_bytes)? == SNAPSHOT_VERIFICATION_REVISION {
+            decode_commit::<SnapshotCompleteMarker>(&marker_bytes, COMPLETE_MARKER)?
+                .offline_grant_digest
+        } else {
+            decode_commit::<CompleteMarker>(&marker_bytes, COMPLETE_MARKER)?.offline_grant_digest
+        };
+        if digest.is_empty() {
+            return Ok(None);
+        }
+        let bytes = required_dependency(&self.root.join(OFFLINE_GRANT_FILE))?;
+        if digest_of(&bytes) != digest {
+            return Err(integrity_err("offline grant digest mismatch"));
+        }
+        let grant: OfflineGrant = decode_commit(&bytes, OFFLINE_GRANT_FILE)?;
+        let view = self
+            .stored_view()?
+            .ok_or_else(|| integrity_err("offline grant has no fixed view"))?;
+        grant.validate_for(&view.snapshot_id, None)?;
+        Ok(Some(grant))
+    }
+
+    /// Authorize an offline reopen using the exact grant persisted by this
+    /// completion. The actor domain comes from local mount policy and is
+    /// never inferred from object presence or the snapshot id.
+    pub fn validate_offline_grant(
+        &self,
+        grant: &OfflineGrant,
+        actor_domain_id: &str,
+    ) -> Result<(), SnapshotError> {
+        let Some(_transaction) = self.try_transaction()? else {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "offline grant is busy during local hydration",
+            ));
+        };
+        let view = self.stored_view()?.ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::SnapshotNotReady,
+                "offline grant has no fixed view",
+            )
+        })?;
+        let stored = self.offline_grant_locked()?.ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::ScopeForbidden,
+                "the completed snapshot has no offline grant",
+            )
+        })?;
+        if stored != *grant {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeForbidden,
+                "offline grant does not match the committed local grant",
+            ));
+        }
+        grant.validate_for(&view.snapshot_id, Some(actor_domain_id))?;
+        if grant.expired() {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LeaseExpired,
+                "offline grant has expired",
+            ));
+        }
+        Ok(())
     }
 
     /// Pin this view locally. A pin only means something for a view that was
@@ -1083,6 +1173,7 @@ impl DurableStore {
                 view,
                 manifest,
                 Some(closure),
+                stream_reader.and_then(|reader| reader.offline_grant()),
                 (fetched, resumed, repaired),
             ),
             None => self.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired),
@@ -1343,7 +1434,15 @@ impl DurableStore {
         let fetched = fetched.load(std::sync::atomic::Ordering::Relaxed);
         let resumed = resumed.load(std::sync::atomic::Ordering::Relaxed);
         let repaired = repaired.load(std::sync::atomic::Ordering::Relaxed);
-        store.finish_hydration_commit(view, manifest, closure, (fetched, resumed, repaired))
+        store.finish_hydration_commit(
+            view,
+            manifest,
+            closure,
+            snapshot
+                .as_ref()
+                .and_then(|s| s.reader.and_then(|r| r.offline_grant())),
+            (fetched, resumed, repaired),
+        )
     }
 
     /// Batched hydration: same verification, write-ahead, resume and journal
@@ -1829,7 +1928,15 @@ impl DurableStore {
         let fetched = fetched.load(Relaxed);
         let resumed = resumed.load(Relaxed);
         let repaired = repaired.load(Relaxed);
-        store.finish_hydration_commit(view, manifest, closure, (fetched, resumed, repaired))
+        store.finish_hydration_commit(
+            view,
+            manifest,
+            closure,
+            snapshot
+                .as_ref()
+                .and_then(|s| s.reader.and_then(|r| r.offline_grant())),
+            (fetched, resumed, repaired),
+        )
     }
 
     // A file lock is held for the whole publication transaction, including
@@ -1837,13 +1944,7 @@ impl DurableStore {
     // a short critical-section lock held by a downloading task. Dropping the
     // handle (including after process exit) releases the OS lock.
     pub(super) fn try_transaction(&self) -> Result<Option<TransactionGuard>, SnapshotError> {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join(TRANSACTION_LOCK))
-            .map_err(io_err)?;
+        let lock = secure_fs::open_rw_create(&self.root.join(TRANSACTION_LOCK)).map_err(io_err)?;
         match lock.try_lock() {
             Ok(()) => Ok(Some(TransactionGuard(lock))),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
@@ -2014,6 +2115,7 @@ impl DurableStore {
         validate_view(&view)?;
         let manifest: Vec<SnapshotFile> = decode_commit(&manifest_bytes, MANIFEST_FILE)?;
         let pin: PinRecord = decode_commit(&pin_bytes, PIN_FILE)?;
+        self.verify_offline_grant(&marker.offline_grant_digest, &view.snapshot_id)?;
         let (dependencies, bytes_total) = validate_manifest(&manifest)?;
         if marker.snapshot_id != view.snapshot_id
             || marker.namespace_view_id != view.namespace_view_id
@@ -2028,6 +2130,7 @@ impl DurableStore {
             || pin.view_digest != marker.view_digest
             || pin.manifest_digest != marker.manifest_digest
             || pin.blobs != dependencies
+            || pin.offline_grant_digest != marker.offline_grant_digest
         {
             return Err(integrity_err(
                 "completion view, pin or file closure mismatch",
@@ -2123,6 +2226,7 @@ impl DurableStore {
         let (blobs, bytes_total) = validate_manifest_policy(&manifest, true)?;
         let pin: SnapshotPinRecord = decode_commit(&pin_bytes, PIN_FILE)?;
         let index: MetadataIndex = decode_commit(&index_bytes, METADATA_INDEX_FILE)?;
+        self.verify_offline_grant(&marker.offline_grant_digest, &view.snapshot_id)?;
         if index.verification_revision != SNAPSHOT_VERIFICATION_REVISION
             || marker.snapshot_id != view.snapshot_id
             || marker.namespace_view_id != view.namespace_view_id
@@ -2142,6 +2246,7 @@ impl DurableStore {
             || pin.metadata_index_digest != marker.metadata_index_digest
             || pin.pages != index.pages
             || pin.blobs != blobs
+            || pin.offline_grant_digest != marker.offline_grant_digest
         {
             return Err(integrity_err(
                 "snapshot view, pin or closure index mismatch",
@@ -2182,6 +2287,31 @@ impl DurableStore {
         Ok(closure)
     }
 
+    fn verify_offline_grant(
+        &self,
+        expected_digest: &str,
+        snapshot_id: &str,
+    ) -> Result<(), SnapshotError> {
+        let path = self.root.join(OFFLINE_GRANT_FILE);
+        let Some(bytes) = read_optional(&path)? else {
+            return if expected_digest.is_empty() {
+                Ok(())
+            } else {
+                Err(integrity_err(
+                    "completion references a missing offline grant",
+                ))
+            };
+        };
+        if expected_digest.is_empty() || digest_of(&bytes) != expected_digest {
+            return Err(integrity_err(
+                "offline grant digest is not bound to completion",
+            ));
+        }
+        let grant: OfflineGrant = decode_commit(&bytes, OFFLINE_GRANT_FILE)?;
+        grant.validate_for(snapshot_id, None)?;
+        Ok(())
+    }
+
     fn verify_snapshot_links(
         &self,
         closure: &ValidatedSnapshotClosure,
@@ -2211,7 +2341,7 @@ impl DurableStore {
         resumed: u64,
         repaired: u64,
     ) -> Result<HydrateReport, SnapshotError> {
-        self.finish_hydration_commit(view, manifest, None, (fetched, resumed, repaired))
+        self.finish_hydration_commit(view, manifest, None, None, (fetched, resumed, repaired))
     }
 
     fn finish_hydration_commit(
@@ -2219,10 +2349,11 @@ impl DurableStore {
         view: &ViewMeta,
         manifest: &[SnapshotFile],
         closure: Option<&ValidatedSnapshotClosure>,
+        offline_grant: Option<&OfflineGrant>,
         counts: (u64, u64, u64),
     ) -> Result<HydrateReport, SnapshotError> {
         super::stage::trace_sync("durable_hydration_commit", || {
-            self.finish_hydration_commit_inner(view, manifest, closure, counts)
+            self.finish_hydration_commit_inner(view, manifest, closure, offline_grant, counts)
         })
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))
     }
@@ -2232,6 +2363,7 @@ impl DurableStore {
         view: &ViewMeta,
         manifest: &[SnapshotFile],
         closure: Option<&ValidatedSnapshotClosure>,
+        offline_grant: Option<&OfflineGrant>,
         counts: (u64, u64, u64),
     ) -> Result<HydrateReport, SnapshotError> {
         let (fetched, resumed, repaired) = counts;
@@ -2315,6 +2447,32 @@ impl DurableStore {
             .map(|closure| self.persist_snapshot_metadata(closure))
             .transpose()
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+        let offline_grant_digest = if let Some(grant) = offline_grant {
+            grant
+                .validate_for(&view.snapshot_id, None)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+            let bytes = encode_record(grant)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+            write_atomic(&self.root, OFFLINE_GRANT_FILE, &bytes)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+            durability_checkpoint(&self.root, "offline-grant-durable")
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
+            digest_of(&bytes)
+        } else {
+            match fs::remove_file(self.root.join(OFFLINE_GRANT_FILE)) {
+                Ok(()) => sync_dir(&self.root).map_err(|error| {
+                    tag_hydration_error(error, HydrationSubstage::HydrationCommit)
+                })?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(tag_hydration_error(
+                        io_err(error),
+                        HydrationSubstage::HydrationCommit,
+                    ))
+                }
+            }
+            String::new()
+        };
         let pin_bytes = if let Some(metadata) = &metadata {
             encode_record(&SnapshotPinRecord {
                 verification_revision: SNAPSHOT_VERIFICATION_REVISION,
@@ -2329,6 +2487,7 @@ impl DurableStore {
                 metadata_index_digest: metadata.metadata_index_digest.clone(),
                 pages: metadata.pages.clone(),
                 blobs: dependencies,
+                offline_grant_digest: offline_grant_digest.clone(),
                 pinned_at_unix: now_unix(),
             })
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?
@@ -2343,6 +2502,7 @@ impl DurableStore {
                 view_digest: view_digest.clone(),
                 manifest_digest: manifest_digest.clone(),
                 blobs: dependencies,
+                offline_grant_digest: offline_grant_digest.clone(),
                 pinned_at_unix: now_unix(),
             })
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?
@@ -2377,6 +2537,7 @@ impl DurableStore {
                 descriptor_digest: metadata.descriptor_digest,
                 metadata_index_digest: metadata.metadata_index_digest,
                 pin_digest: digest_of(&pin_bytes),
+                offline_grant_digest,
                 files: manifest.len() as u64,
                 directories: closure.directories().len() as u64,
                 pages: metadata.pages.len() as u64,
@@ -2393,6 +2554,7 @@ impl DurableStore {
                 view_digest,
                 manifest_digest,
                 pin_digest: digest_of(&pin_bytes),
+                offline_grant_digest,
                 files: manifest.len() as u64,
                 bytes: bytes_total,
                 hydrated_at_unix: now_unix(),
@@ -2499,7 +2661,7 @@ impl DurableStore {
         len: usize,
     ) -> Result<Option<Vec<u8>>, SnapshotError> {
         let path = self.blob_path(digest)?;
-        let mut f = match fs::File::open(&path) {
+        let mut f = match secure_fs::open_regular(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(e)),
@@ -2640,7 +2802,7 @@ impl DurableStore {
     pub fn read_blob(&self, digest: &str, expected_size: u64) -> Result<Vec<u8>, SnapshotError> {
         let capacity = buffered_size(expected_size)?;
         let path = self.blob_path(digest)?;
-        let mut input = File::open(&path).map_err(|e| {
+        let mut input = secure_fs::open_regular(&path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 SnapshotError::new(
                     SnapshotErrorCode::PathNotFound,
@@ -2717,7 +2879,7 @@ impl DurableStore {
         // Completion and resume must not collect a potentially 8 TiB CAS
         // object into memory. Read at most one byte beyond its advertised
         // size so growth cannot turn verification into an unbounded stream.
-        let mut input = File::open(&path)
+        let mut input = secure_fs::open_regular(&path)
             .map_err(io_err)?
             .take(expected_size.saturating_add(1));
         let mut hash = Context::new(&SHA256);
@@ -2753,7 +2915,7 @@ impl DurableStore {
     /// rather than a silently smaller set of hydrated files.
     fn read_journal(&self) -> Result<HashMap<String, FileRecord>, SnapshotError> {
         let path = self.root.join(JOURNAL_FILE);
-        let bytes = match fs::read(&path) {
+        let bytes = match secure_fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(io_err(e)),
@@ -2792,11 +2954,7 @@ impl DurableStore {
         if bytes.is_empty() {
             return Ok(());
         }
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join(JOURNAL_FILE))
-            .map_err(io_err)?;
+        let mut f = secure_fs::open_append_create(&self.root.join(JOURNAL_FILE)).map_err(io_err)?;
         durability_checkpoint(&self.root, "journal-write")?;
         f.write_all(bytes).map_err(io_err)?;
         durability_checkpoint(&self.root, "journal-written")?;
@@ -2815,11 +2973,7 @@ impl DurableStore {
             uuid::Uuid::new_v4()
         ));
         let result = (|| {
-            let file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp)
-                .map_err(io_err)?;
+            let file = secure_fs::open_create_new(&tmp).map_err(io_err)?;
             let mut output = io::BufWriter::with_capacity(256 * 1024, &file);
             durability_checkpoint(&self.root, "journal-compact-write")?;
             for file in manifest {
@@ -2863,7 +3017,7 @@ impl DurableStore {
             .iter()
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |idx| idx + 1);
-        let file = OpenOptions::new().write(true).open(&path).map_err(io_err)?;
+        let file = secure_fs::open_write(&path).map_err(io_err)?;
         file.set_len(end as u64).map_err(io_err)?;
         file.sync_all().map_err(io_err)?;
         sync_dir(&self.root)
@@ -2893,7 +3047,7 @@ pub(super) fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), Sn
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
-        let mut f = File::create(&tmp).map_err(io_err)?;
+        let mut f = secure_fs::open_create_new(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
         durability_checkpoint(dir, "object-file-sync")?;
         f.sync_all().map_err(io_err)?;
@@ -2971,10 +3125,7 @@ where
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let handle = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary_path)
+    let handle = secure_fs::open_create_new(&temporary_path)
         .map_err(io_err)
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     let temporary = PendingBlob(temporary_path);
@@ -3077,7 +3228,7 @@ fn buffered_allocation_error() -> SnapshotError {
 
 fn sync_file(path: &Path) -> Result<(), SnapshotError> {
     durability_checkpoint(path, "file-sync")?;
-    File::open(path)
+    secure_fs::open_regular(path)
         .map_err(io_err)?
         .sync_all()
         .map_err(io_err)?;
@@ -3112,7 +3263,7 @@ pub(super) fn create_dirs_durable(path: &Path) -> Result<(), SnapshotError> {
             Err(e) => return Err(io_err(e)),
         }
     }
-    fs::create_dir_all(path).map_err(io_err)?;
+    secure_fs::create_dir_all_no_symlink(path).map_err(io_err)?;
     for directory in missing.iter().rev() {
         sync_dir(directory)?;
         sync_dir(parent_dir(directory))?;
@@ -3127,7 +3278,7 @@ fn parent_dir(path: &Path) -> &Path {
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SnapshotError> {
-    match fs::read(path) {
+    match secure_fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(io_err(e)),
@@ -3325,7 +3476,7 @@ mod streaming_durability_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, fs::OpenOptions};
 
     use super::*;
 
@@ -3781,6 +3932,46 @@ mod tests {
             .read_blob(&digest, body.len() as u64)
             .expect_err("tampered blob must not be served");
         assert_eq!(err.code, SnapshotErrorCode::DigestMismatch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_blob_rejects_a_final_symlink_even_when_target_matches() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(tmp.path()).unwrap();
+        let body = b"symlink target must not be trusted";
+        let digest = digest_of(body);
+        let blob = store.blob_path(&digest).unwrap();
+        let target = tmp.path().join("outside");
+        std::fs::write(&target, body).unwrap();
+        symlink(&target, &blob).unwrap();
+
+        let err = store
+            .read_blob(&digest, body.len() as u64)
+            .expect_err("CAS reads must not follow a final symlink");
+        assert!(matches!(
+            err.code,
+            SnapshotErrorCode::Internal | SnapshotErrorCode::DigestMismatch
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_creation_rejects_an_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        symlink(&outside, root.join("redirect")).unwrap();
+
+        let err = create_dirs_durable(&root.join("redirect").join("child")).unwrap_err();
+        assert_eq!(err.code, SnapshotErrorCode::Internal);
+        assert!(!outside.join("child").exists());
     }
 
     #[test]

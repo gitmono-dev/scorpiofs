@@ -5,7 +5,9 @@ use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
-    descriptor_wire::DescriptorWire, types::ResolveResponse, SnapshotError, SnapshotErrorCode,
+    descriptor_wire::DescriptorWire,
+    types::{OfflineGrant, ResolveResponse},
+    SnapshotError, SnapshotErrorCode,
 };
 
 #[derive(Deserialize)]
@@ -21,16 +23,6 @@ struct CanonicalResolve {
     delivery: String,
     #[serde(default, deserialize_with = "present_grant")]
     offline_grant: Option<OfflineGrant>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OfflineGrant {
-    grant_id: String,
-    snapshot_id: String,
-    actor_domain_id: String,
-    expires_at: String,
-    policy: String,
 }
 
 fn present_grant<'de, D: Deserializer<'de>>(decoder: D) -> Result<Option<OfflineGrant>, D::Error> {
@@ -115,7 +107,7 @@ pub(crate) fn parse_request(
     if timestamp(&wire.lease_expires_at)? <= resolved {
         return Err(invalid());
     }
-    if let Some(grant) = wire.offline_grant {
+    if let Some(grant) = &wire.offline_grant {
         if !opaque(&grant.grant_id)
             || !opaque(&grant.actor_domain_id)
             || grant.snapshot_id != descriptor.snapshot_id
@@ -133,5 +125,6 @@ pub(crate) fn parse_request(
         lease_id: wire.lease_id,
         lease_expires_at: wire.lease_expires_at,
         authorization_epoch: wire.authorization_epoch,
+        offline_grant: wire.offline_grant,
     })
 }
