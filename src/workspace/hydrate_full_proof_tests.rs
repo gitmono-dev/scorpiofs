@@ -3,6 +3,98 @@ use std::fs;
 use super::*;
 
 #[tokio::test]
+async fn held_metadata_allows_another_owner_to_collect_before_serialized_index_publication() {
+    let fixture = Fixture::update_version(true, 0);
+    fixture.hold_metadata.store(true, Ordering::SeqCst);
+    let server = Server::new(fixture).await;
+    let reader = server.reader().await;
+    let temp = tempfile::tempdir().unwrap();
+    let first = Arc::new(
+        DurableStore::open_for_workspace(
+            temp.path(),
+            "11111111-2222-4333-8444-555555555612",
+            &reader,
+        )
+        .unwrap(),
+    );
+    let second = Arc::new(
+        DurableStore::open_for_workspace(
+            temp.path(),
+            "11111111-2222-4333-8444-555555555613",
+            &reader,
+        )
+        .unwrap(),
+    );
+    assert_eq!(first.content_dir(), second.content_dir());
+    let first_source = reader.clone();
+    let first_target = first.clone();
+    let first_task =
+        tokio::spawn(async move { hydrate_workspace(&first_target, &first_source).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.fixture.metadata_started.notified(),
+    )
+    .await
+    .unwrap();
+    let second_source = reader.clone();
+    let second_target = second.clone();
+    let mut second_task =
+        tokio::spawn(async move { hydrate_workspace(&second_target, &second_source).await });
+    let concurrent = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while server.fixture.metadata_calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if concurrent.is_err() {
+        first_task.abort();
+        second_task.abort();
+        let _ = first_task.await;
+        let _ = second_task.await;
+        panic!("another owner remained blocked behind metadata HTTP while sharing the scope index");
+    }
+    let scope = first.content_dir().parent().unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(scope.join("closures.lock"))
+        .unwrap();
+    lock.try_lock()
+        .expect("held metadata collectors must not own the publication lock");
+    lock.unlock().unwrap();
+    first_task.abort();
+    assert!(first_task.await.unwrap_err().is_cancelled());
+    assert!(!first.is_snapshot_complete().unwrap());
+    assert!(!second.is_snapshot_complete().unwrap());
+    assert!(!scope.join("closures.json").exists());
+    server.fixture.hold_metadata.store(false, Ordering::SeqCst);
+    server.fixture.metadata_release.notify_waiters();
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(30), &mut second_task).await;
+    if finished.is_err() {
+        second_task.abort();
+        let _ = second_task.await;
+        panic!("surviving owner could not publish its proved root and complete hydration");
+    }
+    let report = finished.unwrap().unwrap().unwrap();
+    assert!(report.complete);
+    assert_eq!(report.completion_kind, CompletionKind::FullSnapshot);
+    assert!(!first.is_snapshot_complete().unwrap());
+    assert!(scope.join("closures.json").exists());
+    assert_full_snapshot(&second, &reader, &server.fixture);
+    let reopened = DurableStore::open_for_workspace(
+        temp.path(),
+        "11111111-2222-4333-8444-555555555613",
+        &reader,
+    )
+    .unwrap();
+    assert_full_snapshot(&reopened, &reader, &server.fixture);
+    assert!(bounded_hydrate(&first, &reader).await.complete);
+    assert_full_snapshot(&first, &reader, &server.fixture);
+}
+
+#[tokio::test]
 async fn actual_workspace_full_proof_skips_busy_old_owner_but_keeps_resume_and_commit_cas_audits() {
     for objects in [true, false] {
         let server = Server::new(Fixture::new(objects, false, false)).await;

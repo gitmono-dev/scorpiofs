@@ -632,8 +632,6 @@ impl<'a> IncrementalSync<'a> {
             ));
         }
         self.reader.ensure_lease().await?;
-        let mut transaction = self.cache.full_proof_transaction(&mut self.meters).await?;
-        self.reader.ensure_lease().await?;
         let reader = self.reader;
         let (pages, route_visits, collector_decodes) = reader.snapshot_pages_with(self).await?;
         let (closure, facts, mut meters) =
@@ -641,6 +639,8 @@ impl<'a> IncrementalSync<'a> {
         reader.validate_snapshot_files(closure.files())?;
         meters.collector_route_visits = route_visits;
         meters.collector_page_decodes = collector_decodes;
+        let mut transaction = self.cache.full_proof_transaction(&mut self.meters).await?;
+        reader.ensure_lease().await?;
         // Publish current reachable records only from the final root proof.
         // Cached page bytes are hints, never record file-list truth.
         // Unrelated old roots never enter this snapshot's dependency set.
