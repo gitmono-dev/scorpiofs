@@ -12,7 +12,7 @@ on:
         options: [smoke, medium]
         default: smoke
       rounds:
-        description: Complete cold/single/rename repetitions (3 to 10)
+        description: Complete cold/single/rename/batch repetitions (3 to 10)
         required: true
         default: '3'
       session_started_utc:
