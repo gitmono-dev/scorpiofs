@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod capabilities;
+mod cas_content;
 mod cas_index;
 mod chunk_wire;
 pub mod client;
@@ -21,6 +22,7 @@ pub mod error_wire;
 pub mod frames;
 pub mod fuse;
 mod fuse_owned;
+mod fuse_store;
 pub mod incremental;
 pub mod layer;
 mod lease_wire;

@@ -29,9 +29,12 @@ use futures::stream::iter;
 
 use crate::{
     snapshot::{
+        capabilities::CapabilityAdvertisement,
+        cas_content::VerifiedCasContent,
         closure::{verify_directory_pages, ValidatedSnapshotClosure},
         durable::DurableStore,
         fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission},
+        fuse_store::{ContentKey, StoreContent, StoreSmallCache},
         FileMembershipError, MetadataProofLimits, OwnedChunkedFile, ProvenSnapshotFile, ScopeCache,
         SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode, SnapshotFile,
         SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
@@ -82,6 +85,8 @@ struct State {
     chunked: HashMap<u64, Arc<crate::snapshot::range::ChunkedFile>>,
     /// Modern online mounts retain paid payload/reply owners in fixed slots.
     owned: Option<OwnedFuseCache>,
+    /// Only a canonical, authorized online v3 workspace owns this cache.
+    store_small: Option<StoreSmallCache>,
     /// Lazy mounts: directory pages are fetched on first readdir/lookup.
     lazy: bool,
     /// None for legacy file-only manifests, which cannot prove namespace absence.
@@ -259,12 +264,22 @@ impl Mst2Fuse {
             _ => None,
         };
         let root_page_id = reader.descriptor().metadata_root.clone();
+        let store_small = if scope_pages.is_some()
+            && matches!(
+                reader.capability_advertisement(),
+                CapabilityAdvertisement::Canonical(_)
+            ) {
+            Some(StoreSmallCache::new(&reader.content_scope)?)
+        } else {
+            None
+        };
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
             contents: HashMap::new(),
             chunked: HashMap::new(),
             owned: owned_cache(Some(&reader), store.as_ref())?,
+            store_small,
             lazy: true,
             namespace_scope: Some(reader.descriptor().scope.clone()),
         };
@@ -582,6 +597,7 @@ impl Mst2Fuse {
             contents: HashMap::new(),
             chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
+            store_small: None,
             lazy: false,
             namespace_scope: None,
         };
@@ -633,6 +649,7 @@ impl Mst2Fuse {
             contents: HashMap::new(),
             chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
+            store_small: None,
             lazy: false,
             namespace_scope: Some(closure.descriptor().scope.clone()),
         };
@@ -797,6 +814,84 @@ impl Mst2Fuse {
         self.reader
             .as_ref()
             .filter(|reader| self.store.is_none() && reader.capabilities().features.metadata_pages)
+    }
+
+    fn store_reader(&self) -> Option<&SnapshotReader> {
+        if self.state.lock().unwrap().store_small.is_some() {
+            self.reader.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Each logical path proves its own fixed membership before sharing bytes.
+    /// A CAS miss alone may reach the existing sized, accounted transport.
+    async fn read_store_small(
+        &self,
+        reader: &SnapshotReader,
+        node: &FileNode,
+        offset: u64,
+        requested: u64,
+    ) -> Result<ReplyData> {
+        let proven = Self::proven_node(reader, node, None).await?;
+        if requested == 0 || offset >= node.size {
+            proven.validate(reader).await.map_err(io_err)?;
+            return Ok(ReplyData { data: Bytes::new() });
+        }
+        let key = ContentKey::new(&node.digest, node.size).map_err(io_err)?;
+        let end = offset.saturating_add(requested).min(node.size);
+        let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
+        let stop = usize::try_from(end).map_err(|_| Errno::from(libc::EIO))?;
+        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        let cached = self
+            .state
+            .lock()
+            .unwrap()
+            .store_small
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .get(key);
+        let content = match cached {
+            Some(content) => content,
+            None => {
+                let store = self.store.as_ref().ok_or_else(|| Errno::from(libc::EIO))?;
+                match VerifiedCasContent::read(
+                    store,
+                    &node.digest,
+                    node.size,
+                    &reader.content_scope,
+                )
+                .map_err(io_err)?
+                {
+                    Some(content) => StoreContent::Cas(content),
+                    None => StoreContent::Wire(
+                        reader
+                            .read_proven_content(&proven, reader.capabilities().features.objects)
+                            .await
+                            .map_err(io_err)?,
+                    ),
+                }
+            }
+        };
+        if content.len() as u64 != node.size
+            || (node.fs_kind == "symlink"
+                && (!(1..=4095).contains(&content.len()) || content.as_bytes().contains(&0)))
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        proven.validate(reader).await.map_err(io_err)?;
+        let data = admission
+            .store_content(content.clone(), start, stop)
+            .map_err(io_err)?;
+        self.state
+            .lock()
+            .unwrap()
+            .store_small
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .insert(key, content)
+            .map_err(io_err)?;
+        Ok(ReplyData { data })
     }
 
     async fn proven_node(
@@ -1373,6 +1468,9 @@ impl Filesystem for Mst2Fuse {
 
     async fn open(&self, _req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
         let node = self.node(inode)?;
+        if let Some(reader) = self.store_reader() {
+            reader.ensure_lease().await.map_err(io_err)?;
+        }
         if is_symlink(&node) {
             // The kernel resolves symlinks itself; opening the link inode
             // directly (e.g. O_NOFOLLOW) is ELOOP, never "serve target text
@@ -1439,90 +1537,104 @@ impl Filesystem for Mst2Fuse {
                 .read_owned(reader, inode, &f, offset, size as u64)
                 .await;
         }
-        if size == 0 || offset >= f.size {
-            return Ok(ReplyData { data: Bytes::new() });
-        }
-        let end = offset.saturating_add(size as u64).min(f.size);
-
-        // 1. Whole content already in memory (verified when it was read).
-        if let Some(bytes) = self.state.lock().unwrap().contents.get(&inode).cloned() {
-            return Ok(ReplyData {
-                data: verified_slice(&bytes, f.size, offset, end)?,
-            });
-        }
-
-        // 2. Small file: whole content (CAS when hydrated, OBJECT frames
-        //    otherwise), cached in memory — a small file's whole bytes are
-        //    cheap and repeats are common.
-        if f.size <= crate::snapshot::range::OBJECT_CAP {
-            if let Some(store) = &self.store {
-                if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
-                    let arc = Arc::new(bytes);
-                    let out = verified_slice(&arc, f.size, offset, end)?;
-                    self.state.lock().unwrap().contents.insert(inode, arc);
-                    return Ok(ReplyData { data: out });
-                }
+        let store_reader = self.store_reader();
+        if let Some(reader) = store_reader {
+            reader.ensure_lease().await.map_err(io_err)?;
+            if f.size <= crate::snapshot::OBJECT_CAP {
+                return self.read_store_small(reader, &f, offset, size as u64).await;
             }
-            let bytes = Arc::new(self.fetch_content(&f).await?);
-            let out = verified_slice(&bytes, f.size, offset, end)?;
-            self.state.lock().unwrap().contents.insert(inode, bytes);
-            return Ok(ReplyData { data: out });
         }
+        let reply = async {
+            if size == 0 || offset >= f.size {
+                return Ok(ReplyData { data: Bytes::new() });
+            }
+            let end = offset.saturating_add(size as u64).min(f.size);
 
-        // 3. Large file: serve the requested range only (spec 07 §6, BODY-12).
-        //    Local CAS builds private chunk facts with a cold whole scan,
-        //    then verifies complete covering chunks from the returned buffers.
-        //    Uncovered mutations are detected when read or by a strict audit.
-        //    The verified chunk reader is the live-transport path when the
-        //    CAS does not hold the file.
-        if let Some(store) = &self.store {
-            if let Some(bytes) = store
-                .read_indexed_blob_range(&f.digest, f.size, offset, (end - offset) as usize)
-                .map_err(io_err)?
-            {
-                if bytes.len() as u64 != end - offset {
-                    return Err(Errno::from(libc::EIO));
-                }
+            // 1. Whole content already in memory (verified when it was read).
+            if let Some(bytes) = self.state.lock().unwrap().contents.get(&inode).cloned() {
                 return Ok(ReplyData {
-                    data: Bytes::from(bytes),
+                    data: verified_slice(&bytes, f.size, offset, end)?,
                 });
             }
-        }
 
-        // 4. Large file online: verified chunk reader, transferred range only.
-        let reader = self
-            .reader
-            .as_ref()
-            .ok_or_else(|| Errno::from(libc::EIO))?
-            .clone();
-        let chunked = {
-            let cached = self.state.lock().unwrap().chunked.get(&inode).cloned();
-            match cached {
-                Some(c) => c,
-                None => {
-                    let path = format!("/{}", f.path);
-                    let c = Arc::new(
-                        crate::snapshot::range::ChunkedFile::open(
-                            &reader, &path, &f.digest, f.size,
-                        )
-                        .await
-                        .map_err(io_err)?,
-                    );
-                    self.state.lock().unwrap().chunked.insert(inode, c.clone());
-                    c
+            // 2. Small file: whole content (CAS when hydrated, OBJECT frames
+            //    otherwise), cached in memory — a small file's whole bytes are
+            //    cheap and repeats are common.
+            if f.size <= crate::snapshot::range::OBJECT_CAP {
+                if let Some(store) = &self.store {
+                    if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
+                        let arc = Arc::new(bytes);
+                        let out = verified_slice(&arc, f.size, offset, end)?;
+                        self.state.lock().unwrap().contents.insert(inode, arc);
+                        return Ok(ReplyData { data: out });
+                    }
+                }
+                let bytes = Arc::new(self.fetch_content(&f).await?);
+                let out = verified_slice(&bytes, f.size, offset, end)?;
+                self.state.lock().unwrap().contents.insert(inode, bytes);
+                return Ok(ReplyData { data: out });
+            }
+
+            // 3. Large file: serve the requested range only (spec 07 §6, BODY-12).
+            //    Local CAS builds private chunk facts with a cold whole scan,
+            //    then verifies complete covering chunks from the returned buffers.
+            //    Uncovered mutations are detected when read or by a strict audit.
+            //    The verified chunk reader is the live-transport path when the
+            //    CAS does not hold the file.
+            if let Some(store) = &self.store {
+                if let Some(bytes) = store
+                    .read_indexed_blob_range(&f.digest, f.size, offset, (end - offset) as usize)
+                    .map_err(io_err)?
+                {
+                    if bytes.len() as u64 != end - offset {
+                        return Err(Errno::from(libc::EIO));
+                    }
+                    return Ok(ReplyData {
+                        data: Bytes::from(bytes),
+                    });
                 }
             }
-        };
-        let data = chunked
-            .read_range(offset, end - offset)
-            .await
-            .map_err(io_err)?;
-        if data.len() as u64 != end - offset {
-            return Err(Errno::from(libc::EIO));
+
+            // 4. Large file online: verified chunk reader, transferred range only.
+            let reader = self
+                .reader
+                .as_ref()
+                .ok_or_else(|| Errno::from(libc::EIO))?
+                .clone();
+            let chunked = {
+                let cached = self.state.lock().unwrap().chunked.get(&inode).cloned();
+                match cached {
+                    Some(c) => c,
+                    None => {
+                        let path = format!("/{}", f.path);
+                        let c = Arc::new(
+                            crate::snapshot::range::ChunkedFile::open(
+                                &reader, &path, &f.digest, f.size,
+                            )
+                            .await
+                            .map_err(io_err)?,
+                        );
+                        self.state.lock().unwrap().chunked.insert(inode, c.clone());
+                        c
+                    }
+                }
+            };
+            let data = chunked
+                .read_range(offset, end - offset)
+                .await
+                .map_err(io_err)?;
+            if data.len() as u64 != end - offset {
+                return Err(Errno::from(libc::EIO));
+            }
+            Ok(ReplyData {
+                data: Bytes::from(data),
+            })
         }
-        Ok(ReplyData {
-            data: Bytes::from(data),
-        })
+        .await?;
+        if let Some(reader) = store_reader {
+            reader.ensure_lease().await.map_err(io_err)?;
+        }
+        Ok(reply)
     }
 
     /// Return the symlink target recorded in the fixed view. The content is
@@ -1537,6 +1649,10 @@ impl Filesystem for Mst2Fuse {
         };
         if let Some(reader) = self.owned_reader() {
             return self.read_owned(reader, inode, &f, 0, f.size).await;
+        }
+        if let Some(reader) = self.store_reader() {
+            reader.ensure_lease().await.map_err(io_err)?;
+            return self.read_store_small(reader, &f, 0, f.size).await;
         }
         let cached = self.state.lock().unwrap().contents.get(&inode).cloned();
         let target = match cached {
