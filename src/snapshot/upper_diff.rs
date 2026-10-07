@@ -158,7 +158,7 @@ pub async fn scan_upper(
         .map_err(|error| unknown(format!("upper scan task failed: {error}")))??;
     let mut meters = scanned.meters;
     meters.lower_queries += 1;
-    let root_base = match lower.path_state("").await? {
+    let root_base = match lower.path_state_for_diff("", pause).await? {
         SnapshotPathState::Present(identity @ SnapshotNodeIdentity::Directory { .. }) => identity,
         _ => return Err(unknown("fixed lower scope root is not a proved directory")),
     };
@@ -204,7 +204,8 @@ pub async fn scan_upper(
                     return Err(unknown("invalid or conflicting OCI whiteout target"));
                 }
                 let target_path = join(&directory, target);
-                let base = base_at(lower, &target_path, lower_directory, &mut meters).await?;
+                let base =
+                    base_at(lower, &target_path, lower_directory, pause, &mut meters).await?;
                 if let Some(base) = base {
                     changes.insert(
                         target_path.clone(),
@@ -218,7 +219,7 @@ pub async fn scan_upper(
                 }
                 continue;
             }
-            let base = base_at(lower, &path, lower_directory, &mut meters).await?;
+            let base = base_at(lower, &path, lower_directory, pause, &mut meters).await?;
             let base_directory = matches!(base, Some(SnapshotNodeIdentity::Directory { .. }));
             if base.as_ref().is_none_or(|identity| !node.matches(identity)) {
                 changes.insert(
@@ -241,7 +242,7 @@ pub async fn scan_upper(
         }
         if opaque && lower_directory {
             meters.lower_queries += 1;
-            let entries = lower.directory_entries(&directory).await?;
+            let entries = lower.directory_entries_for_diff(&directory, pause).await?;
             meters.lower_directory_entries = meters
                 .lower_directory_entries
                 .checked_add(entries.len() as u64)
@@ -290,6 +291,7 @@ async fn base_at(
     lower: &Mst2Fuse,
     path: &str,
     parent_directory: bool,
+    pause: &MutationPause,
     meters: &mut DiffMeters,
 ) -> Result<Option<SnapshotNodeIdentity>, SnapshotError> {
     lower.validate_metadata_path(path)?;
@@ -297,7 +299,7 @@ async fn base_at(
         return Ok(None);
     }
     meters.lower_queries += 1;
-    match lower.path_state(path).await? {
+    match lower.path_state_for_diff(path, pause).await? {
         super::SnapshotPathState::Present(identity) => Ok(Some(identity)),
         super::SnapshotPathState::AbsentProven => Ok(None),
     }

@@ -43,7 +43,7 @@ impl Layer for Mst2Fuse {
     }
 
     async fn is_opaque(&self, _ctx: asyncfuse::raw::Request, inode: Inode) -> Result<bool> {
-        match self.node(inode)? {
+        match self.metadata_node(inode)? {
             Node::Dir(_) => Ok(false),
             Node::File(_) => Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into()),
         }
@@ -61,7 +61,7 @@ impl Layer for Mst2Fuse {
         _handle: Option<u64>,
         _mapping: bool,
     ) -> std::io::Result<(Stat64, std::time::Duration)> {
-        let node = self.node(inode).map_err(|e| {
+        let node = self.metadata_node(inode).map_err(|e| {
             let raw = i32::from(e);
             tracing::warn!(
                 inode,
