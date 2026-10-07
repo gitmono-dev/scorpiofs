@@ -710,6 +710,59 @@ async fn batch_aliases_commit_logical_totals_and_one_retained_content_dependency
 }
 
 #[tokio::test]
+async fn batch_alias_resume_rejects_conflicting_sizes_and_propagates_real_cas_io_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = DurableStore::open(temp.path()).unwrap();
+    let meters = store.enable_verification_meters();
+    let mut manifest: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|path| SnapshotFile {
+            rel_path: path.into(),
+            fs_kind: "regular".into(),
+            size: 4,
+            content_digest: digest_of(b"same"),
+        })
+        .collect();
+    manifest[1].size = 5;
+    let error = store
+        .hydrate_batches(
+            &view(),
+            &manifest,
+            2,
+            2,
+            |_| Box::pin(async { panic!("invalid aliases must never fetch") }),
+            |_| Box::pin(async { panic!("invalid aliases must never fetch") }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::IntegrityError);
+    assert_eq!(meters.snapshot().calls, 0);
+    assert!(!temp.path().join(COMPLETE_MARKER).exists());
+
+    manifest[1].size = 4;
+    // ENOTDIR is a real I/O error, distinct from an absent CAS blob. It
+    // cannot become a missing hint or be cached for a second alias.
+    fs::remove_dir(store.content_dir()).unwrap();
+    fs::write(store.content_dir(), b"blocked directory").unwrap();
+    let error = store
+        .hydrate_batches(
+            &view(),
+            &manifest,
+            2,
+            2,
+            |_| Box::pin(async { panic!("a CAS I/O error must not fetch") }),
+            |_| Box::pin(async { panic!("a CAS I/O error must not fetch") }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert_eq!(hydration_error_label(&error), Some("cas_resume_audit"));
+    assert_eq!(meters.snapshot_for(CasVerificationReason::Resume).calls, 1);
+    assert_eq!(meters.snapshot_for(CasVerificationReason::Resume).errors, 1);
+    assert!(!temp.path().join(COMPLETE_MARKER).exists());
+}
+
+#[tokio::test]
 async fn full_view_identity_conflicts_leave_the_original_commit_untouched() {
     let temp = tempfile::tempdir().unwrap();
     let store = DurableStore::open(temp.path()).unwrap();

@@ -1637,24 +1637,41 @@ impl DurableStore {
         // Paths sharing a digest are journaled individually but fetched once.
         let need = super::stage::trace_sync("cas_resume_audit", || {
             let mut need: Vec<SnapshotFile> = Vec::new();
+            // Reuse is a hint for this pass only. Alias paths share the same
+            // validated digest/size, so avoid re-reading their whole CAS body.
+            // The final dependency audit still rehashes and syncs every unique
+            // blob after fetching, including these cache hits.
+            let mut audited = HashMap::new();
             for f in manifest {
-                match store.verify_blob(&f.content_digest, f.size, CasVerificationReason::Resume) {
-                    Ok(true) => {
-                        resumed.fetch_add(1, Relaxed);
-                        bytes_total.fetch_add(f.size, Relaxed);
-                        journal.append(&FileRecord {
-                            rel_path: f.rel_path.clone(),
-                            digest: f.content_digest.clone(),
-                            size: f.size,
-                        })?;
+                let key = (f.content_digest.as_str(), f.size);
+                let (verified, damaged) = if let Some(result) = audited.get(&key) {
+                    *result
+                } else {
+                    let verified = store.verify_blob(
+                        &f.content_digest,
+                        f.size,
+                        CasVerificationReason::Resume,
+                    )?;
+                    let result = (
+                        verified,
+                        !verified && store.blob_path(&f.content_digest)?.exists(),
+                    );
+                    audited.insert(key, result);
+                    result
+                };
+                if verified {
+                    resumed.fetch_add(1, Relaxed);
+                    bytes_total.fetch_add(f.size, Relaxed);
+                    journal.append(&FileRecord {
+                        rel_path: f.rel_path.clone(),
+                        digest: f.content_digest.clone(),
+                        size: f.size,
+                    })?;
+                } else {
+                    if damaged {
+                        repaired.fetch_add(1, Relaxed);
                     }
-                    Ok(false) => {
-                        if store.blob_path(&f.content_digest)?.exists() {
-                            repaired.fetch_add(1, Relaxed);
-                        }
-                        need.push(f.clone());
-                    }
-                    Err(e) => return Err(e),
+                    need.push(f.clone());
                 }
             }
             Ok::<_, SnapshotError>(need)

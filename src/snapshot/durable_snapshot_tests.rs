@@ -173,7 +173,8 @@ async fn full_batch_merges_small_and_large_aliases_and_resumes_all_logical_paths
         large,
     ]);
     let temp = tempfile::tempdir().unwrap();
-    let store = DurableStore::open(temp.path()).unwrap();
+    let mut store = DurableStore::open(temp.path()).unwrap();
+    let meters = store.enable_verification_meters();
     let report = hydrate_full_core(&store, "batch", &view, &closure, &raw)
         .await
         .unwrap();
@@ -184,6 +185,10 @@ async fn full_batch_merges_small_and_large_aliases_and_resumes_all_logical_paths
     assert_eq!(report.total_files, 8);
     assert_eq!(report.bytes_total, 4 * (5 + 256 * 1024 + 1));
     assert_eq!(report.completion_kind, CompletionKind::FullSnapshot);
+    let cold = meters.snapshot_for(CasVerificationReason::Resume);
+    assert_eq!(cold.calls, 2);
+    assert_eq!(cold.missing, 2);
+    assert_eq!(cold.read_bytes, 0);
     let marker: SnapshotCompleteMarker =
         serde_json::from_slice(&fs::read(temp.path().join(COMPLETE_MARKER)).unwrap()).unwrap();
     assert_eq!(marker.verification_revision, SNAPSHOT_VERIFICATION_REVISION);
@@ -211,7 +216,130 @@ async fn full_batch_merges_small_and_large_aliases_and_resumes_all_logical_paths
         .unwrap();
     assert_eq!(warm.fetched, 0);
     assert_eq!(warm.resumed, 8);
+    assert_eq!(warm.bytes_total, report.bytes_total);
+    assert_eq!(store.read_journal().unwrap().len(), 8);
+    let resumed = meters.snapshot_for(CasVerificationReason::Resume);
+    assert_eq!(resumed.calls - cold.calls, 2);
+    assert_eq!(resumed.verified - cold.verified, 2);
+    assert_eq!(resumed.read_bytes - cold.read_bytes, 5 + 256 * 1024 + 1);
     assert!(store.is_snapshot_complete().unwrap());
+
+    // Both duplicated sizes still repair through one fetch per content unit.
+    fs::write(store.blob_path(&digest_of(b"small")).unwrap(), b"bad!!").unwrap();
+    let large_digest = raw
+        .keys()
+        .find(|digest| raw[*digest].len() > 256 * 1024)
+        .unwrap();
+    fs::remove_file(store.blob_path(large_digest).unwrap()).unwrap();
+    let repaired = hydrate_full_core(&store, "batch", &view, &closure, &raw)
+        .await
+        .unwrap();
+    assert_eq!(repaired.fetched, 2);
+    assert_eq!(repaired.resumed, 0);
+    assert_eq!(
+        repaired.repaired, 4,
+        "four paths name the damaged small blob"
+    );
+    assert_eq!(repaired.total_files, 8);
+    assert_eq!(repaired.bytes_total, report.bytes_total);
+    let audited = meters.snapshot_for(CasVerificationReason::Resume);
+    assert_eq!(audited.calls - resumed.calls, 2);
+    assert_eq!(audited.digest_mismatches - resumed.digest_mismatches, 1);
+    assert_eq!(audited.missing - resumed.missing, 1);
+    assert_eq!(store.read_journal().unwrap().len(), 8);
+    assert_eq!(store.snapshot_manifest().unwrap().files(), closure.files());
+}
+
+#[tokio::test]
+async fn full_batch_resume_audits_one_blob_for_128_paths_and_keeps_every_journal_entry() {
+    let bytes = vec![0x67; 8 * 1024];
+    let (closure, raw, view) = fixture_contents(vec![bytes.clone(); 64]);
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = DurableStore::open(temp.path()).unwrap();
+    hydrate_full_core(&store, "batch", &view, &closure, &raw)
+        .await
+        .unwrap();
+    let meters = store.enable_verification_meters();
+    let report = store
+        .hydrate_batches_closure::<_, _, HashMap<String, std::sync::Arc<Vec<u8>>>, Vec<u8>>(
+            &view,
+            closure.files(),
+            Some(SnapshotHydration {
+                closure: &closure,
+                reader: None,
+            }),
+            (2, 2),
+            |_| Box::pin(async { panic!("the shared blob is already verified") }),
+            |_| Box::pin(async { panic!("all fixture files are small") }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.total_files, 128);
+    assert_eq!(report.resumed, 128);
+    assert_eq!(report.fetched, 0);
+    assert_eq!(report.bytes_total, 128 * bytes.len() as u64);
+    assert_eq!(store.read_journal().unwrap().len(), 128);
+    for reason in [
+        CasVerificationReason::Resume,
+        CasVerificationReason::HydrationCommit,
+    ] {
+        let audited = meters.snapshot_for(reason);
+        assert_eq!(audited.calls, 1);
+        assert_eq!(audited.verified, 1);
+        assert_eq!(audited.read_bytes, bytes.len() as u64);
+    }
+    assert_eq!(store.snapshot_manifest().unwrap().files(), closure.files());
+}
+
+#[tokio::test]
+async fn batch_alias_reuse_does_not_cache_proof_across_the_final_dependency_audit() {
+    let (closure, raw, view) = fixture_contents(vec![b"warm".to_vec(), b"fetch".to_vec()]);
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = DurableStore::open(temp.path()).unwrap();
+    hydrate_full_core(&store, "batch", &view, &closure, &raw)
+        .await
+        .unwrap();
+    let warm_path = store.blob_path(&digest_of(b"warm")).unwrap();
+    fs::remove_file(store.blob_path(&digest_of(b"fetch")).unwrap()).unwrap();
+    let meters = store.enable_verification_meters();
+    let error = store
+        .hydrate_batches_closure::<_, _, HashMap<String, std::sync::Arc<Vec<u8>>>, Vec<u8>>(
+            &view,
+            closure.files(),
+            Some(SnapshotHydration {
+                closure: &closure,
+                reader: None,
+            }),
+            (2, 2),
+            move |batch| {
+                let warm_path = warm_path.clone();
+                Box::pin(async move {
+                    assert_eq!(batch.len(), 1);
+                    assert_eq!(batch[0].content_digest, digest_of(b"fetch"));
+                    // A different workspace or local writer can change the
+                    // shared CAS after the resume hint was checked.
+                    fs::write(warm_path, b"bad!").unwrap();
+                    Ok(HashMap::from([(
+                        digest_of(b"fetch"),
+                        std::sync::Arc::new(b"fetch".to_vec()),
+                    )]))
+                })
+            },
+            |_| Box::pin(async { panic!("all fixture files are small") }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::IntegrityError);
+    assert_eq!(hydration_error_label(&error), Some("dependency_audit"));
+    assert_eq!(meters.snapshot_for(CasVerificationReason::Resume).calls, 2);
+    assert_eq!(
+        meters
+            .snapshot_for(CasVerificationReason::HydrationCommit)
+            .digest_mismatches,
+        1
+    );
+    assert!(!temp.path().join(COMPLETE_MARKER).exists());
+    assert!(!store.is_snapshot_complete().unwrap());
 }
 
 #[tokio::test]
