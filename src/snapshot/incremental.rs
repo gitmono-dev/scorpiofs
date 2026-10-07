@@ -30,7 +30,7 @@
 //! The pin-backed record reuse rules above apply to the file-only `sync` API.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
     path::{Path, PathBuf},
     time::Duration,
@@ -723,7 +723,7 @@ impl<'a> IncrementalSync<'a> {
 
         let mut files_out: Vec<SnapshotFile> = Vec::new();
         let mut states: HashMap<String, DirState> = HashMap::new();
-        let mut frontier: Vec<Item> = Vec::new();
+        let mut frontier: VecDeque<Item> = VecDeque::new();
         let mut route_ids = HashMap::new();
 
         // Reuse hit -> the record covers the whole subtree: hand its files to
@@ -793,7 +793,7 @@ impl<'a> IncrementalSync<'a> {
                             pending_children: 0,
                         },
                     );
-                    frontier.push(Item::Page {
+                    frontier.push_back(Item::Page {
                         dir,
                         route: Vec::new(),
                         expected,
@@ -970,7 +970,7 @@ impl<'a> IncrementalSync<'a> {
                         for c in children {
                             let mut next = route.clone();
                             next.push(c.label);
-                            frontier.push(Item::Page {
+                            frontier.push_back(Item::Page {
                                 dir: dir.clone(),
                                 route: next,
                                 expected: format!(

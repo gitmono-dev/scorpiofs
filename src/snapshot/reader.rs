@@ -5,7 +5,7 @@
 //! bind paths, routes and handles to the snapshot id/generation.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex,
@@ -774,11 +774,11 @@ impl SnapshotReader {
             ));
         }
         self.ensure_lease().await?;
-        let mut frontier = vec![PageFrontier {
+        let mut frontier = VecDeque::from([PageFrontier {
             dir: "/".to_string(),
             route: Vec::new(),
             expected: self.descriptor().metadata_root.clone(),
-        }];
+        }]);
         // Immutable page bytes may be shared, but each logical directory
         // must still be expanded. Identical directories have identical page
         // ids; deduplicating the walk by id would omit one of their paths.
@@ -901,7 +901,7 @@ impl SnapshotReader {
                         for c in children {
                             let mut route = f.route.clone();
                             route.push(c.label);
-                            frontier.push(PageFrontier {
+                            frontier.push_back(PageFrontier {
                                 dir: f.dir.clone(),
                                 route,
                                 expected: format!(
@@ -1255,7 +1255,7 @@ impl SnapshotReader {
 fn collect_directory(
     dir: &str,
     e: &mst2_codec::metapage::Entry,
-    frontier: &mut Vec<PageFrontier>,
+    frontier: &mut VecDeque<PageFrontier>,
 ) -> Result<(), SnapshotError> {
     use mst2_codec::metapage::EntryKind as MetaEntryKind;
     if e.kind != MetaEntryKind::Directory {
@@ -1274,7 +1274,7 @@ fn collect_directory(
     } else {
         format!("{}/{}", dir.trim_start_matches('/'), name)
     };
-    frontier.push(PageFrontier {
+    frontier.push_back(PageFrontier {
         dir: format!("/{rel}"),
         route: Vec::new(),
         expected: format!("sha256:{}", crate::snapshot::frames::hex32(&e.child_root)),
