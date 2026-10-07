@@ -267,21 +267,6 @@ impl OwnedChunkedFile {
         self.chunks.lock().await.len as u64 == self.map.chunk_count
     }
 
-    /// Caller-owned compatibility copy. Use read_range_owned to retain credits
-    /// through the returned bytes' actual lifetime.
-    pub async fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, SnapshotError> {
-        let owner = self.read_range_owned(offset, length).await?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(owner.len()).map_err(|_| {
-            SnapshotError::new(
-                SnapshotErrorCode::LimitExceeded,
-                "caller range allocation failed",
-            )
-        })?;
-        bytes.extend_from_slice(owner.as_bytes());
-        Ok(bytes)
-    }
-
     pub async fn read_range_owned(
         &self,
         offset: u64,

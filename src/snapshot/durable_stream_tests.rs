@@ -624,13 +624,13 @@ async fn hydrate_parallel(
     match core {
         "concurrent" => {
             store
-                .hydrate_snapshot_concurrent(reader, closure, 2, fetch)
+                .hydrate_snapshot_concurrent_with_body(reader, closure, 2, fetch)
                 .await
         }
         "batch" => {
             let source = reader.clone();
             store
-                .hydrate_snapshot_batches(
+                .hydrate_snapshot_batches_with_body(
                     reader,
                     closure,
                     2,
