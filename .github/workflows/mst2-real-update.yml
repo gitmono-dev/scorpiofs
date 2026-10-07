@@ -1,0 +1,187 @@
+name: MST2 shipped workspace v3 commit updates
+
+on:
+  workflow_dispatch:
+    inputs:
+      mega_sha:
+        description: Immutable reviewed native server SHA
+        required: true
+      profile:
+        type: choice
+        description: Fixture size; start with smoke to verify both real sinks
+        options: [smoke, medium]
+        default: smoke
+      rounds:
+        description: Complete cold/single/rename/batch repetitions (3 to 10)
+        required: true
+        default: '3'
+      session_started_utc:
+        description: Actual dispatch UTC start, retained on recovery
+        required: true
+      session_deadline_utc:
+        description: Original UTC deadline, exactly start plus 235 minutes
+        required: true
+      recover_original_window:
+        type: boolean
+        description: Retry a failed measurement using its original start and deadline
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 235
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      NO_PROXY: localhost,127.0.0.1
+      MEGA_SHA: ${{ inputs.mega_sha }}
+      SCORPIO_SHA: ${{ github.sha }}
+      PROFILE: ${{ inputs.profile }}
+      ROUNDS: ${{ inputs.rounds }}
+      STARTED_INPUT: ${{ inputs.session_started_utc }}
+      DEADLINE_INPUT: ${{ inputs.session_deadline_utc }}
+      RECOVERY_INPUT: ${{ inputs.recover_original_window }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SCORPIO_SHA }}
+          path: scorpiofs
+          persist-credentials: false
+
+      - name: Admit the original session window before builds
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
+          from commit_update_projection import window_anchor
+          recovery = os.environ.get('RECOVERY_INPUT', 'false')
+          if recovery not in ('false', 'true'):
+              raise ValueError('invalid original-window recovery flag')
+          anchor = window_anchor(os.environ['STARTED_INPUT'], os.environ['DEADLINE_INPUT'], admission=recovery == 'false')
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('MST2_SESSION_STARTED=' + os.environ['STARTED_INPUT'] + '\n')
+              stream.write('MST2_SESSION_DEADLINE=' + os.environ['DEADLINE_INPUT'] + '\n')
+              stream.write('MST2_WORK_CLEANUP_DEADLINE_MONOTONIC=' + repr(anchor) + '\n')
+              stream.write('MST2_OWNED_ROOT=' + os.environ['RUNNER_TEMP'] + '/mst2-real-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '\n')
+          PY
+
+      - uses: actions/checkout@v7
+        with:
+          repository: gitmono-dev/mega2
+          ref: ${{ env.MEGA_SHA }}
+          path: mega2
+          persist-credentials: false
+
+      - uses: actions/cache@v6
+        with:
+          path: scorpiofs/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('scorpiofs/Cargo.lock') }}
+
+      - name: Install native FUSE and owned server dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libfuse3-dev fuse3 protobuf-compiler postgresql-client
+          if ! grep -qxF user_allow_other /etc/fuse.conf; then
+            printf '\nuser_allow_other\n' | sudo tee -a /etc/fuse.conf >/dev/null
+          fi
+          grep -qxF user_allow_other /etc/fuse.conf
+          test -c /dev/fuse
+          test -r /dev/fuse
+          test -w /dev/fuse
+          fusermount3 --version
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build immutable server and shipped v3 client
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$MEGA_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C scorpiofs rev-parse HEAD)" = "$SCORPIO_SHA"
+          test "$(git -C mega2 rev-parse HEAD)" = "$MEGA_SHA"
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage server-build -- \
+            cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage client-build -- \
+            cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --bin scorpio
+
+      - name: Check evidence and owned process deadlines
+        shell: bash
+        run: |
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage fences -- bash -euo pipefail -c '
+            python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_bench.py -v
+            python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_budget.py -v
+            python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_projection.py -v
+            python3 -B -m unittest discover -s scorpiofs/tests/mst2-e2e -p "test_workspace_update_*.py" -v
+          '
+
+      - name: Measure real publication to retained v3 workspaces and Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          DRIVER="$GITHUB_WORKSPACE/scorpiofs/target/release/scorpio"
+          DRIVER_SHA=$(sha256sum "$DRIVER" | cut -d ' ' -f 1)
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --execute --projection-traces \
+            --run-root "$MST2_OWNED_ROOT" --mega-source "$GITHUB_WORKSPACE/mega2" \
+            --mega-sha "$MEGA_SHA" --mega-binary "$GITHUB_WORKSPACE/mega2/target/release/mega2" \
+            --driver "$DRIVER" --driver-sha256 "$DRIVER_SHA" --profile "$PROFILE" --rounds "$ROUNDS" \
+            --session-started-utc "$MST2_SESSION_STARTED" --session-deadline-utc "$MST2_SESSION_DEADLINE"
+
+      - name: Verify cleanup within the original deadline
+        if: always()
+        shell: bash
+        run: |
+          if test -n "$MST2_OWNED_ROOT" && test -f scorpiofs/tests/mst2-e2e/commit_update_ci.py; then
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --cleanup --run-root "$MST2_OWNED_ROOT" \
+              --session-deadline-utc "$MST2_SESSION_DEADLINE" --rounds "$ROUNDS"
+          fi
+
+      - name: Stage safe benchmark evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe="$RUNNER_TEMP/mst2-safe-evidence"
+          rm -rf -- "$safe"
+          install -d -m 700 "$safe"
+          printf '{"run_id":"%s","attempt":"%s","scorpio_sha":"%s","mega_sha":"%s","profile":"%s","rounds":%s}\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SCORPIO_SHA" "$MEGA_SHA" "$PROFILE" "$ROUNDS" \
+            > "$safe/run.json"
+          owned_root="${MST2_OWNED_ROOT:-}"
+          root="$owned_root/measurements"
+          if test -f "$owned_root/failure.json" && test ! -L "$owned_root/failure.json"; then
+            cp --no-preserve=mode,ownership --no-target-directory -- "$owned_root/failure.json" "$safe/failure.json"
+            chmod 600 "$safe/failure.json"
+          fi
+          if test -d "$root"; then
+            while IFS= read -r -d '' source; do
+              relative="${source#"$root"/}"
+              target="$safe/measurements/$relative"
+              case "$relative" in
+                */service.toml|*/dependencies.json|*/token*|*/service-private.log|*/scorpio-private.log) continue ;;
+              esac
+              case "$relative" in
+                measurements.jsonl|workspace-observation.jsonl|failure.json|*/measurements.jsonl|*/workspace-observation.jsonl|*/failure.json|*/owned-workspace-daemon.json|*/owned-workspace-worker.json)
+                  install -d -m 700 "$(dirname "$target")"
+                  test -f "$source" && test ! -L "$source"
+                  cp --no-preserve=mode,ownership --no-target-directory -- "$source" "$target"
+                  chmod 600 "$target"
+                  ;;
+              esac
+            done < <(find "$root" -type f -print0)
+          fi
+          find "$safe" -type f -printf '%P\n' | sort
+
+      - name: Upload safe benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mst2-v3-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mst2-safe-evidence
+          if-no-files-found: error
+          retention-days: 7

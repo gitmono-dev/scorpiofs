@@ -132,6 +132,14 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Check real runner budgets and process cleanup
+        run: |
+          python3 -B tests/mst2-e2e/test_commit_update_bench.py -v
+          python3 -B tests/mst2-e2e/test_commit_update_budget.py -v
+          python3 -B tests/mst2-e2e/test_commit_update_projection.py -v
+          python3 -B -m unittest discover -s tests/mst2-e2e -p 'test_workspace_update_*.py' -v
+
+
   docker:
     name: Docker image
     runs-on: ubuntu-latest

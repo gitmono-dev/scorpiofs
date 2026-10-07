@@ -1,6 +1,7 @@
 //! Workspace full hydration uses fixed, bounded OBJECT and streaming lanes.
 
 use crate::snapshot::{
+    durable::{tag_hydration_error, HydrationSubstage},
     stage::{trace_async, trace_sync},
     DurableStore, HydrateReport, IncrementalSync, ScopeCache, SnapshotError, SnapshotErrorCode,
     SnapshotReader,
@@ -27,7 +28,9 @@ pub(crate) async fn hydrate_workspace(
     let cache = ScopeCache::open(scope)?;
     let mut sync = IncrementalSync::new(reader, &cache)
         .with_pin_verification_meters(store.verification_meters());
-    let closure = trace_async("hydrate_metadata_closure", sync.sync_snapshot()).await?;
+    let closure = trace_async("hydrate_metadata_closure", sync.sync_snapshot())
+        .await
+        .map_err(|error| tag_hydration_error(error, HydrationSubstage::MetadataClosure))?;
     tracing::debug!(
         target: "scorpiofs::workspace::performance",
         metadata_sync = ?sync.meters(),
@@ -44,7 +47,8 @@ pub(crate) async fn hydrate_workspace(
         )
         .await;
         store.trace_verification_meters("hydration_without_objects");
-        return result;
+        return result
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit));
     }
     let batches = reader.clone();
     let large = reader.clone();
@@ -69,7 +73,7 @@ pub(crate) async fn hydrate_workspace(
     )
     .await;
     store.trace_verification_meters("hydration");
-    result
+    result.map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))
 }
 
 #[cfg(test)]
@@ -85,7 +89,8 @@ mod tests {
     use axum::{
         body::{Body, Bytes},
         extract::{Path, Query, State},
-        response::Response,
+        http::StatusCode,
+        response::{IntoResponse, Response},
         routing::{get, post},
         Json, Router,
     };
@@ -111,8 +116,16 @@ mod tests {
     fn id(bytes: &[u8; 32]) -> String {
         format!("sha256:{}", hex::encode(bytes))
     }
-    fn lookup_path(path: &str) -> String {
-        format!("/{}", path.trim_start_matches('/'))
+    fn checked_wire_path(path: &str) -> Result<&str, (StatusCode, Json<Value>)> {
+        if mst2_codec::descriptor::validate_scope(path).is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error":{"code":"INVALID_REQUEST","message":"invalid scope-relative HTTP path","request_id":"strict-content-path","retryable":false}}),
+                ),
+            ));
+        }
+        Ok(path)
     }
     fn base64(bytes: &[u8]) -> String {
         const TABLE: &[u8; 64] =
@@ -153,6 +166,8 @@ mod tests {
         object_active: AtomicUsize,
         object_peak: AtomicUsize,
         chunk_calls: AtomicUsize,
+        map_calls: AtomicUsize,
+        leaf_calls: AtomicUsize,
         chunk_active: AtomicUsize,
         chunk_peak: AtomicUsize,
         raw_calls: AtomicUsize,
@@ -236,6 +251,8 @@ mod tests {
                 object_active: AtomicUsize::new(0),
                 object_peak: AtomicUsize::new(0),
                 chunk_calls: AtomicUsize::new(0),
+                map_calls: AtomicUsize::new(0),
+                leaf_calls: AtomicUsize::new(0),
                 chunk_active: AtomicUsize::new(0),
                 chunk_peak: AtomicUsize::new(0),
                 raw_calls: AtomicUsize::new(0),
@@ -448,7 +465,11 @@ mod tests {
         let items = value["items"].as_array().unwrap();
         let mut units = Vec::new();
         for item in items {
-            let bytes = &f.bodies[&lookup_path(item["path"].as_str().unwrap())];
+            let path = match checked_wire_path(item["path"].as_str().unwrap()) {
+                Ok(path) => path,
+                Err(response) => return response.into_response(),
+            };
+            let bytes = &f.bodies[path];
             assert_eq!(item["expected_digest"], digest_of(bytes));
             units.push((hash(bytes), bytes.clone()));
         }
@@ -464,32 +485,46 @@ mod tests {
     async fn map(
         State(f): State<Arc<Fixture>>,
         Query(query): Query<BTreeMap<String, String>>,
-    ) -> Json<Value> {
-        let (map, _) = &f.maps[&lookup_path(&query["path"])];
+    ) -> Response {
+        let path = match checked_wire_path(&query["path"]) {
+            Ok(path) => path,
+            Err(response) => return response.into_response(),
+        };
+        f.map_calls.fetch_add(1, Ordering::SeqCst);
+        let (map, _) = &f.maps[path];
+        assert_eq!(query["expected_digest"], id(&map.file_content_id));
         Json(
-            json!({"snapshot_id":f.sid(),"path":query["path"],"map":{"schema_version":2,"file_content_id":id(&map.file_content_id),"file_size":map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":map.chunk_count.to_string(),"page_count":"1","pages_root":id(&map.pages_root),"map_id":id(&map.map_id())}}),
-        )
+            json!({"snapshot_id":f.sid(),"path":path,"map":{"schema_version":2,"file_content_id":id(&map.file_content_id),"file_size":map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":map.chunk_count.to_string(),"page_count":"1","pages_root":id(&map.pages_root),"map_id":id(&map.map_id())}}),
+        ).into_response()
     }
     async fn leaf(
         State(f): State<Arc<Fixture>>,
         Query(query): Query<BTreeMap<String, String>>,
-    ) -> Json<Value> {
-        let (map, leaf) = &f.maps[&lookup_path(&query["path"])];
+    ) -> Response {
+        let path = match checked_wire_path(&query["path"]) {
+            Ok(path) => path,
+            Err(response) => return response.into_response(),
+        };
+        f.leaf_calls.fetch_add(1, Ordering::SeqCst);
+        let (map, leaf) = &f.maps[path];
         assert_eq!(query["map_id"], id(&map.map_id()));
         assert_eq!(query["page_index"], "0");
         Json(
             json!({"map_id":id(&map.map_id()),"page_index":"0","leaf_base64":base64(&leaf.encode().unwrap()),"proof":[]}),
-        )
+        ).into_response()
     }
     async fn chunks(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
         let value: Value = serde_json::from_slice(&body).unwrap();
         let items = value["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         let item = &items[0];
-        let path = lookup_path(item["path"].as_str().unwrap());
-        let (map, _) = &f.maps[&path];
+        let path = match checked_wire_path(item["path"].as_str().unwrap()) {
+            Ok(path) => path,
+            Err(response) => return response.into_response(),
+        };
+        let (map, _) = &f.maps[path];
         let index: usize = item["chunk_index"].as_str().unwrap().parse().unwrap();
-        let bytes = f.bodies[&path]
+        let bytes = f.bodies[path]
             .chunks(CHUNK_SIZE as usize)
             .nth(index)
             .unwrap();
@@ -521,8 +556,12 @@ mod tests {
         State(f): State<Arc<Fixture>>,
         Query(query): Query<BTreeMap<String, String>>,
     ) -> Response {
+        let path = match checked_wire_path(&query["path"]) {
+            Ok(path) => path,
+            Err(response) => return response.into_response(),
+        };
         f.raw_calls.fetch_add(1, Ordering::SeqCst);
-        let bytes = &f.bodies[&lookup_path(&query["path"])];
+        let bytes = &f.bodies[path];
         Response::builder()
             .header("content-type", "application/octet-stream")
             .body(Body::from(bytes.clone()))
@@ -954,6 +993,95 @@ mod tests {
             5
         );
         assert_full_snapshot(&first, &first_reader, &server.fixture.versions[0]);
+    }
+
+    #[tokio::test]
+    async fn strict_http_paths_cover_owned_proven_and_compatibility_ranges_then_hydration() {
+        let server = Server::new(Fixture::new(true, false, true)).await;
+        let reader = server.reader().await;
+        let bytes = &server.fixture.bodies["/large0"];
+        assert!(bytes.len() > 2 * CHUNK_SIZE as usize);
+        let digest = digest_of(bytes);
+        // The actual HTTP fixture rejects a local manifest path. It never
+        // normalizes a malformed request before echoing the accepted wire path.
+        let rejected = reader
+            .client()
+            .chunk_map(reader.snapshot_id(), "large0", &digest)
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code, SnapshotErrorCode::InvalidRequest);
+        assert_eq!(rejected.http_status, 400);
+        assert_eq!(server.fixture.map_calls.load(Ordering::SeqCst), 0);
+
+        let range =
+            crate::snapshot::OwnedChunkedFile::open(&reader, "large0", &digest, bytes.len() as u64)
+                .await
+                .unwrap();
+        let offset = CHUNK_SIZE as usize - 3;
+        assert_eq!(
+            range
+                .read_range_owned(offset as u64, 9)
+                .await
+                .unwrap()
+                .as_bytes(),
+            &bytes[offset..offset + 9]
+        );
+        let proof = reader.prove_file("large1").await.unwrap();
+        let proven_range = crate::snapshot::OwnedChunkedFile::open_proven(&reader, proof)
+            .await
+            .unwrap();
+        let second = &server.fixture.bodies["/large1"];
+        assert_eq!(
+            proven_range
+                .read_range_owned(0, second.len() as u64)
+                .await
+                .unwrap()
+                .as_bytes(),
+            second
+        );
+        let compatibility_range =
+            crate::snapshot::ChunkedFile::open(&reader, "large0", &digest, bytes.len() as u64)
+                .await
+                .unwrap();
+        assert_eq!(
+            compatibility_range
+                .read_range(2 * CHUNK_SIZE as u64, 7)
+                .await
+                .unwrap(),
+            bytes[2 * CHUNK_SIZE as usize..]
+        );
+        assert_eq!(server.fixture.map_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(server.fixture.leaf_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(server.fixture.chunk_calls.load(Ordering::SeqCst), 6);
+
+        let small = reader.prove_file("d0/f000").await.unwrap();
+        for use_frames in [true, false] {
+            assert_eq!(
+                reader
+                    .read_proven_content(&small, use_frames)
+                    .await
+                    .unwrap()
+                    .as_bytes(),
+                &server.fixture.bodies["/d0/f000"]
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = DurableStore::open_for_workspace(
+            temp.path(),
+            "11111111-2222-4333-8444-555555555540",
+            &reader,
+        )
+        .unwrap();
+        let before = server.fixture.chunk_calls.load(Ordering::SeqCst);
+        let report = bounded_hydrate(&store, &reader).await;
+        assert!(report.complete);
+        assert_eq!(report.completion_kind, CompletionKind::FullSnapshot);
+        assert_eq!(report.fetched, 194);
+        assert_eq!(
+            server.fixture.chunk_calls.load(Ordering::SeqCst) - before,
+            6
+        );
+        assert_full_snapshot(&store, &reader, &server.fixture);
     }
 
     #[tokio::test]

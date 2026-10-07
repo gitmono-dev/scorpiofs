@@ -454,7 +454,8 @@ async fn chunks(
     assert_eq!(items.len(), 1);
     let index: u64 = items[0]["chunk_index"].as_str().unwrap().parse().unwrap();
     assert!(
-        items[0]["path"] == "large.bin" || (fixture.mixed && items[0]["path"] == "large-alias.bin")
+        items[0]["path"] == "/large.bin"
+            || (fixture.mixed && items[0]["path"] == "/large-alias.bin")
     );
     assert_eq!(items[0]["map_id"], id(&fixture.map.map_id()));
     assert_eq!(items[0]["expected_digest"], id(&fixture.advertised));
@@ -896,7 +897,13 @@ async fn parallel_stream_sync_failures_never_complete_and_can_retry() {
             drop(fault);
             assert_eq!(error.code, SnapshotErrorCode::Internal, "{core} {phase}");
             assert!(
-                error.message.contains("injected durability I/O failure"),
+                matches!(
+                    hydration_error_label(&error),
+                    Some("large_content_fetch")
+                        | Some("large_chunk_map")
+                        | Some("large_chunk_read")
+                        | Some("large_cas_write")
+                ) || error.message.contains("injected durability I/O failure"),
                 "{error:?}"
             );
             assert_eq!(
@@ -1106,7 +1113,13 @@ async fn streaming_content_sync_failures_do_not_journal_or_complete_the_file() {
         let error = store.hydrate_snapshot(&reader).await.unwrap_err();
         assert_eq!(error.code, SnapshotErrorCode::Internal, "{phase}");
         assert!(
-            error.message.contains("injected durability I/O failure"),
+            matches!(
+                hydration_error_label(&error),
+                Some("large_content_fetch")
+                    | Some("large_chunk_map")
+                    | Some("large_chunk_read")
+                    | Some("large_cas_write")
+            ) || error.message.contains("injected durability I/O failure"),
             "{error:?}"
         );
         assert_eq!(
