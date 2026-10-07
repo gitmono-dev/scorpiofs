@@ -185,6 +185,201 @@ fn unused() -> ContentBudgetUsage {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn local_access_modes_return_actual_paid_owners_without_holding_execution_slots() {
+    for access in [
+        LocalCasAccess::CallerEstablished,
+        LocalCasAccess::GrantCheckedOnReopen,
+    ] {
+        let (_temp, store, digest, budget, size) = fixture();
+        let scope = scope(1, 1, 1, 1);
+        let completion = scope
+            .run_local(
+                access,
+                ReplyAdmission::reserve(&budget).unwrap(),
+                REQUEST,
+                operation(store, digest, size, budget.clone(), None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scope.outstanding.available_permits(), 1);
+        assert_eq!(scope.running.available_permits(), 1);
+        assert_eq!(scope.process.outstanding.available_permits(), 1);
+        assert_eq!(scope.process.running.available_permits(), 1);
+        assert_eq!(budget.usage().construction_bytes, 0);
+        let owner = completion.result.unwrap().unwrap();
+        let pointer = owner.as_bytes().as_ptr();
+        let reply = completion.admission.cas_range(owner.clone()).unwrap();
+        assert_eq!(reply.as_ptr(), pointer);
+        let paid = budget.usage();
+        drop(owner);
+        let last = reply.clone().slice(17..31);
+        drop(reply);
+        drop(scope);
+        assert_eq!(last.as_ptr(), pointer.wrapping_add(17));
+        assert_eq!(last.as_ref(), &[0x71; 14]);
+        assert_eq!(budget.usage(), paid);
+        drop(last);
+        assert_eq!(budget.usage(), unused());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_cancelled_waiters_refund_only_their_actual_owners_and_running_work_stays_paid() {
+    for access in [
+        LocalCasAccess::CallerEstablished,
+        LocalCasAccess::GrantCheckedOnReopen,
+    ] {
+        let (_temp, store, digest, budget, size) = fixture();
+        let scope = scope(2, 1, 2, 1);
+        let gate = Controller::new();
+        let work = operation(store, digest, size, budget.clone(), Some(gate.0.clone()));
+        let working = scope.clone();
+        let admission = ReplyAdmission::reserve(&budget).unwrap();
+        let task =
+            tokio::spawn(async move { working.run_local(access, admission, REQUEST, work).await });
+        gate.entered().await;
+        assert_ne!(
+            gate.0.thread.lock().unwrap().unwrap(),
+            std::thread::current().id()
+        );
+        let held = budget.usage();
+        assert!(held.output_bytes > 4096 && held.construction_bytes > 1024 * 1024);
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = called.clone();
+        let waiting = scope.clone();
+        let admission = ReplyAdmission::reserve(&budget).unwrap();
+        let queued = tokio::spawn(async move {
+            waiting
+                .run_local(access, admission, REQUEST, move || {
+                    flag.store(true, Ordering::Release);
+                    WorkResult::<Owner>::local(Ok(None), None)
+                })
+                .await
+        });
+        until(|| scope.outstanding.available_permits() == 0).await;
+        let queued_paid = budget.usage();
+        let error = scope
+            .run_local(
+                access,
+                ReplyAdmission::reserve(&budget).unwrap(),
+                REQUEST,
+                || -> WorkResult<Owner> { panic!("rejected local work ran") },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, SnapshotErrorCode::LimitExceeded);
+        assert_eq!(budget.usage(), queued_paid);
+        queued.abort();
+        assert!(queued.await.err().unwrap().is_cancelled());
+        assert!(!called.load(Ordering::Acquire));
+        assert_eq!(budget.usage(), held);
+        task.abort();
+        assert!(task.await.err().unwrap().is_cancelled());
+        assert_eq!(budget.usage(), held);
+        assert_eq!(scope.outstanding.available_permits(), 1);
+        assert_eq!(scope.running.available_permits(), 0);
+        assert_eq!(scope.process.running.available_permits(), 0);
+        gate.0.release();
+        until(|| scope.outstanding.available_permits() == 2 && budget.usage() == unused()).await;
+        assert_eq!(scope.running.available_permits(), 1);
+        assert_eq!(scope.process.outstanding.available_permits(), 2);
+        assert_eq!(scope.process.running.available_permits(), 1);
+    }
+}
+
+#[test]
+fn local_pool_queued_cancellation_skips_actual_cas_open_and_retains_reply_until_cleanup() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for access in [
+            LocalCasAccess::CallerEstablished,
+            LocalCasAccess::GrantCheckedOnReopen,
+        ] {
+            let (_temp, store, digest, budget, size) = fixture();
+            let scope = scope(1, 1, 1, 1);
+            let blocker = Controller::new();
+            let blocking = blocker.0.clone();
+            let thread = tokio::task::spawn_blocking(move || blocking.block());
+            blocker.entered().await;
+            let called = Arc::new(AtomicBool::new(false));
+            let flag = called.clone();
+            let work = operation(store, digest, size, budget.clone(), None);
+            let waiting = scope.clone();
+            let admission = ReplyAdmission::reserve(&budget).unwrap();
+            let paid = budget.usage();
+            let task = tokio::spawn(async move {
+                waiting
+                    .run_local(access, admission, REQUEST, move || {
+                        flag.store(true, Ordering::Release);
+                        work()
+                    })
+                    .await
+            });
+            until(|| {
+                scope.outstanding.available_permits() == 0 && scope.running.available_permits() == 0
+            })
+            .await;
+            task.abort();
+            assert!(task.await.err().unwrap().is_cancelled());
+            assert_eq!(budget.usage(), paid);
+            assert_eq!(paid.construction_bytes, 0);
+            assert_eq!(scope.outstanding.available_permits(), 0);
+            blocker.0.release();
+            thread.await.unwrap();
+            until(|| scope.outstanding.available_permits() == 1 && budget.usage() == unused())
+                .await;
+            assert!(!called.load(Ordering::Acquire));
+            assert_eq!(scope.running.available_permits(), 1);
+            assert_eq!(scope.process.outstanding.available_permits(), 1);
+            assert_eq!(scope.process.running.available_permits(), 1);
+        }
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_worker_panic_is_terminal_and_refunds_every_admission() {
+    let (_temp, store, digest, budget, size) = fixture();
+    let scope = scope(1, 1, 1, 1);
+    let working_budget = budget.clone();
+    let error = scope
+        .run_local(
+            LocalCasAccess::CallerEstablished,
+            ReplyAdmission::reserve(&budget).unwrap(),
+            REQUEST,
+            move || {
+                let mut meters = LocalCasRangeMeters::default();
+                WorkResult::local(
+                    VerifiedCasRange::read_paused(
+                        &store,
+                        &digest,
+                        size,
+                        0,
+                        REQUEST.wanted,
+                        &working_budget,
+                        &mut meters,
+                        || panic!("local worker panic after real buffer admission"),
+                    ),
+                    Some(meters),
+                )
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert_eq!(budget.usage(), unused());
+    assert_eq!(scope.outstanding.available_permits(), 1);
+    assert_eq!(scope.running.available_permits(), 1);
+    assert_eq!(scope.process.outstanding.available_permits(), 1);
+    assert_eq!(scope.process.running.available_permits(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn heartbeat_and_running_cancellation_preserve_real_admitted_buffers_until_work_finishes() {
     let (_temp, store, digest, budget, size) = fixture();
     let scope = scope(1, 1, 1, 1);
