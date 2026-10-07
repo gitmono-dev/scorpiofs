@@ -420,9 +420,9 @@ impl Drop for WriteAdmission {
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(_) => false,
         };
-        if removed && self.intent_name.is_some() {
+        if let (true, Some(intent_name)) = (removed, &self.intent_name) {
             let intents = self.scope.join(INTENTS);
-            if fs::remove_file(intents.join(self.intent_name.as_ref().unwrap())).is_ok() {
+            if fs::remove_file(intents.join(intent_name)).is_ok() {
                 let _ = durable::sync_dir(&intents);
             }
         }

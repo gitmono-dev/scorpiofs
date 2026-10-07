@@ -288,7 +288,11 @@ impl PreparedRemoval {
         {
             return Err(io::Error::last_os_error());
         }
-        if current.st_dev != opened.dev()
+        // MetadataExt::dev uses u64 on Unix, while libc::dev_t is signed on
+        // macOS. Use the same conversion as the standard metadata accessor.
+        #[allow(clippy::unnecessary_cast)]
+        let current_device = current.st_dev as u64;
+        if current_device != opened.dev()
             || current.st_ino != opened.ino()
             || current.st_size < 0
             || current.st_size as u64 != self.expected.size

@@ -3517,8 +3517,7 @@ pub(super) fn audit_retention_metadata(
         validate_manifest_policy(&manifest, revision == SNAPSHOT_VERIFICATION_REVISION)?;
     let view_digest = digest_of(view_bytes);
     let manifest_digest = digest_of(manifest_bytes);
-    let grant_digest;
-    if revision == SNAPSHOT_VERIFICATION_REVISION {
+    let grant_digest = if revision == SNAPSHOT_VERIFICATION_REVISION {
         let descriptor_bytes = required(DESCRIPTOR_FILE)?;
         let index_bytes = required(METADATA_INDEX_FILE)?;
         let descriptor_digest = digest_of(descriptor_bytes);
@@ -3576,7 +3575,7 @@ pub(super) fn audit_retention_metadata(
                 ));
             }
         }
-        grant_digest = pin.offline_grant_digest;
+        pin.offline_grant_digest
     } else if revision == VERIFICATION_REVISION {
         let pin: PinRecord = decode_commit(pin_bytes, PIN_FILE)?;
         if pin.pin_id.is_empty()
@@ -3610,14 +3609,12 @@ pub(super) fn audit_retention_metadata(
                 ));
             }
         }
-        grant_digest = pin.offline_grant_digest;
+        pin.offline_grant_digest
     } else {
         return Err(integrity_err("unsupported retention pin revision"));
-    }
-    if !grant_digest.is_empty() {
-        if digest_of(required(OFFLINE_GRANT_FILE)?) != grant_digest {
-            return Err(integrity_err("retention offline metadata digest differs"));
-        }
+    };
+    if !grant_digest.is_empty() && digest_of(required(OFFLINE_GRANT_FILE)?) != grant_digest {
+        return Err(integrity_err("retention offline metadata digest differs"));
     }
     Ok(())
 }
