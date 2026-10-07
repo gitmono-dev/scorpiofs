@@ -29,9 +29,9 @@ use mst2_codec::{
 };
 use scorpiofs::snapshot::{
     capabilities::CapabilityAdvertisement, durable::digest_of, frames::parse_digest,
-    fuse::Mst2Fuse, DurableStore, FetchCoordinator, IncrementalSync, MetadataProofLimits,
-    Mst2Client, ResolveDelivery, ResolveRequest, ResolveTarget, ScopeCache, SnapshotErrorCode,
-    SnapshotFile, SnapshotReader,
+    fuse::Mst2Fuse, ContentBudgetLimits, DurableStore, FetchCoordinator, IncrementalSync,
+    MetadataProofLimits, Mst2Client, ResolveDelivery, ResolveRequest, ResolveTarget, ScopeCache,
+    SnapshotErrorCode, SnapshotFile, SnapshotReader,
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -42,6 +42,9 @@ const NAMESPACE_VIEW_ID: [u8; 32] = [0x22; 32];
 #[derive(Default)]
 struct Fixture {
     canonical: bool,
+    raw_only: bool,
+    lease_expiry: Option<String>,
+    renewal_requests: AtomicUsize,
     root: [u8; 32],
     pages: HashMap<[u8; 32], Vec<u8>>,
     routes: HashMap<(String, Vec<u8>), [u8; 32]>,
@@ -54,6 +57,10 @@ struct Fixture {
     frame_content: AtomicBool,
     object_requests: Mutex<Vec<Vec<String>>>,
     omit_object: AtomicBool,
+    object_bad_end: AtomicBool,
+    pause_objects: AtomicBool,
+    object_started: Notify,
+    object_release: Notify,
     object_barrier: Option<Arc<tokio::sync::Barrier>>,
     pause_blob: AtomicBool,
     fail_blob_once: AtomicBool,
@@ -241,9 +248,13 @@ fn wide_fixture() -> Fixture {
 
 async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
     if f.canonical {
-        return Json(
-            serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap(),
-        );
+        let mut value: Value =
+            serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap();
+        if f.raw_only {
+            value["features"]["small_objects"] = json!(false);
+            value["features"]["chunk_reads"] = json!(false);
+        }
+        return Json(value);
     }
     Json(json!({
         "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
@@ -261,7 +272,7 @@ async fn resolve(State(f): State<Arc<Fixture>>, body: Bytes) -> Json<Value> {
             "materialization_policy": 1, "fs_semantics": 1, "access_projection": 0,
             "metadata_root": id_string(&f.root), "snapshot_id": f.snapshot_id()
         },
-        "lease_id": "fixture-lease", "lease_expires_at": "2099-01-01T00:00:00Z",
+        "lease_id": "fixture-lease", "lease_expires_at": f.lease_expiry.as_deref().unwrap_or("2099-01-01T00:00:00Z"),
         "publication_sequence": "1", "authorization_epoch": "1"
     });
     if f.canonical {
@@ -280,6 +291,17 @@ async fn resolve(State(f): State<Arc<Fixture>>, body: Bytes) -> Json<Value> {
         response["delivery"] = json!("lazy");
     }
     Json(response)
+}
+
+async fn renew(State(f): State<Arc<Fixture>>) -> (StatusCode, Json<Value>) {
+    f.renewal_requests.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::FORBIDDEN,
+        Json(
+            json!({"error": {"code": "SCOPE_FORBIDDEN", "message": "fixture lease revoked",
+            "request_id": "fixture-renewal", "retryable": false}}),
+        ),
+    )
 }
 
 async fn metadata(
@@ -405,6 +427,10 @@ async fn objects(
     if let Some(barrier) = &f.object_barrier {
         barrier.wait().await;
     }
+    if f.pause_objects.load(Ordering::SeqCst) {
+        f.object_started.notify_one();
+        f.object_release.notified().await;
+    }
     if f.omit_object.swap(false, Ordering::SeqCst) {
         objects.pop();
     }
@@ -422,12 +448,16 @@ async fn objects(
         );
         1
     };
+    let mut request_digest = parse_digest(&digest_of(&body)).unwrap();
+    if f.object_bad_end.load(Ordering::SeqCst) {
+        request_digest[0] ^= 1;
+    }
     wire.extend(
         EndPayload {
             request_item_count: items.len() as u32,
             unique_unit_count: objects.len() as u32,
             logical_bytes,
-            request_body_sha256: parse_digest(&digest_of(&body)).unwrap(),
+            request_body_sha256: request_digest,
         }
         .encode(8, sequence),
     );
@@ -474,6 +504,7 @@ impl HttpFixture {
         let app = Router::new()
             .route("/api/v2/snapshots/capabilities", get(capabilities))
             .route("/api/v2/snapshots/resolve", post(resolve))
+            .route("/api/v2/snapshots/leases/{lease}/renew", post(renew))
             .route("/api/v2/snapshots/{sid}/metadata/pages", post(metadata))
             .route("/api/v2/snapshots/{sid}/blob", get(blob))
             .route("/api/v2/snapshots/{sid}/objects", post(objects))
@@ -861,6 +892,501 @@ async fn owned_lazy_fuse_propagates_page_open_errors_without_wire_fallback() {
         SnapshotErrorCode::Internal
     );
     assert!(http.fixture.requested_ids().is_empty());
+}
+
+fn small_cas_fixture(link_target: &[u8]) -> Fixture {
+    let mut fixture = Fixture::default();
+    let body = vec![0x6a; 8192];
+    let large = vec![0x8b; 2 * 1024 * 1024];
+    let big_small = vec![0xa7; 246 * 1024];
+    let mut entries = vec![
+        file_entry("alpha", EntryKind::Regular, &body),
+        file_entry("big-small", EntryKind::Regular, &big_small),
+        file_entry("empty", EntryKind::Regular, b""),
+        file_entry("exec", EntryKind::Executable, &body),
+        file_entry("large", EntryKind::Regular, &large),
+        file_entry("link", EntryKind::Symlink, link_target),
+    ];
+    fixture.expect_file("alpha", "regular", &body);
+    fixture.expect_file("big-small", "regular", &big_small);
+    fixture.expect_file("empty", "regular", b"");
+    fixture.expect_file("exec", "executable", &body);
+    fixture.expect_file("large", "regular", &large);
+    fixture.expect_file("link", "symlink", link_target);
+    for index in 0..64 {
+        let name = format!("alias{index:03}");
+        entries.push(file_entry(&name, EntryKind::Regular, &body));
+        fixture.expect_file(&name, "regular", &body);
+    }
+    fixture.root = fixture.leaf("/", entries);
+    fixture
+}
+
+fn cas_path(store: &DurableStore, body: &[u8]) -> std::path::PathBuf {
+    store
+        .content_dir()
+        .join(hex::encode(parse_digest(&digest_of(body)).unwrap()))
+}
+
+async fn owned_small_cas_view(
+    http: &HttpFixture,
+    reader: &SnapshotReader,
+    root: &std::path::Path,
+    fill_cas: bool,
+) -> (Arc<DurableStore>, Arc<Mst2Fuse>) {
+    let (store, cache) = owned_fuse_page_cache(root, reader);
+    let closure = IncrementalSync::new(reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    // Reuse the real complete metadata proof exactly as full hydration seeds
+    // membership. These controlled CAS fixtures make no COMPLETE/pin claim.
+    reader.seed_content_membership(&closure).unwrap();
+    if fill_cas {
+        for body in http.fixture.blobs.values() {
+            std::fs::write(cas_path(&store, body), body).unwrap();
+        }
+    }
+    let fs = Arc::new(
+        Mst2Fuse::from_reader_lazy(reader.clone(), Some(store.clone()))
+            .await
+            .unwrap(),
+    );
+    (store, fs)
+}
+
+async fn root_file_inode(fs: &Mst2Fuse, name: &str) -> u64 {
+    fs.lookup(Request::default(), 1, OsStr::new(name))
+        .await
+        .unwrap()
+        .attr
+        .ino
+}
+
+async fn small_read(
+    fs: &Mst2Fuse,
+    name: &str,
+    offset: u64,
+    size: u32,
+) -> asyncfuse::raw::reply::ReplyData {
+    let inode = root_file_inode(fs, name).await;
+    fs.read(Request::default(), inode, inode, offset, size)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn owned_cas_aliases_share_the_actual_reply_owner_and_last_bytes_keep_credit() {
+    let http = HttpFixture::start_canonical(small_cas_fixture(b"alpha")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    http.fixture.requests.lock().unwrap().clear();
+    let slots = reader.content_usage().output_bytes;
+    let alpha = root_file_inode(&fs, "alpha").await;
+    let first = fs
+        .read(Request::default(), alpha, alpha, 0, 8192)
+        .await
+        .unwrap();
+    let paid = reader.content_usage().output_bytes - slots;
+    assert!(paid >= 8192);
+    assert_eq!(reader.content_usage().construction_bytes, 0);
+    // All 64 aliases and the executable must now work from the same owner.
+    // Removing its local object detects a second CAS read or body fallback.
+    std::fs::remove_file(cas_path(&store, &http.fixture.blobs["/alpha"])).unwrap();
+    let mut inodes = HashSet::from([alpha]);
+    for name in (0..64)
+        .map(|index| format!("alias{index:03}"))
+        .chain(["exec".into()])
+    {
+        let inode = root_file_inode(&fs, &name).await;
+        assert!(inodes.insert(inode), "content sharing never merges inodes");
+        let reply = fs
+            .read(Request::default(), inode, inode, 17, 31)
+            .await
+            .unwrap();
+        assert_eq!(reply.data.as_ptr(), first.data.as_ptr().wrapping_add(17));
+        assert_eq!(reply.data.as_ref(), &[0x6a; 31]);
+    }
+    assert_eq!(reader.content_usage().output_bytes, slots + paid);
+    assert!(
+        http.fixture.requested_ids().is_empty(),
+        "seeded membership avoids metadata RPC"
+    );
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+    let clone = first.data.clone();
+    let last = clone.slice(23..41);
+    drop(first);
+    drop(clone);
+    drop(fs);
+    assert_eq!(reader.content_usage().output_bytes, paid);
+    assert_eq!(last.as_ref(), &[0x6a; 18]);
+    drop(last);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn owned_cas_readlink_rejects_nul_and_empty_or_eof_read_retains_no_payload() {
+    let http = HttpFixture::start_canonical(small_cas_fixture(b"alpha")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    let baseline = reader.content_usage().output_bytes;
+    for (name, offset, size) in [
+        ("empty", 0, 1),
+        ("alpha", 0, 0),
+        ("alpha", 8192, 1),
+        ("large", u64::MAX, u32::MAX),
+    ] {
+        assert!(small_read(&fs, name, offset, size).await.data.is_empty());
+        assert_eq!(reader.content_usage().output_bytes, baseline);
+    }
+    let link = root_file_inode(&fs, "link").await;
+    let first = fs.readlink(Request::default(), link).await.unwrap();
+    let second = fs.readlink(Request::default(), link).await.unwrap();
+    assert_eq!(first.data.as_ref(), b"alpha");
+    assert_eq!(first.data.as_ptr(), second.data.as_ptr());
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+
+    let bad = HttpFixture::start_canonical(small_cas_fixture(b"al\0pha")).await;
+    let bad_reader = bad.canonical_reader().await;
+    let bad_root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&bad, &bad_reader, bad_root.path(), true).await;
+    let baseline = bad_reader.content_usage().output_bytes;
+    let link = root_file_inode(&fs, "link").await;
+    for _ in 0..2 {
+        assert!(fs.readlink(Request::default(), link).await.is_err());
+        assert_eq!(bad_reader.content_usage().output_bytes, baseline);
+    }
+    assert!(bad.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(bad.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn owned_cas_integrity_and_regular_file_errors_never_fall_back_to_http() {
+    for fault in ["hash", "size", "directory"] {
+        let http = HttpFixture::start_canonical(small_cas_fixture(b"alpha")).await;
+        let reader = http.canonical_reader().await;
+        let root = tempfile::tempdir().unwrap();
+        let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+        let body = &http.fixture.blobs["/alpha"];
+        let path = cas_path(&store, body);
+        match fault {
+            "hash" => std::fs::write(&path, vec![0x6b; body.len()]).unwrap(),
+            "size" => std::fs::write(&path, &body[..body.len() - 1]).unwrap(),
+            _ => {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            }
+        }
+        let baseline = reader.content_usage().output_bytes;
+        let inode = root_file_inode(&fs, "alpha").await;
+        for _ in 0..2 {
+            assert!(fs
+                .read(Request::default(), inode, inode, 0, 1)
+                .await
+                .is_err());
+            assert_eq!(reader.content_usage().output_bytes, baseline);
+            assert_eq!(reader.content_usage().construction_bytes, 0);
+        }
+        assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+        assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+        if fault == "directory" {
+            std::fs::remove_dir(&path).unwrap();
+        }
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(small_read(&fs, "alpha", 0, 1).await.data.as_ref(), [0x6a]);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_cas_final_symlink_is_an_error_even_when_its_target_matches() {
+    let http = HttpFixture::start_canonical(small_cas_fixture(b"alpha")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    let body = &http.fixture.blobs["/alpha"];
+    let path = cas_path(&store, body);
+    std::fs::remove_file(&path).unwrap();
+    let outside = root.path().join("outside-blob");
+    std::fs::write(&outside, body).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    let baseline = reader.content_usage().output_bytes;
+    let inode = root_file_inode(&fs, "alpha").await;
+    assert!(fs
+        .read(Request::default(), inode, inode, 0, 1)
+        .await
+        .is_err());
+    assert_eq!(reader.content_usage().output_bytes, baseline);
+    assert_eq!(std::fs::read(outside).unwrap().as_slice(), body.as_slice());
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn owned_cas_missing_object_uses_paid_transport_and_bad_end_publishes_no_cache() {
+    let http = HttpFixture::start_canonical(small_cas_fixture(b"alpha")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    let baseline = reader.content_usage().output_bytes;
+    let inode = root_file_inode(&fs, "alpha").await;
+    http.fixture.object_bad_end.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(fs
+            .read(Request::default(), inode, inode, 0, 1)
+            .await
+            .is_err());
+        assert_eq!(reader.content_usage().output_bytes, baseline);
+    }
+    assert_eq!(http.fixture.object_requests.lock().unwrap().len(), 2);
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+    http.fixture.object_bad_end.store(false, Ordering::SeqCst);
+    let first = small_read(&fs, "alpha", 0, 8192).await;
+    let alias = small_read(&fs, "alias000", 7, 19).await;
+    assert_eq!(alias.data.as_ptr(), first.data.as_ptr().wrapping_add(7));
+    assert_eq!(http.fixture.object_requests.lock().unwrap().len(), 3);
+    drop(first);
+    drop(alias);
+    drop(fs);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn owned_cas_missing_object_can_use_accounted_raw_transport_without_reply_copy() {
+    let mut fixture = small_cas_fixture(b"alpha");
+    fixture.raw_only = true;
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    let first = small_read(&fs, "alpha", 0, 8192).await;
+    let alias = small_read(&fs, "alias000", 31, 7).await;
+    assert_eq!(alias.data.as_ptr(), first.data.as_ptr().wrapping_add(31));
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 1);
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    drop(fs);
+    let paid = reader.content_usage().output_bytes;
+    assert!(paid >= 8192);
+    drop(first);
+    assert!(reader.content_usage().output_bytes > 0);
+    drop(alias);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn owned_cas_capacity_failure_does_not_try_a_compatibility_body_or_false_eof() {
+    let http = HttpFixture::start_canonical(small_cas_fixture(b"alpha")).await;
+    let reader = http
+        .canonical_reader()
+        .await
+        .with_content_limits(ContentBudgetLimits::new(192 * 1024, 64 * 1024).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    let baseline = reader.content_usage().output_bytes;
+    let inode = root_file_inode(&fs, "big-small").await;
+    for _ in 0..2 {
+        assert!(fs
+            .read(Request::default(), inode, inode, 0, 1)
+            .await
+            .is_err());
+        assert_eq!(reader.content_usage().output_bytes, baseline);
+        assert_eq!(reader.content_usage().construction_bytes, 0);
+    }
+    assert!(fs
+        .read(Request::default(), inode, inode, 246 * 1024, 1)
+        .await
+        .unwrap()
+        .data
+        .is_empty());
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+fn expiring_cas_fixture() -> Fixture {
+    let mut fixture = small_cas_fixture(b"alpha");
+    let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(6);
+    fixture.lease_expiry = Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        expiry.year(),
+        u8::from(expiry.month()),
+        expiry.day(),
+        expiry.hour(),
+        expiry.minute(),
+        expiry.second()
+    ));
+    fixture
+}
+
+async fn wait_for_cas_revocation(http: &HttpFixture, reader: &SnapshotReader) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while http.fixture.renewal_requests.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        reader.ensure_lease().await.unwrap_err().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+}
+
+#[tokio::test]
+async fn owned_cas_current_lease_gates_open_cached_read_readlink_small_and_large_eof() {
+    let http = HttpFixture::start_canonical(expiring_cas_fixture()).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    let alpha = root_file_inode(&fs, "alpha").await;
+    let link = root_file_inode(&fs, "link").await;
+    let large = root_file_inode(&fs, "large").await;
+    let first = fs
+        .read(Request::default(), alpha, alpha, 0, 8192)
+        .await
+        .unwrap();
+    drop(fs.readlink(Request::default(), link).await.unwrap());
+    assert_eq!(
+        fs.read(Request::default(), large, large, 37, 19)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        &[0x8b; 19]
+    );
+    wait_for_cas_revocation(&http, &reader).await;
+    assert!(fs
+        .open(Request::default(), alpha, libc::O_RDONLY as u32)
+        .await
+        .is_err());
+    for inode in [alpha, large] {
+        for (offset, size) in [(0, 1), (0, 0), (u64::MAX, u32::MAX)] {
+            assert_eq!(
+                i32::from(
+                    fs.read(Request::default(), inode, inode, offset, size)
+                        .await
+                        .unwrap_err()
+                ),
+                -libc::EACCES
+            );
+        }
+    }
+    assert_eq!(
+        i32::from(fs.readlink(Request::default(), link).await.unwrap_err()),
+        -libc::EACCES
+    );
+    assert_eq!(
+        first.data.as_ref(),
+        &[0x6a; 8192],
+        "already delivered bytes retain their owner"
+    );
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn owned_cas_lease_failure_during_a_body_rejects_before_cache_and_reply_publication() {
+    let fixture = expiring_cas_fixture();
+    fixture.pause_objects.store(true, Ordering::SeqCst);
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    let baseline = reader.content_usage().output_bytes;
+    let inode = root_file_inode(&fs, "alpha").await;
+    let reading = fs.clone();
+    let task =
+        tokio::spawn(async move { reading.read(Request::default(), inode, inode, 0, 1).await });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        http.fixture.object_started.notified(),
+    )
+    .await
+    .unwrap();
+    wait_for_cas_revocation(&http, &reader).await;
+    http.fixture.object_release.notify_one();
+    assert_eq!(i32::from(task.await.unwrap().unwrap_err()), -libc::EACCES);
+    assert_eq!(reader.content_usage().output_bytes, baseline);
+    assert_eq!(reader.content_usage().construction_bytes, 0);
+    assert_eq!(http.fixture.object_requests.lock().unwrap().len(), 1);
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn canonical_nonowned_store_keeps_its_existing_cas_and_reply_copy_path() {
+    let http = HttpFixture::start_canonical(small_cas_fixture(b"alpha")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableStore::open_for_reader(root.path().join("view"), root.path().join("cas"), &reader)
+            .unwrap(),
+    );
+    assert!(store.workspace_binding().unwrap().is_none());
+    let body = &http.fixture.blobs["/alpha"];
+    std::fs::write(cas_path(&store, body), body).unwrap();
+    let fs = Mst2Fuse::from_reader_lazy(reader.clone(), Some(store))
+        .await
+        .unwrap();
+    let first = small_read(&fs, "alpha", 0, 31).await;
+    let second = small_read(&fs, "alpha", 0, 31).await;
+    assert_eq!(first.data.as_ref(), second.data.as_ref());
+    assert_ne!(first.data.as_ptr(), second.data.as_ptr());
+    assert_eq!(reader.content_usage().output_bytes, 0);
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn owned_cas_unseeded_lazy_reads_prove_each_alias_without_walking_unrelated_paths() {
+    let fixture = complete_fixture("a", b"target-one");
+    let unrelated = fixture.routes[&("/other".into(), vec![])];
+    *fixture.omit.lock().unwrap() = Some(unrelated);
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, _cache) = owned_fuse_page_cache(root.path(), &reader);
+    let body = &http.fixture.blobs["/a/f.txt"];
+    std::fs::write(cas_path(&store, body), body).unwrap();
+    let fs = Mst2Fuse::from_reader_lazy(reader, Some(store.clone()))
+        .await
+        .unwrap();
+    let a = root_file_inode(&fs, "a").await;
+    let file = fs
+        .lookup(Request::default(), a, OsStr::new("f.txt"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    http.fixture.requests.lock().unwrap().clear();
+    let first = fs.read(Request::default(), file, file, 0, 6).await.unwrap();
+    let expected = [
+        id_string(&http.fixture.root),
+        id_string(&http.fixture.routes[&("/a".into(), vec![])]),
+    ];
+    assert_eq!(http.fixture.requested_ids(), expected);
+    std::fs::remove_file(cas_path(&store, body)).unwrap();
+    let alias = root_file_inode(&fs, "alias").await;
+    let alias_file = fs
+        .lookup(Request::default(), alias, OsStr::new("f.txt"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    assert_ne!(file, alias_file);
+    http.fixture.requests.lock().unwrap().clear();
+    let second = fs
+        .read(Request::default(), alias_file, alias_file, 1, 3)
+        .await
+        .unwrap();
+    assert_eq!(second.data.as_ptr(), first.data.as_ptr().wrapping_add(1));
+    assert_eq!(
+        http.fixture.requested_ids(),
+        expected,
+        "the alias proves its own logical path before sharing bytes"
+    );
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
 }
 
 async fn pin(cache: &ScopeCache, reader: &SnapshotReader, fixture: &Fixture) {

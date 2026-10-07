@@ -10,6 +10,7 @@ use bytes::Bytes;
 
 use super::{
     content::{BudgetClass, Reservation},
+    fuse_store::StoreContent,
     OwnedChunkedFile, ProvenSnapshotFile, SnapshotError, SnapshotErrorCode, SnapshotReader,
     VerifiedContent, VerifiedRange,
 };
@@ -114,12 +115,14 @@ impl OwnedFuseCache {
 enum Payload {
     Content(Arc<VerifiedContent>),
     Range(Arc<VerifiedRange>),
+    Store(StoreContent),
 }
 impl AsRef<[u8]> for Payload {
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::Content(owner) => owner.as_bytes(),
             Self::Range(owner) => owner.as_bytes(),
+            Self::Store(owner) => owner.as_bytes(),
         }
     }
 }
@@ -161,6 +164,14 @@ impl ReplyAdmission {
     pub(crate) fn range(self, owner: Arc<VerifiedRange>) -> Result<Bytes, SnapshotError> {
         let end = owner.len();
         self.publish(Payload::Range(owner), 0, end)
+    }
+    pub(crate) fn store_content(
+        self,
+        owner: StoreContent,
+        start: usize,
+        end: usize,
+    ) -> Result<Bytes, SnapshotError> {
+        self.publish(Payload::Store(owner), start, end)
     }
     fn publish(self, payload: Payload, start: usize, end: usize) -> Result<Bytes, SnapshotError> {
         if start >= end || payload.as_ref().get(start..end).is_none() {
