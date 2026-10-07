@@ -186,6 +186,7 @@ class ProjectionCollector:
         self.directory_bindings = {}
         self.record_identity = None
         self.allowed = set()
+        self.registered = {}
         self.finals = {}
         self.last_bytes = b""
         self._directory(self.cache, private=False)
@@ -350,11 +351,22 @@ class ProjectionCollector:
                 time.sleep(min(.01, max(0, until - time.monotonic())))
         raise TraceRejected("native projection durable acknowledgement incomplete")
 
-    def collect(self, measured, native, identity, logical_id, deadline):
+    def register(self, measured, logical_id):
+        """Admit actual validated receipt IDs before reading shared trace files."""
         attempts = receipt_ids(measured.get("resolve_trace_receipt"), logical_id)
         if self.allowed.intersection(attempts):
             reject()
         self.allowed.update(attempts)
+        self.registered[logical_id] = tuple(attempts)
+
+    def collect(self, measured, native, identity, logical_id, deadline):
+        self.register(measured, logical_id)
+        return self.collect_registered(measured, native, identity, logical_id, deadline)
+
+    def collect_registered(self, measured, native, identity, logical_id, deadline):
+        attempts = receipt_ids(measured.get("resolve_trace_receipt"), logical_id)
+        if self.registered.get(logical_id) != tuple(attempts) or attempts[-1] in self.finals:
+            reject()
         final = attempts[-1]
         status, payloads = self._wait(deadline, required_id=final)
         payload = payloads[final]
@@ -379,6 +391,8 @@ class ProjectionCollector:
 
     def finish(self, expected, deadline):
         status, payloads = self._wait(deadline, closed=True)
-        if len(self.finals) != expected or any(payloads.get(key) != value for key, value in self.finals.items()):
+        if (len(self.finals) != expected
+                or set(self.finals) != {attempts[-1] for attempts in self.registered.values()}
+                or any(payloads.get(key) != value for key, value in self.finals.items())):
             reject()
         return status

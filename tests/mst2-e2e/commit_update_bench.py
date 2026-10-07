@@ -629,6 +629,8 @@ def parser():
     p.add_argument("--run-root", type=Path, required=True)
     p.add_argument("--publication-mode", choices=("native",), default="native")
     p.add_argument("--projection-traces", action="store_true")
+    from workspace_update_build import add_arguments
+    add_arguments(p)
     p.add_argument("--profile", choices=("medium", "smoke"), default="medium")
     p.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     p.add_argument("--deadline-seconds", type=int, choices=range(60, 14401), default=14400)
