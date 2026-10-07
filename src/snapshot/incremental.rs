@@ -583,9 +583,7 @@ pub struct IncrementalSync<'a> {
     meters: SyncMeters,
     reused_page_ids: HashSet<String>,
     rehashed_page_ids: HashSet<[u8; 32]>,
-    page_pool: BTreeMap<String, Vec<u8>>,
     closure_meters: SnapshotClosureMeters,
-    collect_snapshot_pages: bool,
 }
 
 impl<'a> IncrementalSync<'a> {
@@ -598,9 +596,7 @@ impl<'a> IncrementalSync<'a> {
             meters: SyncMeters::default(),
             reused_page_ids: HashSet::new(),
             rehashed_page_ids: HashSet::new(),
-            page_pool: BTreeMap::new(),
             closure_meters: SnapshotClosureMeters::default(),
-            collect_snapshot_pages: false,
         }
     }
 
@@ -620,9 +616,7 @@ impl<'a> IncrementalSync<'a> {
         self.meters = SyncMeters::default();
         self.reused_page_ids.clear();
         self.rehashed_page_ids.clear();
-        self.page_pool.clear();
         self.closure_meters = SnapshotClosureMeters::default();
-        self.collect_snapshot_pages = false;
         Ok(())
     }
 
@@ -631,7 +625,6 @@ impl<'a> IncrementalSync<'a> {
     /// of this API. Full proof still visits the entire logical namespace.
     pub async fn sync_snapshot(&mut self) -> Result<ValidatedSnapshotClosure, SnapshotError> {
         self.reset()?;
-        self.collect_snapshot_pages = true;
         if !self.reader.capabilities().features.metadata_pages {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
@@ -677,7 +670,6 @@ impl<'a> IncrementalSync<'a> {
         self.meters.reused_pages = self.reused_page_ids.len() as u64;
         self.closure_meters = meters;
         transaction.commit(self.cache, &mut self.meters)?;
-        self.page_pool.clear();
         Ok(closure)
     }
 
@@ -690,21 +682,19 @@ impl<'a> IncrementalSync<'a> {
     pub async fn sync(&mut self) -> Result<Vec<SnapshotFile>, SnapshotError> {
         self.reset()?;
         let mut transaction = self.cache.sync_transaction(&mut self.meters).await?;
-        let files = self.acquire(&mut transaction, false).await?;
+        let files = self.acquire(&mut transaction).await?;
         for file in &files {
             self.reader
                 .authorized_context()
                 .validate_relative_path(&file.rel_path)?;
         }
         transaction.commit(self.cache, &mut self.meters)?;
-        self.page_pool.clear();
         Ok(files)
     }
 
     async fn acquire(
         &mut self,
         transaction: &mut ClosureTransaction,
-        full_snapshot: bool,
     ) -> Result<Vec<SnapshotFile>, SnapshotError> {
         const PAGE_BATCH: usize = 64;
 
@@ -744,33 +734,26 @@ impl<'a> IncrementalSync<'a> {
                     match &$parent {
                         Some(parent_path) => {
                             if let Some(ps) = states.get_mut(parent_path) {
-                                if !full_snapshot {
-                                    ps.files.extend(record.files.into_iter().map(|f| {
-                                        SnapshotFile {
-                                            rel_path: with_prefix(&f.rel_path, &$base),
-                                            ..f
-                                        }
+                                ps.files
+                                    .extend(record.files.into_iter().map(|f| SnapshotFile {
+                                        rel_path: with_prefix(&f.rel_path, &$base),
+                                        ..f
                                     }));
-                                }
                                 ps.page_ids.extend(record.page_ids);
-                                if !full_snapshot {
-                                    ps.total_entries = ps
-                                        .total_entries
-                                        .checked_add(record.total_entries)
-                                        .ok_or_else(|| {
-                                            SnapshotError::new(
-                                                SnapshotErrorCode::LimitExceeded,
-                                                "entry count overflow",
-                                            )
-                                        })?;
-                                }
+                                ps.total_entries = ps
+                                    .total_entries
+                                    .checked_add(record.total_entries)
+                                    .ok_or_else(|| {
+                                        SnapshotError::new(
+                                            SnapshotErrorCode::LimitExceeded,
+                                            "entry count overflow",
+                                        )
+                                    })?;
                                 ps.pending_children -= 1;
                             }
                         }
                         None => {
-                            if !full_snapshot {
-                                files_out = record.files;
-                            }
+                            files_out = record.files;
                         }
                     }
                     true
@@ -897,9 +880,6 @@ impl<'a> IncrementalSync<'a> {
                     ));
                 }
                 self.cache.put_page(&id, &bytes)?;
-                if self.collect_snapshot_pages {
-                    self.page_pool.insert(id.clone(), bytes.clone());
-                }
                 by_id.insert(id, bytes);
             }
 
@@ -954,7 +934,7 @@ impl<'a> IncrementalSync<'a> {
                                 format!("sha256:{}", crate::snapshot::frames::hex32(&e.child_root)),
                             ));
                         }
-                        kind if !full_snapshot => {
+                        kind => {
                             let fs_kind = match kind {
                                 mst2_codec::metapage::EntryKind::Regular => "regular",
                                 mst2_codec::metapage::EntryKind::Executable => "executable",
@@ -972,7 +952,6 @@ impl<'a> IncrementalSync<'a> {
                             });
                             self.meters.acquisition_file_entries += 1;
                         }
-                        _ => {}
                     }
                     Ok(())
                 };
@@ -1024,31 +1003,26 @@ impl<'a> IncrementalSync<'a> {
 
                 let mut page_ids: Vec<String> = st.page_ids.into_iter().collect();
                 page_ids.sort();
-                // The file-only API builds records from this walk. Full
-                // snapshots derive every record from the independent proof
-                // below, so do not construct temporary subtree manifests.
-                if !full_snapshot {
-                    transaction.put_record(ClosureRecord {
-                        auth_domain: self.auth_domain.clone(),
-                        metadata_codec: self.codec,
-                        policy_revision: POLICY_REVISION,
-                        root_page_id: st.root_page_id.clone(),
-                        page_ids: page_ids.clone(),
-                        total_entries: st.total_entries,
-                        files: st.files.clone(),
-                        pin_ref: self.reader.snapshot_id().to_string(),
-                    });
-                }
+                // This file-only walk builds records from its verified pages.
+                // Full snapshots build records in the separate root proof.
+                transaction.put_record(ClosureRecord {
+                    auth_domain: self.auth_domain.clone(),
+                    metadata_codec: self.codec,
+                    policy_revision: POLICY_REVISION,
+                    root_page_id: st.root_page_id.clone(),
+                    page_ids: page_ids.clone(),
+                    total_entries: st.total_entries,
+                    files: st.files.clone(),
+                    pin_ref: self.reader.snapshot_id().to_string(),
+                });
 
                 match st.parent.clone() {
                     Some(parent_path) => {
                         if let Some(ps) = states.get_mut(&parent_path) {
-                            if !full_snapshot {
-                                ps.files.extend(st.files.into_iter().map(|f| SnapshotFile {
-                                    rel_path: with_prefix(&f.rel_path, &st.base),
-                                    ..f
-                                }));
-                            }
+                            ps.files.extend(st.files.into_iter().map(|f| SnapshotFile {
+                                rel_path: with_prefix(&f.rel_path, &st.base),
+                                ..f
+                            }));
                             ps.page_ids.extend(page_ids);
                             ps.total_entries = ps
                                 .total_entries
@@ -1109,15 +1083,10 @@ impl<'a> IncrementalSync<'a> {
                 return Ok(None);
             }
         }
-        let files = if self.collect_snapshot_pages {
-            Vec::new()
-        } else {
-            self.meters.reused_file_entries_copied += record.files.len() as u64;
-            record.files.clone()
-        };
+        self.meters.reused_file_entries_copied += record.files.len() as u64;
         let reused = ReusedSubtree {
             page_ids: record.page_ids.clone(),
-            files,
+            files: record.files.clone(),
             total_entries: record.total_entries,
         };
         self.reused_page_ids.extend(record.page_ids.iter().cloned());
@@ -1144,26 +1113,19 @@ impl<'a> IncrementalSync<'a> {
 
 impl SnapshotPageSource for IncrementalSync<'_> {
     fn cached_page(&mut self, id: &str) -> Result<Option<Vec<u8>>, SnapshotError> {
-        if let Some(bytes) = self.page_pool.get(id) {
-            return Ok(Some(bytes.clone()));
-        }
         let bytes = self.cache.read_page_verified_counted(
             id,
             &mut self.meters,
             &mut self.rehashed_page_ids,
         )?;
-        if let Some(bytes) = &bytes {
+        if bytes.is_some() {
             self.reused_page_ids.insert(id.to_owned());
-            if self.collect_snapshot_pages {
-                self.page_pool.insert(id.to_owned(), bytes.clone());
-            }
         }
         Ok(bytes)
     }
 
     fn received_page(&mut self, id: &str, bytes: &[u8]) -> Result<(), SnapshotError> {
         self.cache.put_page(id, bytes)?;
-        self.page_pool.insert(id.to_owned(), bytes.to_vec());
         self.meters.fetched_pages += 1;
         Ok(())
     }
