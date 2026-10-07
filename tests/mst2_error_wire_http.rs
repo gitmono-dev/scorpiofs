@@ -57,7 +57,7 @@ async fn every_spec_error_preserves_legacy_fallback_and_actual_http_status() {
         ("LEASE_EXPIRED", 410, LeaseExpired),
         ("SNAPSHOT_GONE", 410, SnapshotGone),
         ("SNAPSHOT_NOT_READY", 503, SnapshotNotReady),
-        ("METADATA_NOT_READY", 503, Internal),
+        ("METADATA_NOT_READY", 503, MetadataNotReady),
         ("OBJECT_UNAVAILABLE", 503, ObjectUnavailable),
         ("INTEGRITY_ERROR", 502, IntegrityError),
         ("CURSOR_STALE", 409, CursorStale),
@@ -308,17 +308,18 @@ fn explicit_canonical_parser_retains_all_spec_error_types() {
 }
 
 #[test]
-fn original_public_error_enum_still_supports_exhaustive_external_matches() {
+fn public_error_enum_supports_exhaustive_external_matches() {
     fn classify(code: SnapshotErrorCode) -> bool {
         use SnapshotErrorCode::*;
         match code {
             ScopeInvalid | InvalidRequest | LimitExceeded | Unauthenticated | ScopeForbidden
-            | ViewNotFound | SnapshotNotReady | SnapshotGone | PathNotFound | NotDirectory
-            | UnsupportedEntry | LeaseUnknown | LeaseExpired | CursorInvalid | CursorStale
-            | ProofBudgetExceeded | DigestMismatch | IntegrityError | ObjectUnavailable
-            | RangeNotSupported | SymlinkTraversal | DurableViewConflict | TemporaryUnavailable
-            | Internal => true,
+            | ViewNotFound | SnapshotNotReady | MetadataNotReady | SnapshotGone | PathNotFound
+            | NotDirectory | UnsupportedEntry | LeaseUnknown | LeaseExpired | CursorInvalid
+            | CursorStale | ProofBudgetExceeded | DigestMismatch | IntegrityError
+            | ObjectUnavailable | RangeNotSupported | SymlinkTraversal | DurableViewConflict
+            | TemporaryUnavailable | Internal => true,
         }
     }
     assert!(classify(SnapshotErrorCode::Internal));
+    assert!(classify(SnapshotErrorCode::MetadataNotReady));
 }

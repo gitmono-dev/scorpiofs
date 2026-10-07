@@ -48,6 +48,26 @@ pub(crate) struct VerifiedSubtreeFacts {
     pub total_entries: u64,
 }
 
+fn take_subtree_fact(
+    fact: Arc<VerifiedSubtreeFacts>,
+    meters: &mut SnapshotClosureMeters,
+) -> VerifiedSubtreeFacts {
+    // Collection normally consumes the memo's last owner. Preserve a shared
+    // caller's facts while avoiding another copy of every subtree manifest.
+    match Arc::try_unwrap(fact) {
+        Ok(fact) => fact,
+        Err(fact) => {
+            meters.fact_file_copies += fact.files.len() as u64;
+            VerifiedSubtreeFacts {
+                root_page_id: fact.root_page_id.clone(),
+                page_ids: fact.page_ids.clone(),
+                files: fact.files.clone(),
+                total_entries: fact.total_entries,
+            }
+        }
+    }
+}
+
 /// A logical directory, including the scope root and empty directories.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,17 +136,8 @@ impl ValidatedSnapshotClosure {
             }
             let mut facts: Vec<_> = memo
                 .into_values()
-                .map(|fact| VerifiedSubtreeFacts {
-                    root_page_id: fact.root_page_id.clone(),
-                    page_ids: fact.page_ids.clone(),
-                    files: fact.files.clone(),
-                    total_entries: fact.total_entries,
-                })
+                .map(|fact| take_subtree_fact(fact, &mut meters))
                 .collect();
-            meters.fact_file_copies += facts
-                .iter()
-                .map(|fact| fact.files.len() as u64)
-                .sum::<u64>();
             facts.sort_by(|a, b| a.root_page_id.cmp(&b.root_page_id));
             facts
         } else {
@@ -661,6 +672,73 @@ mod tests {
             ],
         );
         (serving("/project", root), pages)
+    }
+
+    #[test]
+    fn subtree_fact_moves_unique_allocations_and_clones_shared_owners() {
+        let make_fact = || {
+            Arc::new(VerifiedSubtreeFacts {
+                root_page_id: "root".into(),
+                page_ids: vec!["root".into(), "child".into()],
+                files: vec![SnapshotFile {
+                    rel_path: "nested/file".into(),
+                    fs_kind: "regular".into(),
+                    size: 4,
+                    content_digest: "sha256:content".into(),
+                }],
+                total_entries: 2,
+            })
+        };
+        let mut meters = SnapshotClosureMeters::default();
+        let unique = make_fact();
+        let pages = unique.page_ids.as_ptr();
+        let files = unique.files.as_ptr();
+        let root = unique.root_page_id.as_ptr();
+        let moved = take_subtree_fact(unique, &mut meters);
+        assert_eq!(moved.page_ids.as_ptr(), pages);
+        assert_eq!(moved.files.as_ptr(), files);
+        assert_eq!(moved.root_page_id.as_ptr(), root);
+        assert_eq!(meters.fact_file_copies, 0);
+
+        let shared = make_fact();
+        let retained = shared.clone();
+        let copied = take_subtree_fact(shared, &mut meters);
+        assert_eq!(copied.root_page_id, retained.root_page_id);
+        assert_eq!(copied.page_ids, retained.page_ids);
+        assert_eq!(copied.files, retained.files);
+        assert_eq!(copied.total_entries, retained.total_entries);
+        assert_ne!(copied.page_ids.as_ptr(), retained.page_ids.as_ptr());
+        assert_ne!(copied.files.as_ptr(), retained.files.as_ptr());
+        assert_eq!(meters.fact_file_copies, 1);
+        assert_eq!(Arc::strong_count(&retained), 1);
+    }
+
+    #[test]
+    fn complete_alias_proof_counts_only_required_parent_file_copies() {
+        let (serving, pages) = aliases();
+        let expected = ValidatedSnapshotClosure::from_canonical_pages(
+            &serving.encode().unwrap(),
+            pages.clone(),
+        )
+        .unwrap();
+        let (closure, facts, meters) =
+            ValidatedSnapshotClosure::with_subtree_facts(expected.descriptor(), pages).unwrap();
+        assert_eq!(closure.files(), expected.files());
+        assert_eq!(closure.directories(), expected.directories());
+        assert_eq!(closure.pages(), expected.pages());
+        assert_eq!(facts.len(), 3, "root, shared child and empty directory");
+        let root = facts
+            .iter()
+            .find(|fact| fact.root_page_id == expected.descriptor().metadata_root)
+            .unwrap();
+        assert_eq!(root.files, expected.files());
+        assert_eq!(root.page_ids.len(), 3);
+        assert_eq!(meters.proof_page_hashes, 3);
+        assert_eq!(meters.proof_logical_files, 2);
+        assert_eq!(
+            meters.fact_file_copies, 2,
+            "one file copied into each root alias"
+        );
     }
 
     #[test]

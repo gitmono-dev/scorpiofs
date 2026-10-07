@@ -21,10 +21,12 @@ use mst2_codec::{
         leaf_proof, merkle_root, ChunkLeaf, ChunkMap, ProofSide, CHUNKS_PER_PAGE, CHUNK_SIZE,
     },
     descriptor::ServingDescriptor,
-    treeframe::{ChunkPayload, EndPayload},
+    metapage::{page_id, Entry, EntryKind, Page},
+    treeframe::{ChunkPayload, EndPayload, MetaPayload},
 };
 use scorpiofs::snapshot::{
-    client::MAX_BUFFERED_FILE_BYTES, ChunkedFile, Mst2Client, SnapshotErrorCode, SnapshotReader,
+    client::MAX_BUFFERED_FILE_BYTES, Mst2Client, OwnedChunkedFile, SnapshotErrorCode,
+    SnapshotReader,
 };
 use serde_json::{json, Value};
 
@@ -72,6 +74,9 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 struct Fixture {
+    descriptor: ServingDescriptor,
+    metadata_page: Vec<u8>,
+    metadata_requests: AtomicU64,
     map: ChunkMap,
     leaves: Vec<ChunkLeaf>,
     hashes: Vec<[u8; 32]>,
@@ -84,17 +89,12 @@ struct Fixture {
 async fn capabilities() -> Json<Value> {
     Json(json!({
         "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
-        "features": {"resolve": true, "directory": true, "leases": true, "chunk_reads": true}
+        "features": {"resolve": true, "directory": true, "leases": true, "metadata_pages": true, "chunk_reads": true}
     }))
 }
 
-async fn resolve() -> Json<Value> {
-    let descriptor = ServingDescriptor {
-        instance_uuid: *uuid::Uuid::parse_str(INSTANCE).unwrap().as_bytes(),
-        namespace_view_id: [0x22; 32],
-        scope: "/project".into(),
-        metadata_root: [1; 32],
-    };
+async fn resolve(State(fixture): State<Arc<Fixture>>) -> Json<Value> {
+    let descriptor = &fixture.descriptor;
     Json(json!({
         "descriptor": {
             "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE,
@@ -105,6 +105,47 @@ async fn resolve() -> Json<Value> {
         "lease_id": "range-budget-lease", "lease_expires_at": "2099-01-01T00:00:00Z",
         "publication_sequence": "1", "authorization_epoch": "1"
     }))
+}
+
+async fn metadata(
+    State(fixture): State<Arc<Fixture>>,
+    Path(snapshot): Path<String>,
+    body: Bytes,
+) -> Response {
+    assert_eq!(snapshot, id(&fixture.descriptor.snapshot_id().unwrap()));
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let items = request["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["directory_path"], "/");
+    assert_eq!(items[0]["route"], json!([]));
+    assert_eq!(
+        items[0]["expected_digest"],
+        id(&fixture.descriptor.metadata_root)
+    );
+    fixture.metadata_requests.fetch_add(1, Ordering::SeqCst);
+    let mut wire = MetaPayload {
+        pages: vec![(
+            fixture.descriptor.metadata_root,
+            fixture.metadata_page.clone(),
+        )],
+    }
+    .encode(19, 0)
+    .unwrap();
+    wire.extend(
+        EndPayload {
+            request_item_count: 1,
+            unique_unit_count: 1,
+            logical_bytes: fixture.metadata_page.len() as u64,
+            request_body_sha256: digest(&body),
+        }
+        .encode(19, 1),
+    );
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", snapshot)
+        .header("x-mega-request-digest", id(&digest(&body)))
+        .body(axum::body::Body::from(wire))
+        .unwrap()
 }
 
 async fn map(
@@ -201,7 +242,7 @@ impl Drop for Server {
     }
 }
 
-async fn open(size: u64) -> (Server, Arc<Fixture>, SnapshotReader, ChunkedFile) {
+async fn open(size: u64) -> (Server, Arc<Fixture>, SnapshotReader, OwnedChunkedFile) {
     let count = size.div_ceil(CHUNK);
     let full: Vec<_> = (0..4)
         .map(|i| digest(&vec![pattern(i); CHUNK_SIZE as usize]))
@@ -228,7 +269,17 @@ async fn open(size: u64) -> (Server, Arc<Fixture>, SnapshotReader, ChunkedFile) 
         .iter()
         .map(|leaf| leaf.leaf_hash().unwrap())
         .collect();
+    let metadata_page =
+        Page::build(&[Entry::file(EntryKind::Regular, b"file", size, CONTENT)]).unwrap();
     let fixture = Arc::new(Fixture {
+        descriptor: ServingDescriptor {
+            instance_uuid: *uuid::Uuid::parse_str(INSTANCE).unwrap().as_bytes(),
+            namespace_view_id: [0x22; 32],
+            scope: "/project".into(),
+            metadata_root: page_id(&metadata_page),
+        },
+        metadata_page,
+        metadata_requests: AtomicU64::new(0),
         map: ChunkMap::new(CONTENT, size, merkle_root(&hashes).unwrap()).unwrap(),
         leaves,
         hashes,
@@ -240,6 +291,10 @@ async fn open(size: u64) -> (Server, Arc<Fixture>, SnapshotReader, ChunkedFile) 
     let app = Router::new()
         .route("/api/v2/snapshots/capabilities", get(capabilities))
         .route("/api/v2/snapshots/resolve", post(resolve))
+        .route(
+            "/api/v2/snapshots/{snapshot}/metadata/pages",
+            post(metadata),
+        )
         .route("/api/v2/snapshots/{snapshot}/chunk-map", get(map))
         .route("/api/v2/snapshots/{snapshot}/chunk-map/pages", get(leaf))
         .route("/api/v2/snapshots/{snapshot}/chunks", post(chunks))
@@ -252,9 +307,11 @@ async fn open(size: u64) -> (Server, Arc<Fixture>, SnapshotReader, ChunkedFile) 
     let reader = SnapshotReader::resolve(Mst2Client::new(base), "/project", 600)
         .await
         .unwrap();
-    let file = ChunkedFile::open(&reader, "file", &id(&CONTENT), size)
+    let file = OwnedChunkedFile::open(&reader, "file", &id(&CONTENT), size)
         .await
         .unwrap();
+    assert_eq!(file.size(), size);
+    assert_eq!(fixture.metadata_requests.load(Ordering::SeqCst), 1);
     (server, fixture, reader, file)
 }
 
@@ -271,22 +328,22 @@ async fn output_limit_is_checked_before_content_and_after_eof_clamping() {
     let (_server, fixture, reader, file) = open(size).await;
     for length in [MAX_BUFFERED_FILE_BYTES + 1, u64::MAX] {
         assert_eq!(
-            file.read_range(0, length).await.unwrap_err().code,
+            file.read_range_owned(0, length).await.unwrap_err().code,
             SnapshotErrorCode::LimitExceeded
         );
     }
     assert!(fixture.leaf_requests.lock().unwrap().is_empty());
     assert!(fixture.chunk_requests.lock().unwrap().is_empty());
     assert!(file
-        .read_range(u64::MAX, u64::MAX)
+        .read_range_owned(u64::MAX, u64::MAX)
         .await
         .unwrap()
         .is_empty());
-    let tail = file.read_range(size - 3, u64::MAX).await.unwrap();
+    let tail = file.read_range_owned(size - 3, u64::MAX).await.unwrap();
     assert_eq!(tail.len(), 3);
-    assert_bytes(&tail, size - 3);
+    assert_bytes(tail.as_bytes(), size - 3);
     assert_eq!(fixture.chunk_requests.lock().unwrap().as_slice(), &[80]);
-    let result = ChunkedFile::open(&reader, "file", &id(&CONTENT), size + 1).await;
+    let result = OwnedChunkedFile::open(&reader, "file", &id(&CONTENT), size + 1).await;
     assert_eq!(
         result.err().unwrap().code,
         SnapshotErrorCode::DigestMismatch
@@ -296,20 +353,20 @@ async fn output_limit_is_checked_before_content_and_after_eof_clamping() {
 #[tokio::test]
 async fn output_larger_than_cache_stays_correct_and_evicted_chunk_is_reverified() {
     let (_server, fixture, _reader, file) = open(80 * CHUNK).await;
-    let bytes = file.read_range(0, 20 * CHUNK).await.unwrap();
-    assert_bytes(&bytes, 0);
+    let bytes = file.read_range_owned(0, 20 * CHUNK).await.unwrap();
+    assert_bytes(bytes.as_bytes(), 0);
     assert_eq!(bytes.len() as u64, 20 * CHUNK);
     assert_eq!(fixture.chunk_requests.lock().unwrap().len(), 20);
-    file.read_range(19 * CHUNK, 7).await.unwrap();
+    file.read_range_owned(19 * CHUNK, 7).await.unwrap();
     assert_eq!(fixture.chunk_requests.lock().unwrap().len(), 20);
     assert!(!file.fully_cached().await);
     fixture.corrupt_chunk.store(0, Ordering::SeqCst);
     assert_eq!(
-        file.read_range(0, 7).await.unwrap_err().code,
+        file.read_range_owned(0, 7).await.unwrap_err().code,
         SnapshotErrorCode::DigestMismatch
     );
     fixture.corrupt_chunk.store(NO_CORRUPTION, Ordering::SeqCst);
-    assert_bytes(&file.read_range(0, 7).await.unwrap(), 0);
+    assert_bytes(file.read_range_owned(0, 7).await.unwrap().as_bytes(), 0);
     assert_eq!(
         fixture
             .chunk_requests
@@ -329,22 +386,31 @@ async fn leaf_cache_refreshes_hits_and_rechecks_proof_after_eviction() {
     let (_server, fixture, _reader, file) = open(17 * page_bytes).await;
     for page in 0..16 {
         assert_bytes(
-            &file.read_range(page * page_bytes, 1).await.unwrap(),
+            file.read_range_owned(page * page_bytes, 1)
+                .await
+                .unwrap()
+                .as_bytes(),
             page * page_bytes,
         );
     }
     // A second chunk on page zero refreshes that leaf without a leaf HTTP call.
-    file.read_range(CHUNK, 1).await.unwrap();
-    file.read_range(16 * page_bytes, 1).await.unwrap();
+    file.read_range_owned(CHUNK, 1).await.unwrap();
+    file.read_range_owned(16 * page_bytes, 1).await.unwrap();
     assert_eq!(fixture.leaf_requests.lock().unwrap().len(), 17);
     // Page one was least recently used; both it and its old chunk were evicted.
     fixture.corrupt_leaf.store(1, Ordering::SeqCst);
     assert_eq!(
-        file.read_range(page_bytes, 1).await.unwrap_err().code,
+        file.read_range_owned(page_bytes, 1).await.unwrap_err().code,
         SnapshotErrorCode::DigestMismatch
     );
     fixture.corrupt_leaf.store(NO_CORRUPTION, Ordering::SeqCst);
-    assert_bytes(&file.read_range(page_bytes, 1).await.unwrap(), page_bytes);
+    assert_bytes(
+        file.read_range_owned(page_bytes, 1)
+            .await
+            .unwrap()
+            .as_bytes(),
+        page_bytes,
+    );
     assert_eq!(
         fixture
             .leaf_requests
@@ -363,9 +429,9 @@ async fn concurrent_reads_remain_correct_while_evicting_each_others_chunks() {
     let file = &file;
     let reads = (0..8).map(|i| async move {
         let offset = i * 8 * CHUNK + 13;
-        let bytes = file.read_range(offset, 3 * CHUNK + 7).await.unwrap();
+        let bytes = file.read_range_owned(offset, 3 * CHUNK + 7).await.unwrap();
         assert_eq!(bytes.len() as u64, 3 * CHUNK + 7);
-        assert_bytes(&bytes, offset);
+        assert_bytes(bytes.as_bytes(), offset);
     });
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -377,7 +443,7 @@ async fn concurrent_reads_remain_correct_while_evicting_each_others_chunks() {
     // At most sixteen verified chunks remain, observable by refetching an old one.
     let before = fixture.chunk_requests.lock().unwrap().len();
     for index in (0..8).map(|i| i * 8) {
-        file.read_range(index * CHUNK, 1).await.unwrap();
+        file.read_range_owned(index * CHUNK, 1).await.unwrap();
     }
     assert!(fixture.chunk_requests.lock().unwrap().len() > before);
 }

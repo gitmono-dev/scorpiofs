@@ -996,7 +996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_http_paths_cover_owned_proven_and_compatibility_ranges_then_hydration() {
+    async fn strict_http_paths_cover_owned_and_proven_ranges_then_hydration() {
         let server = Server::new(Fixture::new(true, false, true)).await;
         let reader = server.reader().await;
         let bytes = &server.fixture.bodies["/large0"];
@@ -1039,19 +1039,16 @@ mod tests {
                 .as_bytes(),
             second
         );
-        let compatibility_range =
-            crate::snapshot::ChunkedFile::open(&reader, "large0", &digest, bytes.len() as u64)
-                .await
-                .unwrap();
         assert_eq!(
-            compatibility_range
-                .read_range(2 * CHUNK_SIZE as u64, 7)
+            range
+                .read_range_owned(2 * CHUNK_SIZE as u64, 7)
                 .await
-                .unwrap(),
-            bytes[2 * CHUNK_SIZE as usize..]
+                .unwrap()
+                .as_bytes(),
+            &bytes[2 * CHUNK_SIZE as usize..]
         );
-        assert_eq!(server.fixture.map_calls.load(Ordering::SeqCst), 3);
-        assert_eq!(server.fixture.leaf_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(server.fixture.map_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(server.fixture.leaf_calls.load(Ordering::SeqCst), 2);
         assert_eq!(server.fixture.chunk_calls.load(Ordering::SeqCst), 6);
 
         let small = reader.prove_file("d0/f000").await.unwrap();

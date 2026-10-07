@@ -927,9 +927,13 @@ class WorkerSession:
         current = env.get("PYTHONPATH")
         env["PYTHONPATH"] = module_dir if not current else module_dir + os.pathsep + current
         try:
+            process_started = time.monotonic()
             output = self._owned_command(
                 [sys.executable, "-c", code, str(path), str(root), str(deadline),
                  "1" if git_checkout else "0", manifest_digest], deadline, env=env)
+            # Includes child startup/imports, manifest read/hash/parse, the
+            # complete oracle and result/anchor IPC. Keep full-side timers.
+            process_ms = (time.monotonic() - process_started) * 1000
             response = _decode_anchor_json(output.rstrip(b"\n"))
             if type(response) is not dict or type(response.get("ok")) is not bool:
                 raise WorkerError("isolated oracle response shape is invalid")
@@ -940,6 +944,7 @@ class WorkerSession:
             result = response.get("result")
             if type(result) is not dict:
                 raise WorkerError("isolated oracle result shape is invalid")
+            result["isolated_oracle_process_ms"] = process_ms
             return result
         finally:
             if created:
@@ -1203,12 +1208,12 @@ class WorkerSession:
         if type(version) is not str or not version or type(round_number) is not int:
             raise ValueError("measurement labels are invalid")
         results = {}
-        if side_order == "scorpio-first":
-            results["scorpio"] = self._measure_scorpio(expected, deadline)
-            results["git"] = self._measure_git(expected, commit, deadline)
-        else:
-            results["git"] = self._measure_git(expected, commit, deadline)
-            results["scorpio"] = self._measure_scorpio(expected, deadline)
+        for side in (("scorpio", "git") if side_order == "scorpio-first" else ("git", "scorpio")):
+            started = time.monotonic()
+            results[side] = (self._measure_scorpio(expected, deadline) if side == "scorpio"
+                             else self._measure_git(expected, commit, deadline))
+            results[side]["operation_started_monotonic"] = started
+            results[side]["operation_finished_monotonic"] = time.monotonic()
         _check_deadline(deadline)
         return {"actual_status": results["scorpio"]["actual_status"],
                 "complete_status": results["scorpio"]["complete_status"],

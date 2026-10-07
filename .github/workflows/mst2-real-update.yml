@@ -6,6 +6,16 @@ on:
       mega_sha:
         description: Immutable reviewed native server SHA
         required: true
+      comparison:
+        type: choice
+        description: Single client or three complete paired A/B rounds on one server
+        options: [single, paired]
+        default: single
+      baseline_sha:
+        description: Immutable baseline client SHA for paired comparison
+        default: '51d91806f3578b194bc7b7b28dbf66c9c2874a0b'
+      candidate_sha:
+        description: Immutable candidate client SHA; defaults to workflow SHA
       profile:
         type: choice
         description: Fixture size; start with smoke to verify both real sinks
@@ -40,6 +50,9 @@ jobs:
       NO_PROXY: localhost,127.0.0.1
       MEGA_SHA: ${{ inputs.mega_sha }}
       SCORPIO_SHA: ${{ github.sha }}
+      COMPARISON: ${{ inputs.comparison }}
+      BASELINE_SHA: ${{ inputs.baseline_sha }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
       PROFILE: ${{ inputs.profile }}
       ROUNDS: ${{ inputs.rounds }}
       STARTED_INPUT: ${{ inputs.session_started_utc }}
@@ -59,6 +72,15 @@ jobs:
           import os, sys
           sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
           from commit_update_projection import window_anchor
+          import re
+          comparison = os.environ.get('COMPARISON', 'single')
+          if comparison not in ('single', 'paired'):
+              raise ValueError('invalid comparison mode')
+          if comparison == 'paired':
+              if os.environ['ROUNDS'] != '3' or any(not re.fullmatch(r'[0-9a-f]{40}', os.environ[k]) for k in ('BASELINE_SHA', 'CANDIDATE_SHA')):
+                  raise ValueError('paired measurement requires two immutable SHAs and three rounds')
+              if os.environ['BASELINE_SHA'] == os.environ['CANDIDATE_SHA']:
+                  raise ValueError('paired comparison requires distinct client versions')
           recovery = os.environ.get('RECOVERY_INPUT', 'false')
           if recovery not in ('false', 'true'):
               raise ValueError('invalid original-window recovery flag')
@@ -68,6 +90,8 @@ jobs:
               stream.write('MST2_SESSION_DEADLINE=' + os.environ['DEADLINE_INPUT'] + '\n')
               stream.write('MST2_WORK_CLEANUP_DEADLINE_MONOTONIC=' + repr(anchor) + '\n')
               stream.write('MST2_OWNED_ROOT=' + os.environ['RUNNER_TEMP'] + '/mst2-real-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '\n')
+              for label in ('a', 'b'):
+                  stream.write('MST2_BUILD_' + label.upper() + '=' + os.environ['RUNNER_TEMP'] + '/mst2-client-' + label + '-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '.json\n')
           PY
 
       - uses: actions/checkout@v7
@@ -81,6 +105,32 @@ jobs:
         with:
           path: scorpiofs/target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('scorpiofs/Cargo.lock') }}
+
+      - uses: actions/checkout@v7
+        if: inputs.comparison == 'paired'
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+          path: client-a
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: inputs.comparison == 'paired'
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: client-b
+          persist-credentials: false
+
+      - uses: actions/cache@v6
+        if: inputs.comparison == 'paired'
+        with:
+          path: client-a/target
+          key: ${{ runner.os }}-mst2-client-a-release-${{ hashFiles('client-a/Cargo.lock') }}
+
+      - uses: actions/cache@v6
+        if: inputs.comparison == 'paired'
+        with:
+          path: client-b/target
+          key: ${{ runner.os }}-mst2-client-b-release-${{ hashFiles('client-b/Cargo.lock') }}
 
       - name: Install native FUSE and owned server dependencies
         timeout-minutes: 10
@@ -105,15 +155,28 @@ jobs:
           [[ "$MEGA_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -C scorpiofs rev-parse HEAD)" = "$SCORPIO_SHA"
           test "$(git -C mega2 rev-parse HEAD)" = "$MEGA_SHA"
-          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage server-build -- \
+          budget_mode=()
+          if test "$COMPARISON" = paired; then budget_mode=(--paired); fi
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py "${budget_mode[@]}" --rounds "$ROUNDS" --stage server-build -- \
             cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
-          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage client-build -- \
-            cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --bin scorpio
+          if test "$COMPARISON" = paired; then
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --paired --rounds "$ROUNDS" --stage client-a-build -- \
+              python3 -B scorpiofs/tests/mst2-e2e/workspace_update_build.py --label a \
+                --source "$GITHUB_WORKSPACE/client-a" --source-sha "$BASELINE_SHA" --receipt "$MST2_BUILD_A"
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --paired --rounds "$ROUNDS" --stage client-b-build -- \
+              python3 -B scorpiofs/tests/mst2-e2e/workspace_update_build.py --label b \
+                --source "$GITHUB_WORKSPACE/client-b" --source-sha "$CANDIDATE_SHA" --receipt "$MST2_BUILD_B"
+          else
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage client-build -- \
+              cargo build --manifest-path scorpiofs/Cargo.toml --locked --release --bin scorpio
+          fi
 
       - name: Check evidence and owned process deadlines
         shell: bash
         run: |
-          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --rounds "$ROUNDS" --stage fences -- bash -euo pipefail -c '
+          budget_mode=()
+          if test "$COMPARISON" = paired; then budget_mode=(--paired); fi
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py "${budget_mode[@]}" --rounds "$ROUNDS" --stage fences -- bash -euo pipefail -c '
             python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_bench.py -v
             python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_budget.py -v
             python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_projection.py -v
@@ -124,12 +187,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DRIVER="$GITHUB_WORKSPACE/scorpiofs/target/release/scorpio"
-          DRIVER_SHA=$(sha256sum "$DRIVER" | cut -d ' ' -f 1)
+          client_args=()
+          if test "$COMPARISON" = paired; then
+            client_args=(--paired --build-a "$MST2_BUILD_A" --build-b "$MST2_BUILD_B")
+          else
+            DRIVER="$GITHUB_WORKSPACE/scorpiofs/target/release/scorpio"
+            DRIVER_SHA=$(sha256sum "$DRIVER" | cut -d ' ' -f 1)
+            client_args=(--driver "$DRIVER" --driver-sha256 "$DRIVER_SHA")
+          fi
           python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --execute --projection-traces \
             --run-root "$MST2_OWNED_ROOT" --mega-source "$GITHUB_WORKSPACE/mega2" \
             --mega-sha "$MEGA_SHA" --mega-binary "$GITHUB_WORKSPACE/mega2/target/release/mega2" \
-            --driver "$DRIVER" --driver-sha256 "$DRIVER_SHA" --profile "$PROFILE" --rounds "$ROUNDS" \
+            "${client_args[@]}" --profile "$PROFILE" --rounds "$ROUNDS" \
             --session-started-utc "$MST2_SESSION_STARTED" --session-deadline-utc "$MST2_SESSION_DEADLINE"
 
       - name: Verify cleanup within the original deadline
@@ -137,21 +206,50 @@ jobs:
         shell: bash
         run: |
           if test -n "$MST2_OWNED_ROOT" && test -f scorpiofs/tests/mst2-e2e/commit_update_ci.py; then
+            budget_mode=()
+            if test "$COMPARISON" = paired; then budget_mode=(--paired); fi
             python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --cleanup --run-root "$MST2_OWNED_ROOT" \
-              --session-deadline-utc "$MST2_SESSION_DEADLINE" --rounds "$ROUNDS"
+              "${budget_mode[@]}" --session-deadline-utc "$MST2_SESSION_DEADLINE" --rounds "$ROUNDS"
           fi
 
       - name: Stage safe benchmark evidence
         if: always()
+        timeout-minutes: 4
         shell: bash
         run: |
           set -euo pipefail
+          python3 -B - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
+          from commit_update_budget import require_external_time
+          require_external_time(os.environ['DEADLINE_INPUT'])
+          PY
           safe="$RUNNER_TEMP/mst2-safe-evidence"
           rm -rf -- "$safe"
           install -d -m 700 "$safe"
-          printf '{"run_id":"%s","attempt":"%s","scorpio_sha":"%s","mega_sha":"%s","profile":"%s","rounds":%s}\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SCORPIO_SHA" "$MEGA_SHA" "$PROFILE" "$ROUNDS" \
-            > "$safe/run.json"
+          python3 -B - "$safe/run.json" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          record = {
+              'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'harness_sha': os.environ['SCORPIO_SHA'], 'mega_sha': os.environ['MEGA_SHA'],
+              'profile': os.environ['PROFILE'], 'rounds': int(os.environ['ROUNDS']),
+              'comparison': os.environ['COMPARISON'],
+              'session_started_utc': os.environ['STARTED_INPUT'],
+              'session_deadline_utc': os.environ['DEADLINE_INPUT'],
+          }
+          Path(sys.argv[1]).write_text(json.dumps(record, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+          if test "$COMPARISON" = paired; then
+            for label in A B; do
+              variable="MST2_BUILD_$label"
+              receipt="${!variable:-}"
+              if test -n "$receipt" && test -f "$receipt" && test ! -L "$receipt"; then
+                cp --no-preserve=mode,ownership --no-target-directory -- "$receipt" "$safe/client-$label-build.json"
+                chmod 600 "$safe/client-$label-build.json"
+              fi
+            done
+          fi
           owned_root="${MST2_OWNED_ROOT:-}"
           root="$owned_root/measurements"
           if test -f "$owned_root/failure.json" && test ! -L "$owned_root/failure.json"; then
@@ -176,12 +274,47 @@ jobs:
             done < <(find "$root" -type f -print0)
           fi
           find "$safe" -type f -printf '%P\n' | sort
+          python3 -B - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
+          from commit_update_budget import require_external_time
+          require_external_time(os.environ['DEADLINE_INPUT'])
+          PY
+
+      - name: Admit upload within the original absolute deadline
+        if: always()
+        id: upload_admission
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
+          from commit_update_budget import require_external_time
+          # Nine minutes for the action, one minute for its final UTC check.
+          require_external_time(os.environ['DEADLINE_INPUT'], 10 * 60)
+          PY
 
       - name: Upload safe benchmark evidence
-        if: always()
+        if: always() && steps.upload_admission.outcome == 'success'
+        id: evidence_upload
+        timeout-minutes: 9
         uses: actions/upload-artifact@v4
         with:
           name: mst2-v3-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mst2-safe-evidence
           if-no-files-found: error
           retention-days: 7
+
+      - name: Verify successful upload ended before the original deadline
+        if: always() && steps.evidence_upload.outcome == 'success'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
+          from commit_update_budget import require_external_time
+          require_external_time(os.environ['DEADLINE_INPUT'])
+          print('Evidence upload finished within the original session deadline')
+          PY

@@ -119,6 +119,63 @@ class ProjectionCollectionTests(unittest.TestCase):
         self.assertEqual(result["prior_attempt_observations"], [first])
         collector.finish(1, time.monotonic() + 1)
 
+    def paired_inputs(self):
+        logical = "mst2:test:client-b:r1:v1:resolve"
+        payload = dict(self.payload, request_id=logical + ":a1")
+        measured = json.loads(json.dumps(self.measured))
+        measured["resolve_trace_receipt"] = {
+            "logical_request_id": logical, "attempt_ids": [logical + ":a1"],
+            "final_attempt_id": logical + ":a1", "retry_count": 0}
+        return logical, payload, measured
+
+    def test_two_admitted_clients_can_read_the_same_real_acknowledged_trace_file(self):
+        logical, second, measured = self.paired_inputs()
+        for payloads in ([self.payload, second], [second, self.payload]):
+            with self.subTest(first=payloads[0]["request_id"]):
+                self.write(payloads, closed=True)
+                collector = projection.ProjectionCollector(self.cache)
+                collector.register(self.measured, self.logical)
+                collector.register(measured, logical)
+                first = collector.collect_registered(self.measured, self.native, self.identity,
+                                                     self.logical, time.monotonic() + 1)
+                other = collector.collect_registered(measured, self.native, self.identity,
+                                                     logical, time.monotonic() + 1)
+                self.assertEqual(first["payload"], self.payload)
+                self.assertEqual(other["payload"], second)
+                self.assertTrue(collector.finish(2, time.monotonic() + 1)["closed"])
+
+    def test_paired_registration_preserves_unknown_duplicate_and_full_collection_rejection(self):
+        logical, second, measured = self.paired_inputs()
+        for failure in ("unknown", "duplicate", "register-twice", "uncollected", "receipt-drift", "collect-twice"):
+            with self.subTest(failure=failure):
+                payloads = [self.payload, second]
+                if failure == "unknown":
+                    payloads.append(dict(second, request_id="unknown:a1"))
+                if failure == "duplicate":
+                    payloads.append(second)
+                self.write(payloads, closed=True)
+                collector = projection.ProjectionCollector(self.cache)
+                collector.register(self.measured, self.logical)
+                collector.register(measured, logical)
+                with self.assertRaises(projection.TraceRejected):
+                    if failure == "register-twice":
+                        collector.register(measured, logical)
+                    else:
+                        collector.collect_registered(self.measured, self.native, self.identity,
+                                                     self.logical, time.monotonic() + 1)
+                        if failure == "uncollected":
+                            collector.finish(1, time.monotonic() + 1)
+                        elif failure == "receipt-drift":
+                            changed = json.loads(json.dumps(measured))
+                            changed["resolve_trace_receipt"].update(
+                                attempt_ids=[logical + ":a1", logical + ":a2"],
+                                final_attempt_id=logical + ":a2", retry_count=1)
+                            collector.collect_registered(changed, self.native, self.identity,
+                                                         logical, time.monotonic() + 1)
+                        elif failure == "collect-twice":
+                            collector.collect_registered(self.measured, self.native, self.identity,
+                                                         self.logical, time.monotonic() + 1)
+
     def test_waits_for_real_delayed_durable_record_within_original_deadline(self):
         self.write([])
         collector = projection.ProjectionCollector(self.cache)

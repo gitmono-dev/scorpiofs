@@ -47,7 +47,9 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
     assert_eq!(d["descriptor"]["snapshot_id"].as_str(), Some(sid.as_str()));
 
     // The manifest locates the t08 fixture files.
-    let manifest = reader.file_manifest().await.expect("manifest");
+    let closure = reader.snapshot_closure().await.expect("manifest");
+    reader.seed_content_membership(&closure).unwrap();
+    let manifest = closure.files();
     let by_path: std::collections::HashMap<_, _> =
         manifest.iter().map(|f| (f.rel_path.as_str(), f)).collect();
 
@@ -56,10 +58,10 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
         .get("t08/a.txt")
         .expect("t08/a.txt seeded by the t08 oracle");
     let bytes = reader
-        .read_file_frames(&small.rel_path, &small.content_digest, small.size)
+        .read_content(small, true)
         .await
         .expect("small file over OBJECT frames");
-    assert_eq!(bytes, b"t08 alpha\n");
+    assert_eq!(bytes.as_bytes(), b"t08 alpha\n");
     assert_eq!(bytes.len() as u64, small.size);
 
     // An older client can still request zstd; the upgraded HTTP service
@@ -93,7 +95,7 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
     if let Some(empty) = by_path.get("t08/empty.txt") {
         assert_eq!(empty.size, 0);
         let bytes = reader
-            .read_file_frames(&empty.rel_path, &empty.content_digest, 0)
+            .read_content(empty, true)
             .await
             .expect("empty file over OBJECT frames");
         assert!(bytes.is_empty());
@@ -108,28 +110,34 @@ async fn frame_transport_verifies_objects_chunks_and_leases() {
         "fixture must exceed the OBJECT cap"
     );
     let assembled = reader
-        .read_file_frames(&large.rel_path, &large.content_digest, large.size)
+        .read_content(large, true)
         .await
         .expect("large file over CHUNK frames");
     assert_eq!(assembled.len() as u64, large.size);
     assert_eq!(assembled.len(), 2 * CHUNK + 7);
     // Deterministic pattern written by the oracle: byte i = (73i+11) % 256.
-    for (i, b) in assembled.iter().enumerate() {
+    for (i, b) in assembled.as_bytes().iter().enumerate() {
         assert_eq!(*b, ((73u64 * i as u64 + 11) % 256) as u8);
     }
 
     // A wrong digest over the frame path is refused, not served.
-    let tampered = reader
-        .read_file_frames(
-            &small.rel_path,
-            &("sha256:".to_string() + &"0".repeat(64)),
-            small.size,
+    let error = reader
+        .client()
+        .objects(
+            &sid,
+            &[(
+                format!("/{}", small.rel_path),
+                "sha256:".to_string() + &"0".repeat(64),
+            )],
+            reader.encoding_hint(),
         )
-        .await;
-    assert!(matches!(
-        tampered.map_err(|e| e.code),
-        Err(scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch)
-    ));
+        .await
+        .expect_err("server must reject the wrong expected digest over the frame endpoint");
+    assert_eq!(
+        error.code,
+        scorpiofs::snapshot::SnapshotErrorCode::DigestMismatch
+    );
+    assert_eq!(error.http_status, 409);
 
     // Lease lifecycle: renew extends, release is idempotent, and a released
     // lease cannot be renewed. The snapshot stays readable via the lease

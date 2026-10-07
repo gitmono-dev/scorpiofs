@@ -288,14 +288,14 @@ async fn warm_1151_file_resume_bounds_real_journal_syncs_and_syncs_every_blob() 
             }
             "concurrent" => {
                 store
-                    .hydrate_concurrent(&view(), &manifest, 8, |_| {
+                    .hydrate_concurrent_with_body::<_, Vec<u8>>(&view(), &manifest, 8, |_| {
                         Box::pin(async { panic!("warm source read") })
                     })
                     .await
             }
             "batches" => {
                 store
-                    .hydrate_batches(
+                    .hydrate_batches_with_body::<_, _, Vec<u8>, Vec<u8>>(
                         &view(),
                         &manifest,
                         4,
@@ -354,7 +354,7 @@ async fn concurrent_cold_appends_keep_complete_json_records_and_bounded_syncs() 
     let manifest = many_files(257);
     let counter = SyncCounter::install(temp.path());
     let report = store
-        .hydrate_concurrent(&view(), &manifest, 16, |file| {
+        .hydrate_concurrent_with_body(&view(), &manifest, 16, |file| {
             Box::pin(async move {
                 tokio::task::yield_now().await;
                 Ok(Arc::new(file.rel_path.into_bytes()))
@@ -606,7 +606,7 @@ async fn repair_failure_revokes_old_complete_in_all_three_hydration_cores() {
             }
             "concurrent" => {
                 store
-                    .hydrate_concurrent(&view(), &files(), 4, |_| {
+                    .hydrate_concurrent_with_body::<_, Vec<u8>>(&view(), &files(), 4, |_| {
                         Box::pin(async {
                             Err(SnapshotError::new(
                                 SnapshotErrorCode::ObjectUnavailable,
@@ -618,7 +618,7 @@ async fn repair_failure_revokes_old_complete_in_all_three_hydration_cores() {
             }
             "batch" => {
                 store
-                    .hydrate_batches(
+                    .hydrate_batches_with_body::<_, _, Vec<u8>, Vec<u8>>(
                         &view(),
                         &files(),
                         4,
@@ -675,7 +675,7 @@ async fn batch_aliases_commit_logical_totals_and_one_retained_content_dependency
         })
         .collect();
     let report = store
-        .hydrate_batches(
+        .hydrate_batches_with_body::<_, _, _, Vec<u8>>(
             &view(),
             &manifest,
             4,
@@ -708,6 +708,59 @@ async fn batch_aliases_commit_logical_totals_and_one_retained_content_dependency
         }]
     );
     assert!(store.is_pinned().unwrap());
+}
+
+#[tokio::test]
+async fn batch_alias_resume_rejects_conflicting_sizes_and_propagates_real_cas_io_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = DurableStore::open(temp.path()).unwrap();
+    let meters = store.enable_verification_meters();
+    let mut manifest: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|path| SnapshotFile {
+            rel_path: path.into(),
+            fs_kind: "regular".into(),
+            size: 4,
+            content_digest: digest_of(b"same"),
+        })
+        .collect();
+    manifest[1].size = 5;
+    let error = store
+        .hydrate_batches_with_body::<_, _, Vec<u8>, Vec<u8>>(
+            &view(),
+            &manifest,
+            2,
+            2,
+            |_| Box::pin(async { panic!("invalid aliases must never fetch") }),
+            |_| Box::pin(async { panic!("invalid aliases must never fetch") }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::IntegrityError);
+    assert_eq!(meters.snapshot().calls, 0);
+    assert!(!temp.path().join(COMPLETE_MARKER).exists());
+
+    manifest[1].size = 4;
+    // ENOTDIR is a real I/O error, distinct from an absent CAS blob. It
+    // cannot become a missing hint or be cached for a second alias.
+    fs::remove_dir(store.content_dir()).unwrap();
+    fs::write(store.content_dir(), b"blocked directory").unwrap();
+    let error = store
+        .hydrate_batches_with_body::<_, _, Vec<u8>, Vec<u8>>(
+            &view(),
+            &manifest,
+            2,
+            2,
+            |_| Box::pin(async { panic!("a CAS I/O error must not fetch") }),
+            |_| Box::pin(async { panic!("a CAS I/O error must not fetch") }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert_eq!(hydration_error_label(&error), Some("cas_resume_audit"));
+    assert_eq!(meters.snapshot_for(CasVerificationReason::Resume).calls, 1);
+    assert_eq!(meters.snapshot_for(CasVerificationReason::Resume).errors, 1);
+    assert!(!temp.path().join(COMPLETE_MARKER).exists());
 }
 
 #[tokio::test]
@@ -884,7 +937,7 @@ async fn blob_sync_and_directory_sync_errors_cannot_publish_a_batch_complete() {
         let store = DurableStore::open(temp.path()).unwrap();
         let fault = FaultGuard::install(store.content_dir(), phase, false);
         let error = store
-            .hydrate_batches(
+            .hydrate_batches_with_body::<_, _, _, Vec<u8>>(
                 &view(),
                 &files(),
                 4,

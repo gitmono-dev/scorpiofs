@@ -1,9 +1,14 @@
 use std::{
     collections::BTreeMap,
-    sync::atomic::{AtomicUsize, Ordering},
+    ffi::OsStr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use asyncfuse::raw::prelude::{Filesystem, Request};
 use axum::{
     body::{Body, Bytes},
     extract::{Query, State},
@@ -66,6 +71,15 @@ struct Fixture {
     map_requests: AtomicUsize,
     chunk_requests: AtomicUsize,
     renewal_requests: AtomicUsize,
+    metadata_pages: bool,
+    aliases: bool,
+    manifest_size_delta: u64,
+    directory_requests: AtomicUsize,
+    leaf_requests: AtomicUsize,
+    paths: Mutex<Vec<String>>,
+    hold_stage: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
     expiry: String,
 }
 impl Fixture {
@@ -115,17 +129,54 @@ impl Fixture {
             map_requests: AtomicUsize::new(0),
             chunk_requests: AtomicUsize::new(0),
             renewal_requests: AtomicUsize::new(0),
+            metadata_pages: true,
+            aliases: false,
+            manifest_size_delta: 0,
+            directory_requests: AtomicUsize::new(0),
+            leaf_requests: AtomicUsize::new(0),
+            paths: Mutex::new(Vec::new()),
+            hold_stage: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
             expiry: "2099-01-01T00:00:00Z".into(),
         }
     }
     fn bytes(&self, index: u64) -> Vec<u8> {
         vec![index as u8; self.map.chunk_len(index).unwrap() as usize]
     }
+    async fn hold(&self, stage: usize) {
+        if self.hold_stage.load(Ordering::SeqCst) == stage {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+    fn accepts_path(&self, path: &str) -> bool {
+        path == "file" || self.aliases && path == "alias"
+    }
 }
 
-async fn capabilities() -> Json<Value> {
+async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
     Json(
-        json!({"protocol_versions":[2],"metadata_codecs":[1],"frame_encodings":["identity"],"features":{"resolve":true,"directory":true,"leases":true,"metadata_pages":true,"chunk_reads":true}}),
+        json!({"protocol_versions":[2],"metadata_codecs":[1],"frame_encodings":["identity"],"features":{"resolve":true,"directory":true,"leases":true,"metadata_pages":f.metadata_pages,"chunk_reads":true}}),
+    )
+}
+async fn directory_response(
+    State(f): State<Arc<Fixture>>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert!(!f.metadata_pages);
+    assert_eq!(query["path"], "/");
+    f.directory_requests.fetch_add(1, Ordering::SeqCst);
+    let names: &[&str] = if f.aliases {
+        &["alias", "file"]
+    } else {
+        &["file"]
+    };
+    let entries: Vec<_> = names.iter().map(|name| {
+        json!({"name":name,"fs_kind":"regular","size":(f.map.file_size + f.manifest_size_delta).to_string(),"content_digest":id(&f.map.file_content_id)})
+    }).collect();
+    Json(
+        json!({"snapshot_id":id(&f.descriptor.snapshot_id().unwrap()),"path":"/","metadata_root":id(&f.descriptor.metadata_root),"directory_root":id(&f.descriptor.metadata_root),"node_class":"native_tree","lifecycle":"mutable","range_start_exclusive":null,"entries":entries,"entry_count":names.len().to_string(),"next_cursor":null,"proof_pages":[]}),
     )
 }
 async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
@@ -146,8 +197,9 @@ async fn map_response(
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
     f.map_requests.fetch_add(1, Ordering::SeqCst);
-    assert_eq!(query["path"].trim_start_matches('/'), "file");
+    assert!(f.accepts_path(query["path"].trim_start_matches('/')));
     assert_eq!(query["expected_digest"], id(&f.map.file_content_id));
+    f.hold(1).await;
     Json(
         json!({"snapshot_id":id(&f.descriptor.snapshot_id().unwrap()),"path":query["path"],"schema_version":2,"file_content_id":id(&f.map.file_content_id),"file_size":f.map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":f.map.chunk_count.to_string(),"page_count":f.map.page_count.to_string(),"pages_root":id(&f.map.pages_root),"map_id":id(&f.map.map_id())}),
     )
@@ -156,7 +208,10 @@ async fn leaf_response(
     State(f): State<Arc<Fixture>>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
+    f.leaf_requests.fetch_add(1, Ordering::SeqCst);
     assert_eq!(query["page"], "0");
+    assert!(f.accepts_path(query["path"].trim_start_matches('/')));
+    f.hold(2).await;
     Json(
         json!({"snapshot_id":id(&f.descriptor.snapshot_id().unwrap()),"path":query["path"],"map_id":id(&f.map.map_id()),"page_count":"1","leaf":{"page_index":"0","count":f.map.chunk_count.to_string(),"data_base64":base64(&f.leaf.encode().unwrap())},"proof":[]}),
     )
@@ -166,7 +221,9 @@ async fn chunks(State(f): State<Arc<Fixture>>, body: Bytes) -> Response<Body> {
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(request["items"].as_array().unwrap().len(), 1);
     let item = &request["items"][0];
-    assert_eq!(item["path"], "/file");
+    let path = item["path"].as_str().unwrap();
+    assert!(path.starts_with('/') && f.accepts_path(&path[1..]));
+    f.paths.lock().unwrap().push(path.into());
     assert_eq!(item["expected_digest"], id(&f.map.file_content_id));
     assert_eq!(item["map_id"], id(&f.map.map_id()));
     let index = item["chunk_index"]
@@ -215,6 +272,7 @@ async fn chunks(State(f): State<Arc<Fixture>>, body: Bytes) -> Response<Body> {
     if mode == 8 {
         wire.push(0);
     }
+    f.hold(3).await;
     let response = if mode == 9 {
         use futures::StreamExt;
         Body::from_stream(
@@ -255,6 +313,7 @@ impl Server {
             .route("/api/v2/snapshots/capabilities", get(capabilities))
             .route("/api/v2/snapshots/resolve", post(resolve))
             .route("/api/v2/snapshots/leases/{lease}/renew", post(renew))
+            .route("/api/v2/snapshots/{sid}/directory", get(directory_response))
             .route("/api/v2/snapshots/{sid}/chunk-map", get(map_response))
             .route(
                 "/api/v2/snapshots/{sid}/chunk-map/pages",
@@ -273,12 +332,14 @@ impl Server {
             .with_content_limits(
                 super::super::ContentBudgetLimits::new(limit, 8 * 1024 * 1024).unwrap(),
             );
-        let closure = super::super::ValidatedSnapshotClosure::from_pages(
-            reader.descriptor(),
-            BTreeMap::from([(id(&fixture.descriptor.metadata_root), fixture.page.clone())]),
-        )
-        .unwrap();
-        reader.seed_content_membership(&closure).unwrap();
+        if fixture.metadata_pages {
+            let closure = super::super::ValidatedSnapshotClosure::from_pages(
+                reader.descriptor(),
+                BTreeMap::from([(id(&fixture.descriptor.metadata_root), fixture.page.clone())]),
+            )
+            .unwrap();
+            reader.seed_content_membership(&closure).unwrap();
+        }
         Self {
             reader,
             fixture,
@@ -295,6 +356,32 @@ impl Server {
         .await
         .unwrap()
     }
+    async fn online_tokens(&self) -> BTreeMap<String, Arc<OnlineSnapshotFile>> {
+        let fs = crate::snapshot::fuse::Mst2Fuse::from_reader(self.reader.clone())
+            .await
+            .unwrap();
+        let names: &[&str] = if self.fixture.aliases {
+            &["alias", "file"]
+        } else {
+            &["file"]
+        };
+        let mut tokens = BTreeMap::new();
+        for name in names {
+            let entry = fs
+                .lookup(
+                    Request::default(),
+                    super::super::fuse::ROOT_INODE,
+                    OsStr::new(name),
+                )
+                .await
+                .unwrap();
+            let token = fs.online_file_for_test(entry.attr.ino).unwrap();
+            assert_eq!(token.file().rel_path, *name);
+            tokens.insert((*name).to_string(), token);
+        }
+        assert!(self.reader.content_membership.get().is_none());
+        tokens
+    }
 }
 
 async fn construction_idle(reader: &SnapshotReader) {
@@ -305,6 +392,50 @@ async fn construction_idle(reader: &SnapshotReader) {
     })
     .await
     .unwrap();
+}
+
+// Always release a held HTTP response, including when an assertion panics.
+// The operation under test observes a real renewal rejection, not an injected
+// local lease failure or a synthetic transport response.
+struct HeldResponse {
+    fixture: Arc<Fixture>,
+}
+impl HeldResponse {
+    fn new(fixture: &Arc<Fixture>, stage: usize) -> Self {
+        fixture.hold_stage.store(stage, Ordering::SeqCst);
+        Self {
+            fixture: fixture.clone(),
+        }
+    }
+    async fn entered(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.fixture.entered.notified())
+            .await
+            .unwrap();
+    }
+    fn release(&self) {
+        self.fixture.hold_stage.store(0, Ordering::SeqCst);
+        self.fixture.release.notify_one();
+    }
+}
+impl Drop for HeldResponse {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+async fn renewal_rejected(server: &Server) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.fixture.renewal_requests.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Wait for the real renewal task to latch the terminal 403 result.
+    assert_eq!(
+        server.reader.ensure_lease().await.unwrap_err().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
 }
 
 fn expiry_in_three_seconds() -> String {
@@ -582,7 +713,7 @@ async fn eight_tib_map_shape_opens_without_allocating_or_fetching_file_payload()
     let mut fixture = Fixture::new(1);
     fixture.map = ChunkMap::new(
         fixture.map.file_content_id,
-        super::super::range::MAX_FILE_SIZE,
+        super::super::content_profile::MAX_FILE_SIZE,
         fixture.map.pages_root,
     )
     .unwrap();
@@ -601,7 +732,7 @@ async fn eight_tib_map_shape_opens_without_allocating_or_fetching_file_payload()
             &server.reader,
             "file",
             &digest,
-            super::super::range::MAX_FILE_SIZE + 1
+            super::super::content_profile::MAX_FILE_SIZE + 1
         )
         .await
         .err()
@@ -736,4 +867,261 @@ async fn transferred_proof_opens_ranges_without_initializing_a_complete_closure(
     assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
     drop(file);
     assert_eq!(consumer.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn online_manifest_ranges_keep_paid_owners_and_each_alias_wire_path() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(1);
+    fixture.metadata_pages = false;
+    fixture.aliases = true;
+    let server = Server::start_fixture(fixture, 8 * 1024 * 1024).await;
+    let tokens = server.online_tokens().await;
+    assert_eq!(server.fixture.directory_requests.load(Ordering::SeqCst), 1);
+    // The actual public manifest mount has been dropped. It does not seed a
+    // fictitious complete closure or leave its payload cache reservation alive.
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+    let alias = OwnedChunkedFile::open_online_path(&server.reader, tokens["alias"].clone())
+        .await
+        .unwrap();
+    let file = OwnedChunkedFile::open_online_path(&server.reader, tokens["file"].clone())
+        .await
+        .unwrap();
+    let held_alias = alias.read_range_owned(0, 1).await.unwrap();
+    let held_file = file.read_range_owned(0, 1).await.unwrap();
+    assert_eq!(held_alias.as_bytes(), [0]);
+    assert_eq!(held_file.as_bytes(), [0]);
+    assert_eq!(alias.read_range_owned(0, 1).await.unwrap().as_bytes(), [0]);
+    assert_eq!(file.read_range_owned(0, 1).await.unwrap().as_bytes(), [0]);
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(*server.fixture.paths.lock().unwrap(), ["/alias", "/file"]);
+    assert!(server.reader.content_membership.get().is_none());
+    let last_alias = held_alias.clone();
+    drop(alias);
+    drop(file);
+    assert_eq!(server.reader.content_usage().output_bytes, 2048);
+    drop(held_alias);
+    assert_eq!(server.reader.content_usage().output_bytes, 2048);
+    assert_eq!(last_alias.as_bytes(), [0]);
+    drop(last_alias);
+    assert_eq!(server.reader.content_usage().output_bytes, 1024);
+    drop(held_file);
+    construction_idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn online_authority_rejects_foreign_domains_and_keeps_public_open_strict() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(1);
+    fixture.metadata_pages = false;
+    let server = Server::start_fixture(fixture, 8 * 1024 * 1024).await;
+    let tokens = server.online_tokens().await;
+    assert_eq!(
+        OwnedChunkedFile::open(
+            &server.reader,
+            "file",
+            &id(&server.fixture.map.file_content_id),
+            server.fixture.map.file_size
+        )
+        .await
+        .err()
+        .unwrap()
+        .code,
+        SnapshotErrorCode::SnapshotNotReady
+    );
+    let mut foreign_fixture = Fixture::new(1);
+    foreign_fixture.metadata_pages = false;
+    let foreign = Server::start_fixture(foreign_fixture, 8 * 1024 * 1024).await;
+    let foreign_tokens = foreign.online_tokens().await;
+    assert_eq!(
+        OwnedChunkedFile::open_online_path(&server.reader, foreign_tokens["file"].clone())
+            .await
+            .err()
+            .unwrap()
+            .code,
+        SnapshotErrorCode::IntegrityError
+    );
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(foreign.fixture.map_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+    assert!(server.reader.content_membership.get().is_none());
+    // The actual no-pages public mount token still opens its own fixed path.
+    let file = OwnedChunkedFile::open_online_path(&server.reader, tokens["file"].clone())
+        .await
+        .unwrap();
+    assert_eq!(file.read_range_owned(0, 1).await.unwrap().as_bytes(), [0]);
+    drop(file);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn online_manifest_size_is_checked_against_the_real_map_before_chunk_http() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(1);
+    fixture.metadata_pages = false;
+    fixture.manifest_size_delta = 1;
+    let server = Server::start_fixture(fixture, 8 * 1024 * 1024).await;
+    let tokens = server.online_tokens().await;
+    assert_eq!(
+        OwnedChunkedFile::open_online_path(&server.reader, tokens["file"].clone())
+            .await
+            .err()
+            .unwrap()
+            .code,
+        SnapshotErrorCode::DigestMismatch
+    );
+    assert_eq!(server.fixture.directory_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 0);
+    assert!(server.reader.content_membership.get().is_none());
+    construction_idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn online_bad_frames_and_cancelled_body_publish_no_range_or_chunk_owner() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(1);
+    fixture.metadata_pages = false;
+    let server = Server::start_fixture(fixture, 8 * 1024 * 1024).await;
+    let tokens = server.online_tokens().await;
+    let file = Arc::new(
+        OwnedChunkedFile::open_online_path(&server.reader, tokens["file"].clone())
+            .await
+            .unwrap(),
+    );
+    for mode in [1, 2, 3, 4, 5, 6, 7, 8, 10] {
+        server.fixture.mode.store(mode, Ordering::SeqCst);
+        assert!(file.read_range_owned(0, 1).await.is_err(), "mode{mode}");
+        construction_idle(&server.reader).await;
+        assert_eq!(file.chunks.lock().await.len, 0, "mode{mode}");
+        assert_eq!(
+            server.reader.content_usage().output_bytes,
+            1024,
+            "mode{mode}"
+        );
+    }
+    server.fixture.mode.store(9, Ordering::SeqCst);
+    let held = HeldResponse::new(&server.fixture, 3);
+    let task = tokio::spawn({
+        let file = file.clone();
+        async move { file.read_range_owned(0, 1).await }
+    });
+    held.entered().await;
+    held.release();
+    assert!(!task.is_finished());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    construction_idle(&server.reader).await;
+    assert_eq!(file.chunks.lock().await.len, 0);
+    assert_eq!(server.reader.content_usage().output_bytes, 1024);
+    server.fixture.mode.store(0, Ordering::SeqCst);
+    assert_eq!(file.read_range_owned(0, 1).await.unwrap().as_bytes(), [0]);
+    assert!(server.reader.content_membership.get().is_none());
+    drop(file);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn online_map_leaf_and_chunk_replies_cannot_publish_after_real_403_renewal() {
+    let _serial = TEST_LOCK.lock().await;
+    for stage in [1, 2, 3] {
+        let mut fixture = Fixture::new(1);
+        fixture.metadata_pages = false;
+        fixture.expiry = expiry_in_three_seconds();
+        let server = Server::start_fixture(fixture, 8 * 1024 * 1024).await;
+        let tokens = server.online_tokens().await;
+        if stage == 1 {
+            let held = HeldResponse::new(&server.fixture, stage);
+            let task = tokio::spawn({
+                let reader = server.reader.clone();
+                let token = tokens["file"].clone();
+                async move { OwnedChunkedFile::open_online_path(&reader, token).await }
+            });
+            held.entered().await;
+            renewal_rejected(&server).await;
+            held.release();
+            assert_eq!(
+                task.await.unwrap().err().unwrap().code,
+                SnapshotErrorCode::ScopeForbidden
+            );
+            assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(server.reader.content_usage().output_bytes, 0);
+        } else {
+            let file = Arc::new(
+                OwnedChunkedFile::open_online_path(&server.reader, tokens["file"].clone())
+                    .await
+                    .unwrap(),
+            );
+            let held = HeldResponse::new(&server.fixture, stage);
+            let task = tokio::spawn({
+                let file = file.clone();
+                async move { file.read_range_owned(0, 1).await }
+            });
+            held.entered().await;
+            renewal_rejected(&server).await;
+            held.release();
+            assert_eq!(
+                task.await.unwrap().unwrap_err().code,
+                SnapshotErrorCode::ScopeForbidden
+            );
+            assert_eq!(file.chunks.lock().await.len, 0);
+            assert_eq!(file.leaves.lock().await.get(0).is_some(), stage == 3);
+            assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                server.fixture.chunk_requests.load(Ordering::SeqCst),
+                usize::from(stage == 3)
+            );
+            assert_eq!(server.reader.content_usage().output_bytes, 1024);
+            drop(file);
+            assert_eq!(server.reader.content_usage().output_bytes, 0);
+        }
+        assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
+        assert!(server.reader.content_membership.get().is_none());
+        construction_idle(&server.reader).await;
+    }
+}
+
+#[tokio::test]
+async fn online_warm_zero_length_and_eof_ranges_reject_the_revoked_lease() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(1);
+    fixture.metadata_pages = false;
+    fixture.expiry = expiry_in_three_seconds();
+    let server = Server::start_fixture(fixture, 8 * 1024 * 1024).await;
+    let tokens = server.online_tokens().await;
+    let file = OwnedChunkedFile::open_online_path(&server.reader, tokens["file"].clone())
+        .await
+        .unwrap();
+    let before_revoke = file.read_range_owned(0, 1).await.unwrap();
+    let output_before_revoke = server.reader.content_usage().output_bytes;
+    renewal_rejected(&server).await;
+    for (offset, length) in [(0, 1), (0, 0), (u64::MAX, u64::MAX)] {
+        assert_eq!(
+            file.read_range_owned(offset, length)
+                .await
+                .unwrap_err()
+                .code,
+            SnapshotErrorCode::ScopeForbidden
+        );
+    }
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        server.reader.content_usage().output_bytes,
+        output_before_revoke
+    );
+    assert!(server.reader.content_membership.get().is_none());
+    drop(file);
+    assert_eq!(server.reader.content_usage().output_bytes, 1024);
+    assert_eq!(before_revoke.as_bytes(), [0]);
+    drop(before_revoke);
+    construction_idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
 }
