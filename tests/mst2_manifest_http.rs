@@ -46,6 +46,8 @@ struct Fixture {
     canonical: bool,
     raw_only: bool,
     lease_expiry: Option<String>,
+    renewal_gone: bool,
+    pause_renewal: bool,
     renewal_requests: AtomicUsize,
     root: [u8; 32],
     pages: HashMap<[u8; 32], Vec<u8>>,
@@ -307,10 +309,18 @@ async fn resolve(State(f): State<Arc<Fixture>>, body: Bytes) -> Json<Value> {
 
 async fn renew(State(f): State<Arc<Fixture>>) -> (StatusCode, Json<Value>) {
     f.renewal_requests.fetch_add(1, Ordering::SeqCst);
+    if f.pause_renewal {
+        return std::future::pending().await;
+    }
+    let (status, code) = if f.renewal_gone {
+        (StatusCode::GONE, "SNAPSHOT_GONE")
+    } else {
+        (StatusCode::FORBIDDEN, "SCOPE_FORBIDDEN")
+    };
     (
-        StatusCode::FORBIDDEN,
+        status,
         Json(
-            json!({"error": {"code": "SCOPE_FORBIDDEN", "message": "fixture lease revoked",
+            json!({"error": {"code": code, "message": "fixture retention failure",
             "request_id": "fixture-renewal", "retryable": false}}),
         ),
     )
@@ -1953,12 +1963,15 @@ async fn wait_for_cas_revocation(http: &HttpFixture, reader: &SnapshotReader) {
     );
 }
 
-#[tokio::test]
-async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_metadata() {
-    let http = HttpFixture::start_canonical(expiring_cas_fixture()).await;
+async fn assert_owned_cached_metadata_failure(
+    fixture: Fixture,
+    terminal: SnapshotErrorCode,
+    errno: i32,
+) {
+    let http = HttpFixture::start_canonical(fixture).await;
     let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
-    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
     let alpha = root_file_inode(&fs, "alpha").await;
     let before = fs
         .getattr(Request::default(), alpha, None, 0)
@@ -2016,13 +2029,29 @@ async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_me
         scorpiofs::snapshot::SnapshotPathState::AbsentProven
     ));
     assert!(!fs.directory_entries("").await.unwrap().is_empty());
+    let link = root_file_inode(&fs, "link").await;
+    let large = root_file_inode(&fs, "large").await;
+    let first = fs
+        .read(Request::default(), alpha, alpha, 0, 8192)
+        .await
+        .unwrap();
+    drop(fs.readlink(Request::default(), link).await.unwrap());
+    drop(
+        fs.read(Request::default(), large, large, 17, 19)
+            .await
+            .unwrap(),
+    );
     let metadata = http.fixture.requested_ids();
     let usage = reader.content_usage();
-    wait_for_cas_revocation(&http, &reader).await;
-    assert_eq!(
-        reader.local_lease_status().unwrap_err().code,
-        SnapshotErrorCode::ScopeForbidden
-    );
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while http.fixture.renewal_requests.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(reader.ensure_lease().await.unwrap_err().code, terminal);
+    })
+    .await
+    .unwrap();
+    assert_eq!(reader.local_lease_status().unwrap_err().code, terminal);
     for inode in [1, alpha] {
         assert_eq!(
             i32::from(
@@ -2031,7 +2060,7 @@ async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_me
                     .err()
                     .unwrap()
             ),
-            -libc::EACCES
+            -errno
         );
         assert_eq!(
             Layer::getattr_with_mapping(fs.as_ref(), inode, None, false)
@@ -2039,7 +2068,7 @@ async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_me
                 .err()
                 .unwrap()
                 .raw_os_error(),
-            Some(libc::EACCES)
+            Some(errno)
         );
     }
     for name in ["alpha", "missing"] {
@@ -2050,7 +2079,7 @@ async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_me
                     .err()
                     .unwrap()
             ),
-            -libc::EACCES
+            -errno
         );
     }
     for offset in [0, i64::MAX] {
@@ -2061,7 +2090,7 @@ async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_me
                     .err()
                     .unwrap()
             ),
-            -libc::EACCES
+            -errno
         );
         assert_eq!(
             i32::from(
@@ -2070,16 +2099,16 @@ async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_me
                     .err()
                     .unwrap()
             ),
-            -libc::EACCES
+            -errno
         );
     }
     assert_eq!(
         i32::from(fs.opendir(Request::default(), 1, 0).await.err().unwrap()),
-        -libc::EACCES
+        -errno
     );
     assert_eq!(
         i32::from(fs.statfs(Request::default(), 1).await.err().unwrap()),
-        -libc::EACCES
+        -errno
     );
     assert_eq!(
         i32::from(
@@ -2088,20 +2117,43 @@ async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_me
                 .err()
                 .unwrap()
         ),
-        -libc::EACCES
+        -errno
     );
     for path in ["", "/", "alpha", "missing"] {
-        assert_eq!(
-            fs.path_state(path).await.unwrap_err().code,
-            SnapshotErrorCode::ScopeForbidden
-        );
+        assert_eq!(fs.path_state(path).await.unwrap_err().code, terminal);
     }
     for path in ["", "/", "missing"] {
-        assert_eq!(
-            fs.directory_entries(path).await.unwrap_err().code,
-            SnapshotErrorCode::ScopeForbidden
-        );
+        assert_eq!(fs.directory_entries(path).await.unwrap_err().code, terminal);
     }
+    for inode in [alpha, large] {
+        assert_eq!(
+            i32::from(
+                fs.open(Request::default(), inode, libc::O_RDONLY as u32)
+                    .await
+                    .unwrap_err()
+            ),
+            -errno
+        );
+        for (offset, size) in [(0, 1), (0, 0), (u64::MAX, u32::MAX)] {
+            assert_eq!(
+                i32::from(
+                    fs.read(Request::default(), inode, inode, offset, size)
+                        .await
+                        .unwrap_err()
+                ),
+                -errno
+            );
+        }
+    }
+    assert_eq!(
+        i32::from(fs.readlink(Request::default(), link).await.unwrap_err()),
+        -errno
+    );
+    assert_eq!(
+        first.data.as_ref(),
+        &[0x6a; 8192],
+        "delivered bytes retain their owner"
+    );
     assert_eq!(before.attr.size, 8192, "delivered metadata is immutable");
     assert!(fs
         .fsync(Request::default(), alpha, alpha, false)
@@ -2116,6 +2168,32 @@ async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_me
     assert!(http.fixture.object_requests.lock().unwrap().is_empty());
     assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
     assert_eq!(reader.content_usage(), usage);
+}
+
+#[tokio::test]
+async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_metadata() {
+    assert_owned_cached_metadata_failure(
+        expiring_cas_fixture(),
+        SnapshotErrorCode::ScopeForbidden,
+        libc::EACCES,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn owned_cached_metadata_and_content_report_stale_after_real_renewal_410() {
+    let mut fixture = expiring_cas_fixture();
+    fixture.renewal_gone = true;
+    assert_owned_cached_metadata_failure(fixture, SnapshotErrorCode::SnapshotGone, libc::ESTALE)
+        .await;
+}
+
+#[tokio::test]
+async fn owned_cached_metadata_and_content_report_stale_after_actual_deadline() {
+    let mut fixture = expiring_cas_fixture();
+    fixture.pause_renewal = true;
+    assert_owned_cached_metadata_failure(fixture, SnapshotErrorCode::LeaseExpired, libc::ESTALE)
+        .await;
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
