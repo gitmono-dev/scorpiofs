@@ -6,7 +6,7 @@
 //! does not prove authorization or permit an offline read.
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -195,18 +195,12 @@ impl Drop for AuthorityLock {
 fn bind_directory(dir: &Path, binding: &CacheBinding) -> Result<(), SnapshotError> {
     let io_error =
         |error: std::io::Error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string());
-    fs::create_dir_all(dir).map_err(io_error)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join(AUTHORITY_LOCK))
-        .map_err(io_error)?;
+    super::secure_fs::create_dir_all_no_symlink(dir).map_err(io_error)?;
+    let lock = super::secure_fs::open_rw_create(&dir.join(AUTHORITY_LOCK)).map_err(io_error)?;
     lock.lock().map_err(io_error)?;
     let _guard = AuthorityLock(lock);
     let path = dir.join(AUTHORITY_FILE);
-    match fs::read(&path) {
+    match super::secure_fs::read(&path) {
         Ok(bytes) => {
             let stored: CacheBinding = serde_json::from_slice(&bytes).map_err(|_| {
                 SnapshotError::new(
@@ -246,12 +240,7 @@ fn bind_directory(dir: &Path, binding: &CacheBinding) -> Result<(), SnapshotErro
     let bytes = serde_json::to_vec(binding)
         .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))?;
     let temp = dir.join(AUTHORITY_TMP);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp)
-        .map_err(io_error)?;
+    let mut file = super::secure_fs::open_write_truncate(&temp).map_err(io_error)?;
     file.write_all(&bytes).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
     fs::rename(&temp, &path).map_err(io_error)?;

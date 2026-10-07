@@ -14,7 +14,7 @@ use std::{
 
 use ring::digest::{Context, SHA256};
 
-use super::{SnapshotError, SnapshotErrorCode};
+use super::{secure_fs, SnapshotError, SnapshotErrorCode};
 
 const CHUNK_SIZE: u64 = 1024 * 1024;
 const INDEX_FORMAT: u32 = 1;
@@ -210,7 +210,7 @@ fn io_error(error: io::Error) -> SnapshotError {
 }
 
 fn open(path: &Path, size: u64) -> Result<Option<File>, SnapshotError> {
-    let input = match File::open(path) {
+    let input = match secure_fs::open_regular(path) {
         Ok(input) => input,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error(error)),
