@@ -22,6 +22,7 @@ use axum::{
     Json, Router,
 };
 use futures::StreamExt;
+use libfuse_fs::unionfs::layer::Layer;
 use mst2_codec::{
     descriptor::ServingDescriptor,
     metapage::{page_id, BranchChild, Entry, EntryKind, Page},
@@ -62,6 +63,9 @@ struct Fixture {
     object_started: Notify,
     object_release: Notify,
     object_barrier: Option<Arc<tokio::sync::Barrier>>,
+    pause_metadata: AtomicBool,
+    metadata_started: Notify,
+    metadata_release: Notify,
     pause_blob: AtomicBool,
     fail_blob_once: AtomicBool,
     blob_started: Notify,
@@ -334,6 +338,10 @@ async fn metadata(
         }
     }
     f.requests.lock().unwrap().push(ids);
+    if f.pause_metadata.load(Ordering::SeqCst) {
+        f.metadata_started.notify_one();
+        f.metadata_release.notified().await;
+    }
     if items
         .iter()
         .any(|item| !item["route"].as_array().unwrap().is_empty())
@@ -1232,6 +1240,329 @@ async fn wait_for_cas_revocation(http: &HttpFixture, reader: &SnapshotReader) {
         reader.ensure_lease().await.unwrap_err().code,
         SnapshotErrorCode::ScopeForbidden
     );
+}
+
+#[tokio::test]
+async fn owned_cached_metadata_rejects_revocation_without_fetching_content_or_metadata() {
+    let http = HttpFixture::start_canonical(expiring_cas_fixture()).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    let alpha = root_file_inode(&fs, "alpha").await;
+    let before = fs
+        .getattr(Request::default(), alpha, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(before.attr.size, 8192);
+    assert!(fs.getattr(Request::default(), 1, None, 0).await.is_ok());
+    assert_eq!(
+        i32::from(
+            fs.lookup(Request::default(), 1, OsStr::new("missing"))
+                .await
+                .err()
+                .unwrap()
+        ),
+        -libc::ENOENT
+    );
+    for offset in [0, i64::MAX] {
+        let reply = fs.readdir(Request::default(), 1, 1, offset).await.unwrap();
+        let mut entries = std::pin::pin!(reply.entries);
+        while let Some(entry) = entries.next().await {
+            entry.unwrap();
+        }
+        let reply = fs
+            .readdirplus(Request::default(), 1, 1, offset as u64, 0)
+            .await
+            .unwrap();
+        let mut entries = std::pin::pin!(reply.entries);
+        while let Some(entry) = entries.next().await {
+            entry.unwrap();
+        }
+    }
+    assert!(fs.opendir(Request::default(), 1, 0).await.is_ok());
+    assert!(fs.statfs(Request::default(), 1).await.is_ok());
+    assert!(!Layer::is_opaque(fs.as_ref(), Request::default(), 1)
+        .await
+        .unwrap());
+    assert_eq!(
+        Layer::getattr_with_mapping(fs.as_ref(), alpha, None, false)
+            .await
+            .unwrap()
+            .0
+            .st_size,
+        8192
+    );
+    assert!(matches!(
+        fs.path_state("alpha").await.unwrap(),
+        scorpiofs::snapshot::SnapshotPathState::Present(_)
+    ));
+    assert!(matches!(
+        fs.path_state("").await.unwrap(),
+        scorpiofs::snapshot::SnapshotPathState::Present(_)
+    ));
+    assert!(matches!(
+        fs.path_state("missing").await.unwrap(),
+        scorpiofs::snapshot::SnapshotPathState::AbsentProven
+    ));
+    assert!(!fs.directory_entries("").await.unwrap().is_empty());
+    let metadata = http.fixture.requested_ids();
+    let usage = reader.content_usage();
+    wait_for_cas_revocation(&http, &reader).await;
+    assert_eq!(
+        reader.local_lease_status().unwrap_err().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    for inode in [1, alpha] {
+        assert_eq!(
+            i32::from(
+                fs.getattr(Request::default(), inode, None, 0)
+                    .await
+                    .err()
+                    .unwrap()
+            ),
+            -libc::EACCES
+        );
+        assert_eq!(
+            Layer::getattr_with_mapping(fs.as_ref(), inode, None, false)
+                .await
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
+    for name in ["alpha", "missing"] {
+        assert_eq!(
+            i32::from(
+                fs.lookup(Request::default(), 1, OsStr::new(name))
+                    .await
+                    .err()
+                    .unwrap()
+            ),
+            -libc::EACCES
+        );
+    }
+    for offset in [0, i64::MAX] {
+        assert_eq!(
+            i32::from(
+                fs.readdir(Request::default(), 1, 1, offset)
+                    .await
+                    .err()
+                    .unwrap()
+            ),
+            -libc::EACCES
+        );
+        assert_eq!(
+            i32::from(
+                fs.readdirplus(Request::default(), 1, 1, offset as u64, 0)
+                    .await
+                    .err()
+                    .unwrap()
+            ),
+            -libc::EACCES
+        );
+    }
+    assert_eq!(
+        i32::from(fs.opendir(Request::default(), 1, 0).await.err().unwrap()),
+        -libc::EACCES
+    );
+    assert_eq!(
+        i32::from(fs.statfs(Request::default(), 1).await.err().unwrap()),
+        -libc::EACCES
+    );
+    assert_eq!(
+        i32::from(
+            Layer::is_opaque(fs.as_ref(), Request::default(), 1)
+                .await
+                .err()
+                .unwrap()
+        ),
+        -libc::EACCES
+    );
+    for path in ["", "/", "alpha", "missing"] {
+        assert_eq!(
+            fs.path_state(path).await.unwrap_err().code,
+            SnapshotErrorCode::ScopeForbidden
+        );
+    }
+    for path in ["", "/", "missing"] {
+        assert_eq!(
+            fs.directory_entries(path).await.unwrap_err().code,
+            SnapshotErrorCode::ScopeForbidden
+        );
+    }
+    assert_eq!(before.attr.size, 8192, "delivered metadata is immutable");
+    assert!(fs
+        .fsync(Request::default(), alpha, alpha, false)
+        .await
+        .is_ok());
+    assert!(fs
+        .release(Request::default(), alpha, alpha, 0, 0, false)
+        .await
+        .is_ok());
+    assert!(fs.releasedir(Request::default(), 1, 1, 0).await.is_ok());
+    assert_eq!(http.fixture.requested_ids(), metadata);
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(reader.content_usage(), usage);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn owned_revoked_metadata_still_allows_paused_local_diff_but_cannot_load_another_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits, UpperChangeKind},
+        util::mutation_fence::MutationFence,
+    };
+
+    let mut fixture = complete_fixture("a", b"fresh");
+    fixture.lease_expiry = expiring_cas_fixture().lease_expiry;
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    assert!(!fs.directory_entries("a").await.unwrap().is_empty());
+    let metadata = http.fixture.requested_ids();
+    let usage = reader.content_usage();
+    wait_for_cas_revocation(&http, &reader).await;
+    assert_eq!(
+        fs.directory_entries("a").await.unwrap_err().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    let upper = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(upper.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fence = MutationFence::new(1);
+    let pause = fence.pause().await.unwrap();
+    assert!(scan_upper(&fs, upper.path(), &pause, DiffLimits::default())
+        .await
+        .unwrap()
+        .is_clean());
+
+    std::fs::create_dir(upper.path().join("a")).unwrap();
+    std::fs::set_permissions(
+        upper.path().join("a"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(upper.path().join("a/f.txt"), b"private edit").unwrap();
+    std::fs::set_permissions(
+        upper.path().join("a/f.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let dirty = scan_upper(&fs, upper.path(), &pause, DiffLimits::default())
+        .await
+        .unwrap();
+    assert!(dirty.changes.iter().any(|change| {
+        change.rel_path == "a/f.txt" && change.kind == UpperChangeKind::Modified
+    }));
+    std::fs::write(upper.path().join(".wh..wh..opq"), b"").unwrap();
+    let opaque = scan_upper(&fs, upper.path(), &pause, DiffLimits::default())
+        .await
+        .unwrap();
+    assert!(opaque
+        .changes
+        .iter()
+        .any(|change| { change.rel_path == "other" && change.kind == UpperChangeKind::Deleted }));
+    std::fs::remove_file(upper.path().join(".wh..wh..opq")).unwrap();
+
+    // Its directory identity is recorded by the root, but its contents have
+    // not been loaded. Even verified local page hints require the live lease.
+    std::fs::create_dir(upper.path().join("other")).unwrap();
+    std::fs::set_permissions(
+        upper.path().join("other"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(upper.path().join("other/tail.txt"), b"local").unwrap();
+    assert_eq!(
+        scan_upper(&fs, upper.path(), &pause, DiffLimits::default())
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    std::fs::remove_file(upper.path().join("other/tail.txt")).unwrap();
+    std::fs::write(upper.path().join("other/.wh..wh..opq"), b"").unwrap();
+    assert_eq!(
+        scan_upper(&fs, upper.path(), &pause, DiffLimits::default())
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    assert_eq!(http.fixture.requested_ids(), metadata);
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(reader.content_usage(), usage);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn owned_directory_revoked_during_wire_load_keeps_the_directory_unpublished() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use scorpiofs::{
+        snapshot::upper_diff::{scan_upper, DiffLimits},
+        util::mutation_fence::MutationFence,
+    };
+
+    let mut fixture = complete_fixture("a", b"fresh");
+    fixture.lease_expiry = expiring_cas_fixture().lease_expiry;
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, _cache) = owned_fuse_page_cache(root.path(), &reader);
+    let fs = Arc::new(
+        Mst2Fuse::from_reader_lazy(reader.clone(), Some(store))
+            .await
+            .unwrap(),
+    );
+    let a = root_file_inode(&fs, "a").await;
+    http.fixture.pause_metadata.store(true, Ordering::SeqCst);
+    let read_fs = fs.clone();
+    let reading = tokio::spawn(async move {
+        read_fs
+            .lookup(Request::default(), a, OsStr::new("f.txt"))
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        http.fixture.metadata_started.notified(),
+    )
+    .await
+    .unwrap();
+    wait_for_cas_revocation(&http, &reader).await;
+    http.fixture.metadata_release.notify_one();
+    assert_eq!(
+        i32::from(reading.await.unwrap().err().unwrap()),
+        -libc::EACCES
+    );
+    let metadata = http.fixture.requested_ids();
+    let upper = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(upper.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir(upper.path().join("a")).unwrap();
+    std::fs::set_permissions(
+        upper.path().join("a"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(upper.path().join("a/f.txt"), b"local").unwrap();
+    let fence = MutationFence::new(1);
+    let pause = fence.pause().await.unwrap();
+    assert_eq!(
+        scan_upper(&fs, upper.path(), &pause, DiffLimits::default())
+            .await
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::ScopeForbidden,
+        "a failed in-flight page must not turn into recorded metadata"
+    );
+    assert_eq!(http.fixture.requested_ids(), metadata);
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
