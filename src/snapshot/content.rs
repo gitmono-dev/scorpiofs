@@ -140,6 +140,10 @@ impl ContentBudget {
                 <= PROCESS_CONSTRUCTION_BYTES - COORDINATOR_CONSTRUCTION_BYTES
     }
 
+    pub(crate) fn can_prefetch_hydration(&self) -> bool {
+        self.can_overlap_hydration()
+    }
+
     #[cfg(test)]
     pub(crate) fn reserve_test_capacity(
         &self,

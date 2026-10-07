@@ -77,7 +77,11 @@ pub(crate) async fn hydrate_workspace(
 }
 
 #[cfg(test)]
+#[path = "."]
 mod tests {
+    #[path = "hydrate_prefetch_tests.rs"]
+    mod ordered_prefetch;
+
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::{
