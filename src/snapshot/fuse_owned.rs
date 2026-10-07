@@ -10,6 +10,7 @@ use bytes::Bytes;
 
 use super::{
     cas_range::VerifiedCasRange,
+    cas_worker::CasReadScope,
     content::{BudgetClass, ContentBudget, Reservation},
     fuse_store::StoreContent,
     OwnedChunkedFile, ProvenSnapshotFile, SnapshotError, SnapshotErrorCode, SnapshotReader,
@@ -117,6 +118,7 @@ impl OwnedFuseCache {
 /// range payloads live in actual replies, not in an inode payload cache.
 pub(crate) struct StoreRangeCache {
     pub(crate) ranges: FixedCache<RangeEntry>,
+    pub(crate) workers: Arc<CasReadScope>,
     _reservation: Reservation,
 }
 
@@ -127,6 +129,7 @@ impl StoreRangeCache {
             .reserve(BudgetClass::Output, size_of::<Self>())?;
         Ok(Self {
             ranges: FixedCache::new(),
+            workers: reader.content_scope.cas_workers(),
             _reservation: reservation,
         })
     }
@@ -168,7 +171,7 @@ impl ReplyAdmission {
     pub(crate) fn new(reader: &SnapshotReader) -> Result<Self, SnapshotError> {
         Self::reserve(&reader.content_scope)
     }
-    fn reserve(budget: &ContentBudget) -> Result<Self, SnapshotError> {
+    pub(super) fn reserve(budget: &ContentBudget) -> Result<Self, SnapshotError> {
         // bytes1.12.1 boxes repr(C) Owned<T> = AtomicUsize + T. Include both
         // alignment gaps conservatively; clones/slices share that same box.
         let charge =

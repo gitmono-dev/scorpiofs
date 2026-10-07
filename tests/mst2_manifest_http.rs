@@ -3501,3 +3501,198 @@ async fn failed_fetch_releases_singleflight_key_for_retry() {
     assert_eq!(bytes.as_slice(), b"same");
     assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 2);
 }
+
+// Runtime isolation alone does not isolate the process-wide CAS running gate.
+// Run each pool-queue case in its own process so its two reads can both reach
+// spawn_blocking without holding up unrelated lease tests in this binary.
+fn run_cas_pool_test_in_isolated_process(test_name: &str) -> bool {
+    const MARKER: &str = "SCORPIO_CAS_POOL_TEST";
+    if std::env::var(MARKER).ok().as_deref() == Some(test_name) {
+        return false;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(MARKER, test_name)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated CAS pool test failed: {test_name}"
+    );
+    true
+}
+
+// This occupies the isolated runtime's only blocking thread. The controller
+// releases it even if an assertion unwinds, so no test strands a worker.
+struct BlockingPoolHold {
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BlockingPoolHold {
+    async fn new() -> Self {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let blocking = gate.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let mut released = blocking.0.lock().unwrap();
+            while !*released {
+                released = blocking.1.wait(released).unwrap();
+            }
+        });
+        let hold = Self {
+            gate,
+            worker: Some(worker),
+        };
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        hold
+    }
+
+    fn release(&self) {
+        *self.gate.0.lock().unwrap() = true;
+        self.gate.1.notify_all();
+    }
+
+    async fn finish(&mut self) {
+        self.release();
+        self.worker.take().unwrap().await.unwrap();
+    }
+}
+
+impl Drop for BlockingPoolHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[test]
+fn owned_cas_pool_queue_preserves_metadata_responsiveness_and_rejects_real_lease_failures() {
+    if run_cas_pool_test_in_isolated_process(
+        "owned_cas_pool_queue_preserves_metadata_responsiveness_and_rejects_real_lease_failures",
+    ) {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for (terminal, errno) in [
+            (SnapshotErrorCode::ScopeForbidden, libc::EACCES),
+            (SnapshotErrorCode::SnapshotGone, libc::ESTALE),
+            (SnapshotErrorCode::LeaseExpired, libc::ESTALE),
+        ] {
+            let mut fixture = expiring_cas_fixture();
+            fixture.renewal_gone = terminal == SnapshotErrorCode::SnapshotGone;
+            fixture.pause_renewal = terminal == SnapshotErrorCode::LeaseExpired;
+            let http = HttpFixture::start_canonical(fixture).await;
+            let reader = http.canonical_reader().await;
+            let root = tempfile::tempdir().unwrap();
+            let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+            let alpha = root_file_inode(&fs, "alpha").await;
+            let large = root_file_inode(&fs, "large").await;
+            let metadata = http.fixture.requested_ids();
+            let baseline = reader.content_usage();
+            let mut hold = BlockingPoolHold::new().await;
+            let mut small_read = Box::pin(fs.read(Request::default(), alpha, alpha, 0, 19));
+            let mut large_read = Box::pin(fs.read(Request::default(), large, large, 17, 19));
+            assert!(futures::poll!(small_read.as_mut()).is_pending());
+            let small_pending = reader.content_usage();
+            assert!(small_pending.output_bytes > baseline.output_bytes);
+            assert!(futures::poll!(large_read.as_mut()).is_pending());
+            let pending = reader.content_usage();
+            assert!(pending.output_bytes > small_pending.output_bytes);
+            assert_eq!(pending.construction_bytes, baseline.construction_bytes);
+            let attr = tokio::time::timeout(
+                Duration::from_secs(1),
+                fs.getattr(Request::default(), alpha, None, 0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(attr.attr.size, 8192);
+            // Actual HTTP renewal and the actual std::Instant grant clock
+            // keep progressing while both CAS closures wait in the pool.
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while http.fixture.renewal_requests.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(reader.ensure_lease().await.unwrap_err().code, terminal);
+            })
+            .await
+            .unwrap();
+            assert_eq!(reader.content_usage(), pending);
+            hold.finish().await;
+            assert_eq!(i32::from(small_read.await.unwrap_err()), -errno);
+            assert_eq!(i32::from(large_read.await.unwrap_err()), -errno);
+            assert_eq!(reader.content_usage(), baseline);
+            assert_eq!(http.fixture.requested_ids(), metadata);
+            assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+            assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
+#[test]
+fn owned_cas_cancelled_pool_queue_keeps_reply_credits_until_cleanup_and_can_retry() {
+    if run_cas_pool_test_in_isolated_process(
+        "owned_cas_cancelled_pool_queue_keeps_reply_credits_until_cleanup_and_can_retry",
+    ) {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let http = HttpFixture::start_canonical(small_cas_fixture(b"alpha")).await;
+        let reader = http.canonical_reader().await;
+        let root = tempfile::tempdir().unwrap();
+        let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+        let alpha = root_file_inode(&fs, "alpha").await;
+        let large = root_file_inode(&fs, "large").await;
+        let metadata = http.fixture.requested_ids();
+        let baseline = reader.content_usage();
+        let mut hold = BlockingPoolHold::new().await;
+        let mut small_read = Box::pin(fs.read(Request::default(), alpha, alpha, 0, 19));
+        let mut large_read = Box::pin(fs.read(Request::default(), large, large, 17, 19));
+        assert!(futures::poll!(small_read.as_mut()).is_pending());
+        let small_pending = reader.content_usage();
+        assert!(small_pending.output_bytes > baseline.output_bytes);
+        assert!(futures::poll!(large_read.as_mut()).is_pending());
+        let pending = reader.content_usage();
+        assert!(pending.output_bytes > small_pending.output_bytes);
+        assert_eq!(pending.construction_bytes, baseline.construction_bytes);
+        drop(small_read);
+        drop(large_read);
+        assert_eq!(reader.content_usage(), pending);
+        std::fs::remove_file(cas_path(&store, &http.fixture.blobs["/alpha"])).unwrap();
+        hold.finish().await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reader.content_usage() != baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+        assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(http.fixture.requested_ids(), metadata);
+        // Neither cancelled closure published a payload. A live retry with
+        // the CAS object now absent must use the verified owned wire path.
+        let reply = fs
+            .read(Request::default(), alpha, alpha, 0, 19)
+            .await
+            .unwrap();
+        assert_eq!(reply.data.as_ref(), &[0x6a; 19]);
+        assert_eq!(http.fixture.object_requests.lock().unwrap().len(), 1);
+        assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(http.fixture.requested_ids(), metadata);
+    });
+}
