@@ -300,8 +300,9 @@ def endpoint_pair(base_url, git_url):
     return base.port
 
 
-def service_binding(options):
+def service_binding(options, identity_env=None):
     """Bind HTTP socket, process start identity, effective DB and MST instance."""
+    expected_env = os.environ if identity_env is None else identity_env
     proc = Path(f"/proc/{options.service_pid}")
     started = proc.joinpath("stat").read_text().rsplit(") ", 1)[1].split()[19]
     argv = [x.decode() for x in proc.joinpath("cmdline").read_bytes().split(b"\0") if x]
@@ -317,9 +318,9 @@ def service_binding(options):
         raise AssertionError("unreviewed service environment overrides literal config")
     db = urlsplit(inherited.get("MEGA_DATABASE__DB_URL", config["database"]["db_url"]))
     if (db.scheme not in ("postgres", "postgresql") or db.query or db.fragment
-            or db.hostname != os.environ.get("PGHOST") or db.port != int(os.environ["PGPORT"])
-            or db.username != os.environ.get("PGUSER")
-            or db.path != "/" + options.database or os.environ.get("PGDATABASE") != options.database):
+            or db.hostname != expected_env.get("PGHOST") or db.port != int(expected_env["PGPORT"])
+            or db.username != expected_env.get("PGUSER")
+            or db.path != "/" + options.database or expected_env.get("PGDATABASE") != options.database):
         raise AssertionError("read-only identity DB does not match the running service")
     if (not config["mst2"]["enabled"] or config["mst2"]["instance_uuid"] != options.instance_id
             or bool(config["mst2"]["publication_enabled"]) != (options.publication_mode == "native")):
