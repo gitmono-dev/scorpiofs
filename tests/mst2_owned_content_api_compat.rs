@@ -5,21 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use scorpiofs::snapshot::{
     durable::{DurableStore, ViewMeta},
-    FetchCoordinator, FileMembershipError, ProvenSnapshotFile, SnapshotError, SnapshotErrorCode,
-    SnapshotFile, SnapshotReader, ValidatedSnapshotClosure,
+    FileMembershipError, ProvenSnapshotFile, SnapshotError, SnapshotErrorCode, SnapshotFile,
+    SnapshotReader, ValidatedSnapshotClosure,
 };
-
-async fn legacy_fetch(
-    coordinator: &Arc<FetchCoordinator>,
-    file: SnapshotFile,
-) -> Result<(), SnapshotError> {
-    let result: Arc<Vec<u8>> = coordinator.fetch(file, false).await?;
-    let _: &Vec<u8> = &result;
-    let _: &[u8] = &result;
-    let mut copied: Vec<u8> = result.as_ref().clone();
-    copied.push(0);
-    Ok(())
-}
 
 async fn selective_membership(reader: &SnapshotReader) -> Result<(), FileMembershipError> {
     let proven: Arc<ProvenSnapshotFile> = reader.prove_file("file").await?;
@@ -174,7 +162,6 @@ async fn legacy_hydration(
 
 #[test]
 fn legacy_public_api_compiles_without_running_hydration() {
-    let _ = legacy_fetch;
     let _ = legacy_hydration;
     let _ = selective_membership;
     let _ = membership_error;

@@ -354,7 +354,7 @@ async fn assert_alias_membership(seeded: bool) {
     };
     let leader = tokio::spawn({
         let c = coordinator.clone();
-        async move { c.fetch(file("a"), false).await }
+        async move { c.fetch_owned(file("a"), false).await }
     });
     server.fixture.wait_blobs(1).await;
     let mut invalid = Vec::new();
@@ -370,13 +370,14 @@ async fn assert_alias_membership(seeded: bool) {
     wrong.fs_kind = "regular".into();
     invalid.push((wrong, SnapshotErrorCode::DigestMismatch));
     for (file, expected) in invalid {
-        let error = tokio::time::timeout(Duration::from_secs(1), coordinator.fetch(file, false))
-            .await
-            .expect("unproven caller joined a blocked download")
-            .unwrap_err();
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), coordinator.fetch_owned(file, false))
+                .await
+                .expect("unproven caller joined a blocked download")
+                .unwrap_err();
         assert_eq!(error.code, expected);
     }
-    let mut waiter = Box::pin(coordinator.fetch(file("/b"), false));
+    let mut waiter = Box::pin(coordinator.fetch_owned(file("/b"), false));
     assert!(futures::poll!(waiter.as_mut()).is_pending());
     server.fixture.blob_release.add_permits(1);
     let a = leader.await.unwrap().unwrap();
@@ -390,7 +391,7 @@ async fn assert_alias_membership(seeded: bool) {
     legacy_regular.fs_kind = "file".into();
     assert_eq!(
         coordinator
-            .fetch(legacy_regular, false)
+            .fetch_owned(legacy_regular, false)
             .await
             .unwrap()
             .as_slice(),
@@ -407,10 +408,10 @@ async fn cancelling_first_caller_preserves_a_proven_alias_waiter() {
     let coordinator = FetchCoordinator::new(server.reader(None).await, 2);
     let first = tokio::spawn({
         let c = coordinator.clone();
-        async move { c.fetch(file("a"), false).await }
+        async move { c.fetch_owned(file("a"), false).await }
     });
     server.fixture.wait_blobs(1).await;
-    let mut waiter = Box::pin(coordinator.fetch(file("b"), false));
+    let mut waiter = Box::pin(coordinator.fetch_owned(file("b"), false));
     assert!(futures::poll!(waiter.as_mut()).is_pending());
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
@@ -501,7 +502,7 @@ async fn assert_current_lease(seeded: bool) {
     };
     let first = tokio::spawn({
         let c = coordinator.clone();
-        async move { c.fetch(file("a"), false).await }
+        async move { c.fetch_owned(file("a"), false).await }
     });
     server.fixture.wait_blobs(1).await;
     tokio::time::timeout(
@@ -515,10 +516,13 @@ async fn assert_current_lease(seeded: bool) {
         reader.ensure_lease().await.unwrap_err().code,
         SnapshotErrorCode::LeaseUnknown
     );
-    let error = tokio::time::timeout(Duration::from_secs(1), coordinator.fetch(file("b"), false))
-        .await
-        .expect("waiter reused a leader despite its own failed lease")
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        coordinator.fetch_owned(file("b"), false),
+    )
+    .await
+    .expect("waiter reused a leader despite its own failed lease")
+    .unwrap_err();
     assert_eq!(error.code, SnapshotErrorCode::LeaseUnknown);
     assert_eq!(server.fixture.metadata_requests.load(Ordering::SeqCst), 1);
     assert_eq!(server.fixture.blob_requests.lock().unwrap().len(), 1);
@@ -556,7 +560,7 @@ async fn corrupt_root_proof_does_not_fetch_or_poison_membership_retry() {
     fixture.corrupt.store(true, Ordering::SeqCst);
     let server = Server::start(fixture).await;
     let coordinator = FetchCoordinator::new(server.reader(None).await, 1);
-    let error = coordinator.fetch(file("a"), false).await.unwrap_err();
+    let error = coordinator.fetch_owned(file("a"), false).await.unwrap_err();
     assert!(matches!(
         error.code,
         SnapshotErrorCode::DigestMismatch | SnapshotErrorCode::IntegrityError
@@ -565,7 +569,7 @@ async fn corrupt_root_proof_does_not_fetch_or_poison_membership_retry() {
     server.fixture.corrupt.store(false, Ordering::SeqCst);
     assert_eq!(
         coordinator
-            .fetch(file("a"), false)
+            .fetch_owned(file("a"), false)
             .await
             .unwrap()
             .as_slice(),
@@ -582,7 +586,7 @@ async fn cancelled_membership_initialization_is_retried_from_the_fixed_root() {
     let coordinator = FetchCoordinator::new(server.reader(None).await, 1);
     let first = tokio::spawn({
         let c = coordinator.clone();
-        async move { c.fetch(file("a"), false).await }
+        async move { c.fetch_owned(file("a"), false).await }
     });
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -597,7 +601,7 @@ async fn cancelled_membership_initialization_is_retried_from_the_fixed_root() {
     server.fixture.metadata_release.add_permits(1);
     assert_eq!(
         coordinator
-            .fetch(file("b"), false)
+            .fetch_owned(file("b"), false)
             .await
             .unwrap()
             .as_slice(),
@@ -619,8 +623,8 @@ async fn credentials_cannot_share_another_coordinators_download_or_membership() 
     );
     let a = FetchCoordinator::new(a, 1);
     let b = FetchCoordinator::new(b, 1);
-    let a = tokio::spawn(async move { a.fetch(file("a"), false).await });
-    let b = tokio::spawn(async move { b.fetch(file("b"), false).await });
+    let a = tokio::spawn(async move { a.fetch_owned(file("a"), false).await });
+    let b = tokio::spawn(async move { b.fetch_owned(file("b"), false).await });
     server.fixture.wait_blobs(2).await;
     server.fixture.blob_release.add_permits(2);
     let a = a.await.unwrap().unwrap();
@@ -661,12 +665,12 @@ async fn assert_legacy_requests(seeded: bool) {
     };
     let first = tokio::spawn({
         let c = coordinator.clone();
-        async move { c.fetch(file("a"), false).await }
+        async move { c.fetch_owned(file("a"), false).await }
     });
     server.fixture.wait_blobs(1).await;
     let error = tokio::time::timeout(
         Duration::from_secs(2),
-        coordinator.fetch(file("absent"), false),
+        coordinator.fetch_owned(file("absent"), false),
     )
     .await
     .expect("legacy absent path reused another caller's result")
@@ -674,7 +678,7 @@ async fn assert_legacy_requests(seeded: bool) {
     assert_eq!(error.code, SnapshotErrorCode::PathNotFound);
     let second = tokio::spawn({
         let c = coordinator.clone();
-        async move { c.fetch(file("b"), false).await }
+        async move { c.fetch_owned(file("b"), false).await }
     });
     server.fixture.wait_blobs(3).await;
     server.fixture.blob_release.add_permits(2);
