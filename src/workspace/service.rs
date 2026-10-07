@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     future::Future,
     path::{Path, PathBuf},
@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex,
     },
+    time::Duration,
 };
 
 use tokio::{
@@ -20,8 +21,8 @@ use crate::snapshot::{
     fuse::Mst2Fuse,
     stage::{trace_async, trace_blocking, trace_sync},
     upper_diff::{scan_upper, DiffLimits},
-    CompletionKind, DurableStore, HydrateReport, LocalPinState, MetadataProofLimits, Mst2Client,
-    SnapshotError, SnapshotErrorCode, SnapshotReader,
+    CacheLimits, CompletionKind, DurableStore, HydrateReport, LocalPinState, MetadataProofLimits,
+    Mst2Client, SnapshotError, SnapshotErrorCode, SnapshotReader,
 };
 
 pub struct WorkspaceConfig {
@@ -33,6 +34,7 @@ pub struct WorkspaceConfig {
     pub lease_seconds: u64,
     pub metadata_limits: MetadataProofLimits,
     pub diff_limits: DiffLimits,
+    pub cache_limits: CacheLimits,
     /// Explicit local diagnostic switch; ordinary serving allocates no profiler.
     pub read_profile: bool,
 }
@@ -48,6 +50,7 @@ impl WorkspaceConfig {
             lease_seconds: 300,
             metadata_limits: MetadataProofLimits::default(),
             diff_limits: DiffLimits::default(),
+            cache_limits: CacheLimits::default(),
             read_profile: false,
         }
     }
@@ -118,6 +121,7 @@ pub struct WorkspaceService {
     operations: Arc<Semaphore>,
     hydrations: Arc<Semaphore>,
     shutting_down: AtomicBool,
+    cache_worker_started: AtomicBool,
     observer: Option<Arc<WorkspaceObserver>>,
 }
 
@@ -162,8 +166,118 @@ impl WorkspaceService {
             config,
             entries: StdMutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            cache_worker_started: AtomicBool::new(false),
             observer,
         }))
+    }
+
+    fn start_cache_worker(self: &Arc<Self>) {
+        if self.cache_worker_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let service = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_scope = None::<PathBuf>;
+            let mut owners = BTreeMap::<PathBuf, String>::new();
+            loop {
+                interval.tick().await;
+                let Some(service) = service.upgrade() else {
+                    break;
+                };
+                if service.shutting_down.load(Ordering::Acquire) {
+                    break;
+                }
+                let Ok(permit) = service.operations.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let entries = service.cache_entries();
+                let mut scopes = BTreeSet::new();
+                for entry in entries {
+                    let Ok(runtime) = entry.runtime.try_lock() else {
+                        continue;
+                    };
+                    if let Some(store) = &runtime.store {
+                        if let Some(scope) = store.content_dir().parent() {
+                            scopes.insert(scope.to_path_buf());
+                        }
+                    }
+                }
+                owners.retain(|scope, _| scopes.contains(scope));
+                let next = scopes
+                    .iter()
+                    .find(|scope| last_scope.as_ref().is_none_or(|last| *scope > last))
+                    .or_else(|| scopes.first())
+                    .cloned();
+                if let Some(scope) = next {
+                    let next_owner = service
+                        .maintain_cache_scope(&scope, owners.get(&scope).map(String::as_str))
+                        .await;
+                    if let Some(owner) = next_owner {
+                        owners.insert(scope.clone(), owner);
+                    }
+                    last_scope = Some(scope);
+                }
+                // Shutdown joins this actual maintenance, including promotion
+                // and collector blocking jobs, through the operation permit.
+                drop(permit);
+            }
+        });
+    }
+
+    fn cache_entries(&self) -> Vec<Arc<Workspace>> {
+        let mut entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
+        entries.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        entries
+    }
+
+    /// One scope and at most eight owner promotions per invocation. Busy and
+    /// unknown owners remain protected by the collector, and the background
+    /// cursor revisits them without holding another workspace's runtime lock.
+    async fn maintain_cache_scope(&self, scope: &Path, after: Option<&str>) -> Option<String> {
+        match super::cache::pressure(scope.to_path_buf()).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return None,
+        }
+        let entries = self.cache_entries();
+        let start = after.map_or(0, |last| {
+            entries.partition_point(|entry| entry.id.as_str() <= last)
+        });
+        let mut visited = 0usize;
+        let mut last = None;
+        for entry in entries[start..].iter().chain(entries[..start].iter()) {
+            if visited == 8 {
+                break;
+            }
+            let Ok(runtime) = entry.runtime.try_lock() else {
+                continue;
+            };
+            let (Some(store), Some(reader)) = (&runtime.store, &runtime.reader) else {
+                continue;
+            };
+            if store.content_dir().parent() != Some(scope) || runtime.upper_removed {
+                continue;
+            }
+            visited += 1;
+            last = Some(entry.id.clone());
+            if let Err(error) =
+                super::cache::promote(store.clone(), reader, self.config.cache_limits).await
+            {
+                tracing::debug!(target: "scorpiofs::workspace::performance", code = ?error.code,
+                    "cache root promotion deferred; owner remains protected");
+            }
+        }
+        match super::cache::collect(scope.to_path_buf()).await {
+            Ok(report) => tracing::debug!(target: "scorpiofs::workspace::performance",
+                scanned_entries = report.scanned_entries, deleted_entries = report.deleted_entries,
+                deleted_bytes = report.deleted_bytes, "bounded cache collection completed"),
+            Err(error) => {
+                tracing::debug!(target: "scorpiofs::workspace::performance", code = ?error.code,
+                "cache collection deferred without retiring owners")
+            }
+        }
+        last
     }
 
     pub(crate) async fn read_profile(
@@ -236,6 +350,7 @@ impl WorkspaceService {
                 "workspace service is shutting down",
             ));
         }
+        self.start_cache_worker();
         let capacity = self
             .workspace_capacity
             .clone()
@@ -334,13 +449,20 @@ impl WorkspaceService {
             )
         };
         runtime.reader = Some(reader.clone());
+        let scope = reader
+            .authorized_context()
+            .scope_cache_dir(&self.config.cache_root);
+        self.maintain_cache_scope(&scope, None).await;
         let cache_root = self.config.cache_root.clone();
+        let cache_limits = self.config.cache_limits;
         let id = workspace.id.clone();
         let fixed = reader.clone();
         let store = Arc::new(
             trace_blocking("store_bind", move || {
                 trace_sync("store_bind_work", || {
-                    let mut store = DurableStore::open_for_workspace(cache_root, &id, &fixed)?;
+                    let mut store = DurableStore::open_for_workspace_with_cache_limits(
+                        cache_root, &id, &fixed, cache_limits,
+                    )?;
                     if tracing::enabled!(target: "scorpiofs::workspace::performance", tracing::Level::DEBUG) {
                         store.enable_verification_meters();
                     }
@@ -777,6 +899,32 @@ impl WorkspaceService {
                 runtime.upper_removed = true;
                 remove_if_present(&workspace.mountpoint, false)?;
                 runtime.mountpoint_removed = true;
+            } else {
+                // Preparation can bind a store before creating private paths.
+                // The binding checks prove all three paths remain absent;
+                // such an owner still needs explicit cache-use retirement.
+                if runtime.mount.is_some() {
+                    return Err(WorkspaceError::new(
+                        "WORKSPACE_UNKNOWN",
+                        "native owner has no private directory binding",
+                    ));
+                }
+                runtime.upper_removed = true;
+                runtime.mountpoint_removed = true;
+            }
+            check_private_paths(&workspace, &runtime)?;
+            check_retired_mountpoint(&workspace, &runtime)?;
+            // Neither release nor shutdown retires CACHE_USE. Native IO is
+            // joined above, and the upper is removed or proved never created.
+            if let Some(store) = &runtime.store {
+                let store = store.clone();
+                trace_blocking("cache_use_retire", move || store.retire_cache_use())
+                    .await
+                    .map_err(|_| {
+                        WorkspaceError::new("WORKSPACE_UNKNOWN", "cache use retirement task failed")
+                    })??;
+            }
+            if runtime.directory_identity.is_some() {
                 fs::remove_dir(&workspace.directory)?;
             }
             service.entries.lock().unwrap().remove(&workspace.id);

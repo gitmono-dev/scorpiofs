@@ -7,6 +7,7 @@
 //!   resume, a completeness marker and a pin.
 
 pub mod auth;
+pub mod cache_retention;
 pub mod capabilities;
 mod cas_content;
 mod cas_index;
@@ -47,6 +48,7 @@ pub mod upper_diff;
 pub mod workspace_pins;
 
 pub use auth::{AuthorizedSnapshotContext, CacheDomain};
+pub use cache_retention::{CacheCollectionReport, CacheLimits};
 pub use client::Mst2Client;
 pub use closure::{SnapshotClosureMeters, SnapshotDirectory, ValidatedSnapshotClosure};
 pub use content::{ContentBudgetLimits, ContentBudgetUsage, VerifiedContent, VerifiedContentBatch};

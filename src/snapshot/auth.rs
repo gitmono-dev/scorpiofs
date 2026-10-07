@@ -182,6 +182,75 @@ const AUTHORITY_FILE: &str = "authority.json";
 const AUTHORITY_LOCK: &str = "authority.lock";
 const AUTHORITY_TMP: &str = "authority.json.tmp";
 
+pub(crate) fn validate_retention_scope(dir: &Path) -> Result<(), SnapshotError> {
+    let binding = retention_binding(dir)?;
+    let invalid = || {
+        SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "managed scope authority or location differs",
+        )
+    };
+    validate_scope(&binding.scope)?;
+    let scope_id = hash_fields(b"mega.scorpio.scope.v1\0", &[binding.scope.as_bytes()]);
+    if binding.revision != 1
+        || binding.snapshot_id.is_some()
+        || binding.domain.len() != 64
+        || !binding
+            .domain
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || dir.file_name() != Some(scope_id.as_ref())
+        || dir.parent().and_then(Path::file_name) != Some(binding.domain.as_ref())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_retention_content_scope(scope: &Path) -> Result<(), SnapshotError> {
+    let content = scope.join("blobs");
+    match fs::symlink_metadata(&content) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            if retention_binding(&content)? != retention_binding(scope)? {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::IntegrityError,
+                    "managed content authority differs from scope",
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "managed content scope is not a real directory",
+        )),
+    }
+}
+
+fn retention_binding(dir: &Path) -> Result<CacheBinding, SnapshotError> {
+    use std::io::Read;
+    let invalid = || {
+        SnapshotError::new(
+            SnapshotErrorCode::IntegrityError,
+            "managed scope authority or location differs",
+        )
+    };
+    let file = super::secure_fs::open_regular_nonblocking(&dir.join(AUTHORITY_FILE))
+        .map_err(|_| invalid())?;
+    if file.metadata().map_err(|_| invalid())?.len() > 16 * 1024 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() > 16 * 1024 {
+        return Err(invalid());
+    }
+    let binding: CacheBinding = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    Ok(binding)
+}
+
 struct AuthorityLock(File);
 
 impl Drop for AuthorityLock {
@@ -193,6 +262,7 @@ impl Drop for AuthorityLock {
 }
 
 fn bind_directory(dir: &Path, binding: &CacheBinding) -> Result<(), SnapshotError> {
+    let _cache_io = super::cache_retention::io_guard(dir)?;
     let io_error =
         |error: std::io::Error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string());
     super::secure_fs::create_dir_all_no_symlink(dir).map_err(io_error)?;
@@ -239,7 +309,12 @@ fn bind_directory(dir: &Path, binding: &CacheBinding) -> Result<(), SnapshotErro
     }
     let bytes = serde_json::to_vec(binding)
         .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))?;
-    let temp = dir.join(AUTHORITY_TMP);
+    let admission =
+        super::cache_retention::WriteAdmission::begin(dir, AUTHORITY_FILE, bytes.len() as u64)?;
+    let temp = admission
+        .as_ref()
+        .map(|admission| admission.temporary_path())
+        .unwrap_or_else(|| dir.join(AUTHORITY_TMP));
     let mut file = super::secure_fs::open_write_truncate(&temp).map_err(io_error)?;
     file.write_all(&bytes).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;

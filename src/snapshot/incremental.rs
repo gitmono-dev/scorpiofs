@@ -125,6 +125,7 @@ pub struct SyncMeters {
 /// may keep the same open-file description alive after this handle closes.
 struct IndexLock {
     file: File,
+    _scope_guard: Option<super::cache_retention::ScopeIoGuard>,
 }
 
 impl Drop for IndexLock {
@@ -202,6 +203,7 @@ impl ScopeCache {
     /// the scope live in subdirectories, so pin liveness is discoverable.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
         let dir = dir.into();
+        let _cache_io = super::cache_retention::io_guard(&dir)?;
         secure_fs::create_dir_all_no_symlink(&dir.join("pages")).map_err(io_err)?;
         Ok(ScopeCache { dir })
     }
@@ -265,11 +267,15 @@ impl ScopeCache {
     }
 
     fn try_index_lock(&self) -> Result<Option<IndexLock>, SnapshotError> {
+        let scope_guard = super::cache_retention::io_guard(&self.dir)?;
         // Lock a stable inode, not closures.json which publication replaces.
         // No blocking lock call may stall the async task that owns the lock.
         let lock = secure_fs::open_rw_create(&self.dir.join("closures.lock")).map_err(io_err)?;
         match lock.try_lock() {
-            Ok(()) => Ok(Some(IndexLock { file: lock })),
+            Ok(()) => Ok(Some(IndexLock {
+                file: lock,
+                _scope_guard: scope_guard,
+            })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(e)) => Err(io_err(e)),
         }
@@ -499,6 +505,7 @@ impl ScopeCache {
         page_id: &str,
     ) -> Result<Option<Vec<u8>>, SnapshotError> {
         use std::io::Read;
+        let _cache_io = super::cache_retention::io_guard(&self.dir)?;
 
         use mst2_codec::metapage::PAGE_MAX_BYTES;
 
@@ -545,6 +552,7 @@ impl ScopeCache {
         meters: &mut SyncMeters,
         rehashed_page_ids: &mut HashSet<[u8; 32]>,
     ) -> Result<Option<Vec<u8>>, SnapshotError> {
+        let _cache_io = super::cache_retention::io_guard(&self.dir)?;
         let want = match parse_page_id(page_id) {
             Ok(w) => w,
             // A corrupt record falls back to fetching. Do not even inspect
@@ -552,18 +560,35 @@ impl ScopeCache {
             Err(_) => return Ok(None),
         };
         let path = self.page_path(&want);
-        let bytes = match secure_fs::read(&path) {
-            Ok(b) => b,
+        let mut file = match secure_fs::open_regular_nonblocking(&path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(e)),
         };
+        use std::io::Read;
+
+        use mst2_codec::metapage::PAGE_MAX_BYTES;
+        if file.metadata().map_err(io_err)?.len() > PAGE_MAX_BYTES as u64 {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(PAGE_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io_err)?;
+        if bytes.len() > PAGE_MAX_BYTES {
+            return Ok(None);
+        }
         meters.page_rehashes += 1;
         meters.page_rehash_bytes += bytes.len() as u64;
         rehashed_page_ids.insert(want);
         meters.unique_page_rehashes = rehashed_page_ids.len() as u64;
         if mst2_codec::metapage::page_id(&bytes) != want {
-            // Corrupt: remove so a later sync re-fetches instead of re-reading.
-            let _ = fs::remove_file(&path);
+            // Treat corruption as a miss. A concurrent writer can replace this
+            // digest after our read, so the old bytes cannot authorize unlink.
+            if _cache_io.is_none() {
+                let _ = fs::remove_file(&path);
+            }
             return Ok(None);
         }
         Ok(Some(bytes))
@@ -1150,12 +1175,19 @@ fn io_err(e: std::io::Error) -> SnapshotError {
 
 /// Temp-file + rename so a crash never leaves a half-written record or page.
 fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
+    let _cache_io = super::cache_retention::io_guard(dir)?;
     secure_fs::create_dir_all_no_symlink(dir).map_err(io_err)?;
-    let tmp = dir.join(format!(
-        ".{name}.tmp.{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    let admission = super::cache_retention::WriteAdmission::begin(dir, name, data.len() as u64)?;
+    let tmp = admission
+        .as_ref()
+        .map(|admission| admission.temporary_path())
+        .unwrap_or_else(|| {
+            dir.join(format!(
+                ".{name}.tmp.{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+        });
     let result = (|| {
         use std::io::Write as _;
         let mut f = secure_fs::open_create_new(&tmp).map_err(io_err)?;

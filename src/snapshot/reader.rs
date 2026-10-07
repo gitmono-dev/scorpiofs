@@ -42,6 +42,74 @@ impl SnapshotPageSource for NetworkPages {
     }
 }
 
+/// Counts unique wire bytes separately from logical route expansion. Aliased
+/// directories cannot bypass the route/allocation budget by sharing a page id.
+struct PageCollectionBudget {
+    limits: super::CacheLimits,
+    deadline: Instant,
+    routes: usize,
+    bytes: usize,
+    allocation: usize,
+    pages: HashSet<String>,
+}
+
+impl PageCollectionBudget {
+    fn check(&self) -> Result<(), SnapshotError> {
+        if Instant::now() >= self.deadline {
+            return Err(Self::limit());
+        }
+        Ok(())
+    }
+    fn limit() -> SnapshotError {
+        SnapshotError::new(
+            SnapshotErrorCode::LimitExceeded,
+            "cache metadata acquisition budget exceeded",
+        )
+    }
+    fn allocate(&mut self, bytes: usize) -> Result<(), SnapshotError> {
+        self.check()?;
+        self.allocation = self.allocation.checked_add(bytes).ok_or_else(Self::limit)?;
+        if self.allocation > self.limits.max_inventory_bytes {
+            return Err(Self::limit());
+        }
+        Ok(())
+    }
+    fn route(&mut self, dir_len: usize, route_len: usize) -> Result<(), SnapshotError> {
+        self.routes = self.routes.checked_add(1).ok_or_else(Self::limit)?;
+        if self.routes > self.limits.max_root_nodes {
+            return Err(Self::limit());
+        }
+        self.allocate(
+            dir_len
+                .saturating_mul(8)
+                .saturating_add(route_len.saturating_mul(8))
+                .saturating_add(1024),
+        )
+    }
+    fn page(&mut self, id: &str, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.check()?;
+        if bytes.len() > mst2_codec::metapage::PAGE_MAX_BYTES {
+            return Err(Self::limit());
+        }
+        if !self.pages.contains(id) {
+            if self.pages.len() >= self.limits.max_entries {
+                return Err(Self::limit());
+            }
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .ok_or_else(Self::limit)?;
+            if self.bytes > self.limits.max_metadata_bytes {
+                return Err(Self::limit());
+            }
+            // Encoded, decoded and map bookkeeping, admitted before decode.
+            self.allocate(bytes.len().saturating_mul(16).saturating_add(512))?;
+            self.pages.insert(id.to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// One pending page fetch: a directory plus the label route from that
 /// directory's MTP2 root, and the page id the parent page committed to (the
 /// descriptor's `metadata_root` for the scope root).
@@ -750,6 +818,41 @@ impl SnapshotReader {
         Ok(closure)
     }
 
+    /// Full canonical metadata proof for managed-cache retention. This fetches
+    /// no bodies and creates neither COMPLETE nor a pin. Every route, page,
+    /// decoded entry and logical path is admitted before retained expansion.
+    pub async fn snapshot_closure_for_cache(
+        &self,
+        limits: super::CacheLimits,
+    ) -> Result<ValidatedSnapshotClosure, SnapshotError> {
+        limits.validate()?;
+        let deadline = Instant::now() + Duration::from_millis(limits.max_scan_millis);
+        let mut budget = PageCollectionBudget {
+            limits,
+            deadline,
+            routes: 0,
+            bytes: 0,
+            allocation: 0,
+            pages: HashSet::new(),
+        };
+        let (pages, _, _) = self
+            .snapshot_pages_with_budget(&mut NetworkPages, Some(&mut budget))
+            .await?;
+        // Rebuild the canonical descriptor from the reader's validated view,
+        // rather than relying on cached derived files or closure-index rows.
+        let descriptor = ValidatedSnapshotClosure::canonical_descriptor_bytes(self.descriptor())?;
+        let closure = ValidatedSnapshotClosure::from_canonical_pages_bounded(
+            &descriptor,
+            pages,
+            limits.max_root_nodes,
+            limits.max_inventory_bytes,
+            Some(deadline),
+        )?;
+        self.validate_snapshot_files(closure.files())?;
+        self.ensure_lease().await?;
+        Ok(closure)
+    }
+
     pub(crate) fn validate_snapshot_files(
         &self,
         files: &[SnapshotFile],
@@ -767,6 +870,14 @@ impl SnapshotReader {
         &self,
         source: &mut impl SnapshotPageSource,
     ) -> Result<(BTreeMap<String, Vec<u8>>, u64, u64), SnapshotError> {
+        self.snapshot_pages_with_budget(source, None).await
+    }
+
+    async fn snapshot_pages_with_budget(
+        &self,
+        source: &mut impl SnapshotPageSource,
+        mut budget: Option<&mut PageCollectionBudget>,
+    ) -> Result<(BTreeMap<String, Vec<u8>>, u64, u64), SnapshotError> {
         if !self.caps.features.metadata_pages {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::SnapshotNotReady,
@@ -774,6 +885,9 @@ impl SnapshotReader {
             ));
         }
         self.ensure_lease().await?;
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.route(1, 0)?;
+        }
         let mut frontier = VecDeque::from([PageFrontier {
             dir: "/".to_string(),
             route: Vec::new(),
@@ -789,6 +903,9 @@ impl SnapshotReader {
         let mut route_visits = 0;
         let mut page_decodes = 0;
         while !frontier.is_empty() {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.check()?;
+            }
             let take = frontier
                 .len()
                 .min(PAGES_BATCH)
@@ -808,6 +925,9 @@ impl SnapshotReader {
                 route_ids.insert((f.dir.clone(), f.route.clone()), f.expected.clone());
                 if !decoded.contains_key(&f.expected) {
                     if let Some(bytes) = source.cached_page(&f.expected)? {
+                        if let Some(budget) = budget.as_deref_mut() {
+                            budget.page(&f.expected, &bytes)?;
+                        }
                         decoded.insert(f.expected.clone(), decode_page(&bytes)?);
                         page_decodes += 1;
                         page_bytes.insert(f.expected.clone(), bytes);
@@ -858,6 +978,9 @@ impl SnapshotReader {
                         format!("metadata/pages payload does not hash to {id}"),
                     ));
                 }
+                if let Some(budget) = budget.as_deref_mut() {
+                    budget.page(&id, &bytes)?;
+                }
                 let page = decode_page(&bytes)?;
                 page_decodes += 1;
                 source.received_page(&id, &bytes)?;
@@ -889,16 +1012,19 @@ impl SnapshotReader {
                 match page {
                     mst2_codec::metapage::Page::Leaf { entries } => {
                         for e in entries {
-                            collect_directory(&f.dir, e, &mut frontier)?;
+                            collect_directory(&f.dir, e, &mut frontier, budget.as_deref_mut())?;
                         }
                     }
                     mst2_codec::metapage::Page::Branch {
                         terminal, children, ..
                     } => {
                         if let Some(e) = terminal {
-                            collect_directory(&f.dir, e, &mut frontier)?;
+                            collect_directory(&f.dir, e, &mut frontier, budget.as_deref_mut())?;
                         }
                         for c in children {
+                            if let Some(budget) = budget.as_deref_mut() {
+                                budget.route(f.dir.len(), f.route.len() + 1)?;
+                            }
                             let mut route = f.route.clone();
                             route.push(c.label);
                             frontier.push_back(PageFrontier {
@@ -1256,10 +1382,14 @@ fn collect_directory(
     dir: &str,
     e: &mst2_codec::metapage::Entry,
     frontier: &mut VecDeque<PageFrontier>,
+    budget: Option<&mut PageCollectionBudget>,
 ) -> Result<(), SnapshotError> {
     use mst2_codec::metapage::EntryKind as MetaEntryKind;
     if e.kind != MetaEntryKind::Directory {
         return Ok(());
+    }
+    if let Some(budget) = budget {
+        budget.route(dir.len().saturating_add(e.name.len()).saturating_add(1), 0)?;
     }
     let name = std::str::from_utf8(&e.name)
         .map_err(|_| {
@@ -1485,6 +1615,35 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, fixture, task)
+    }
+
+    #[tokio::test]
+    async fn cache_metadata_promotion_bounds_real_wire_pages_and_alias_expansion() {
+        for byte_budget in [true, false] {
+            let (url, fixture, server) = serve_closure_fixture(closure_http_fixture()).await;
+            let reader = SnapshotReader::resolve(Mst2Client::new(url), "/project", 600)
+                .await
+                .unwrap();
+            let mut limits = super::super::CacheLimits::default();
+            limits.max_scan_millis = 10_000;
+            if byte_budget {
+                limits.max_metadata_bytes = 1;
+            } else {
+                limits.max_root_nodes = 1;
+            }
+            let error = reader.snapshot_closure_for_cache(limits).await.unwrap_err();
+            assert_eq!(error.code, SnapshotErrorCode::LimitExceeded);
+            let requests = fixture.requested.lock().unwrap();
+            assert!(!requests.is_empty());
+            assert_eq!(
+                requests.len(),
+                1,
+                "expansion refuses before a second metadata request"
+            );
+            drop(requests);
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[tokio::test]

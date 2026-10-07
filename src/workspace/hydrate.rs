@@ -2,7 +2,7 @@
 
 use crate::snapshot::{
     durable::{tag_hydration_error, HydrationSubstage},
-    stage::{trace_async, trace_sync},
+    stage::{trace_async, trace_blocking, trace_sync},
     DurableStore, HydrateReport, IncrementalSync, ScopeCache, SnapshotError, SnapshotErrorCode,
     SnapshotReader,
 };
@@ -36,6 +36,24 @@ pub(crate) async fn hydrate_workspace(
         full_root_proof = ?sync.closure_meters(),
         "workspace metadata acquired with full namespace proof"
     );
+    // Retention proves metadata reachability independently of completeness.
+    // It allows pressure recovery before full-body capacity is reserved.
+    let owned_store = store.clone();
+    let (closure, retained) = trace_blocking("hydrate_retain_metadata_root", move || {
+        let retained = owned_store.retain_snapshot_root(&closure);
+        (closure, retained)
+    })
+    .await
+    .map_err(|_| SnapshotError::new(SnapshotErrorCode::Internal, "cache root worker failed"))?;
+    retained?;
+    if super::cache::pressure(scope.to_path_buf()).await? {
+        // Busy or unknown sibling owners remain protected. The capacity
+        // admission below still decides whether this hydration can proceed.
+        if let Err(error) = super::cache::collect(scope.to_path_buf()).await {
+            tracing::debug!(target: "scorpiofs::workspace::performance", code = ?error.code,
+                "pre-hydration collection deferred");
+        }
+    }
     // sync_snapshot has dropped the scope-index transaction before hydration
     // acquires this owner's durable publication lock. Cached pages remain
     // hints; this exact fixed root has been proved including empty directories.
@@ -86,6 +104,9 @@ mod tests {
 
     #[path = "hydrate_full_proof_tests.rs"]
     mod full_proof;
+
+    #[path = "cache_pressure_tests.rs"]
+    mod cache_pressure;
 
     use std::{
         collections::{BTreeMap, BTreeSet},

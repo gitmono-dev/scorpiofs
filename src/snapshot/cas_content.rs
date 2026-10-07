@@ -112,6 +112,7 @@ impl VerifiedCasContent {
             AccountedBuffer::new(budget, BudgetClass::Output, capacity, size_of::<Self>())?;
         let _scratch_reservation = budget.reserve(BudgetClass::Construction, READ_SCRATCH_BYTES)?;
         let mut scratch = [0u8; READ_SCRATCH_BYTES];
+        let _cache_io = super::cache_retention::io_guard(store.content_dir())?;
         let path = store.content_dir().join(hex::encode(expected_digest));
         let start = meters.as_ref().map(|_| Instant::now());
         let opened = secure_fs::open_regular_nonblocking(&path);

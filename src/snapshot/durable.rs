@@ -40,7 +40,6 @@ use std::{
 
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 
 pub use super::cas_index::LocalCasRangeMeters;
 use crate::snapshot::{
@@ -495,6 +494,7 @@ pub struct HydrateReport {
 /// blob is addressed by the digest of its bytes and re-verified before use,
 /// and it is what makes a new version reuse content instead of downloading
 /// it again (spec 11 §3/§10.2: key is auth_domain + digest + size).
+#[derive(Clone)]
 pub struct DurableStore {
     pub(super) root: PathBuf,
     pub(super) content: PathBuf,
@@ -622,13 +622,18 @@ impl Drop for VerificationAttempt<'_> {
 }
 
 /// Transaction lifetime owns the lock, even if fork/dup retains a descriptor.
-pub(super) struct TransactionGuard(File);
+pub(super) struct TransactionGuard(
+    File,
+    Option<super::cache_retention::ScopeIoGuard>,
+    Option<std::sync::Arc<super::cache_retention::HydrationBudget>>,
+);
 
 impl Drop for TransactionGuard {
     fn drop(&mut self) {
         if let Err(error) = self.0.unlock() {
             tracing::warn!(%error, "failed to release local hydration lock");
         }
+        self.1.take();
     }
 }
 
@@ -641,6 +646,17 @@ impl DurableStore {
     ) -> Result<Self, SnapshotError> {
         let root = root.into();
         let content = content.into();
+        let _root_io = super::cache_retention::io_guard(&root)?;
+        let _content_io = super::cache_retention::io_guard(&content)?;
+        if let Some(scope) = super::cache_retention::managed_scope(&content)? {
+            if !root.starts_with(&scope)
+                || root.parent().and_then(Path::file_name) != Some("owners".as_ref())
+            {
+                return Err(integrity_err(
+                    "managed shared CAS requires a registered workspace owner",
+                ));
+            }
+        }
         let context = reader.authorized_context();
         context.bind_view_cache(&root)?;
         context.bind_scope_cache(&content)?;
@@ -664,6 +680,18 @@ impl DurableStore {
     ) -> Result<Self, SnapshotError> {
         let root = root.into();
         let content = content.into();
+        let _root_io = super::cache_retention::io_guard(&root)?;
+        let _content_io = super::cache_retention::io_guard(&content)?;
+        if let Some(scope) = super::cache_retention::managed_scope(&content)? {
+            if !root.starts_with(&scope)
+                || root.parent().and_then(Path::file_name) != Some("owners".as_ref())
+                || !root.join("workspace.json").try_exists().map_err(io_err)?
+            {
+                return Err(integrity_err(
+                    "managed shared CAS requires an existing registered workspace owner",
+                ));
+            }
+        }
         create_dirs_durable(&root)?;
         create_dirs_durable(&content)?;
         let store = Self {
@@ -1171,7 +1199,7 @@ impl DurableStore {
         B: AsRef<[u8]>,
     {
         let _transaction = self
-            .prepare_hydration_for_kind(view, manifest, closure.is_some())
+            .prepare_hydration_for_kind(view, manifest, closure)
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let journal = JournalBatch::new(self);
         let mut fetched = 0u64;
@@ -1220,11 +1248,17 @@ impl DurableStore {
                 f.size > crate::snapshot::OBJECT_CAP
                     && source.reader().capabilities().features.chunk_reads
             }) {
-                write_reader_blob(&self.content, source, f, prefetch_chunks)
-                    .await
-                    .map_err(|error| {
-                        tag_hydration_error(error, HydrationSubstage::LargeContentFetch)
-                    })?;
+                write_reader_blob(
+                    &self.content,
+                    source,
+                    f,
+                    prefetch_chunks,
+                    _transaction.2.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    tag_hydration_error(error, HydrationSubstage::LargeContentFetch)
+                })?;
             } else {
                 let owner = fetch(f).await.map_err(|error| {
                     tag_hydration_error(error, HydrationSubstage::SmallObjectFetch)
@@ -1256,9 +1290,13 @@ impl DurableStore {
                         HydrationSubstage::SmallObjectFetch,
                     ));
                 }
-                write_atomic(&self.content, &blob_name(&f.content_digest), bytes).map_err(
-                    |error| tag_hydration_error(error, HydrationSubstage::SmallObjectFetch),
-                )?;
+                write_atomic_with_budget(
+                    &self.content,
+                    &blob_name(&f.content_digest),
+                    bytes,
+                    _transaction.2.clone(),
+                )
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::SmallObjectFetch))?;
             }
             journal
                 .append(&FileRecord {
@@ -1391,7 +1429,7 @@ impl DurableStore {
                 .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         }
         let _transaction = self
-            .prepare_hydration_for_kind(view, manifest, closure.is_some())
+            .prepare_hydration_for_kind(view, manifest, closure)
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let journal = JournalBatch::new(self);
         let fetched = std::sync::atomic::AtomicU64::new(0);
@@ -1438,6 +1476,7 @@ impl DurableStore {
                 let bytes_total = &bytes_total;
                 let journal = &journal;
                 let fetch = fetch.clone();
+                let cache_budget = _transaction.2.clone();
                 async move {
                     use std::sync::atomic::Ordering::Relaxed;
                     let logical_files = aliases.len() as u64 + 1;
@@ -1463,6 +1502,7 @@ impl DurableStore {
                             HydrationRangeSource::FixedRoot(reader),
                             &f,
                             prefetch_chunks,
+                            cache_budget.clone(),
                         )
                         .await?;
                     } else {
@@ -1488,7 +1528,12 @@ impl DurableStore {
                                 ),
                             ));
                         }
-                        write_atomic(&store.content, &blob_name(&f.content_digest), bytes)?;
+                        write_atomic_with_budget(
+                            &store.content,
+                            &blob_name(&f.content_digest),
+                            bytes,
+                            cache_budget.clone(),
+                        )?;
                     }
                     for file in std::iter::once(&f).chain(aliases.iter()) {
                         journal.append(&FileRecord {
@@ -1721,7 +1766,7 @@ impl DurableStore {
                 .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         }
         let _transaction = self
-            .prepare_hydration_for_kind(view, manifest, closure.is_some())
+            .prepare_hydration_for_kind(view, manifest, closure)
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::HydrationCommit))?;
         let journal = JournalBatch::new(self);
         let fetched = std::sync::atomic::AtomicU64::new(0);
@@ -1828,9 +1873,10 @@ impl DurableStore {
                 .try_for_each_concurrent(batch_concurrency.max(1), |batch| {
                     let fetch_batch = fetch_batch.clone();
                     let journal = &journal;
+                    let cache_budget = _transaction.2.clone();
                     async move {
                         let bytes = fetch_batch(batch.clone()).await?;
-                        let writer = CasBatchWriter::new(&store.content)?;
+                        let writer = CasBatchWriter::new(&store.content, cache_budget)?;
                         for f in &batch {
                             let content = bytes.content(&f.content_digest).ok_or_else(|| {
                                 SnapshotError::new(
@@ -1872,6 +1918,7 @@ impl DurableStore {
                 .try_for_each_concurrent(large_concurrency.max(1), |f| {
                     let fetch_large = fetch_large.clone();
                     let journal = &journal;
+                    let cache_budget = _transaction.2.clone();
                     async move {
                         if let Some(reader) = stream_reader
                             .filter(|reader| reader.capabilities().features.chunk_reads)
@@ -1881,6 +1928,7 @@ impl DurableStore {
                                 HydrationRangeSource::FixedRoot(reader),
                                 &f,
                                 prefetch_chunks,
+                                cache_budget.clone(),
                             )
                             .await?;
                         } else {
@@ -1907,7 +1955,12 @@ impl DurableStore {
                                     ),
                                 ));
                             }
-                            write_atomic(&store.content, &blob_name(&f.content_digest), bytes)?;
+                            write_atomic_with_budget(
+                                &store.content,
+                                &blob_name(&f.content_digest),
+                                bytes,
+                                cache_budget,
+                            )?;
                         }
                         journal.append(&FileRecord {
                             rel_path: f.rel_path.clone(),
@@ -1963,9 +2016,10 @@ impl DurableStore {
     // a short critical-section lock held by a downloading task. Dropping the
     // handle (including after process exit) releases the OS lock.
     pub(super) fn try_transaction(&self) -> Result<Option<TransactionGuard>, SnapshotError> {
+        let scope_guard = super::cache_retention::io_guard(&self.content)?;
         let lock = secure_fs::open_rw_create(&self.root.join(TRANSACTION_LOCK)).map_err(io_err)?;
         match lock.try_lock() {
-            Ok(()) => Ok(Some(TransactionGuard(lock))),
+            Ok(()) => Ok(Some(TransactionGuard(lock, scope_guard, None))),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(e)) => Err(io_err(e)),
         }
@@ -1984,9 +2038,13 @@ impl DurableStore {
         &self,
         view: &ViewMeta,
         manifest: &[SnapshotFile],
-        full_snapshot: bool,
+        closure: Option<&ValidatedSnapshotClosure>,
     ) -> Result<TransactionGuard, SnapshotError> {
-        let transaction = self.transaction()?;
+        let full_snapshot = closure.is_some();
+        if let Some(closure) = closure {
+            self.retain_snapshot_root(closure)?;
+        }
+        let mut transaction = self.transaction()?;
         super::workspace_pins::validate_hydration(self, view)?;
         validate_view_policy(view, full_snapshot)?;
         // Check identity before revoking anything: a conflicting caller must
@@ -2029,6 +2087,7 @@ impl DurableStore {
                 ));
             }
         }
+        transaction.2 = super::cache_retention::HydrationBudget::reserve(self, manifest, closure)?;
         // The journal is only a resume hint, so validate and repair it before
         // revoking a still-valid COMPLETE claim. A non-tail corruption must
         // not make an otherwise verified store permanently unavailable.
@@ -2786,8 +2845,9 @@ impl DurableStore {
     /// Read a hydrated file by CAS digest, re-verifying before returning it.
     pub fn read_blob(&self, digest: &str, expected_size: u64) -> Result<Vec<u8>, SnapshotError> {
         let capacity = buffered_size(expected_size)?;
+        let _cache_io = super::cache_retention::io_guard(&self.content)?;
         let path = self.blob_path(digest)?;
-        let mut input = secure_fs::open_regular(&path).map_err(|e| {
+        let mut input = secure_fs::open_regular_nonblocking(&path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 SnapshotError::new(
                     SnapshotErrorCode::PathNotFound,
@@ -2840,6 +2900,7 @@ impl DurableStore {
         expected_size: u64,
         reason: CasVerificationReason,
     ) -> Result<bool, SnapshotError> {
+        let _cache_io = super::cache_retention::io_guard(&self.content)?;
         let mut attempt = VerificationAttempt {
             counters: self
                 .verification_meters
@@ -2864,7 +2925,7 @@ impl DurableStore {
         // Completion and resume must not collect a potentially 8 TiB CAS
         // object into memory. Read at most one byte beyond its advertised
         // size so growth cannot turn verification into an unbounded stream.
-        let mut input = secure_fs::open_regular(&path)
+        let mut input = secure_fs::open_regular_nonblocking(&path)
             .map_err(io_err)?
             .take(expected_size.saturating_add(1));
         let mut hash = Context::new(&SHA256);
@@ -2939,6 +3000,11 @@ impl DurableStore {
         if bytes.is_empty() {
             return Ok(());
         }
+        let _admission = super::cache_retention::WriteAdmission::begin(
+            &self.root,
+            JOURNAL_FILE,
+            bytes.len() as u64,
+        )?;
         let mut f = secure_fs::open_append_create(&self.root.join(JOURNAL_FILE)).map_err(io_err)?;
         durability_checkpoint(&self.root, "journal-write")?;
         f.write_all(bytes).map_err(io_err)?;
@@ -2952,11 +3018,26 @@ impl DurableStore {
     }
 
     fn compact_journal(&self, manifest: &[SnapshotFile]) -> Result<(), SnapshotError> {
-        let tmp = self.root.join(format!(
-            ".{JOURNAL_FILE}.tmp.{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let maximum = super::cache_retention::managed_scope(&self.content)?
+            .map(|scope| {
+                super::cache_retention::inventory_limits(&scope)
+                    .map(|limits| limits.max_inventory_bytes as u64)
+            })
+            .transpose()?
+            .unwrap_or(u64::MAX);
+        let maximum = super::cache_retention::serialized_size(manifest, maximum)?;
+        let admission =
+            super::cache_retention::WriteAdmission::begin(&self.root, JOURNAL_FILE, maximum)?;
+        let tmp = admission
+            .as_ref()
+            .map(|admission| admission.temporary_path())
+            .unwrap_or_else(|| {
+                self.root.join(format!(
+                    ".{JOURNAL_FILE}.tmp.{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+            });
         let result = (|| {
             let file = secure_fs::open_create_new(&tmp).map_err(io_err)?;
             let mut output = io::BufWriter::with_capacity(256 * 1024, &file);
@@ -3015,20 +3096,37 @@ fn blob_name(digest: &str) -> String {
 
 struct CasBatchWriter<'a> {
     dir: &'a Path,
+    budget: Option<std::sync::Arc<super::cache_retention::HydrationBudget>>,
 }
 
 impl<'a> CasBatchWriter<'a> {
-    fn new(dir: &'a Path) -> Result<Self, SnapshotError> {
+    fn new(
+        dir: &'a Path,
+        budget: Option<std::sync::Arc<super::cache_retention::HydrationBudget>>,
+    ) -> Result<Self, SnapshotError> {
         create_dirs_durable(dir)?;
-        Ok(Self { dir })
+        Ok(Self { dir, budget })
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), SnapshotError> {
-        let temporary = PendingBlob(self.dir.join(format!(
-            ".{name}.tmp.{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        )));
+        let admission = super::cache_retention::WriteAdmission::begin_with_budget(
+            self.dir,
+            name,
+            bytes.len() as u64,
+            self.budget.clone(),
+        )?;
+        let temporary = PendingBlob(
+            admission
+                .as_ref()
+                .map(|admission| admission.temporary_path())
+                .unwrap_or_else(|| {
+                    self.dir.join(format!(
+                        ".{name}.tmp.{}-{}",
+                        std::process::id(),
+                        uuid::Uuid::new_v4()
+                    ))
+                }),
+        );
         let mut file = secure_fs::open_create_new(&temporary.0).map_err(io_err)?;
         file.write_all(bytes).map_err(io_err)?;
         durability_checkpoint(self.dir, "object-file-sync")?;
@@ -3061,14 +3159,39 @@ pub fn digest_of(bytes: &[u8]) -> String {
 /// Write `data` to `dir/name`: unique temp, data fsync, rename, directory
 /// fsync. No successful return is possible when either sync fails.
 pub(super) fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
+    write_atomic_with_budget(dir, name, data, None)
+}
+
+pub(super) fn write_atomic_with_budget(
+    dir: &Path,
+    name: &str,
+    data: &[u8],
+    budget: Option<std::sync::Arc<super::cache_retention::HydrationBudget>>,
+) -> Result<(), SnapshotError> {
+    let _cache_io = super::cache_retention::io_guard(dir)?;
     create_dirs_durable(dir)?;
+    let admission = if budget.is_some() {
+        super::cache_retention::WriteAdmission::begin_with_budget(
+            dir,
+            name,
+            data.len() as u64,
+            budget,
+        )?
+    } else {
+        super::cache_retention::WriteAdmission::begin(dir, name, data.len() as u64)?
+    };
     // Random per writer: concurrent hydrations of identical content may race
     // on the same final name but must not share a tmp path.
-    let tmp = dir.join(format!(
-        ".{name}.tmp.{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    let tmp = admission
+        .as_ref()
+        .map(|admission| admission.temporary_path())
+        .unwrap_or_else(|| {
+            dir.join(format!(
+                ".{name}.tmp.{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+        });
     let result = (|| {
         let mut f = secure_fs::open_create_new(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
@@ -3100,12 +3223,13 @@ async fn write_reader_blob(
     source: HydrationRangeSource<'_>,
     file: &SnapshotFile,
     prefetch_chunks: bool,
+    budget: Option<std::sync::Arc<super::cache_retention::HydrationBudget>>,
 ) -> Result<(), SnapshotError> {
     let source = source
         .open(file)
         .await
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkMap))?;
-    write_reader_blob_stream(dir, file, prefetch_chunks, |offset, length| {
+    write_reader_blob_stream(dir, file, prefetch_chunks, budget, |offset, length| {
         source.read_range_owned(offset, length)
     })
     .await
@@ -3115,6 +3239,7 @@ async fn write_reader_blob_stream<F, Fut>(
     dir: &Path,
     file: &SnapshotFile,
     prefetch_chunks: bool,
+    budget: Option<std::sync::Arc<super::cache_retention::HydrationBudget>>,
     mut read_range: F,
 ) -> Result<(), SnapshotError>
 where
@@ -3124,16 +3249,27 @@ where
     create_dirs_durable(dir)
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     let name = blob_name(&file.content_digest);
-    let temporary_path = dir.join(format!(
-        ".{name}.tmp.{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    let admission =
+        super::cache_retention::WriteAdmission::begin_with_budget(dir, &name, file.size, budget)
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+    let temporary_path = admission
+        .as_ref()
+        .map(|admission| admission.temporary_path())
+        .unwrap_or_else(|| {
+            dir.join(format!(
+                ".{name}.tmp.{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+        });
     let handle = secure_fs::open_create_new(&temporary_path)
         .map_err(io_err)
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
-    let temporary = PendingBlob(temporary_path);
-    let mut output = tokio::fs::File::from_std(handle);
+    let mut output = StreamCasWriter {
+        file: handle,
+        temporary: PendingBlob(temporary_path),
+        _admission: admission,
+    };
     let mut hash = Context::new(&SHA256);
     let mut offset = 0;
     while offset < file.size {
@@ -3158,8 +3294,9 @@ where
             ((offset, length, first), None)
         };
         // Returned owners retain their credits through their ordered write.
-        // try_join drops the pending sibling on error; no task outlives this
-        // writer or can publish its temporary file after cancellation.
+        // try_join drops the pending sibling on error. Actual local IO owns
+        // its FD, temp and disk reservation even if its waiter is cancelled;
+        // only this enclosing task can perform the final CAS rename.
         for (range_offset, range_length, owner) in std::iter::once(first).chain(second) {
             if range_offset != offset || owner.len() as u64 != range_length {
                 return Err(tag_hydration_error(
@@ -3169,11 +3306,13 @@ where
             }
             let bytes = owner.as_bytes();
             hash.update(bytes);
-            output
-                .write_all(bytes)
-                .await
-                .map_err(io_err)
-                .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+            output = tokio::task::spawn_blocking(move || {
+                output.file.write_all(owner.as_bytes()).map_err(io_err)?;
+                Ok::<_, SnapshotError>(output)
+            })
+            .await
+            .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))?
+            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
             offset += range_length;
         }
     }
@@ -3189,19 +3328,22 @@ where
             HydrationSubstage::LargeChunkRead,
         ));
     }
-    output
-        .flush()
-        .await
-        .map_err(io_err)
-        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
-    durability_checkpoint(dir, "object-file-sync")
-        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
-    output
-        .sync_all()
-        .await
-        .map_err(io_err)
-        .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
-    drop(output);
+    let output_directory = dir.to_path_buf();
+    output = tokio::task::spawn_blocking(move || {
+        output.file.flush().map_err(io_err)?;
+        durability_checkpoint(&output_directory, "object-file-sync")?;
+        output.file.sync_all().map_err(io_err)?;
+        Ok::<_, SnapshotError>(output)
+    })
+    .await
+    .map_err(|error| SnapshotError::new(SnapshotErrorCode::Internal, error.to_string()))?
+    .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+    let StreamCasWriter {
+        file: handle,
+        temporary,
+        _admission,
+    } = output;
+    drop(handle);
     fs::rename(&temporary.0, dir.join(name))
         .map_err(io_err)
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
@@ -3209,6 +3351,12 @@ where
 }
 
 struct PendingBlob(PathBuf);
+
+struct StreamCasWriter {
+    file: File,
+    temporary: PendingBlob,
+    _admission: Option<super::cache_retention::WriteAdmission>,
+}
 
 impl Drop for PendingBlob {
     fn drop(&mut self) {
@@ -3332,6 +3480,146 @@ pub(super) fn completion_revision(bytes: &[u8]) -> Result<u32, SnapshotError> {
         verification_revision: u32,
     }
     Ok(decode_commit::<Header>(bytes, COMPLETE_MARKER)?.verification_revision)
+}
+
+/// Metadata consistency for destructive cache inventory, deliberately separate
+/// from COMPLETE's whole-body audit. The caller has independently proved the
+/// fixed canonical root and bounded every input/allocation before this call.
+pub(super) fn audit_retention_metadata(
+    closure: &ValidatedSnapshotClosure,
+    records: &BTreeMap<&str, Vec<u8>>,
+) -> Result<(), SnapshotError> {
+    let required = |name| {
+        records
+            .get(name)
+            .ok_or_else(|| integrity_err("retention metadata dependency missing"))
+    };
+    let view_bytes = required(VIEW_FILE)?;
+    let manifest_bytes = required(MANIFEST_FILE)?;
+    let pin_bytes = required(PIN_FILE)?;
+    let view: ViewMeta = decode_commit(view_bytes, VIEW_FILE)?;
+    validate_view_policy(&view, true)?;
+    validate_snapshot_view(&view, closure)?;
+    let manifest: Vec<SnapshotFile> = decode_commit(manifest_bytes, MANIFEST_FILE)?;
+    for file in &manifest {
+        let index = closure
+            .files()
+            .binary_search_by(|expected| expected.rel_path.cmp(&file.rel_path))
+            .map_err(|_| integrity_err("retention pin file lacks fixed-root membership"))?;
+        if closure.files()[index] != *file {
+            return Err(integrity_err(
+                "retention pin file differs from fixed-root membership",
+            ));
+        }
+    }
+    let revision = completion_revision(pin_bytes)?;
+    let (blobs, bytes_total) =
+        validate_manifest_policy(&manifest, revision == SNAPSHOT_VERIFICATION_REVISION)?;
+    let view_digest = digest_of(view_bytes);
+    let manifest_digest = digest_of(manifest_bytes);
+    let grant_digest;
+    if revision == SNAPSHOT_VERIFICATION_REVISION {
+        let descriptor_bytes = required(DESCRIPTOR_FILE)?;
+        let index_bytes = required(METADATA_INDEX_FILE)?;
+        let descriptor_digest = digest_of(descriptor_bytes);
+        let index_digest = digest_of(index_bytes);
+        let pin: SnapshotPinRecord = decode_commit(pin_bytes, PIN_FILE)?;
+        let index: MetadataIndex = decode_commit(index_bytes, METADATA_INDEX_FILE)?;
+        let expected_pages: Vec<_> = closure
+            .pages()
+            .iter()
+            .map(|(id, bytes)| PageDependency {
+                page_id: id.clone(),
+                size: bytes.len() as u64,
+            })
+            .collect();
+        if descriptor_bytes.as_slice() != closure.descriptor_bytes()
+            || manifest.as_slice() != closure.files()
+            || index.verification_revision != SNAPSHOT_VERIFICATION_REVISION
+            || index.pages != expected_pages
+            || index.directories.as_slice() != closure.directories()
+            || pin.pin_id.is_empty()
+            || pin.snapshot_id != view.snapshot_id
+            || pin.namespace_view_id != view.namespace_view_id
+            || pin.scope != view.scope
+            || pin.lease_id != view.lease_id
+            || pin.view_digest != view_digest
+            || pin.manifest_digest != manifest_digest
+            || pin.descriptor_digest != descriptor_digest
+            || pin.metadata_index_digest != index_digest
+            || pin.pages != expected_pages
+            || pin.blobs != blobs
+        {
+            return Err(integrity_err(
+                "snapshot pin metadata differs from canonical retention root",
+            ));
+        }
+        if let Some(marker_bytes) = records.get(COMPLETE_MARKER) {
+            let marker: SnapshotCompleteMarker = decode_commit(marker_bytes, COMPLETE_MARKER)?;
+            if marker.verification_revision != revision
+                || marker.completion_kind != CompletionKind::FullSnapshot
+                || marker.snapshot_id != view.snapshot_id
+                || marker.namespace_view_id != view.namespace_view_id
+                || marker.view_digest != view_digest
+                || marker.manifest_digest != manifest_digest
+                || marker.descriptor_digest != descriptor_digest
+                || marker.metadata_index_digest != index_digest
+                || marker.pin_digest != digest_of(pin_bytes)
+                || marker.files != manifest.len() as u64
+                || marker.directories != closure.directories().len() as u64
+                || marker.pages != expected_pages.len() as u64
+                || marker.bytes != bytes_total
+                || marker.offline_grant_digest != pin.offline_grant_digest
+            {
+                return Err(integrity_err(
+                    "snapshot completion metadata differs from retention root",
+                ));
+            }
+        }
+        grant_digest = pin.offline_grant_digest;
+    } else if revision == VERIFICATION_REVISION {
+        let pin: PinRecord = decode_commit(pin_bytes, PIN_FILE)?;
+        if pin.pin_id.is_empty()
+            || pin.snapshot_id != view.snapshot_id
+            || pin.namespace_view_id != view.namespace_view_id
+            || pin.scope != view.scope
+            || pin.lease_id != view.lease_id
+            || pin.view_digest != view_digest
+            || pin.manifest_digest != manifest_digest
+            || pin.blobs != blobs
+        {
+            return Err(integrity_err(
+                "file pin metadata differs from canonical retention root",
+            ));
+        }
+        if let Some(marker_bytes) = records.get(COMPLETE_MARKER) {
+            let marker: CompleteMarker = decode_commit(marker_bytes, COMPLETE_MARKER)?;
+            if marker.verification_revision != revision
+                || marker.completion_kind != CompletionKind::FileClosure
+                || marker.snapshot_id != view.snapshot_id
+                || marker.namespace_view_id != view.namespace_view_id
+                || marker.view_digest != view_digest
+                || marker.manifest_digest != manifest_digest
+                || marker.pin_digest != digest_of(pin_bytes)
+                || marker.files != manifest.len() as u64
+                || marker.bytes != bytes_total
+                || marker.offline_grant_digest != pin.offline_grant_digest
+            {
+                return Err(integrity_err(
+                    "file completion metadata differs from retention root",
+                ));
+            }
+        }
+        grant_digest = pin.offline_grant_digest;
+    } else {
+        return Err(integrity_err("unsupported retention pin revision"));
+    }
+    if !grant_digest.is_empty() {
+        if digest_of(required(OFFLINE_GRANT_FILE)?) != grant_digest {
+            return Err(integrity_err("retention offline metadata digest differs"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_snapshot_view(
