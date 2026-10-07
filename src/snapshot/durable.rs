@@ -50,18 +50,74 @@ use crate::snapshot::{
 };
 
 trait BorrowedBatch {
-    fn content_bytes(&self, digest: &str) -> Option<&[u8]>;
+    fn content(&self, digest: &str) -> Option<BorrowedBatchContent<'_>>;
+}
+
+enum BorrowedBatchContent<'a> {
+    Raw(&'a [u8]),
+    Verified(&'a super::VerifiedContent),
+}
+
+impl<'a> BorrowedBatchContent<'a> {
+    fn validate(self, file: &SnapshotFile, _content_dir: &Path) -> Result<&'a [u8], SnapshotError> {
+        let data = match self {
+            Self::Raw(data) => {
+                #[cfg(test)]
+                owned_proof_tests::record_raw_hash(_content_dir, data.len() as u64);
+                let got = digest_of(data);
+                if got != file.content_digest {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        format!(
+                            "{}: expected {}, got {got}",
+                            file.rel_path, file.content_digest
+                        ),
+                    ));
+                }
+                data
+            }
+            Self::Verified(content) => {
+                let digest = super::frames::parse_digest(&file.content_digest)?;
+                if !content.matches_integrity(&digest, file.size) {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::DigestMismatch,
+                        format!(
+                            "{}: verified OBJECT owner does not match fixed digest and size",
+                            file.rel_path
+                        ),
+                    ));
+                }
+                #[cfg(test)]
+                owned_proof_tests::record_verified_reuse(_content_dir, content.len() as u64);
+                content.as_bytes()
+            }
+        };
+        if data.len() as u64 != file.size {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::DigestMismatch,
+                format!(
+                    "{}: view advertises {} bytes, content is {}",
+                    file.rel_path,
+                    file.size,
+                    data.len()
+                ),
+            ));
+        }
+        Ok(data)
+    }
 }
 
 impl<B: AsRef<[u8]>> BorrowedBatch for HashMap<String, std::sync::Arc<B>> {
-    fn content_bytes(&self, digest: &str) -> Option<&[u8]> {
-        self.get(digest).map(|body| body.as_ref().as_ref())
+    fn content(&self, digest: &str) -> Option<BorrowedBatchContent<'_>> {
+        self.get(digest)
+            .map(|body| BorrowedBatchContent::Raw(body.as_ref().as_ref()))
     }
 }
 
 impl BorrowedBatch for super::VerifiedContentBatch {
-    fn content_bytes(&self, digest: &str) -> Option<&[u8]> {
-        self.get(digest).map(|body| body.as_bytes())
+    fn content(&self, digest: &str) -> Option<BorrowedBatchContent<'_>> {
+        self.get(digest)
+            .map(|body| BorrowedBatchContent::Verified(body.as_ref()))
     }
 }
 
@@ -1577,7 +1633,9 @@ impl DurableStore {
     }
 
     /// Bounded owned OBJECT batches for a complete fixed reader. The batch
-    /// table and bodies are borrowed through independent CAS verification.
+    /// table and bodies retain their publication-verified immutable ownership.
+    /// The fixed digest and size must match before reusing that proof; the
+    /// installed CAS still receives an independent full audit before commit.
     pub async fn hydrate_snapshot_content_batches<FBatch, FLarge>(
         &self,
         reader: &SnapshotReader,
@@ -1774,7 +1832,7 @@ impl DurableStore {
                         let bytes = fetch_batch(batch.clone()).await?;
                         let writer = CasBatchWriter::new(&store.content)?;
                         for f in &batch {
-                            let data = bytes.content_bytes(&f.content_digest).ok_or_else(|| {
+                            let content = bytes.content(&f.content_digest).ok_or_else(|| {
                                 SnapshotError::new(
                                     SnapshotErrorCode::DigestMismatch,
                                     format!(
@@ -1783,27 +1841,10 @@ impl DurableStore {
                                     ),
                                 )
                             })?;
-                            let got = digest_of(data);
-                            if got != f.content_digest {
-                                return Err(SnapshotError::new(
-                                    SnapshotErrorCode::DigestMismatch,
-                                    format!(
-                                        "{}: expected {}, got {got}",
-                                        f.rel_path, f.content_digest
-                                    ),
-                                ));
-                            }
-                            if data.len() as u64 != f.size {
-                                return Err(SnapshotError::new(
-                                    SnapshotErrorCode::DigestMismatch,
-                                    format!(
-                                        "{}: view advertises {} bytes, content is {}",
-                                        f.rel_path,
-                                        f.size,
-                                        data.len()
-                                    ),
-                                ));
-                            }
+                            // Only a publish-verified immutable owner can
+                            // reuse its proof. Raw callbacks still hash fully.
+                            // Installed CAS bytes are audited again at commit.
+                            let data = content.validate(f, &store.content)?;
                             writer.write(&blob_name(&f.content_digest), data)?;
                         }
                         writer.finish()?;
@@ -3439,6 +3480,10 @@ pub(super) mod durability_tests;
 #[cfg(test)]
 #[path = "durable_snapshot_tests.rs"]
 mod snapshot_durability_tests;
+
+#[cfg(test)]
+#[path = "durable_owned_proof_tests.rs"]
+pub(crate) mod owned_proof_tests;
 
 #[cfg(all(test, unix))]
 #[path = "durable_stream_tests.rs"]
