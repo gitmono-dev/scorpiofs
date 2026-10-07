@@ -2547,11 +2547,7 @@ async fn canonical_stored_constructors_preserve_empty_directories_and_actual_cas
         let paid = reader.content_usage().output_bytes - slots;
         assert!(paid >= 8192);
         let after_first = http.fixture.requested_ids();
-        let lazy = constructor == StoredOnlineConstructor::LazyOrdinaryStore;
-        let mut expected_metadata = metadata;
-        if lazy {
-            expected_metadata.push(id_string(&http.fixture.root));
-        }
+        let expected_metadata = metadata;
         assert_eq!(after_first, expected_metadata);
         // A digest cache hit must share bytes while each alias retains its inode.
         std::fs::remove_file(cas_path(&store, &http.fixture.blobs["/alpha"])).unwrap();
@@ -2567,11 +2563,8 @@ async fn canonical_stored_constructors_preserve_empty_directories_and_actual_cas
                 .unwrap();
             assert_eq!(reply.data.as_ptr(), first.data.as_ptr().wrapping_add(17));
             assert_eq!(reply.data.as_ref(), &[0x6a; 31]);
-            // Lazy membership shares a path cell, not metadata page bytes:
-            // each new alias proves this selected root independently.
-            if lazy && name != "alpha" {
-                expected_metadata.push(id_string(&http.fixture.root));
-            }
+            // Each inode retains its own path membership from the directory's
+            // canonical fixed-root proof while sharing verified content bytes.
             assert_eq!(http.fixture.requested_ids(), expected_metadata);
             let repeated = fs
                 .read(Request::default(), inode, inode, 17, 31)
@@ -2587,9 +2580,6 @@ async fn canonical_stored_constructors_preserve_empty_directories_and_actual_cas
             .await
             .unwrap();
         assert_eq!(range.data.as_ref(), &[0x8b; 19]);
-        if lazy {
-            expected_metadata.push(id_string(&http.fixture.root));
-        }
         assert_eq!(http.fixture.requested_ids(), expected_metadata);
         let repeated_range = fs
             .read(Request::default(), large, large, 17, 19)
@@ -2752,11 +2742,7 @@ async fn owned_cas_unseeded_lazy_reads_prove_each_alias_without_walking_unrelate
         .ino;
     http.fixture.requests.lock().unwrap().clear();
     let first = fs.read(Request::default(), file, file, 0, 6).await.unwrap();
-    let expected = [
-        id_string(&http.fixture.root),
-        id_string(&http.fixture.routes[&("/a".into(), vec![])]),
-    ];
-    assert_eq!(http.fixture.requested_ids(), expected);
+    assert!(http.fixture.requested_ids().is_empty());
     std::fs::remove_file(cas_path(&store, body)).unwrap();
     let alias = root_file_inode(&fs, "alias").await;
     let alias_file = fs
@@ -2772,10 +2758,9 @@ async fn owned_cas_unseeded_lazy_reads_prove_each_alias_without_walking_unrelate
         .await
         .unwrap();
     assert_eq!(second.data.as_ptr(), first.data.as_ptr().wrapping_add(1));
-    assert_eq!(
-        http.fixture.requested_ids(),
-        expected,
-        "the alias proves its own logical path before sharing bytes"
+    assert!(
+        http.fixture.requested_ids().is_empty(),
+        "the alias reuses its root-bound directory membership before sharing bytes"
     );
     assert!(http.fixture.object_requests.lock().unwrap().is_empty());
     assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);

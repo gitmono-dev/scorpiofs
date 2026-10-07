@@ -1,6 +1,7 @@
 //! Selective fixed-root file membership, independent of complete closure proof.
 
 use std::{
+    collections::BTreeMap,
     mem::size_of,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -92,20 +93,21 @@ fn not_file(message: &str) -> FileMembershipError {
 /// ```
 #[derive(Debug)]
 pub struct ProvenSnapshotFile {
-    file: SnapshotFile,
+    file: Arc<SnapshotFile>,
+    identity: Arc<MembershipIdentity>,
+}
+
+#[derive(Debug)]
+struct MembershipIdentity {
     domain: CacheDomain,
     epoch: u64,
     scope: String,
     root: String,
     snapshot: String,
 }
-impl ProvenSnapshotFile {
-    pub fn file(&self) -> &SnapshotFile {
-        &self.file
-    }
-    fn mint(reader: &SnapshotReader, file: SnapshotFile) -> Arc<Self> {
+impl MembershipIdentity {
+    fn new(reader: &SnapshotReader) -> Arc<Self> {
         Arc::new(Self {
-            file,
             domain: reader.authorized_context().cache_domain().clone(),
             epoch: reader.authorized_context().authorization_epoch(),
             scope: reader.descriptor().scope.clone(),
@@ -113,7 +115,7 @@ impl ProvenSnapshotFile {
             snapshot: reader.snapshot_id().to_string(),
         })
     }
-    pub(crate) async fn validate(&self, reader: &SnapshotReader) -> Result<(), SnapshotError> {
+    fn validate(&self, reader: &SnapshotReader) -> Result<(), SnapshotError> {
         let context = reader.authorized_context();
         if self.domain != *context.cache_domain()
             || self.epoch != context.authorization_epoch()
@@ -125,8 +127,151 @@ impl ProvenSnapshotFile {
                 "proven file belongs to a different reader authority or fixed root",
             ));
         }
-        context.validate_relative_path(&self.file.rel_path)?;
+        Ok(())
+    }
+}
+impl ProvenSnapshotFile {
+    pub fn file(&self) -> &SnapshotFile {
+        &self.file
+    }
+    pub(crate) fn shared_file(&self) -> Arc<SnapshotFile> {
+        self.file.clone()
+    }
+    fn mint(reader: &SnapshotReader, file: SnapshotFile) -> Arc<Self> {
+        Arc::new(Self {
+            file: Arc::new(file),
+            identity: MembershipIdentity::new(reader),
+        })
+    }
+    pub(crate) async fn validate(&self, reader: &SnapshotReader) -> Result<(), SnapshotError> {
+        self.identity.validate(reader)?;
+        reader
+            .authorized_context()
+            .validate_relative_path(&self.file.rel_path)?;
         reader.ensure_lease().await
+    }
+}
+
+/// An opaque directory path committed by the fixed descriptor root. A child
+/// can only be derived from the parent's complete canonical radix proof.
+#[derive(Debug)]
+pub(crate) struct ProvenSnapshotDirectory {
+    path: String,
+    root: String,
+    identity: Arc<MembershipIdentity>,
+}
+
+pub(crate) struct ProvenDirectoryEntries {
+    directory: Arc<ProvenSnapshotDirectory>,
+    entries: Arc<Vec<Entry>>,
+}
+
+impl ProvenSnapshotDirectory {
+    pub(crate) fn scope_root(reader: &SnapshotReader) -> Arc<Self> {
+        Arc::new(Self {
+            path: String::new(),
+            root: reader.descriptor().metadata_root.clone(),
+            identity: MembershipIdentity::new(reader),
+        })
+    }
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+    pub(crate) fn root(&self) -> &str {
+        &self.root
+    }
+    pub(crate) fn validate(&self, reader: &SnapshotReader) -> Result<(), SnapshotError> {
+        self.identity.validate(reader)?;
+        reader
+            .authorized_context()
+            .validate_relative_path(&self.path)
+    }
+    pub(crate) async fn verify(
+        self: &Arc<Self>,
+        reader: &SnapshotReader,
+        pages: &BTreeMap<String, Vec<u8>>,
+        max_entries: usize,
+    ) -> Result<ProvenDirectoryEntries, SnapshotError> {
+        self.validate(reader)?;
+        reader.ensure_lease().await?;
+        let entries = super::closure::verify_directory_pages(&self.root, pages, max_entries)?;
+        let max_file_bytes = match reader.capability_advertisement() {
+            super::capabilities::CapabilityAdvertisement::Canonical(caps) => {
+                caps.limits().max_file_bytes
+            }
+            _ => super::content_profile::MAX_FILE_SIZE,
+        };
+        for entry in entries.iter() {
+            let path = self.child_path(entry)?;
+            reader.authorized_context().validate_relative_path(&path)?;
+            reader.client().validate_path(&path)?;
+            if entry.size > max_file_bytes
+                || entry.kind == EntryKind::Symlink && !(1..=4095).contains(&entry.size)
+            {
+                return Err(SnapshotError::new(
+                    SnapshotErrorCode::LimitExceeded,
+                    "lazy directory file size exceeds serving profile",
+                ));
+            }
+        }
+        reader.ensure_lease().await?;
+        Ok(ProvenDirectoryEntries {
+            directory: self.clone(),
+            entries,
+        })
+    }
+    fn child_path(&self, entry: &Entry) -> Result<String, SnapshotError> {
+        let name =
+            std::str::from_utf8(&entry.name).map_err(|_| integrity("non-UTF-8 MTP2 name"))?;
+        Ok(if self.path.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}/{name}", self.path)
+        })
+    }
+}
+
+impl ProvenDirectoryEntries {
+    pub(crate) fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+    pub(crate) fn directory(
+        &self,
+        index: usize,
+    ) -> Result<Arc<ProvenSnapshotDirectory>, SnapshotError> {
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or_else(|| integrity("missing proved entry"))?;
+        if entry.kind != EntryKind::Directory {
+            return Err(integrity("proved entry is not a directory"));
+        }
+        Ok(Arc::new(ProvenSnapshotDirectory {
+            path: self.directory.child_path(entry)?,
+            root: format!("sha256:{}", hex::encode(entry.child_root)),
+            identity: self.directory.identity.clone(),
+        }))
+    }
+    pub(crate) fn file(&self, index: usize) -> Result<Arc<ProvenSnapshotFile>, SnapshotError> {
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or_else(|| integrity("missing proved entry"))?;
+        let fs_kind = match entry.kind {
+            EntryKind::Regular => "regular",
+            EntryKind::Executable => "executable",
+            EntryKind::Symlink => "symlink",
+            EntryKind::Directory => return Err(integrity("proved entry is not a file")),
+        };
+        Ok(Arc::new(ProvenSnapshotFile {
+            file: Arc::new(SnapshotFile {
+                rel_path: self.directory.child_path(entry)?,
+                fs_kind: fs_kind.into(),
+                size: entry.size,
+                content_digest: format!("sha256:{}", hex::encode(entry.content_id)),
+            }),
+            identity: self.directory.identity.clone(),
+        }))
     }
 }
 
