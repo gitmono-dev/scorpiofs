@@ -797,6 +797,61 @@ async fn root_denial_and_bad_end_keep_fixed_failed_workspaces_without_mounting_o
 }
 
 #[tokio::test]
+async fn destroying_failed_preparation_retires_unknown_cache_use_without_private_directories() {
+    let (observer, mut observations) =
+        WorkspaceObserver::channel("11111111-2222-4333-8444-666666666667", 1).unwrap();
+    let h = Harness::new_with_observer(RootFailure::Denied, false, 1, 2, Some(observer)).await;
+    assert_eq!(
+        h.create(request("lazy")).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let status = h.list().await;
+    let id = status[0]["workspace_id"].as_str().unwrap();
+    let record = observations.try_recv().unwrap();
+    assert_eq!(record.workspace_id, id);
+    h.assert_no_mount_directory();
+    let use_path = record.store.join("CACHE_USE.json");
+    let use_record: Value = serde_json::from_slice(&std::fs::read(&use_path).unwrap()).unwrap();
+    assert_eq!(use_record["retired"], false);
+    assert!(use_record["descriptor_digest"].is_null());
+    let body = b"unreferenced CAS from an older retired lifetime";
+    let orphan = record
+        .content_store
+        .join(digest_of(body).trim_start_matches("sha256:"));
+    std::fs::write(&orphan, body).unwrap();
+    let scope = record.content_store.parent().unwrap().to_path_buf();
+    let before_scope = scope.clone();
+    let before = tokio::task::spawn_blocking(move || {
+        scorpiofs::snapshot::cache_retention::collect_scope(&before_scope)
+    })
+    .await
+    .unwrap();
+    match before {
+        Ok(report) => assert_eq!(report.deleted_entries, 0),
+        Err(error) => assert_eq!(
+            error.code,
+            scorpiofs::snapshot::SnapshotErrorCode::SnapshotNotReady
+        ),
+    }
+    assert_eq!(std::fs::read(&orphan).unwrap(), body);
+    h.destroy(id).await;
+    assert_eq!(h.list().await, json!([]));
+    h.assert_no_mount_directory();
+    let retired: Value = serde_json::from_slice(&std::fs::read(&use_path).unwrap()).unwrap();
+    assert_eq!(retired["retired"], true);
+    let report = tokio::task::spawn_blocking(move || {
+        scorpiofs::snapshot::cache_retention::collect_scope(&scope)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(report.deleted_entries > 0);
+    assert!(!orphan.exists());
+    assert!(!record.store.join("DURABLE_COMPLETE").exists());
+    h.fixture.assert_only_canonical_requests();
+}
+
+#[tokio::test]
 async fn cancelled_caller_retains_creation_and_workspace_capacity_until_failed_entry_is_destroyed()
 {
     let h = Harness::new(RootFailure::Denied, true, 1, 2).await;

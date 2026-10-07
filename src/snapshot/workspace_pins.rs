@@ -44,6 +44,17 @@ impl WorkspaceBinding {
         &self.snapshot_id
     }
 
+    pub(super) fn scope_name(&self) -> &str {
+        &self.scope
+    }
+
+    pub(super) fn validate_retention_store(
+        &self,
+        store: &DurableStore,
+    ) -> Result<PathBuf, SnapshotError> {
+        self.validate_store(store)
+    }
+
     fn scope_dir(&self, root: &Path) -> Result<PathBuf, SnapshotError> {
         canonical_uuid(&self.workspace_id)?;
         let sid = hex::encode(parse_digest(&self.snapshot_id)?);
@@ -168,7 +179,7 @@ impl DurableStore {
         )
     }
 
-    fn open_workspace_context(
+    pub(super) fn open_workspace_context(
         root: &Path,
         workspace_id: &str,
         context: &AuthorizedSnapshotContext,
@@ -177,6 +188,8 @@ impl DurableStore {
         let scope = context.scope_cache_dir(root);
         durable::create_dirs_durable(&scope)?;
         context.bind_scope_cache(&scope)?;
+        let _cache_io = super::cache_retention::io_guard(&scope)?;
+        let _owner_admission = super::cache_retention::admit_owner(&scope, workspace_id)?;
         let binding = WorkspaceBinding {
             revision: REVISION,
             workspace_id: workspace_id.into(),
@@ -234,6 +247,7 @@ impl DurableStore {
             require_registration(&store, &binding)?;
         }
         store.completed_manifest_locked()?;
+        store.register_cache_use(&binding)?;
         Ok(store)
     }
 
@@ -460,13 +474,14 @@ fn register(
             "workspace UUID is already bound to another fixed snapshot",
         ));
     }
-    durable::write_atomic(
+    durable::write_atomic_with_budget(
         &dir,
         &format!("{}.json", binding.workspace_id),
         &encode(&Registration {
             binding: binding.clone(),
             state,
         })?,
+        super::cache_retention::owner_budget(store.root()),
     )
 }
 
@@ -483,92 +498,102 @@ fn read_registration(scope: &Path, id: &str) -> Result<Option<Registration>, Sna
 
 /// Fixed registry paths only. A damaged or busy owner blocks cleanup rather
 /// than authorizing deletion; it cannot prove a pin for incremental reuse.
-pub(super) fn owner_inventory(
-    scope: &Path,
-    releasing: Option<&WorkspaceBinding>,
-    meters: Option<&durable::CasVerificationMeters>,
-) -> Result<Vec<(String, PinAudit)>, SnapshotError> {
-    let directory = scope.join(REGISTRY_DIR);
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            ensure_owners_registered(scope, &BTreeSet::new())?;
-            return Ok(vec![]);
-        }
-        Err(error) => return Err(io_error(error)),
-    };
-    check_directory(&directory)?;
-    let mut out = vec![];
-    let mut registered = BTreeSet::new();
-    for entry in entries {
-        let entry = entry.map_err(io_error)?;
-        if entry.path().extension() != Some("json".as_ref()) {
-            continue;
-        }
-        let name = entry.file_name();
-        let id = name
-            .to_str()
-            .and_then(|name| name.strip_suffix(".json"))
-            .ok_or_else(|| integrity("invalid workspace registry filename"))?;
-        canonical_uuid(id)?;
-        let registration = read_registration(scope, id)?
-            .ok_or_else(|| integrity("workspace registry entry disappeared"))?;
-        if registration.binding.workspace_id != id {
-            return Err(integrity("workspace registry owner changed"));
-        }
-        let sid = hex::encode(parse_digest(&registration.binding.snapshot_id)?);
-        let root = scope.join(&sid).join("owners").join(id);
-        let store = DurableStore {
-            root,
-            content: scope.join("blobs"),
-            verification_meters: meters.cloned(),
-        };
-        let binding = require_owner(&store)?;
-        if binding != registration.binding {
-            return Err(integrity("registry entry differs from its workspace owner"));
-        }
-        // The release caller already holds this exact owner's transaction.
-        // Audit every other owner, even a Released registry row: a damaged or
-        // busy owner remains conservative evidence against pruning.
-        let audit = if releasing == Some(&binding) {
-            if registration.state != RegistrationState::Released
-                || release_record(&store, &binding)?.is_none()
-            {
-                return Err(integrity(
-                    "index pruning requires a durable owner revocation",
-                ));
-            }
-            PinAudit::Inactive
-        } else {
-            store.audit_pin()?
-        };
-        if matches!(&audit, PinAudit::Active(id) if id != &binding.snapshot_id) {
-            return Err(integrity(
-                "audited snapshot differs from its fixed workspace owner",
-            ));
-        }
-        registered.insert((sid, id.to_owned()));
-        out.push((binding.snapshot_id, audit));
-    }
-    ensure_owners_registered(scope, &registered)?;
-    Ok(out)
+pub(super) struct RetentionOwner {
+    pub binding: WorkspaceBinding,
+    pub root: PathBuf,
+    pub released: bool,
+    pub release_finished: bool,
 }
 
-// A missing registry row must not hide an existing owner from cleanup. This
-// scan discovers fixed owner locations only; it never supplies read authority.
-fn ensure_owners_registered(
+pub(super) fn discover_retention_owners(
     scope: &Path,
-    registered: &BTreeSet<(String, String)>,
-) -> Result<(), SnapshotError> {
+    limits: super::cache_retention::CacheLimits,
+    deadline: std::time::Instant,
+) -> Result<Vec<RetentionOwner>, SnapshotError> {
+    let mut steps = 0usize;
+    let mut step = || {
+        steps += 1;
+        if steps > limits.max_entries || std::time::Instant::now() >= deadline {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::LimitExceeded,
+                "workspace inventory budget exceeded",
+            ));
+        }
+        Ok(())
+    };
+    let directory = scope.join(REGISTRY_DIR);
+    let mut out = Vec::new();
+    let mut registered = BTreeSet::new();
+    match fs::read_dir(&directory) {
+        Ok(entries) => {
+            check_directory(&directory)?;
+            for entry in entries {
+                step()?;
+                let entry = entry.map_err(io_error)?;
+                let name = entry.file_name();
+                let name = name
+                    .to_str()
+                    .ok_or_else(|| integrity("invalid registry filename"))?;
+                let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(integrity("registry contains a nonregular entry"));
+                }
+                if let Some(id) = name.strip_suffix(".lock") {
+                    canonical_uuid(id)?;
+                    continue;
+                }
+                if name.starts_with('.') && name.contains(".json.tmp.") {
+                    // Only a final registration is authority. A temp remains a
+                    // writer/recovery candidate and never supplies a hidden owner.
+                    continue;
+                }
+                let id = name
+                    .strip_suffix(".json")
+                    .ok_or_else(|| integrity("unknown workspace registry entry"))?;
+                canonical_uuid(id)?;
+                if out.len() >= limits.max_owners {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::LimitExceeded,
+                        "workspace owner budget exceeded",
+                    ));
+                }
+                let registration = read_registration(scope, id)?
+                    .ok_or_else(|| integrity("workspace registry entry disappeared"))?;
+                if registration.binding.workspace_id != id {
+                    return Err(integrity("workspace registry owner changed"));
+                }
+                let sid = hex::encode(parse_digest(&registration.binding.snapshot_id)?);
+                let root = scope.join(&sid).join("owners").join(id);
+                let store = DurableStore {
+                    root: root.clone(),
+                    content: scope.join("blobs"),
+                    verification_meters: None,
+                };
+                let binding = require_owner(&store)?;
+                if binding != registration.binding {
+                    return Err(integrity("registry entry differs from workspace owner"));
+                }
+                let release = release_record(&store, &binding)?;
+                registered.insert((sid, id.to_owned()));
+                out.push(RetentionOwner {
+                    binding,
+                    root,
+                    released: registration.state == RegistrationState::Released,
+                    release_finished: release
+                        .is_some_and(|record| record.phase == ReleasePhase::Revoked),
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
+    }
+    // A missing registration cannot hide an existing fixed owner. This uses
+    // the same bounded structural discovery for reuse and destructive GC.
     for view in fs::read_dir(scope).map_err(io_error)? {
+        step()?;
         let view = view.map_err(io_error)?;
         let name = view.file_name();
-        let Some(sid) = name.to_str().filter(|name| {
-            name.len() == 64
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        }) else {
+        let Some(sid) = name.to_str().filter(|name| canonical_hex(name)) else {
             continue;
         };
         check_directory(&view.path())?;
@@ -580,21 +605,65 @@ fn ensure_owners_registered(
         };
         check_directory(&owners)?;
         for owner in entries {
+            step()?;
             let owner = owner.map_err(io_error)?;
-            let name = owner.file_name();
-            let id = name
-                .to_str()
-                .ok_or_else(|| integrity("invalid workspace owner filename"))?;
-            canonical_uuid(id)?;
+            let id = owner
+                .file_name()
+                .into_string()
+                .map_err(|_| integrity("invalid owner directory"))?;
+            canonical_uuid(&id)?;
             check_directory(&owner.path())?;
-            if !registered.contains(&(sid.to_owned(), id.to_owned())) {
-                return Err(integrity(
-                    "workspace owner is missing from the retention registry",
-                ));
+            if !registered.contains(&(sid.to_owned(), id)) {
+                return Err(integrity("workspace owner is absent from registry"));
             }
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+fn canonical_hex(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(super) fn owner_inventory(
+    scope: &Path,
+    releasing: Option<&WorkspaceBinding>,
+    meters: Option<&durable::CasVerificationMeters>,
+) -> Result<Vec<(String, PinAudit)>, SnapshotError> {
+    let limits = super::cache_retention::inventory_limits(scope)?;
+    let owners = discover_retention_owners(
+        scope,
+        limits,
+        std::time::Instant::now() + std::time::Duration::from_millis(limits.max_scan_millis),
+    )?;
+    let mut out = Vec::with_capacity(owners.len());
+    for owner in owners {
+        let store = DurableStore {
+            root: owner.root,
+            content: scope.join("blobs"),
+            verification_meters: meters.cloned(),
+        };
+        let audit = if releasing == Some(&owner.binding) {
+            if !owner.released || release_record(&store, &owner.binding)?.is_none() {
+                return Err(integrity(
+                    "index pruning requires a durable owner revocation",
+                ));
+            }
+            PinAudit::Inactive
+        } else {
+            store.audit_pin()?
+        };
+        if matches!(&audit, PinAudit::Active(id) if id != &owner.binding.snapshot_id) {
+            return Err(integrity(
+                "audited snapshot differs from fixed workspace owner",
+            ));
+        }
+        out.push((owner.binding.snapshot_id, audit));
+    }
+    Ok(out)
 }
 
 fn validate_authority(
@@ -680,7 +749,7 @@ fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>,
         Ok(_) => {}
     }
     let mut bytes = Vec::new();
-    super::secure_fs::open_regular(path)
+    super::secure_fs::open_regular_nonblocking(path)
         .map_err(io_error)?
         .take(16 * 1024 + 1)
         .read_to_end(&mut bytes)

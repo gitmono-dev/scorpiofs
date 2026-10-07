@@ -89,6 +89,11 @@ pub struct ValidatedSnapshotClosure {
 }
 
 impl ValidatedSnapshotClosure {
+    pub(crate) fn canonical_descriptor_bytes(
+        descriptor: &Descriptor,
+    ) -> Result<Vec<u8>, SnapshotError> {
+        canonical_descriptor(descriptor)
+    }
     pub fn from_pages(
         descriptor: &Descriptor,
         pages: BTreeMap<String, Vec<u8>>,
@@ -108,8 +113,30 @@ impl ValidatedSnapshotClosure {
         pages: BTreeMap<String, Vec<u8>>,
         include_facts: bool,
     ) -> Result<(Self, Vec<VerifiedSubtreeFacts>, SnapshotClosureMeters), SnapshotError> {
+        Self::validate_pages_bounded(
+            descriptor,
+            pages,
+            include_facts,
+            usize::MAX,
+            usize::MAX,
+            None,
+        )
+    }
+
+    fn validate_pages_bounded(
+        descriptor: &Descriptor,
+        pages: BTreeMap<String, Vec<u8>>,
+        include_facts: bool,
+        max_nodes: usize,
+        max_logical_bytes: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(Self, Vec<VerifiedSubtreeFacts>, SnapshotClosureMeters), SnapshotError> {
         let descriptor_bytes = canonical_descriptor(descriptor)?;
-        let mut validator = ClosureValidator::new(&pages, usize::MAX)?;
+        let mut validator =
+            ClosureValidator::new_bounded(&pages, max_nodes, max_logical_bytes, deadline)?;
+        validator.max_logical_entries = max_nodes;
+        validator.max_logical_bytes = max_logical_bytes;
+        validator.deadline = deadline;
         validator.walk_directory(
             &descriptor.scope,
             "",
@@ -164,6 +191,16 @@ impl ValidatedSnapshotClosure {
         descriptor_bytes: &[u8],
         pages: BTreeMap<String, Vec<u8>>,
     ) -> Result<Self, SnapshotError> {
+        Self::from_canonical_pages_bounded(descriptor_bytes, pages, usize::MAX, usize::MAX, None)
+    }
+
+    pub(crate) fn from_canonical_pages_bounded(
+        descriptor_bytes: &[u8],
+        pages: BTreeMap<String, Vec<u8>>,
+        max_nodes: usize,
+        max_logical_bytes: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self, SnapshotError> {
         let serving = ServingDescriptor::decode(descriptor_bytes)
             .map_err(|e| integrity(format!("invalid serving descriptor: {e}")))?;
         let descriptor = Descriptor {
@@ -182,7 +219,15 @@ impl ValidatedSnapshotClosure {
                     .map_err(|e| integrity(e.to_string()))?,
             ),
         };
-        let closure = Self::from_pages(&descriptor, pages)?;
+        let closure = Self::validate_pages_bounded(
+            &descriptor,
+            pages,
+            false,
+            max_nodes,
+            max_logical_bytes,
+            deadline,
+        )?
+        .0;
         if closure.descriptor_bytes != descriptor_bytes {
             return Err(integrity("serving descriptor bytes are not canonical"));
         }
@@ -286,12 +331,25 @@ struct ClosureValidator<'a> {
     files: Vec<SnapshotFile>,
     meters: SnapshotClosureMeters,
     max_radix_entries: usize,
+    max_logical_entries: usize,
+    max_logical_bytes: usize,
+    logical_bytes: usize,
+    deadline: Option<std::time::Instant>,
 }
 
 impl ClosureValidator<'_> {
     fn new(
         bytes: &BTreeMap<String, Vec<u8>>,
         max_radix_entries: usize,
+    ) -> Result<ClosureValidator<'_>, SnapshotError> {
+        Self::new_bounded(bytes, max_radix_entries, usize::MAX, None)
+    }
+
+    fn new_bounded(
+        bytes: &BTreeMap<String, Vec<u8>>,
+        max_radix_entries: usize,
+        max_allocation: usize,
+        deadline: Option<std::time::Instant>,
     ) -> Result<ClosureValidator<'_>, SnapshotError> {
         let mut validator = ClosureValidator {
             bytes,
@@ -304,8 +362,13 @@ impl ClosureValidator<'_> {
             files: Vec::new(),
             meters: SnapshotClosureMeters::default(),
             max_radix_entries,
+            max_logical_entries: usize::MAX,
+            max_logical_bytes: max_allocation,
+            logical_bytes: 0,
+            deadline,
         };
         for (id, bytes) in bytes {
+            validator.admit_allocation(bytes.len().saturating_mul(16).saturating_add(512))?;
             validator.meters.proof_page_hashes += 1;
             validator.meters.proof_page_hash_bytes += bytes.len() as u64;
             if page_id(bytes) != parse_digest(id)? {
@@ -398,6 +461,7 @@ impl ClosureValidator<'_> {
         depth: usize,
         active: &mut HashSet<String>,
     ) -> Result<Arc<Vec<Entry>>, SnapshotError> {
+        self.check_deadline()?;
         if depth > MAX_DEPTH {
             return Err(limit("metadata radix depth exceeds 255"));
         }
@@ -407,6 +471,11 @@ impl ClosureValidator<'_> {
         if !active.insert(id.to_string()) {
             return Err(integrity("cycle in metadata radix pages"));
         }
+        self.admit_allocation(
+            self.bytes
+                .get(id)
+                .map_or(0, |bytes| bytes.len().saturating_mul(4).saturating_add(256)),
+        )?;
         let page = self
             .decoded
             .get(id)
@@ -434,6 +503,11 @@ impl ClosureValidator<'_> {
                     {
                         return Err(limit("directory entry proof budget exceeded"));
                     }
+                    let allocation = child_entries.iter().try_fold(0usize, |sum, entry| {
+                        sum.checked_add(entry.name.len().saturating_add(256).saturating_mul(4))
+                            .ok_or_else(|| limit("radix proof allocation overflow"))
+                    })?;
+                    self.admit_allocation(allocation)?;
                     entries.extend(child_entries.iter().cloned());
                 }
                 entries
@@ -443,6 +517,11 @@ impl ClosureValidator<'_> {
             return Err(limit("directory entry proof budget exceeded"));
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let rebuild_allocation = entries.iter().try_fold(0usize, |sum, entry| {
+            sum.checked_add(entry.name.len().saturating_add(256).saturating_mul(4))
+                .ok_or_else(|| limit("canonical rebuild allocation overflow"))
+        })?;
+        self.admit_allocation(rebuild_allocation)?;
         let rebuilt = Page::build(&entries)
             .map_err(|e| integrity(format!("invalid metadata entry partition: {e}")))?;
         if rebuilt != self.bytes[id] {
@@ -464,6 +543,7 @@ impl ClosureValidator<'_> {
         root: &str,
         active: &mut HashSet<String>,
     ) -> Result<(), SnapshotError> {
+        self.admit_logical_path(rel_path)?;
         validate_composed_path(scope, rel_path)?;
         if !active.insert(root.to_string()) {
             return Err(integrity("cycle in logical directory graph"));
@@ -489,6 +569,7 @@ impl ClosureValidator<'_> {
             if entry.kind == EntryKind::Directory {
                 self.walk_directory(scope, &child_path, &digest(&entry.child_root), active)?;
             } else {
+                self.admit_logical_path(&child_path)?;
                 if entry.size > MAX_FILE_SIZE
                     || (entry.kind == EntryKind::Symlink && !(1..=4095).contains(&entry.size))
                 {
@@ -522,6 +603,36 @@ impl ClosureValidator<'_> {
             }
         }
         active.remove(root);
+        Ok(())
+    }
+
+    fn check_deadline(&self) -> Result<(), SnapshotError> {
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(limit("metadata root proof deadline exceeded"));
+        }
+        Ok(())
+    }
+
+    fn admit_logical_path(&mut self, path: &str) -> Result<(), SnapshotError> {
+        self.check_deadline()?;
+        if self.paths.len() >= self.max_logical_entries {
+            return Err(limit("metadata logical entry budget exceeded"));
+        }
+        self.admit_allocation(path.len().saturating_mul(4).saturating_add(512))
+    }
+
+    fn admit_allocation(&mut self, bytes: usize) -> Result<(), SnapshotError> {
+        self.check_deadline()?;
+        self.logical_bytes = self
+            .logical_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| limit("metadata logical allocation overflow"))?;
+        if self.logical_bytes > self.max_logical_bytes {
+            return Err(limit("metadata logical allocation budget exceeded"));
+        }
         Ok(())
     }
 }

@@ -1,5 +1,6 @@
 //! ScorpioFS / Worktree v3: fixed snapshots and private workspace ownership.
 
+mod cache;
 pub mod http;
 mod hydrate;
 mod mount;

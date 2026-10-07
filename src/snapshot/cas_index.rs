@@ -212,7 +212,7 @@ fn io_error(error: io::Error) -> SnapshotError {
 }
 
 fn open(path: &Path, size: u64) -> Result<Option<File>, SnapshotError> {
-    let input = match secure_fs::open_regular(path) {
+    let input = match secure_fs::open_regular_nonblocking(path) {
         Ok(input) => input,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error(error)),
@@ -412,6 +412,7 @@ pub(super) fn read_strict(
     len: usize,
     meters: &mut LocalCasRangeMeters,
 ) -> Result<Option<Vec<u8>>, SnapshotError> {
+    let _cache_io = super::cache_retention::io_guard(path)?;
     let Some(input) = open(path, size)? else {
         return Ok(None);
     };
@@ -453,6 +454,7 @@ fn read_with_cache(
     len: usize,
     meters: &mut LocalCasRangeMeters,
 ) -> Result<Option<Vec<u8>>, SnapshotError> {
+    let _cache_io = super::cache_retention::io_guard(path)?;
     let Some(input) = open(path, size)? else {
         return Ok(None);
     };
@@ -487,6 +489,7 @@ pub(super) fn read_indexed_into(
     scratch: &mut [u8],
     meters: &mut LocalCasRangeMeters,
 ) -> Result<bool, SnapshotError> {
+    let _cache_io = super::cache_retention::io_guard(path)?;
     let input = match secure_fs::open_regular_nonblocking(path) {
         Ok(input) => input,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),

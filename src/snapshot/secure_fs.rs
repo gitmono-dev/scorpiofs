@@ -127,6 +127,222 @@ pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Delete the currently opened regular entry through directory descriptors.
+/// The caller owns the scope lifecycle fence; no saved digest list authorizes
+/// this operation. Intermediate components and the final entry are no-follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegularIdentity {
+    pub size: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified: (i64, i64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl RegularIdentity {
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache entry is not regular",
+            ));
+        }
+        Ok(Self {
+            size: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+#[cfg(unix)]
+pub(crate) struct PreparedRemoval {
+    parent: File,
+    entry: File,
+    name: std::ffi::CString,
+    expected: RegularIdentity,
+}
+
+#[cfg(unix)]
+pub(crate) fn prepare_current_regular(
+    directory: &Path,
+    name: &str,
+    expected: RegularIdentity,
+) -> io::Result<Option<PreparedRemoval>> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+        path::Component,
+    };
+    if !directory.is_absolute()
+        || name.is_empty()
+        || name.contains(['/', '\\', '\0'])
+        || name == "."
+        || name == ".."
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid cache retirement path",
+        ));
+    }
+    let root = CString::new("/").unwrap();
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut parent = unsafe { File::from_raw_fd(fd) };
+    for component in directory.components() {
+        match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(part) => {
+                let part = CString::new(part.as_bytes())
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                let fd = unsafe {
+                    libc::openat(
+                        parent.as_raw_fd(),
+                        part.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                parent = unsafe { File::from_raw_fd(fd) };
+            }
+            _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+        }
+    }
+    let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let entry = unsafe { File::from_raw_fd(fd) };
+    let opened = entry.metadata()?;
+    if RegularIdentity::from_metadata(&opened)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache retirement entry changed",
+        ));
+    }
+    match entry.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(io::ErrorKind::WouldBlock.into()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    }
+    let removal = PreparedRemoval {
+        parent,
+        entry,
+        name,
+        expected,
+    };
+    removal.verify()?;
+    Ok(Some(removal))
+}
+
+#[cfg(unix)]
+impl PreparedRemoval {
+    pub(crate) fn verify(&self) -> io::Result<()> {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        let opened = self.entry.metadata()?;
+        let mut current: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                &mut current,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if current.st_dev != opened.dev()
+            || current.st_ino != opened.ino()
+            || current.st_size < 0
+            || current.st_size as u64 != self.expected.size
+            || current.st_mode & libc::S_IFMT != libc::S_IFREG
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache retirement lifetime changed",
+            ));
+        }
+        if RegularIdentity::from_metadata(&opened)? != self.expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache retirement object changed",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn remove(self) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        self.verify()?;
+        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.parent.sync_all()?;
+        Ok(true)
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) struct PreparedRemoval;
+
+#[cfg(not(unix))]
+pub(crate) fn prepare_current_regular(
+    _directory: &Path,
+    _name: &str,
+    _expected: RegularIdentity,
+) -> io::Result<Option<PreparedRemoval>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "managed cache retirement requires directory-descriptor support",
+    ))
+}
+
+#[cfg(not(unix))]
+impl PreparedRemoval {
+    pub(crate) fn verify(&self) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    pub(crate) fn remove(self) -> io::Result<bool> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// Create a directory chain after checking every existing component is a
 /// real directory.  `std::fs::create_dir_all` follows intermediate symlinks;
 /// that is unsafe for cache and authority roots because a redirected parent
