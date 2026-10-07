@@ -52,14 +52,14 @@ def fixed_source(source, source_sha, deadline):
     return source, sha256(lock, deadline)
 
 
-def build_argv(source):
+def build_argv(source, binary_name="scorpio"):
     return ["cargo", "build", "--manifest-path", str(source / "Cargo.toml"),
-            "--locked", "--release", "--bin", "scorpio"]
+            "--locked", "--release", "--bin", binary_name]
 
 
-def binary_path(source, binary):
+def binary_path(source, binary, binary_name="scorpio"):
     binary = Path(binary)
-    expected = source / "target" / "release" / "scorpio"
+    expected = source / "target" / "release" / binary_name
     if binary.is_symlink() or not binary.is_file() or binary.resolve(strict=True) != expected:
         raise ValueError("client binary must be the release artifact of its pinned checkout")
     # Reject target/release symlinks as well as a substituted final file.
@@ -69,8 +69,9 @@ def binary_path(source, binary):
 
 
 def build(source, source_sha, label, receipt, deadline):
-    if label not in ("a", "b"):
-        raise ValueError("client label must be a or b")
+    if label not in ("a", "b", "server"):
+        raise ValueError("build label must be a, b or server")
+    binary_name = "mega2" if label == "server" else "scorpio"
     source, lock_before = fixed_source(source, source_sha, deadline)
     receipt = Path(receipt)
     if receipt.exists() or receipt.is_symlink() or receipt.resolve().is_relative_to(source):
@@ -80,12 +81,12 @@ def build(source, source_sha, label, receipt, deadline):
     # These children inherit that group and its one stage deadline.
     rustc = output(["rustc", "--version"], deadline, env).decode().strip()
     cargo = output(["cargo", "--version"], deadline, env).decode().strip()
-    argv = build_argv(source)
+    argv = build_argv(source, binary_name)
     subprocess.run(argv, env=env, check=True, timeout=remaining(deadline))
     _, lock_after = fixed_source(source, source_sha, deadline)
     if lock_after != lock_before:
         raise AssertionError("client lock changed while building")
-    binary = binary_path(source, source / "target/release/scorpio")
+    binary = binary_path(source, source / "target/release" / binary_name, binary_name)
     record = {"revision": 1, "label": label, "source": str(source), "source_sha": source_sha,
               "cargo_lock_sha256": lock_after, "binary": str(binary), "binary_sha256": sha256(binary, deadline),
               "build_argv": argv, "build_env": BUILD_ENV, "rustc_version": rustc, "cargo_version": cargo}
@@ -106,9 +107,10 @@ def load(receipt, label, deadline):
             or record["revision"] != 1 or record["label"] != label):
         raise ValueError("client build receipt shape or label differs")
     source, lock = fixed_source(record["source"], record["source_sha"], deadline)
-    binary = binary_path(source, record["binary"])
+    binary_name = "mega2" if label == "server" else "scorpio"
+    binary = binary_path(source, record["binary"], binary_name)
     if (record["cargo_lock_sha256"] != lock or record["binary_sha256"] != sha256(binary, deadline)
-            or record["build_argv"] != build_argv(source) or record["build_env"] != BUILD_ENV
+            or record["build_argv"] != build_argv(source, binary_name) or record["build_env"] != BUILD_ENV
             or not isinstance(record["rustc_version"], str) or not record["rustc_version"].startswith("rustc ")
             or not isinstance(record["cargo_version"], str) or not record["cargo_version"].startswith("cargo ")):
         raise AssertionError("client release build binding differs")
@@ -181,7 +183,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--label", choices=("a", "b"), required=True)
+    parser.add_argument("--label", choices=("a", "b", "server"), required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     opts = parser.parse_args()
     build(opts.source, opts.source_sha, opts.label, opts.receipt,

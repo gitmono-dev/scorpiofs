@@ -8,14 +8,18 @@ on:
         required: true
       comparison:
         type: choice
-        description: Single client or three complete paired A/B rounds on one server
-        options: [single, paired]
-        default: single
+        description: Isolated fair A/B plus independent B diagnostic, or historical harness modes
+        options: [isolated, single, paired]
+        default: isolated
       baseline_sha:
         description: Immutable baseline client SHA for paired comparison
-        default: '51d91806f3578b194bc7b7b28dbf66c9c2874a0b'
+        default: 'd265e31169fb2f8b137ce9922784ebd0238c6397'
       candidate_sha:
-        description: Immutable candidate client SHA; defaults to workflow SHA
+        description: Immutable candidate client SHA, separate from workflow harness H
+        default: 'bb0b485abc919aa53507c614020c0a184eda3e3c'
+      bootstrap_commit_time:
+        description: Common uint32 bootstrap seconds; isolated mode requires reproducible server init
+        default: '1700000000'
       profile:
         type: choice
         description: Fixture size; start with smoke to verify both real sinks
@@ -63,6 +67,7 @@ jobs:
       DEADLINE_INPUT: ${{ inputs.session_deadline_utc }}
       RECOVERY_INPUT: ${{ inputs.recover_original_window }}
       READ_PROFILE_INPUT: ${{ inputs.workspace_read_profile }}
+      BOOTSTRAP_COMMIT_TIME: ${{ inputs.bootstrap_commit_time }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -79,9 +84,9 @@ jobs:
           from commit_update_projection import window_anchor
           import re
           comparison = os.environ.get('COMPARISON', 'single')
-          if comparison not in ('single', 'paired'):
+          if comparison not in ('single', 'paired', 'isolated'):
               raise ValueError('invalid comparison mode')
-          if comparison == 'paired':
+          if comparison in ('paired', 'isolated'):
               if os.environ['ROUNDS'] != '3' or any(not re.fullmatch(r'[0-9a-f]{40}', os.environ[k]) for k in ('BASELINE_SHA', 'CANDIDATE_SHA')):
                   raise ValueError('paired measurement requires two immutable SHAs and three rounds')
               if os.environ['BASELINE_SHA'] == os.environ['CANDIDATE_SHA']:
@@ -89,6 +94,12 @@ jobs:
           recovery = os.environ.get('RECOVERY_INPUT', 'false')
           if recovery not in ('false', 'true'):
               raise ValueError('invalid original-window recovery flag')
+          if comparison == 'isolated':
+              from workspace_update_campaign import BASELINE, CANDIDATE, commit_time
+              if (os.environ['BASELINE_SHA'] != BASELINE or os.environ['CANDIDATE_SHA'] != CANDIDATE
+                      or recovery != 'false' or os.environ.get('READ_PROFILE_INPUT', 'false') != 'false'):
+                  raise ValueError('isolated campaign requires the fixed fair sources, no recovery and separate diagnostic')
+              commit_time(os.environ['BOOTSTRAP_COMMIT_TIME'])
           anchor = window_anchor(os.environ['STARTED_INPUT'], os.environ['DEADLINE_INPUT'], admission=recovery == 'false')
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
               stream.write('MST2_SESSION_STARTED=' + os.environ['STARTED_INPUT'] + '\n')
@@ -97,6 +108,7 @@ jobs:
               stream.write('MST2_OWNED_ROOT=' + os.environ['RUNNER_TEMP'] + '/mst2-real-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '\n')
               for label in ('a', 'b'):
                   stream.write('MST2_BUILD_' + label.upper() + '=' + os.environ['RUNNER_TEMP'] + '/mst2-client-' + label + '-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '.json\n')
+              stream.write('MST2_SERVER_BUILD=' + os.environ['RUNNER_TEMP'] + '/mst2-server-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '.json\n')
           PY
 
       - uses: actions/checkout@v7
@@ -112,32 +124,33 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('scorpiofs/Cargo.lock') }}
 
       - uses: actions/checkout@v7
-        if: inputs.comparison == 'paired'
+        if: inputs.comparison != 'single'
         with:
           ref: ${{ env.BASELINE_SHA }}
           path: client-a
           persist-credentials: false
 
       - uses: actions/checkout@v7
-        if: inputs.comparison == 'paired'
+        if: inputs.comparison != 'single'
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           path: client-b
           persist-credentials: false
 
       - uses: actions/cache@v6
-        if: inputs.comparison == 'paired'
+        if: inputs.comparison != 'single'
         with:
           path: client-a/target
           key: ${{ runner.os }}-mst2-client-a-release-${{ hashFiles('client-a/Cargo.lock') }}
 
       - uses: actions/cache@v6
-        if: inputs.comparison == 'paired'
+        if: inputs.comparison != 'single'
         with:
           path: client-b/target
           key: ${{ runner.os }}-mst2-client-b-release-${{ hashFiles('client-b/Cargo.lock') }}
 
       - name: Install native FUSE and owned server dependencies
+        if: inputs.comparison != 'isolated'
         timeout-minutes: 10
         run: |
           sudo apt-get update
@@ -152,6 +165,32 @@ jobs:
           fusermount3 --version
 
       - uses: dtolnay/rust-toolchain@stable
+        if: inputs.comparison != 'isolated'
+
+      - name: Install isolated native dependencies and toolchain under original preflight deadline
+        if: inputs.comparison == 'isolated'
+        shell: bash
+        run: |
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --paired --isolated-backends \
+            --rounds 3 --stage preflight -- bash -euo pipefail -c '
+              sudo apt-get update
+              sudo apt-get install -y pkg-config libssl-dev libfuse3-dev fuse3 protobuf-compiler postgresql-client
+              if ! grep -qxF user_allow_other /etc/fuse.conf; then
+                printf "\nuser_allow_other\n" | sudo tee -a /etc/fuse.conf >/dev/null
+              fi
+              grep -qxF user_allow_other /etc/fuse.conf
+              test -c /dev/fuse && test -r /dev/fuse && test -w /dev/fuse
+              fusermount3 --version
+              rustup toolchain install stable --profile minimal
+              rustup default stable
+            '
+
+      - name: Verify checkout and native preflight used the original 15-minute slot
+        if: inputs.comparison == 'isolated'
+        shell: bash
+        run: |
+          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --paired --isolated-backends \
+            --rounds 3 --stage preflight -- python3 -B -c 'import os; assert os.path.isfile("mega2/Cargo.lock")'
 
       - name: Build immutable server and shipped v3 client
         shell: bash
@@ -162,13 +201,20 @@ jobs:
           test "$(git -C mega2 rev-parse HEAD)" = "$MEGA_SHA"
           budget_mode=()
           if test "$COMPARISON" = paired; then budget_mode=(--paired); fi
-          python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py "${budget_mode[@]}" --rounds "$ROUNDS" --stage server-build -- \
-            cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
-          if test "$COMPARISON" = paired; then
-            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --paired --rounds "$ROUNDS" --stage client-a-build -- \
+          if test "$COMPARISON" = isolated; then budget_mode=(--paired --isolated-backends); fi
+          if test "$COMPARISON" = isolated; then
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py "${budget_mode[@]}" --rounds "$ROUNDS" --stage server-build -- \
+              python3 -B scorpiofs/tests/mst2-e2e/workspace_update_build.py --label server \
+                --source "$GITHUB_WORKSPACE/mega2" --source-sha "$MEGA_SHA" --receipt "$MST2_SERVER_BUILD"
+          else
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py "${budget_mode[@]}" --rounds "$ROUNDS" --stage server-build -- \
+              cargo build --manifest-path mega2/Cargo.toml --locked --release --bin mega2
+          fi
+          if test "$COMPARISON" != single; then
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py "${budget_mode[@]}" --rounds "$ROUNDS" --stage client-a-build -- \
               python3 -B scorpiofs/tests/mst2-e2e/workspace_update_build.py --label a \
                 --source "$GITHUB_WORKSPACE/client-a" --source-sha "$BASELINE_SHA" --receipt "$MST2_BUILD_A"
-            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py --paired --rounds "$ROUNDS" --stage client-b-build -- \
+            python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py "${budget_mode[@]}" --rounds "$ROUNDS" --stage client-b-build -- \
               python3 -B scorpiofs/tests/mst2-e2e/workspace_update_build.py --label b \
                 --source "$GITHUB_WORKSPACE/client-b" --source-sha "$CANDIDATE_SHA" --receipt "$MST2_BUILD_B"
           else
@@ -181,6 +227,7 @@ jobs:
         run: |
           budget_mode=()
           if test "$COMPARISON" = paired; then budget_mode=(--paired); fi
+          if test "$COMPARISON" = isolated; then budget_mode=(--paired --isolated-backends); fi
           python3 -B scorpiofs/tests/mst2-e2e/commit_update_budget.py "${budget_mode[@]}" --rounds "$ROUNDS" --stage fences -- bash -euo pipefail -c '
             python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_bench.py -v
             python3 -B scorpiofs/tests/mst2-e2e/test_commit_update_budget.py -v
@@ -199,12 +246,15 @@ jobs:
           elif test "${READ_PROFILE_INPUT:-false}" != false; then
             exit 1
           fi
-          if test "$COMPARISON" = paired; then
+          if test "$COMPARISON" != single; then
             client_args=(--paired --build-a "$MST2_BUILD_A" --build-b "$MST2_BUILD_B")
           else
             DRIVER="$GITHUB_WORKSPACE/scorpiofs/target/release/scorpio"
             DRIVER_SHA=$(sha256sum "$DRIVER" | cut -d ' ' -f 1)
             client_args=(--driver "$DRIVER" --driver-sha256 "$DRIVER_SHA")
+          fi
+          if test "$COMPARISON" = isolated; then
+            client_args+=(--isolated-backends --harness-sha "$SCORPIO_SHA" --bootstrap-commit-time "$BOOTSTRAP_COMMIT_TIME" --server-build-receipt "$MST2_SERVER_BUILD")
           fi
           python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --execute --projection-traces \
             --run-root "$MST2_OWNED_ROOT" --mega-source "$GITHUB_WORKSPACE/mega2" \
@@ -219,6 +269,7 @@ jobs:
           if test -n "$MST2_OWNED_ROOT" && test -f scorpiofs/tests/mst2-e2e/commit_update_ci.py; then
             budget_mode=()
             if test "$COMPARISON" = paired; then budget_mode=(--paired); fi
+            if test "$COMPARISON" = isolated; then budget_mode=(--paired --isolated-backends); fi
             python3 -B scorpiofs/tests/mst2-e2e/commit_update_ci.py --cleanup --run-root "$MST2_OWNED_ROOT" \
               "${budget_mode[@]}" --session-deadline-utc "$MST2_SESSION_DEADLINE" --rounds "$ROUNDS"
           fi
@@ -237,6 +288,13 @@ jobs:
           require_external_time(os.environ['DEADLINE_INPUT'])
           PY
           safe="$RUNNER_TEMP/mst2-safe-evidence"
+          if test "$COMPARISON" = isolated; then
+            python3 -B scorpiofs/tests/mst2-e2e/workspace_update_campaign_export.py \
+              --run-root "$MST2_OWNED_ROOT" --output "$safe" --session-deadline-utc "$DEADLINE_INPUT" \
+              --build-a "$MST2_BUILD_A" --build-b "$MST2_BUILD_B" --server-build "$MST2_SERVER_BUILD" --with-run-metadata
+            find "$safe" -type f -printf '%P\n' | sort
+            exit 0
+          fi
           rm -rf -- "$safe"
           install -d -m 700 "$safe"
           python3 -B - "$safe/run.json" <<'PY'

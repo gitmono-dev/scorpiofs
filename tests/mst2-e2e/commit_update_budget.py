@@ -24,6 +24,12 @@ STAGE_MINIMUM = {"server-build": 5 * 60, "client-build": 5 * 60,
                  "fences": 60, "setup": 60}
 PAIRED_STAGES = {"server-build": 35 * 60, "client-a-build": 20 * 60,
                  "client-b-build": 20 * 60, "fences": 10 * 60, "setup": 10 * 60}
+CAMPAIGN_STAGES = {"preflight": 15 * 60, "server-build": 35 * 60,
+                   "client-a-build": 20 * 60, "client-b-build": 20 * 60,
+                   "fences": 5 * 60, "setup": 10 * 60}
+DIAGNOSTIC_SECONDS = 20 * 60
+CAMPAIGN_REPORT = 5 * 60
+CAMPAIGN_MARGIN = 5 * 60
 
 
 def recovery_flag(value):
@@ -128,6 +134,70 @@ class SessionBudget:
                    self.cleanup_deadline - CLEANUP_RESERVE)
 
 
+class IsolatedCampaignBudget(SessionBudget):
+    """One parent anchor, including all seven backend lifetimes and export."""
+
+    def __init__(self, deadline_utc, rounds, cleanup_deadline=None,
+                 recover_original_window=False, paired=True):
+        if not paired or rounds != 3 or recover_original_window:
+            raise ValueError("isolated campaign requires three fair rounds and no recovery")
+        super().__init__(deadline_utc, rounds, cleanup_deadline, False, True)
+        self.stages = CAMPAIGN_STAGES
+        self.measurement_deadline = (self.cleanup_deadline - CAMPAIGN_REPORT
+                                     - CLEANUP_RESERVE - CAMPAIGN_MARGIN)
+        self._next_round = 1
+        self._phase_deadline = None
+        self._diagnostic_admitted = False
+
+    def stage_deadline(self, stage):
+        if stage not in self.stages:
+            raise ValueError("unknown isolated campaign stage")
+        names = tuple(self.stages)
+        later = sum(self.stages[name] for name in names[names.index(stage) + 1:])
+        reserve = (later + 3 * ROUND_SECONDS + DIAGNOSTIC_SECONDS
+                   + CAMPAIGN_REPORT + CLEANUP_RESERVE + CAMPAIGN_MARGIN)
+        # Checkout and queue time already consumed the fixed preflight slot.
+        # Do not grant a fresh 15 minutes when its shell step finally starts.
+        self.require((.001 if stage == "preflight" else self.stages[stage]) + reserve)
+        return min(time.monotonic() + self.stages[stage], self.cleanup_deadline - reserve)
+
+    def round_deadline(self, number):
+        if type(number) is not int or number != self._next_round or self._phase_deadline is not None:
+            raise ValueError("fair rounds must be admitted and closed exactly once in order")
+        reserve = ((3 - number) * ROUND_SECONDS + DIAGNOSTIC_SECONDS
+                   + CAMPAIGN_REPORT + CLEANUP_RESERVE + CAMPAIGN_MARGIN)
+        self.require(ROUND_SECONDS + reserve)
+        self._phase_deadline = min(time.monotonic() + ROUND_SECONDS, self.cleanup_deadline - reserve)
+        return self._phase_deadline
+
+    def diagnostic_deadline(self):
+        if self._next_round != 4 or self._phase_deadline is not None or self._diagnostic_admitted:
+            raise ValueError("diagnostic requires all three closed fair rounds")
+        reserve = CAMPAIGN_REPORT + CLEANUP_RESERVE + CAMPAIGN_MARGIN
+        self.require(DIAGNOSTIC_SECONDS + reserve)
+        self._phase_deadline = min(time.monotonic() + DIAGNOSTIC_SECONDS, self.cleanup_deadline - reserve)
+        self._diagnostic_admitted = True
+        return self._phase_deadline
+
+    def close_phase(self, deadline):
+        if deadline != self._phase_deadline or time.monotonic() >= deadline:
+            raise TimeoutError("complete backend lifetime exceeded its original phase deadline")
+        self._phase_deadline = None
+        if not self._diagnostic_admitted:
+            self._next_round += 1
+
+    def report_deadline(self):
+        if not self._diagnostic_admitted or self._phase_deadline is not None:
+            raise ValueError("report requires the complete closed diagnostic chain")
+        reserve = CLEANUP_RESERVE + CAMPAIGN_MARGIN
+        self.require(CAMPAIGN_REPORT + reserve)
+        return min(time.monotonic() + CAMPAIGN_REPORT, self.cleanup_deadline - reserve)
+
+    def cleanup_stage_deadline(self):
+        self.require(CLEANUP_RESERVE + CAMPAIGN_MARGIN)
+        return min(time.monotonic() + CLEANUP_RESERVE, self.cleanup_deadline - CAMPAIGN_MARGIN)
+
+
 def from_options(options):
     recovery = recovery_flag(getattr(options, "recover_original_window",
                                     os.environ.get("RECOVERY_INPUT", "false")))
@@ -135,8 +205,11 @@ def from_options(options):
     if existing is not None:
         if getattr(existing, "paired", False) != getattr(options, "paired", False):
             raise ValueError("measurement mode differs from the admitted budget")
+        if isinstance(existing, IsolatedCampaignBudget) != getattr(options, "isolated_backends", False):
+            raise ValueError("backend isolation differs from the admitted budget")
         return existing
-    return SessionBudget(options.session_deadline_utc, options.rounds,
+    cls = IsolatedCampaignBudget if getattr(options, "isolated_backends", False) else SessionBudget
+    return cls(options.session_deadline_utc, options.rounds,
                          getattr(options, "work_cleanup_deadline_monotonic", None), recovery,
                          getattr(options, "paired", False))
 
@@ -378,8 +451,9 @@ def main():
     parser.add_argument("--work-cleanup-deadline-monotonic", type=float,
                         default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     parser.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
-    parser.add_argument("--stage", choices=tuple(dict.fromkeys((*STAGES, *PAIRED_STAGES))), required=True)
+    parser.add_argument("--stage", choices=tuple(dict.fromkeys((*STAGES, *PAIRED_STAGES, *CAMPAIGN_STAGES))), required=True)
     parser.add_argument("--paired", action="store_true")
+    parser.add_argument("--isolated-backends", action="store_true")
     add_recovery_argument(parser)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     options = parser.parse_args()
@@ -391,7 +465,8 @@ def main():
     if not args:
         raise ValueError("a stage command is required")
     deadline = from_options(options).stage_deadline(options.stage)
-    if options.paired and options.stage in ("client-a-build", "client-b-build"):
+    if options.paired and (options.stage in ("client-a-build", "client-b-build")
+                           or options.isolated_backends and options.stage == "server-build"):
         env = dict(os.environ, MST2_BUILD_DEADLINE_MONOTONIC=repr(deadline))
         status, _, _ = run_process(args, deadline, env=env, capture=False)
     else:

@@ -403,6 +403,9 @@ def persist_failure_record(run_root, error):
 
 
 def execute(options):
+    if getattr(options, "isolated_backends", False):
+        from workspace_update_campaign import execute as execute_campaign
+        return execute_campaign(options)
     root, project = hosted_root(options.run_root)
     if root.exists():
         raise ValueError("disposable job directory must not already exist")
@@ -597,10 +600,15 @@ if __name__ == "__main__":
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--projection-traces", action="store_true")
+    parser.add_argument("--isolated-backends", action="store_true")
+    parser.add_argument("--harness-sha")
+    from workspace_update_campaign import commit_time
+    parser.add_argument("--bootstrap-commit-time", type=commit_time)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--mega-source", type=Path)
     parser.add_argument("--mega-sha")
     parser.add_argument("--mega-binary", type=Path)
+    parser.add_argument("--server-build-receipt", type=Path)
     parser.add_argument("--driver", type=Path)
     parser.add_argument("--driver-sha256")
     from workspace_update_build import add_arguments
@@ -617,6 +625,10 @@ if __name__ == "__main__":
         if opts.execute and opts.cleanup:
             raise ValueError("execute and cleanup are separate operations")
         if opts.cleanup:
+            if opts.isolated_backends:
+                from workspace_update_campaign import verify_cleanup_from_disk
+                print(json.dumps(verify_cleanup_from_disk(opts)), flush=True)
+                raise SystemExit(0)
             owned, compose_project = hosted_root(opts.run_root)
             if (owned / "owned.json").exists():
                 stop_owned(owned, compose_project, budget_module.from_options(opts).cleanup_deadline)

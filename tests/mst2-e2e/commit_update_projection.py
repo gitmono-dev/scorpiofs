@@ -187,6 +187,7 @@ class ProjectionCollector:
         self.record_identity = None
         self.allowed = set()
         self.registered = {}
+        self.receipts = {}
         self.finals = {}
         self.last_bytes = b""
         self._directory(self.cache, private=False)
@@ -358,6 +359,7 @@ class ProjectionCollector:
             reject()
         self.allowed.update(attempts)
         self.registered[logical_id] = tuple(attempts)
+        self.receipts[logical_id] = parse(json.dumps(measured["resolve_trace_receipt"]))
 
     def collect(self, measured, native, identity, logical_id, deadline):
         self.register(measured, logical_id)
@@ -396,3 +398,16 @@ class ProjectionCollector:
                 or any(payloads.get(key) != value for key, value in self.finals.items())):
             reject()
         return status
+
+    def closed_evidence(self, expected, deadline):
+        """Read the actual closed files and registered live receipt authority."""
+        status = self.finish(expected, deadline)
+        raw_status = self._read("status.json", STATUS_BYTES)
+        raw_records = self._read("records.jsonl", FILE_BYTES, stable=True)
+        if (parse(raw_status) != status or raw_records != self.last_bytes
+                or time.monotonic() >= deadline):
+            reject()
+        return {"records_jsonl": raw_records.decode("utf-8"),
+                "status_json": raw_status.decode("utf-8"),
+                "registered_receipts": [parse(json.dumps(value)) for value in self.receipts.values()],
+                "expected_final_count": expected}

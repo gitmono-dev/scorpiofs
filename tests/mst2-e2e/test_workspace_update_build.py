@@ -47,7 +47,7 @@ class ClientBuildTests(unittest.TestCase):
             self.assertIn("--release", argv)
             self.assertEqual(kwargs["env"]["CARGO_BUILD_JOBS"], "2")
             self.assertGreater(kwargs["timeout"], 0)
-            binary = source / "target/release/scorpio"
+            binary = source / "target/release" / ("mega2" if label == "server" else "scorpio")
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"simulated built artifact " + label.encode())
             return subprocess.CompletedProcess(argv, 0)
@@ -69,6 +69,18 @@ class ClientBuildTests(unittest.TestCase):
             self.assertEqual(ra["build_env"], rb["build_env"])
             builds.validate(lanes[0], deadline)
             builds.validate(lanes[1], deadline)
+
+    def test_server_receipt_binds_actual_mega2_artifact_and_same_locked_release_flags(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path, record, deadline = self.receipt(Path(temp), "server")
+            lane = builds.load(path, "server", deadline)
+            self.assertEqual(lane.driver.name, "mega2")
+            self.assertEqual(record["build_argv"][-2:], ["--bin", "mega2"])
+            self.assertEqual(record["build_env"], builds.BUILD_ENV)
+            record["build_argv"][-1] = "scorpio"
+            path.write_text(json.dumps(record))
+            with self.assertRaises(AssertionError):
+                builds.load(path, "server", deadline)
 
     def test_replaced_binary_lock_or_source_head_is_rejected(self):
         for change in ("binary", "lock", "head"):
