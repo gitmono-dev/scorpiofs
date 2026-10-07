@@ -332,10 +332,10 @@ async fn cancelling_full_proof_during_real_http_collect_preserves_index_and_rele
         .write(true)
         .open(cache.dir().join("closures.lock"))
         .unwrap();
-    assert!(matches!(
-        probe.try_lock(),
-        Err(std::fs::TryLockError::WouldBlock)
-    ));
+    probe
+        .try_lock()
+        .expect("metadata collection must leave the publication lock available");
+    probe.unlock().unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(
@@ -390,13 +390,26 @@ async fn full_proof_revoked_at_lock_or_wire_boundary_cannot_publish_index() {
         let scope = cache.dir().to_path_buf();
         let mut task = tokio::spawn(async move {
             let cache = ScopeCache::open(scope).unwrap();
-            IncrementalSync::new(&source, &cache).sync_snapshot().await
+            let mut sync = IncrementalSync::new(&source, &cache);
+            let result = sync.sync_snapshot().await;
+            (
+                result,
+                sync.meters().closure_index_reads,
+                sync.meters().closure_index_writes,
+            )
         });
         if waiting_for_lock {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while next.fixture.requested_ids().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
             assert!(tokio::time::timeout(Duration::from_millis(30), &mut task)
                 .await
                 .is_err());
-            assert!(next.fixture.requested_ids().is_empty());
+            assert!(!next.fixture.requested_ids().is_empty());
         } else {
             tokio::time::timeout(
                 Duration::from_secs(2),
@@ -412,12 +425,15 @@ async fn full_proof_revoked_at_lock_or_wire_boundary_cannot_publish_index() {
             next.fixture.pause_metadata.store(false, Ordering::SeqCst);
             next.fixture.metadata_release.notify_one();
         }
-        let error = tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
+        let (result, index_reads, index_writes) =
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+        let error = result.unwrap_err();
         assert_eq!(error.code, SnapshotErrorCode::ScopeForbidden);
+        assert_eq!(index_reads, u64::from(waiting_for_lock));
+        assert_eq!(index_writes, 0);
         assert_eq!(
             std::fs::read(cache.dir().join("closures.json")).unwrap(),
             index

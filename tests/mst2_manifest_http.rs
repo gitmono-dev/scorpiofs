@@ -3327,7 +3327,7 @@ async fn full_snapshot_root_proof_failure_keeps_the_previous_index_transaction()
         sync.sync_snapshot().await.unwrap_err().code,
         SnapshotErrorCode::IntegrityError
     );
-    assert_eq!(sync.meters().closure_index_reads, 1);
+    assert_eq!(sync.meters().closure_index_reads, 0);
     assert_eq!(sync.meters().closure_index_writes, 0);
     assert_eq!(
         std::fs::read(cache.dir().join("closures.json")).unwrap(),
