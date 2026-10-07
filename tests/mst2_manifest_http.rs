@@ -4,6 +4,9 @@
 #[path = "mst2_manifest_http/reuse_copy_tests.rs"]
 mod reuse_copy_tests;
 
+#[path = "mst2_manifest_http/full_proof_hint_tests.rs"]
+mod full_proof_hint_tests;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
@@ -47,6 +50,7 @@ const NAMESPACE_VIEW_ID: [u8; 32] = [0x22; 32];
 #[derive(Default)]
 struct Fixture {
     canonical: bool,
+    operational_limits: Option<Value>,
     raw_only: bool,
     lease_expiry: Option<String>,
     renewal_gone: bool,
@@ -270,6 +274,11 @@ async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
         if f.raw_only {
             value["features"]["small_objects"] = json!(false);
             value["features"]["chunk_reads"] = json!(false);
+        }
+        if let Some(limits) = &f.operational_limits {
+            for (key, limit) in limits.as_object().unwrap() {
+                value["limits"][key] = limit.clone();
+            }
         }
         return Json(value);
     }
@@ -3075,7 +3084,7 @@ async fn full_snapshot_cache_preserves_empty_alias_radix_and_reports_full_proof(
     assert_eq!(closure.pages().len(), http.fixture.pages.len());
     assert_eq!(sync.meters().closure_index_reads, 1);
     assert_eq!(sync.meters().closure_index_writes, 1);
-    assert_eq!(sync.meters().pin_set_reads, 1);
+    assert_eq!(sync.meters().pin_set_reads, 0);
     assert_eq!(sync.meters().acquisition_file_entries, 0);
     assert_eq!(
         sync.closure_meters().proof_page_hashes,
@@ -3124,7 +3133,7 @@ async fn full_snapshot_cache_preserves_empty_alias_radix_and_reports_full_proof(
     assert_eq!(
         warm.meters().traversal_nodes,
         0,
-        "acquisition reused the pinned root hint"
+        "full proof collects verified page hints directly"
     );
     assert_eq!(warm.meters().closure_index_reads, 1);
     assert_eq!(warm.meters().closure_index_writes, 0);
@@ -3230,7 +3239,13 @@ async fn full_snapshot_commit_update_and_rename_keep_old_view_and_reuse_content(
         2,
         "only changed root and changed other directory"
     );
-    assert!(sync.meters().reused_subtrees > 0);
+    assert_eq!(sync.meters().reused_subtrees, 0);
+    assert!(sync.meters().reused_pages > 0);
+    assert_eq!(sync.meters().pin_set_reads, 0);
+    assert_eq!(
+        sync.closure_meters().proof_page_hashes,
+        closure.pages().len() as u64
+    );
     assert_eq!(hydrate_full(&cache, &reader, &closure).await.fetched, 1);
     let wrong_store = scorpiofs::snapshot::DurableStore::open_for_reader(
         cache.dir().join("wrong-view"),

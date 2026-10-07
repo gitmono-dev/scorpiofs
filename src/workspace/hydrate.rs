@@ -26,8 +26,7 @@ pub(crate) async fn hydrate_workspace(
     })?;
     reader.authorized_context().bind_scope_cache(scope)?;
     let cache = ScopeCache::open(scope)?;
-    let mut sync = IncrementalSync::new(reader, &cache)
-        .with_pin_verification_meters(store.verification_meters());
+    let mut sync = IncrementalSync::new(reader, &cache);
     let closure = trace_async("hydrate_metadata_closure", sync.sync_snapshot())
         .await
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::MetadataClosure))?;
@@ -84,6 +83,9 @@ mod tests {
 
     #[path = "hydrate_owned_proof_tests.rs"]
     mod owned_proof;
+
+    #[path = "hydrate_full_proof_tests.rs"]
+    mod full_proof;
 
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -1723,10 +1725,15 @@ mod tests {
         assert_eq!(warm_resume.calls, 194);
         assert_eq!(warm_resume.verified, 194);
         assert_eq!(warm_resume.read_bytes, unique_bytes);
-        // Reuse inventories the old owner's full pin dependencies before
-        // this owner's resume and commit audits. Network savings do not make
-        // that whole-CAS verification disappear from the measured cost.
-        assert_eq!(second_meters.snapshot().read_bytes, 3 * unique_bytes);
+        // Full metadata proof does not audit old owners. This owner's resume
+        // and commit still independently hash every content dependency.
+        assert_eq!(
+            second_meters
+                .snapshot_for(CasVerificationReason::CompletionAudit)
+                .calls,
+            0
+        );
+        assert_eq!(second_meters.snapshot().read_bytes, 2 * unique_bytes);
         assert_eq!(
             (
                 server.fixture.object_calls.load(Ordering::SeqCst),
@@ -1752,7 +1759,7 @@ mod tests {
             second_meters
                 .snapshot_for(CasVerificationReason::CompletionAudit)
                 .read_bytes,
-            2 * unique_bytes
+            unique_bytes
         );
     }
 
