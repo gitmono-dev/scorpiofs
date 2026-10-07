@@ -288,6 +288,8 @@ impl AccountedBuffer {
 /// Creating a copy from its borrowed bytes is a caller-owned allocation.
 pub struct VerifiedContent {
     buffer: AccountedBuffer,
+    /// The digest checked against these exact immutable bytes at publication.
+    digest: [u8; 32],
 }
 
 /// A bounded OBJECT batch. Its table/key capacity has its own output credits;
@@ -382,6 +384,12 @@ impl BatchBuilder {
 }
 
 impl VerifiedContent {
+    /// Byte integrity only; the durable caller still establishes current
+    /// membership and independently audits the installed CAS before commit.
+    pub(crate) fn matches_integrity(&self, digest: &[u8; 32], size: u64) -> bool {
+        self.digest == *digest && self.len() as u64 == size
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         self.buffer.as_bytes()
     }
@@ -410,7 +418,10 @@ impl VerifiedContent {
                 "content does not match its fixed size and whole digest",
             ));
         }
-        Ok(Arc::new(Self { buffer }))
+        Ok(Arc::new(Self {
+            buffer,
+            digest: *expected_digest,
+        }))
     }
 }
 

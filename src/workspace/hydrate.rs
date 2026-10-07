@@ -82,6 +82,9 @@ mod tests {
     #[path = "hydrate_prefetch_tests.rs"]
     mod ordered_prefetch;
 
+    #[path = "hydrate_owned_proof_tests.rs"]
+    mod owned_proof;
+
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::{
