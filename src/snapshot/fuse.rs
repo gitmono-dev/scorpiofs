@@ -32,7 +32,7 @@ use crate::{
         closure::{verify_directory_pages, ValidatedSnapshotClosure},
         durable::DurableStore,
         fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission},
-        FileMembershipError, MetadataProofLimits, OwnedChunkedFile, ProvenSnapshotFile,
+        FileMembershipError, MetadataProofLimits, OwnedChunkedFile, ProvenSnapshotFile, ScopeCache,
         SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode, SnapshotFile,
         SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
     },
@@ -125,6 +125,8 @@ struct ListEntry {
 pub struct Mst2Fuse {
     reader: Option<SnapshotReader>,
     store: Option<Arc<DurableStore>>,
+    /// Hints only, in the real owned workspace's authorized scope directory.
+    scope_pages: Option<ScopeCache>,
     state: StdMutex<State>,
     metadata_limits: MetadataProofLimits,
 }
@@ -243,6 +245,19 @@ impl Mst2Fuse {
         if let Some(store) = &store {
             store.bind_reader(&reader)?;
         }
+        let scope_pages = match &store {
+            Some(store) if store.workspace_binding()?.is_some() => {
+                let scope = store.content_dir().parent().ok_or_else(|| {
+                    SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        "workspace metadata cache has no scope",
+                    )
+                })?;
+                reader.authorized_context().bind_scope_cache(scope)?;
+                Some(ScopeCache::open(scope)?)
+            }
+            _ => None,
+        };
         let root_page_id = reader.descriptor().metadata_root.clone();
         let mut state = State {
             next_inode: ROOT_INODE,
@@ -266,6 +281,7 @@ impl Mst2Fuse {
         let view = Mst2Fuse {
             reader: Some(reader),
             store,
+            scope_pages,
             state: StdMutex::new(state),
             metadata_limits,
         };
@@ -334,10 +350,26 @@ impl Mst2Fuse {
                 )
                 .collect();
             reader.ensure_lease().await?;
-            let pages = reader
-                .client
-                .metadata_pages(&sid, &items, reader.encoding_hint())
-                .await?;
+            let mut pages = Vec::new();
+            let mut missing = Vec::new();
+            for item in items {
+                let expected = item.expected_digest.as_ref().expect("fixed page digest");
+                if let Some(cache) = &self.scope_pages {
+                    if let Some(bytes) = cache.read_page_verified_bounded(expected)? {
+                        pages.push((crate::snapshot::frames::parse_digest(expected)?, bytes));
+                        continue;
+                    }
+                }
+                missing.push(item);
+            }
+            if !missing.is_empty() {
+                pages.extend(
+                    reader
+                        .client
+                        .metadata_pages(&sid, &missing, reader.encoding_hint())
+                        .await?,
+                );
+            }
             let mut allowed = HashSet::new();
             for (route, _) in &batch {
                 for depth in 0..=route.len() {
@@ -428,6 +460,8 @@ impl Mst2Fuse {
             }
         }
 
+        // Local hints retain the same live fixed-view authority as wire pages.
+        reader.ensure_lease().await?;
         let mut state = self.state.lock().unwrap();
         if matches!(state.nodes.get(&inode), Some(Node::Dir(d)) if d.loaded) {
             return Ok(());
@@ -578,6 +612,7 @@ impl Mst2Fuse {
         Ok(Mst2Fuse {
             reader,
             store,
+            scope_pages: None,
             state: StdMutex::new(state),
             metadata_limits: MetadataProofLimits::default(),
         })
@@ -674,6 +709,7 @@ impl Mst2Fuse {
         Ok(Mst2Fuse {
             reader,
             store,
+            scope_pages: None,
             state: StdMutex::new(state),
             metadata_limits: MetadataProofLimits::default(),
         })

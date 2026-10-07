@@ -26,6 +26,25 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     open_checked(options, path)
 }
 
+/// Open a read-only regular object without blocking on a substituted FIFO.
+///
+/// On Unix, nonblocking open reaches the descriptor type check even when no
+/// FIFO writer is present. It does not change regular-file read semantics.
+/// Other platforms retain the existing no-follow read-only open behavior.
+pub(crate) fn open_regular_nonblocking(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    add_no_follow(&mut options);
+
+    open_checked(options, path)
+}
+
 /// Open a fixed lock/record for read-write coordination without following a
 /// final symlink.  The caller decides whether to lock or write the handle.
 pub(crate) fn open_rw_create(path: &Path) -> io::Result<File> {

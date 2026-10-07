@@ -28,8 +28,10 @@ use mst2_codec::{
     treeframe::{EndPayload, MetaPayload, ObjectPayload},
 };
 use scorpiofs::snapshot::{
-    durable::digest_of, frames::parse_digest, fuse::Mst2Fuse, FetchCoordinator, IncrementalSync,
-    Mst2Client, ScopeCache, SnapshotErrorCode, SnapshotFile, SnapshotReader,
+    capabilities::CapabilityAdvertisement, durable::digest_of, frames::parse_digest,
+    fuse::Mst2Fuse, DurableStore, FetchCoordinator, IncrementalSync, MetadataProofLimits,
+    Mst2Client, ResolveDelivery, ResolveRequest, ResolveTarget, ScopeCache, SnapshotErrorCode,
+    SnapshotFile, SnapshotReader,
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -39,6 +41,7 @@ const NAMESPACE_VIEW_ID: [u8; 32] = [0x22; 32];
 
 #[derive(Default)]
 struct Fixture {
+    canonical: bool,
     root: [u8; 32],
     pages: HashMap<[u8; 32], Vec<u8>>,
     routes: HashMap<(String, Vec<u8>), [u8; 32]>,
@@ -237,6 +240,11 @@ fn wide_fixture() -> Fixture {
 }
 
 async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
+    if f.canonical {
+        return Json(
+            serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap(),
+        );
+    }
     Json(json!({
         "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
         "features": {"resolve": true, "directory": true, "leases": true, "metadata_pages": true,
@@ -245,8 +253,8 @@ async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
     }))
 }
 
-async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
-    Json(json!({
+async fn resolve(State(f): State<Arc<Fixture>>, body: Bytes) -> Json<Value> {
+    let mut response = json!({
         "descriptor": {
             "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE_ID,
             "namespace_view_id": id_string(&NAMESPACE_VIEW_ID), "scope": "/project",
@@ -255,7 +263,23 @@ async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
         },
         "lease_id": "fixture-lease", "lease_expires_at": "2099-01-01T00:00:00Z",
         "publication_sequence": "1", "authorization_epoch": "1"
-    }))
+    });
+    if f.canonical {
+        // The owned v3 path uses the shipped typed latest/lazy request. Full
+        // metadata acquisition below remains distinct from body hydration.
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            request,
+            json!({
+                "target": {"kind": "latest"}, "scope": "/project", "delivery": "lazy",
+                "lease_seconds": 600, "supported_metadata_codecs": [1]
+            })
+        );
+        response["writer_epoch"] = json!("1");
+        response["resolved_at"] = json!("2026-09-15T00:00:00Z");
+        response["delivery"] = json!("lazy");
+    }
+    Json(response)
 }
 
 async fn metadata(
@@ -423,6 +447,11 @@ struct HttpFixture {
 }
 
 impl HttpFixture {
+    async fn start_canonical(mut fixture: Fixture) -> Self {
+        fixture.canonical = true;
+        Self::start(fixture).await
+    }
+
     async fn start(fixture: Fixture) -> Self {
         let fixture = Arc::new(fixture);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -467,6 +496,26 @@ impl HttpFixture {
             .await
             .unwrap()
     }
+
+    async fn canonical_reader(&self) -> SnapshotReader {
+        assert!(self.fixture.canonical);
+        let reader = SnapshotReader::resolve_request(
+            Mst2Client::new(&self.base),
+            &ResolveRequest {
+                target: ResolveTarget::Latest,
+                scope: "/project".into(),
+                delivery: ResolveDelivery::Lazy,
+                lease_seconds: 600,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            reader.capability_advertisement(),
+            CapabilityAdvertisement::Canonical(_)
+        ));
+        reader
+    }
 }
 
 impl Drop for HttpFixture {
@@ -493,6 +542,325 @@ fn assert_manifest(actual: &[SnapshotFile], expected: &[SnapshotFile]) {
         expected.len(),
         "duplicate logical files are also invalid"
     );
+}
+
+fn owned_fuse_page_cache(
+    root: &std::path::Path,
+    reader: &SnapshotReader,
+) -> (Arc<DurableStore>, ScopeCache) {
+    let store = Arc::new(
+        DurableStore::open_for_workspace(root, &uuid::Uuid::new_v4().to_string(), reader).unwrap(),
+    );
+    let scope = store.content_dir().parent().unwrap();
+    reader.authorized_context().bind_scope_cache(scope).unwrap();
+    let cache = ScopeCache::open(scope).unwrap();
+    (store, cache)
+}
+
+fn cached_page_path(cache: &ScopeCache, id: &[u8; 32]) -> std::path::PathBuf {
+    cache.dir().join("pages").join(hex::encode(id))
+}
+
+#[tokio::test]
+async fn owned_lazy_fuse_reuses_synced_metadata_pages_without_expanding_unrelated_directories() {
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
+    let closure = IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    assert_manifest(closure.files(), &http.fixture.expected);
+    http.fixture.requests.lock().unwrap().clear();
+    let fs = Mst2Fuse::from_reader_lazy(reader, Some(store))
+        .await
+        .unwrap();
+
+    // This path loads a single directory. A missing unrelated subtree must
+    // neither be requested nor make this complete listing fail.
+    let unrelated = http.fixture.routes[&("/other".into(), vec![])];
+    std::fs::remove_file(cached_page_path(&cache, &unrelated)).unwrap();
+    *http.fixture.omit.lock().unwrap() = Some(unrelated);
+    assert_eq!(fs.directory_entries("/a").await.unwrap().len(), 2);
+    assert!(http.fixture.requested_ids().is_empty());
+    cache
+        .put_page(&id_string(&unrelated), &http.fixture.pages[&unrelated])
+        .unwrap();
+    *http.fixture.omit.lock().unwrap() = None;
+    for directory in [
+        "",
+        "a",
+        "a/nested",
+        "alias",
+        "alias/nested",
+        "empty-a",
+        "empty-b",
+        "other",
+        "wide",
+    ] {
+        let entries = fs.directory_entries(directory).await.unwrap();
+        if directory.starts_with("empty-") {
+            assert!(entries.is_empty());
+        }
+        if directory == "wide" {
+            assert_eq!(entries.len(), 192);
+        }
+    }
+    let a = fs
+        .lookup(Request::default(), 1, OsStr::new("a"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let alias = fs
+        .lookup(Request::default(), 1, OsStr::new("alias"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    assert_ne!(a, alias, "logical aliases retain separate inodes");
+    assert_ne!(
+        fs.lookup(Request::default(), a, OsStr::new("f.txt"))
+            .await
+            .unwrap()
+            .attr
+            .ino,
+        fs.lookup(Request::default(), alias, OsStr::new("f.txt"))
+            .await
+            .unwrap()
+            .attr
+            .ino,
+    );
+    assert!(http.fixture.requested_ids().is_empty());
+}
+
+#[tokio::test]
+async fn owned_lazy_fuse_fetches_only_missing_corrupt_and_oversized_page_hints() {
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
+    IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    let missing = http.fixture.routes[&("/wide".into(), vec![b'b'])];
+    let corrupt = http.fixture.routes[&("/wide".into(), vec![b'c'])];
+    let oversized = http.fixture.routes[&("/a".into(), vec![])];
+    std::fs::remove_file(cached_page_path(&cache, &missing)).unwrap();
+    std::fs::write(cached_page_path(&cache, &corrupt), b"broken page").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(cached_page_path(&cache, &oversized))
+        .unwrap()
+        .set_len((mst2_codec::metapage::PAGE_MAX_BYTES + 1) as u64)
+        .unwrap();
+    http.fixture.requests.lock().unwrap().clear();
+    let fs = Mst2Fuse::from_reader_lazy(reader, Some(store))
+        .await
+        .unwrap();
+    assert!(http.fixture.requested_ids().is_empty());
+    assert_eq!(fs.directory_entries("wide").await.unwrap().len(), 192);
+    let mut actual = http.fixture.requested_ids();
+    actual.sort();
+    let mut expected = vec![id_string(&missing), id_string(&corrupt)];
+    expected.sort();
+    assert_eq!(actual, expected, "cached radix witnesses are not requested");
+    http.fixture.requests.lock().unwrap().clear();
+    assert_eq!(fs.directory_entries("a").await.unwrap().len(), 2);
+    assert_eq!(http.fixture.requested_ids(), [id_string(&oversized)]);
+}
+
+#[tokio::test]
+async fn owned_lazy_fuse_does_not_publish_a_partial_directory_after_bad_wire() {
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
+    IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    let missing = http.fixture.routes[&("/wide".into(), vec![b'b'])];
+    std::fs::remove_file(cached_page_path(&cache, &missing)).unwrap();
+    *http.fixture.omit.lock().unwrap() = Some(missing);
+    let fs = Mst2Fuse::from_reader_lazy(reader, Some(store))
+        .await
+        .unwrap();
+    http.fixture.requests.lock().unwrap().clear();
+    for _ in 0..2 {
+        assert_eq!(
+            fs.directory_entries("wide").await.unwrap_err().code,
+            SnapshotErrorCode::DigestMismatch
+        );
+    }
+    assert_eq!(
+        http.fixture.requested_ids(),
+        [id_string(&missing), id_string(&missing)]
+    );
+    *http.fixture.omit.lock().unwrap() = None;
+    http.fixture.requests.lock().unwrap().clear();
+    assert_eq!(fs.directory_entries("wide").await.unwrap().len(), 192);
+    assert_eq!(http.fixture.requested_ids(), [id_string(&missing)]);
+}
+
+#[tokio::test]
+async fn owned_lazy_fuse_rejects_another_authority_before_reading_page_hints() {
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
+    IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    let other = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let other_reader = other.canonical_reader().await;
+    assert_eq!(reader.snapshot_id(), other_reader.snapshot_id());
+    assert_ne!(
+        reader.authorized_context().cache_domain(),
+        other_reader.authorized_context().cache_domain()
+    );
+    let error = Mst2Fuse::from_reader_lazy(other_reader, Some(store))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, SnapshotErrorCode::ScopeForbidden);
+    assert!(other.fixture.requested_ids().is_empty());
+}
+
+#[tokio::test]
+async fn lazy_fuse_without_an_owned_store_keeps_the_wire_page_path() {
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_owned, cache) = owned_fuse_page_cache(root.path(), &reader);
+    IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    let ordinary = Arc::new(
+        DurableStore::open_for_reader(
+            cache.dir().join("ordinary-view"),
+            cache.dir().join("blobs"),
+            &reader,
+        )
+        .unwrap(),
+    );
+    assert!(ordinary.workspace_binding().unwrap().is_none());
+    for store in [None, Some(ordinary)] {
+        http.fixture.requests.lock().unwrap().clear();
+        let fs = Mst2Fuse::from_reader_lazy(reader.clone(), store)
+            .await
+            .unwrap();
+        assert_eq!(
+            http.fixture.requested_ids(),
+            [id_string(&http.fixture.root)]
+        );
+        assert_eq!(fs.directory_entries("a").await.unwrap().len(), 2);
+        assert_eq!(http.fixture.requested_ids().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn owned_cached_pages_still_enforce_namespace_node_bounds() {
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
+    IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    http.fixture.requests.lock().unwrap().clear();
+    let error = Mst2Fuse::from_reader_lazy_with_limits(
+        reader,
+        Some(store),
+        MetadataProofLimits {
+            max_cached_nodes: 1,
+            ..MetadataProofLimits::default()
+        },
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.code, SnapshotErrorCode::ProofBudgetExceeded);
+    assert!(http.fixture.requested_ids().is_empty());
+}
+
+#[tokio::test]
+async fn owned_cached_pages_do_not_bypass_the_complete_directory_count_proof() {
+    let mut fixture = complete_fixture("a", b"target-one");
+    let old_wide = fixture.routes[&("/wide".into(), vec![])];
+    let (mut wide, _) = Page::decode(&fixture.pages[&old_wide]).unwrap();
+    match &mut wide {
+        Page::Branch { children, .. } => children[0].subtree_entries += 1,
+        _ => panic!("wide fixture has a radix root"),
+    }
+    let bad_wide = fixture.page("/wide", vec![], wide);
+    let old_root = fixture.root;
+    let (mut root_page, _) = Page::decode(&fixture.pages[&old_root]).unwrap();
+    match &mut root_page {
+        Page::Leaf { entries } => {
+            entries
+                .iter_mut()
+                .find(|e| e.name.as_slice() == b"wide")
+                .unwrap()
+                .child_root = bad_wide
+        }
+        _ => panic!("scope fixture has a leaf root"),
+    }
+    fixture.root = fixture.page("/", vec![], root_page);
+    fixture.pages.remove(&old_root);
+    fixture.pages.remove(&old_wide);
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
+    // These individually hash-valid bytes are deliberately just cache hints.
+    // The fixed-root directory proof must still reject their false count.
+    for (id, bytes) in &http.fixture.pages {
+        cache.put_page(&id_string(id), bytes).unwrap();
+    }
+    let fs = Mst2Fuse::from_reader_lazy(reader, Some(store))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            fs.directory_entries("wide").await.unwrap_err().code,
+            SnapshotErrorCode::IntegrityError
+        );
+    }
+    assert!(http.fixture.requested_ids().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_lazy_fuse_propagates_page_open_errors_without_wire_fallback() {
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
+    IncrementalSync::new(&reader, &cache)
+        .sync_snapshot()
+        .await
+        .unwrap();
+    let fs = Mst2Fuse::from_reader_lazy(reader, Some(store))
+        .await
+        .unwrap();
+    let id = http.fixture.routes[&("/a".into(), vec![])];
+    let path = cached_page_path(&cache, &id);
+    std::fs::remove_file(&path).unwrap();
+    let target = root.path().join("outside-page");
+    std::fs::write(&target, &http.fixture.pages[&id]).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    http.fixture.requests.lock().unwrap().clear();
+    assert_eq!(
+        fs.directory_entries("a").await.unwrap_err().code,
+        SnapshotErrorCode::Internal
+    );
+    assert!(http.fixture.requested_ids().is_empty());
 }
 
 async fn pin(cache: &ScopeCache, reader: &SnapshotReader, fixture: &Fixture) {

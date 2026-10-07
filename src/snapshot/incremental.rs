@@ -431,6 +431,57 @@ impl ScopeCache {
         self.read_page_verified_counted(page_id, &mut SyncMeters::default(), &mut HashSet::new())
     }
 
+    /// Read a digest-verified page hint with fixed, bounded scratch space.
+    /// The caller must bind this cache to its authorization domain and prove
+    /// membership under its fixed snapshot root; cached bytes grant neither.
+    /// Missing, oversized or corrupt pages are misses. Other I/O errors,
+    /// including a final symlink, propagate. Incremental sync meters are not
+    /// changed by this separate v3 FUSE lookup.
+    pub(crate) fn read_page_verified_bounded(
+        &self,
+        page_id: &str,
+    ) -> Result<Option<Vec<u8>>, SnapshotError> {
+        use std::io::Read;
+
+        use mst2_codec::metapage::PAGE_MAX_BYTES;
+
+        let want = match parse_page_id(page_id) {
+            Ok(want) => want,
+            Err(_) => return Ok(None),
+        };
+        let mut file = match secure_fs::open_regular_nonblocking(&self.page_path(&want)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_err(error)),
+        };
+        if file.metadata().map_err(io_err)?.len() > PAGE_MAX_BYTES as u64 {
+            return Ok(None);
+        }
+        // The descriptor's size is only a preflight: the file can grow after
+        // fstat. Read at most one byte beyond the page limit, without trusting
+        // that sampled length or allocating from it.
+        let mut buffer = [0u8; PAGE_MAX_BYTES + 1];
+        let mut filled = 0;
+        loop {
+            match file.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(count) => {
+                    filled += count;
+                    if filled > PAGE_MAX_BYTES {
+                        return Ok(None);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(io_err(error)),
+            }
+        }
+        let bytes = &buffer[..filled];
+        if mst2_codec::metapage::page_id(bytes) != want {
+            return Ok(None);
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
     fn read_page_verified_counted(
         &self,
         page_id: &str,
@@ -1270,6 +1321,125 @@ mod tests {
         cache.put_page(&id, b"not the page").unwrap();
         assert!(cache.read_page_verified(&id).unwrap().is_none());
         assert!(cache.read_page_verified(&id).unwrap().is_none(), "evicted");
+    }
+
+    fn bounded_page_id(bytes: &[u8]) -> String {
+        format!(
+            "sha256:{}",
+            hex::encode(mst2_codec::metapage::page_id(bytes))
+        )
+    }
+
+    #[test]
+    fn bounded_page_hints_verify_exact_bytes_and_treat_absence_or_corruption_as_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        let page = mst2_codec::metapage::Page::Leaf { entries: vec![] }
+            .encode()
+            .unwrap();
+        let id = bounded_page_id(&page);
+        assert_eq!(cache.read_page_verified_bounded(&id).unwrap(), None);
+        cache.put_page(&id, &page).unwrap();
+        assert_eq!(
+            cache.read_page_verified_bounded(&id).unwrap(),
+            Some(page.clone())
+        );
+        cache.put_page(&id, b"corrupt").unwrap();
+        assert_eq!(cache.read_page_verified_bounded(&id).unwrap(), None);
+        assert_eq!(
+            cache
+                .read_page_verified_bounded("sha256:../../outside")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_page_hints_accept_the_limit_and_reject_larger_even_matching_digests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        // Shape and snapshot membership remain the caller's responsibility.
+        // This getter checks the byte bound and hash, before allocating output.
+        let mut bytes = vec![0x5a; mst2_codec::metapage::PAGE_MAX_BYTES];
+        let id = bounded_page_id(&bytes);
+        cache.put_page(&id, &bytes).unwrap();
+        assert_eq!(
+            cache.read_page_verified_bounded(&id).unwrap(),
+            Some(bytes.clone())
+        );
+        bytes.push(0x5a);
+        let oversized_id = bounded_page_id(&bytes);
+        cache.put_page(&oversized_id, &bytes).unwrap();
+        assert_eq!(
+            cache.read_page_verified_bounded(&oversized_id).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_page_hints_reject_oversized_sparse_files_without_reading_the_extent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        let id = bounded_page_id(b"sparse");
+        let path = cache.page_path(&parse_page_id(&id).unwrap());
+        File::create(&path).unwrap().set_len(1u64 << 34).unwrap();
+        assert_eq!(cache.read_page_verified_bounded(&id).unwrap(), None);
+        assert_eq!(fs::metadata(path).unwrap().len(), 1u64 << 34);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_page_hints_reject_a_final_symlink_and_propagate_nonregular_io_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        let bytes = b"outside";
+        let id = bounded_page_id(bytes);
+        let target = tmp.path().join("outside");
+        fs::write(&target, bytes).unwrap();
+        let path = cache.page_path(&parse_page_id(&id).unwrap());
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            cache.read_page_verified_bounded(&id).unwrap_err().code,
+            SnapshotErrorCode::Internal
+        );
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            cache.read_page_verified_bounded(&id).unwrap_err().code,
+            SnapshotErrorCode::Internal
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_page_hints_reject_a_fifo_without_waiting_for_a_writer() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt, sync::mpsc};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ScopeCache::open(tmp.path()).unwrap();
+        let id = bounded_page_id(b"fifo");
+        let path = cache.page_path(&parse_page_id(&id).unwrap());
+        let fifo_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(cache.read_page_verified_bounded(&id));
+        });
+        // A regression may block inside open forever. On timeout, unwinding
+        // drops this join handle; the detached thread cannot hold up libtest's
+        // process exit as a Tokio blocking task would hold up runtime shutdown.
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("FIFO cache hint blocked waiting for a writer");
+        worker.join().unwrap();
+        assert_eq!(result.unwrap_err().code, SnapshotErrorCode::Internal);
     }
 
     #[test]
