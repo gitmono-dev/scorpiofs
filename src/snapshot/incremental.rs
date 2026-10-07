@@ -96,7 +96,9 @@ pub struct SyncMeters {
     /// Serialized bytes published by those transactions.
     pub closure_index_write_bytes: u64,
     /// Scope-directory scans for pins backed by a local COMPLETE dependency
-    /// audit, not server authorization or GC-lease validation.
+    /// audit, not server authorization or GC-lease validation. These scans
+    /// include whole-CAS verification; an optional store meter records its
+    /// actual work under CompletionAudit independently of page reuse counts.
     pub pin_set_reads: u64,
     /// Actual local cached-page hash calls, including repeated checks of
     /// one page and checks that discover corrupt bytes. Missing pages and
@@ -251,6 +253,14 @@ impl ScopeCache {
         &self,
         meters: &mut SyncMeters,
     ) -> Result<ClosureTransaction, SnapshotError> {
+        self.sync_transaction_with_pin_meters(meters, None).await
+    }
+
+    async fn sync_transaction_with_pin_meters(
+        &self,
+        meters: &mut SyncMeters,
+        pin_meters: Option<&super::durable::CasVerificationMeters>,
+    ) -> Result<ClosureTransaction, SnapshotError> {
         let lock = loop {
             if let Some(lock) = self.try_index_lock()? {
                 break lock;
@@ -259,10 +269,25 @@ impl ScopeCache {
         };
         let records = self.load_records_counted(meters)?;
         meters.pin_set_reads += 1;
+        let live_pins = super::stage::trace_sync("metadata_reuse_pin_inventory", || {
+            self.pin_inventory(None, pin_meters).map(|inventory| {
+                inventory
+                    .into_iter()
+                    .filter_map(|(_, audit)| {
+                        if let super::workspace_pins::PinAudit::Active(id) = audit {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
         Ok(ClosureTransaction {
             _lock: lock,
             records,
-            live_pins: self.live_pins().into_iter().collect(),
+            live_pins,
             dirty: false,
         })
     }
@@ -456,6 +481,7 @@ pub struct IncrementalSync<'a> {
     page_pool: BTreeMap<String, Vec<u8>>,
     closure_meters: SnapshotClosureMeters,
     collect_snapshot_pages: bool,
+    pin_verification_meters: Option<super::durable::CasVerificationMeters>,
 }
 
 impl<'a> IncrementalSync<'a> {
@@ -471,6 +497,7 @@ impl<'a> IncrementalSync<'a> {
             page_pool: BTreeMap::new(),
             closure_meters: SnapshotClosureMeters::default(),
             collect_snapshot_pages: false,
+            pin_verification_meters: None,
         }
     }
 
@@ -481,6 +508,14 @@ impl<'a> IncrementalSync<'a> {
     /// Root-proof work is additional to acquisition's `traversal_nodes`.
     pub fn closure_meters(&self) -> SnapshotClosureMeters {
         self.closure_meters
+    }
+
+    pub(crate) fn with_pin_verification_meters(
+        mut self,
+        meters: Option<super::durable::CasVerificationMeters>,
+    ) -> Self {
+        self.pin_verification_meters = meters;
+        self
     }
 
     fn reset(&mut self) -> Result<(), SnapshotError> {
@@ -509,7 +544,13 @@ impl<'a> IncrementalSync<'a> {
             ));
         }
         self.reader.ensure_lease().await?;
-        let mut transaction = self.cache.sync_transaction(&mut self.meters).await?;
+        let mut transaction = self
+            .cache
+            .sync_transaction_with_pin_meters(
+                &mut self.meters,
+                self.pin_verification_meters.as_ref(),
+            )
+            .await?;
         self.reader.ensure_lease().await?;
         self.acquire(&mut transaction, true).await?;
         let reader = self.reader;
