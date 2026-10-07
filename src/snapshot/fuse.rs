@@ -1980,7 +1980,8 @@ fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
     use crate::snapshot::SnapshotErrorCode::*;
     let code = match e.code {
         PathNotFound => libc::ENOENT,
-        Unauthenticated | ScopeForbidden | LeaseExpired | LeaseUnknown => libc::EACCES,
+        Unauthenticated | ScopeForbidden | LeaseUnknown => libc::EACCES,
+        LeaseExpired | SnapshotGone => libc::ESTALE,
         NotDirectory => libc::ENOTDIR,
         DigestMismatch => libc::EIO,
         _ => libc::EIO,
@@ -2477,13 +2478,17 @@ mod tests {
     #[test]
     fn unavailable_view_does_not_become_a_negative_path_entry() {
         use crate::snapshot::{SnapshotError, SnapshotErrorCode};
-        for code in [
-            SnapshotErrorCode::ViewNotFound,
-            SnapshotErrorCode::SnapshotGone,
+        for (code, errno) in [
+            (SnapshotErrorCode::ViewNotFound, libc::EIO),
+            (SnapshotErrorCode::SnapshotGone, libc::ESTALE),
+            (SnapshotErrorCode::LeaseExpired, libc::ESTALE),
+            (SnapshotErrorCode::ScopeForbidden, libc::EACCES),
+            (SnapshotErrorCode::Unauthenticated, libc::EACCES),
+            (SnapshotErrorCode::LeaseUnknown, libc::EACCES),
         ] {
             assert_eq!(
                 i32::from(io_err(SnapshotError::new(code, "unavailable"))),
-                -libc::EIO
+                -errno
             );
         }
         assert_eq!(
