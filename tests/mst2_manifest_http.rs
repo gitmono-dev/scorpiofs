@@ -1,6 +1,9 @@
 //! Fixed HTTP fixtures with hand-written expected logical paths. The oracle
 //! never uses either production manifest walker to construct its answers.
 
+#[path = "mst2_manifest_http/reuse_copy_tests.rs"]
+mod reuse_copy_tests;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,

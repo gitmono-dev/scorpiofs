@@ -88,6 +88,9 @@ pub struct SyncMeters {
     /// Full snapshot acquisition leaves this at zero: its final independent
     /// root proof constructs the manifest. Cached records are not counted.
     pub acquisition_file_entries: u64,
+    /// Cached manifest entries copied for the file-only reuse result. Full
+    /// snapshot sync derives its manifest from the independent root proof.
+    pub reused_file_entries_copied: u64,
     /// Directories whose subtrees were reused wholesale.
     pub reused_subtrees: u64,
     /// Index read attempts, including a missing or corrupt index. A sync
@@ -137,6 +140,12 @@ struct ClosureTransaction {
     records: HashMap<String, ClosureRecord>,
     live_pins: HashSet<String>,
     dirty: bool,
+}
+
+struct ReusedSubtree {
+    page_ids: Vec<String>,
+    files: Vec<SnapshotFile>,
+    total_entries: u64,
 }
 
 impl ClosureTransaction {
@@ -1039,11 +1048,11 @@ impl<'a> IncrementalSync<'a> {
         root_page_id: &str,
         dir: &str,
         transaction: &mut ClosureTransaction,
-    ) -> Result<Option<ClosureRecord>, SnapshotError> {
+    ) -> Result<Option<ReusedSubtree>, SnapshotError> {
         self.reader
             .authorized_context()
             .validate_relative_path(dir)?;
-        let Some(record) = transaction.records.get(root_page_id).cloned() else {
+        let Some(record) = transaction.records.get_mut(root_page_id) else {
             return Ok(None);
         };
         if !record.compatible(&self.auth_domain, self.codec) {
@@ -1068,13 +1077,17 @@ impl<'a> IncrementalSync<'a> {
                 return Ok(None);
             }
         }
-        // Reuse is granted, and the guarantee is transferred to this
-        // snapshot's own pin so releasing the old one cannot revoke it.
-        if record.pin_ref != self.reader.snapshot_id() {
-            let mut transferred = record.clone();
-            transferred.pin_ref = self.reader.snapshot_id().to_string();
-            transaction.put_record(transferred);
-        }
+        let files = if self.collect_snapshot_pages {
+            Vec::new()
+        } else {
+            self.meters.reused_file_entries_copied += record.files.len() as u64;
+            record.files.clone()
+        };
+        let reused = ReusedSubtree {
+            page_ids: record.page_ids.clone(),
+            files,
+            total_entries: record.total_entries,
+        };
         self.reused_page_ids.extend(record.page_ids.iter().cloned());
         self.meters.reused_pages = self.reused_page_ids.len() as u64;
         self.meters.reused_subtrees += 1;
@@ -1087,7 +1100,13 @@ impl<'a> IncrementalSync<'a> {
             record.page_ids.len(),
             record.files.len()
         );
-        Ok(Some(record))
+        // Keep the transaction's manifest intact; only its pin identity
+        // changes. Full sync replaces hints from the final independent proof.
+        if record.pin_ref != self.reader.snapshot_id() {
+            record.pin_ref = self.reader.snapshot_id().to_string();
+            transaction.dirty = true;
+        }
+        Ok(Some(reused))
     }
 }
 
