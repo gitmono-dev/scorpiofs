@@ -466,10 +466,12 @@ fn coordinator(
 fn start(
     c: &Arc<FetchCoordinator>,
     path: &str,
-) -> tokio::task::JoinHandle<Result<Arc<Vec<u8>>, scorpiofs::snapshot::SnapshotError>> {
+) -> tokio::task::JoinHandle<
+    Result<Arc<scorpiofs::snapshot::VerifiedContent>, scorpiofs::snapshot::SnapshotError>,
+> {
     let c = c.clone();
     let file = file(path);
-    tokio::spawn(async move { c.fetch(file, false).await })
+    tokio::spawn(async move { c.fetch_owned(file, false).await })
 }
 
 async fn idle(c: &FetchCoordinator) {
@@ -493,7 +495,7 @@ async fn distinct_jobs_reject_at_local_cap_and_finish_with_verified_bytes() {
     let second = start(&c, "f00");
     until(|| c.counts().pending_jobs == 2).await;
     assert_eq!(
-        c.fetch(file("f01"), false).await.unwrap_err().code,
+        c.fetch_owned(file("f01"), false).await.unwrap_err().code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(s.fixture.request_count(), 1);
@@ -512,7 +514,7 @@ async fn aliases_share_one_job_and_cancelled_waiters_free_the_caller_slot() {
     let c = s.seeded(1, 1, 2).await;
     let first = start(&c, "a");
     until(|| s.fixture.request_count() == 1).await;
-    let mut alias = Box::pin(c.fetch(file("b"), false));
+    let mut alias = Box::pin(c.fetch_owned(file("b"), false));
     assert!(futures::poll!(alias.as_mut()).is_pending());
     assert_eq!(
         c.counts(),
@@ -522,16 +524,16 @@ async fn aliases_share_one_job_and_cancelled_waiters_free_the_caller_slot() {
         }
     );
     assert_eq!(
-        c.fetch(file("b"), false).await.unwrap_err().code,
+        c.fetch_owned(file("b"), false).await.unwrap_err().code,
         SnapshotErrorCode::LimitExceeded
     );
     drop(alias);
     assert_eq!(c.counts().active_callers, 1);
     assert_eq!(
-        c.fetch(file("f00"), false).await.unwrap_err().code,
+        c.fetch_owned(file("f00"), false).await.unwrap_err().code,
         SnapshotErrorCode::LimitExceeded
     );
-    let mut alias = Box::pin(c.fetch(file("/b"), false));
+    let mut alias = Box::pin(c.fetch_owned(file("/b"), false));
     assert!(futures::poll!(alias.as_mut()).is_pending());
     s.fixture.blob_release.add_permits(1);
     let a = first.await.unwrap().unwrap();
@@ -539,6 +541,11 @@ async fn aliases_share_one_job_and_cancelled_waiters_free_the_caller_slot() {
     assert!(Arc::ptr_eq(&a, &b));
     assert_eq!(s.fixture.request_count(), 1);
     idle(&c).await;
+    assert_eq!(c.content_usage().output_bytes, 1024);
+    drop(a);
+    assert_eq!(c.content_usage().output_bytes, 1024);
+    drop(b);
+    assert_eq!(c.content_usage().output_bytes, 0);
 }
 
 #[tokio::test]
@@ -553,7 +560,7 @@ async fn last_queued_waiter_cancels_without_http_and_original_caller_can_cancel(
     queued.abort();
     assert!(queued.await.unwrap_err().is_cancelled());
     until(|| c.counts().pending_jobs == 1).await;
-    let mut alias = Box::pin(c.fetch(file("b"), false));
+    let mut alias = Box::pin(c.fetch_owned(file("b"), false));
     assert!(futures::poll!(alias.as_mut()).is_pending());
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
@@ -563,7 +570,7 @@ async fn last_queued_waiter_cancels_without_http_and_original_caller_can_cancel(
     assert_eq!(*s.fixture.requests.lock().unwrap(), vec!["/a"]);
     s.fixture.blob_release.add_permits(1);
     assert_eq!(
-        c.fetch(file("f00"), false).await.unwrap().as_slice(),
+        c.fetch_owned(file("f00"), false).await.unwrap().as_slice(),
         content("f00")
     );
     idle(&c).await;
@@ -576,14 +583,14 @@ async fn cancelled_running_generation_cannot_remove_immediate_same_key_retry() {
     let c = s.seeded(2, 2, 4).await;
     let first = start(&c, "a");
     until(|| s.fixture.request_count() == 1).await;
-    let mut alias = Box::pin(c.fetch(file("b"), false));
+    let mut alias = Box::pin(c.fetch_owned(file("b"), false));
     assert!(futures::poll!(alias.as_mut()).is_pending());
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     drop(alias);
     // Poll on this single-thread runtime before yielding: the replacement is
     // inserted while the cancelled old leader still owns its job permit.
-    let mut retry = Box::pin(c.fetch(file("b"), false));
+    let mut retry = Box::pin(c.fetch_owned(file("b"), false));
     assert!(futures::poll!(retry.as_mut()).is_pending());
     assert_eq!(
         c.counts(),
@@ -605,7 +612,7 @@ async fn cancellation_before_first_leader_poll_is_latched_and_issues_no_http() {
     let _serial = TEST_LOCK.lock().await;
     let s = Server::start(true).await;
     let c = s.seeded(1, 1, 1).await;
-    let mut fetch = Box::pin(c.fetch(file("a"), false));
+    let mut fetch = Box::pin(c.fetch_owned(file("a"), false));
     assert!(futures::poll!(fetch.as_mut()).is_pending());
     assert_eq!(
         c.counts(),
@@ -628,7 +635,7 @@ async fn cancellation_before_first_leader_poll_is_latched_and_issues_no_http() {
     assert_eq!(s.fixture.request_count(), 0);
     s.fixture.blob_release.add_permits(1);
     assert_eq!(
-        c.fetch(file("a"), false).await.unwrap().as_slice(),
+        c.fetch_owned(file("a"), false).await.unwrap().as_slice(),
         content("a")
     );
     idle(&c).await;
@@ -654,7 +661,7 @@ async fn membership_waits_take_caller_slots_and_failed_proofs_and_bodies_release
         }
     );
     assert_eq!(
-        c.fetch(file("b"), false).await.unwrap_err().code,
+        c.fetch_owned(file("b"), false).await.unwrap_err().code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(s.fixture.metadata_requests.load(Ordering::SeqCst), 1);
@@ -664,7 +671,7 @@ async fn membership_waits_take_caller_slots_and_failed_proofs_and_bodies_release
     idle(&c).await;
     s.fixture.block_metadata.store(false, Ordering::SeqCst);
     s.fixture.corrupt_metadata.store(true, Ordering::SeqCst);
-    let bad = c.fetch(file("a"), false).await.unwrap_err();
+    let bad = c.fetch_owned(file("a"), false).await.unwrap_err();
     assert!(matches!(
         bad.code,
         SnapshotErrorCode::DigestMismatch | SnapshotErrorCode::IntegrityError
@@ -674,14 +681,14 @@ async fn membership_waits_take_caller_slots_and_failed_proofs_and_bodies_release
     s.fixture.corrupt_blob.store(true, Ordering::SeqCst);
     s.fixture.blob_release.add_permits(1);
     assert_eq!(
-        c.fetch(file("a"), false).await.unwrap_err().code,
+        c.fetch_owned(file("a"), false).await.unwrap_err().code,
         SnapshotErrorCode::DigestMismatch
     );
     idle(&c).await;
     s.fixture.corrupt_blob.store(false, Ordering::SeqCst);
     s.fixture.blob_release.add_permits(1);
     assert_eq!(
-        c.fetch(file("a"), false).await.unwrap().as_slice(),
+        c.fetch_owned(file("a"), false).await.unwrap().as_slice(),
         content("a")
     );
     idle(&c).await;
@@ -700,7 +707,7 @@ async fn legacy_jobs_remain_independent_and_cancellation_releases_admission() {
     let b = start(&c, "b");
     until(|| s.fixture.request_count() == 2).await;
     assert_eq!(
-        c.fetch(file("a"), false).await.unwrap_err().code,
+        c.fetch_owned(file("a"), false).await.unwrap_err().code,
         SnapshotErrorCode::LimitExceeded
     );
     a.abort();
@@ -738,7 +745,7 @@ async fn process_job_and_caller_caps_apply_across_coordinators_and_cleanup_resto
     until(|| s.fixture.request_count() == 4).await;
     let extra = coordinator(reader.clone(), &closure, 1, 64, 256);
     assert_eq!(
-        extra.fetch(file("a"), false).await.unwrap_err().code,
+        extra.fetch_owned(file("a"), false).await.unwrap_err().code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(
@@ -783,7 +790,7 @@ async fn process_job_and_caller_caps_apply_across_coordinators_and_cleanup_resto
     until(|| s.fixture.request_count() == 8).await;
     assert_eq!(FetchCoordinator::process_counts().pending_jobs, 4);
     assert_eq!(
-        extra.fetch(file("b"), false).await.unwrap_err().code,
+        extra.fetch_owned(file("b"), false).await.unwrap_err().code,
         SnapshotErrorCode::LimitExceeded
     );
     assert_eq!(
@@ -812,7 +819,11 @@ async fn process_job_and_caller_caps_apply_across_coordinators_and_cleanup_resto
     // Release old server handlers too; they are not client-owned job permits.
     s.fixture.blob_release.add_permits(9);
     assert_eq!(
-        extra.fetch(file("a"), false).await.unwrap().as_slice(),
+        extra
+            .fetch_owned(file("a"), false)
+            .await
+            .unwrap()
+            .as_slice(),
         content("a")
     );
     idle(&extra).await;
@@ -871,7 +882,7 @@ async fn invalid_limits_and_extreme_concurrency_are_bounded_without_constructor_
         let c = s.seeded(running, 1, 1).await;
         s.fixture.blob_release.add_permits(1);
         assert_eq!(
-            c.fetch(file("a"), false).await.unwrap().as_slice(),
+            c.fetch_owned(file("a"), false).await.unwrap().as_slice(),
             content("a")
         );
         idle(&c).await;
@@ -891,25 +902,14 @@ async fn small_budget_coordinator(s: &Server) -> Arc<FetchCoordinator> {
     .unwrap()
 }
 
-fn start_owned(
-    c: &Arc<FetchCoordinator>,
-    path: &str,
-) -> tokio::task::JoinHandle<
-    Result<Arc<scorpiofs::snapshot::VerifiedContent>, scorpiofs::snapshot::SnapshotError>,
-> {
-    let c = c.clone();
-    let file = file(path);
-    tokio::spawn(async move { c.fetch_owned(file, false).await })
-}
-
 #[tokio::test]
 async fn returned_aliases_and_unreceived_task_results_keep_capacity_until_last_arc() {
     let _serial = TEST_LOCK.lock().await;
     let s = Server::start(true).await;
     let c = small_budget_coordinator(&s).await;
-    let first = start_owned(&c, "a");
+    let first = start(&c, "a");
     until(|| s.fixture.request_count() == 1).await;
-    let waiter = start_owned(&c, "b");
+    let waiter = start(&c, "b");
     until(|| c.counts().active_callers == 2).await;
     s.fixture.blob_release.add_permits(1);
     let owner = first.await.unwrap().unwrap();
@@ -987,10 +987,10 @@ async fn queued_and_running_cancellation_drop_actual_fixed_output_owners() {
     let _serial = TEST_LOCK.lock().await;
     let s = Server::start(true).await;
     let c = small_budget_coordinator(&s).await;
-    let first = start_owned(&c, "a");
+    let first = start(&c, "a");
     until(|| s.fixture.request_count() == 1).await;
     assert_eq!(c.content_usage().output_bytes, 1024);
-    let queued = start_owned(&c, "f00");
+    let queued = start(&c, "f00");
     until(|| c.counts().pending_jobs == 2).await;
     assert_eq!(
         c.content_usage().output_bytes,
@@ -1239,27 +1239,4 @@ async fn owned_batch_end_without_eof_and_actual_cancellation_keep_then_release_a
             .len(),
         2
     );
-}
-
-#[tokio::test]
-async fn legacy_and_owned_aliases_keep_distinct_result_types_and_shared_count_admission() {
-    let _serial = TEST_LOCK.lock().await;
-    let s = Server::start(true).await;
-    let c = small_budget_coordinator(&s).await;
-    let legacy = start(&c, "a");
-    until(|| s.fixture.request_count() == 1).await;
-    let owned = start_owned(&c, "b");
-    until(|| c.counts().pending_jobs == 2).await;
-    assert_eq!(c.counts().active_callers, 2);
-    s.fixture.blob_release.add_permits(2);
-    let legacy: Arc<Vec<u8>> = legacy.await.unwrap().unwrap();
-    let owned = owned.await.unwrap().unwrap();
-    assert_eq!(legacy.as_slice(), content("a"));
-    assert_eq!(owned.as_slice(), content("b"));
-    idle(&c).await;
-    assert_eq!(s.fixture.request_count(), 2);
-    assert_eq!(c.content_usage().output_bytes, 1024);
-    drop(owned);
-    assert_eq!(c.content_usage().output_bytes, 0);
-    assert_eq!(legacy.as_slice(), content("a"));
 }

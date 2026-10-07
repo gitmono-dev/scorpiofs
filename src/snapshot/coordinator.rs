@@ -6,7 +6,8 @@
 //! Deployments without metadata pages keep a separate online request for
 //! every caller, preserving the server's per-path authorization check.
 //! Queued/running jobs and active callers have process and coordinator count
-//! limits. These limits do not account returned body bytes or process RSS.
+//! limits. Retained output and managed construction bytes have separate
+//! ownership-based budgets; neither budget accounts process RSS.
 
 use std::{
     collections::HashMap,
@@ -19,37 +20,7 @@ use crate::snapshot::{
     SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader, ValidatedSnapshotClosure,
 };
 
-#[derive(Clone)]
-enum FetchContent {
-    Legacy(Arc<Vec<u8>>),
-    Owned(Arc<super::VerifiedContent>),
-}
-
-impl FetchContent {
-    fn len(&self) -> usize {
-        match self {
-            Self::Legacy(bytes) => bytes.len(),
-            Self::Owned(bytes) => bytes.len(),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum FetchMode {
-    Legacy,
-    Owned,
-}
-
-impl FetchMode {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::Owned => "owned",
-        }
-    }
-}
-
-type FetchResult = Result<FetchContent, Arc<SnapshotError>>;
+type FetchResult = Result<Arc<super::VerifiedContent>, Arc<SnapshotError>>;
 
 /// Maximum queued/running coordinator content jobs in one process.
 pub const MAX_PROCESS_PENDING_JOBS: usize = 256;
@@ -229,7 +200,7 @@ impl JobGuard {
         }
     }
 
-    fn complete(mut self, result: Result<FetchContent, SnapshotError>) {
+    fn complete(mut self, result: Result<Arc<super::VerifiedContent>, SnapshotError>) {
         let waiters = self.take_waiters();
         self.completed = true;
         let shared = result.map_err(Arc::new);
@@ -434,48 +405,14 @@ impl FetchCoordinator {
         self.inflight.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Fetch verified bytes through the original Vec API and single-flight
-    /// identity. Count admission and fixed-view checks remain enforced.
-    /// Legacy result allocations are not covered by retained-output byte
-    /// quotas; use [`Self::fetch_owned`] when ownership accounting is required.
-    pub async fn fetch(
-        self: &Arc<Self>,
-        file: SnapshotFile,
-        use_frames: bool,
-    ) -> Result<Arc<Vec<u8>>, SnapshotError> {
-        match self
-            .fetch_content(file, use_frames, FetchMode::Legacy)
-            .await?
-        {
-            FetchContent::Legacy(bytes) => Ok(bytes),
-            FetchContent::Owned(_) => Err(result_mode_error()),
-        }
-    }
-
     /// Fetch one immutable whole-file allocation whose byte reservation
     /// follows every result Arc until its last actual owner drops.
-    /// Owned and legacy flights are distinct; aliases within each mode share
-    /// one verified allocation without a compatibility copy per waiter.
+    /// Proven aliases share one verified allocation without a copy per waiter.
     pub async fn fetch_owned(
         self: &Arc<Self>,
         file: SnapshotFile,
         use_frames: bool,
     ) -> Result<Arc<super::VerifiedContent>, SnapshotError> {
-        match self
-            .fetch_content(file, use_frames, FetchMode::Owned)
-            .await?
-        {
-            FetchContent::Owned(bytes) => Ok(bytes),
-            FetchContent::Legacy(_) => Err(result_mode_error()),
-        }
-    }
-
-    async fn fetch_content(
-        self: &Arc<Self>,
-        file: SnapshotFile,
-        use_frames: bool,
-        mode: FetchMode,
-    ) -> Result<FetchContent, SnapshotError> {
         // A canonical path is not a membership proof. A caller cannot bypass
         // its own fixed-view check by naming another leader's content id.
         self.reader
@@ -496,11 +433,11 @@ impl FetchCoordinator {
             // or its authorization result; concurrency is still bounded.
             self.reader.ensure_lease().await?;
             let _job = CountAdmission::acquire(&self.jobs, &process_admission().jobs)?;
-            return self.lead(&file, use_frames, mode, None).await;
+            return self.lead(&file, use_frames, None).await;
         }
         self.validate_membership(&file).await?;
         self.reader.ensure_lease().await?;
-        let key = format!("{}:{}:{}", mode.key(), file.content_digest, file.size);
+        let key = format!("{}:{}", file.content_digest, file.size);
         let (tx, rx) = oneshot::channel();
         let (registration, job) = {
             let mut map = self.lock()?;
@@ -551,7 +488,7 @@ impl FetchCoordinator {
                 let result = tokio::select! {
                     biased;
                     _ = cancelled(&mut cancel) => Err(SnapshotError::new(SnapshotErrorCode::Internal, "fetch has no live waiters")),
-                    result = guard.coordinator.lead(&file, use_frames, mode, Some(guard.flight.cancel.subscribe())) => result,
+                    result = guard.coordinator.lead(&file, use_frames, Some(guard.flight.cancel.subscribe())) => result,
                 };
                 guard.complete(result);
             });
@@ -604,9 +541,8 @@ impl FetchCoordinator {
         &self,
         file: &SnapshotFile,
         use_frames: bool,
-        mode: FetchMode,
         cancellation: Option<watch::Receiver<bool>>,
-    ) -> Result<FetchContent, SnapshotError> {
+    ) -> Result<Arc<super::VerifiedContent>, SnapshotError> {
         let _permit = self.semaphore.clone().acquire_owned().await.map_err(|e| {
             SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
@@ -622,25 +558,10 @@ impl FetchCoordinator {
                 "fetch has no live waiters",
             ));
         }
-        let bytes = match mode {
-            FetchMode::Owned => FetchContent::Owned(
-                self.reader
-                    .read_owned_file(file, use_frames, &self.content)
-                    .await?,
-            ),
-            FetchMode::Legacy => {
-                let bytes = if use_frames {
-                    self.reader
-                        .read_file_frames(&file.rel_path, &file.content_digest, file.size)
-                        .await?
-                } else {
-                    self.reader
-                        .read_file(&file.rel_path, &file.content_digest)
-                        .await?
-                };
-                FetchContent::Legacy(Arc::new(bytes))
-            }
-        };
+        let bytes = self
+            .reader
+            .read_owned_file(file, use_frames, &self.content)
+            .await?;
         // The fetch paths verify content; the size must also match the view.
         if bytes.len() as u64 != file.size {
             return Err(SnapshotError::new(
@@ -655,13 +576,6 @@ impl FetchCoordinator {
         }
         Ok(bytes)
     }
-}
-
-fn result_mode_error() -> SnapshotError {
-    SnapshotError::new(
-        SnapshotErrorCode::Internal,
-        "fetch flight result mode differs",
-    )
 }
 
 async fn cancelled(receiver: &mut watch::Receiver<bool>) {

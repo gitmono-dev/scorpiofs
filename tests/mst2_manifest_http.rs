@@ -2660,12 +2660,12 @@ async fn assert_raw_concurrent_hydration(seeded: bool) {
     };
     let report = tokio::time::timeout(
         Duration::from_secs(5),
-        store.hydrate_snapshot_concurrent(&reader, &closure, 3, move |file| {
+        store.hydrate_snapshot_concurrent_with_body(&reader, &closure, 3, move |file| {
             let barrier = barrier.clone();
             let coordinator = coordinator.clone();
             Box::pin(async move {
                 barrier.wait().await;
-                coordinator.fetch(file, false).await
+                coordinator.fetch_owned(file, false).await
             })
         }),
     )
@@ -3381,14 +3381,14 @@ async fn cancelling_first_fetch_preserves_another_waiter_and_single_source_reque
     let leader = tokio::spawn({
         let c = coordinator.clone();
         let f = file.clone();
-        async move { c.fetch(f, false).await }
+        async move { c.fetch_owned(f, false).await }
     });
     tokio::time::timeout(Duration::from_secs(3), http.fixture.blob_started.notified())
         .await
         .unwrap();
     // Register the other waiter before cancelling the first caller. If the
     // last live caller cancels, its flight must end rather than be reused.
-    let mut waiter = Box::pin(coordinator.fetch(file, false));
+    let mut waiter = Box::pin(coordinator.fetch_owned(file, false));
     assert!(futures::poll!(waiter.as_mut()).is_pending());
     leader.abort();
     assert!(leader.await.unwrap_err().is_cancelled());
@@ -3410,13 +3410,13 @@ async fn failed_fetch_releases_singleflight_key_for_retry() {
     let file = http.fixture.expected[0].clone();
     assert_eq!(
         coordinator
-            .fetch(file.clone(), false)
+            .fetch_owned(file.clone(), false)
             .await
             .unwrap_err()
             .code,
         SnapshotErrorCode::ScopeForbidden
     );
-    let bytes = tokio::time::timeout(Duration::from_secs(3), coordinator.fetch(file, false))
+    let bytes = tokio::time::timeout(Duration::from_secs(3), coordinator.fetch_owned(file, false))
         .await
         .unwrap()
         .unwrap();
