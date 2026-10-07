@@ -658,11 +658,15 @@ impl SnapshotReader {
         limit: u32,
     ) -> Result<crate::snapshot::types::DirectoryResponse, SnapshotError> {
         self.context.validate_relative_path(dir)?;
-        self.ensure_lease().await?;
         let mut cursor: Option<String> = None;
         let mut merged: Option<crate::snapshot::types::DirectoryResponse> = None;
         let mut progress = super::directory::Progress::default();
         loop {
+            // A paginated directory enumeration is one logical operation,
+            // but every page is a separate request.  Renew immediately before
+            // each request so a slow wide directory cannot issue a request
+            // after its fixed reader lease has expired.
+            self.ensure_lease().await?;
             let page = self
                 .client
                 .directory(self.snapshot_id(), dir, limit, cursor.as_deref())
@@ -888,7 +892,6 @@ impl SnapshotReader {
     /// baseline for the page walk (spec 11 §6: both transports must produce
     /// the same entry set for the same view).
     pub async fn file_manifest_directory(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
-        self.ensure_lease().await?;
         let mut out = Vec::new();
         self.walk_dir("/", &self.descriptor().metadata_root, &mut out)
             .await?;
@@ -905,6 +908,10 @@ impl SnapshotReader {
         let mut cursor: Option<String> = None;
         let mut progress = super::directory::Progress::for_root(expected_root);
         loop {
+            // `walk_dir` may span many paginated requests and recursive
+            // directories.  Check the independent lease at each network
+            // boundary instead of relying on the check for the first page.
+            self.ensure_lease().await?;
             let page = self
                 .client
                 .directory(self.snapshot_id(), dir, 256, cursor.as_deref())
@@ -1003,6 +1010,7 @@ impl SnapshotReader {
 
         // Large file: verify the map binding, every leaf proof, every chunk
         // hash, then the whole-file hash.
+        self.ensure_lease().await?;
         let map = self.client.chunk_map(sid, &request_path, digest).await?;
         if map.file_size != size {
             return Err(SnapshotError::new(
@@ -1012,6 +1020,7 @@ impl SnapshotReader {
         }
         let mut chunk_hashes: Vec<[u8; 32]> = Vec::with_capacity(map.chunk_count as usize);
         for page_index in 0..map.page_count {
+            self.ensure_lease().await?;
             let leaf = self
                 .client
                 .chunk_map_page(sid, &request_path, digest, &map, page_index)
@@ -1031,6 +1040,7 @@ impl SnapshotReader {
         let map_id = map.map_id.clone();
         let mut out: Vec<Option<Vec<u8>>> = (0..map.chunk_count).map(|_| None).collect();
         for start in (0..map.chunk_count).step_by(128) {
+            self.ensure_lease().await?;
             let items: Vec<crate::snapshot::frames::ChunkRequest> = (start
                 ..(start + 128).min(map.chunk_count))
                 .map(|i| crate::snapshot::frames::ChunkRequest {
@@ -1212,6 +1222,7 @@ impl SnapshotReader {
             return VerifiedContent::publish(output, size, &digest, receipt.into_content());
         }
 
+        self.ensure_lease().await?;
         let map = self
             .client
             .chunk_map(self.snapshot_id(), &request_path, &file.content_digest)
@@ -1227,6 +1238,7 @@ impl SnapshotReader {
         let mut hashes = [[0u8; 32]; 64];
         let mut covered_hashes = 0usize;
         for page in 0..map.page_count {
+            self.ensure_lease().await?;
             let leaf = self
                 .client
                 .chunk_map_page(

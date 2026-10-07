@@ -3,6 +3,7 @@
 
 use std::{
     cell::RefCell,
+    fs::OpenOptions,
     process::{Child, Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
