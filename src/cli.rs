@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     io::{self, Write},
     net::SocketAddr,
-    path::PathBuf,
     time::Duration,
 };
 
@@ -15,6 +14,10 @@ use crate::{
     util::{config, logging},
     workspace::{WorkspaceConfig, WorkspaceService},
 };
+
+mod observation_sink;
+pub use observation_sink::ObservationFileOptions;
+use observation_sink::ObservationSink;
 
 /// Stable process exit codes shared by the CLIs (scripts depend on these).
 pub mod exit {
@@ -47,6 +50,15 @@ pub fn init(
 /// mounted by explicit requests, after selecting their fixed lower view.
 /// Assumes [`init`] has already loaded configuration.
 pub async fn serve(http_addr: SocketAddr) -> i32 {
+    serve_with_observation(http_addr, None).await
+}
+
+/// Explicit diagnostic output. Ordinary serving creates no observation task,
+/// file, additional resolve request, or diagnostic request header.
+pub async fn serve_with_observation(
+    http_addr: SocketAddr,
+    observation: Option<ObservationFileOptions>,
+) -> i32 {
     // Bind the HTTP listener up-front so a bind failure is a clean exit (code 4)
     // rather than a panic inside the daemon task.
     let listener = match tokio::net::TcpListener::bind(http_addr).await {
@@ -58,20 +70,39 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
     };
     tracing::info!("server running on {http_addr}");
 
+    let (observer, mut sink) = match observation {
+        None => (None, None),
+        Some(options) => match ObservationSink::start(options) {
+            Ok((observer, sink)) => (Some(observer), Some(sink)),
+            Err(error) => {
+                tracing::error!("workspace observation initialization failed: {error}");
+                return exit::CONFIG;
+            }
+        },
+    };
+
     let token = config::mst2_auth_token();
-    let service = match WorkspaceService::new(
-        Mst2Client::with_token(
-            config::mst2_base_url(),
-            (!token.is_empty()).then(|| token.to_owned()),
-        ),
-        WorkspaceConfig::new(
-            PathBuf::from(config::store_path()).join("workspaces-v3"),
-            PathBuf::from(config::store_path()).join("mst2-cache"),
-        ),
-    ) {
+    let paths = config::runtime_paths();
+    let client = Mst2Client::with_token(
+        config::mst2_base_url(),
+        (!token.is_empty()).then(|| token.to_owned()),
+    );
+    let workspace_config =
+        WorkspaceConfig::new(paths.workspace_root.into(), paths.cache_root.into());
+    let initialized = match &observer {
+        Some(observer) => {
+            WorkspaceService::new_with_observer(client, workspace_config, observer.clone())
+        }
+        None => WorkspaceService::new(client, workspace_config),
+    };
+    let service = match initialized {
         Ok(service) => service,
         Err(error) => {
             tracing::error!("workspace initialization failed: {error}");
+            drop(observer);
+            if let Some(sink) = sink {
+                let _ = sink.finish(exit::CONFIG).await;
+            }
             return exit::CONFIG;
         }
     };
@@ -85,8 +116,8 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
     let mut exit_code = exit::SUCCESS;
     let mut daemon_finished = false;
 
-    // The daemon owns its explicitly created mounts. There is no separate
-    // dictionary workspace session to initialize or supervise at startup.
+    // The daemon owns its explicitly created mounts. No workspace lifecycle
+    // is initialized before the HTTP listener admits an explicit request.
     tokio::select! {
         res = &mut daemon_task => {
             daemon_finished = true;
@@ -103,6 +134,10 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
             }
         }
         _ = shutdown_signal() => {}
+        _ = observation_failed(&mut sink) => {
+            tracing::error!("workspace observation failure requires daemon shutdown");
+            exit_code = exit::INTERNAL;
+        }
     }
 
     // Drain HTTP requests before cleaning up their mounts: an admitted create
@@ -130,7 +165,23 @@ pub async fn serve(http_addr: SocketAddr) -> i32 {
         }
     }
 
+    // HTTP and owned cleanup have joined. Any detached lifecycle owner still
+    // holding the service keeps the producer alive, which rejects sink finish.
+    drop(service);
+    drop(observer);
+    if let Some(sink) = sink {
+        if !sink.finish(exit_code).await && exit_code == exit::SUCCESS {
+            exit_code = exit::INTERNAL;
+        }
+    }
     exit_code
+}
+
+async fn observation_failed(sink: &mut Option<ObservationSink>) {
+    match sink {
+        Some(sink) => sink.failed().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Every workspace command goes through the daemon that owns its mount, reader,
@@ -301,7 +352,7 @@ pub fn config_init(path: &str, force: bool) -> i32 {
     match std::fs::write(path, CONFIG_TEMPLATE) {
         Ok(()) => {
             println!("wrote config template to {path}");
-            println!("edit base_url/lfs_url, then: scorpio --config-path {path} doctor");
+            println!("edit mst2_base_url, then: scorpio --config-path {path} doctor");
             exit::SUCCESS
         }
         Err(e) => {
@@ -314,18 +365,16 @@ pub fn config_init(path: &str, force: bool) -> i32 {
 /// `scorpio config validate`: offline-validate a config file, reporting all
 /// problems. Does not load the process-wide config.
 pub fn config_validate(config_path: &str, overrides: HashMap<String, String>) -> i32 {
-    match config::validate_file(config_path, overrides) {
-        Ok(()) => {
-            println!("{config_path}: OK");
-            exit::SUCCESS
+    let problems = config::validate_file(config_path, overrides);
+    if problems.is_empty() {
+        println!("{config_path}: OK");
+        exit::SUCCESS
+    } else {
+        eprintln!("{config_path}: {} problem(s) found:", problems.len());
+        for p in &problems {
+            eprintln!("  - {p}");
         }
-        Err(problems) => {
-            eprintln!("{config_path}: {} problem(s) found:", problems.len());
-            for p in &problems {
-                eprintln!("  - {p}");
-            }
-            exit::CONFIG
-        }
+        exit::CONFIG
     }
 }
 
@@ -338,8 +387,7 @@ pub fn config_show() -> i32 {
 
 /// Emit effective runtime paths as NUL-delimited records for `install.sh`.
 ///
-/// This deliberately avoids global config initialization because initialization
-/// creates runtime directories, which would be unsafe during installer checks.
+/// Resolution is read-only and uses the same derived roots as the daemon.
 pub fn config_installer_paths(config_path: &str, overrides: HashMap<String, String>) -> i32 {
     let paths = match config::resolve_runtime_paths(config_path, overrides) {
         Ok(paths) => paths,
@@ -348,15 +396,7 @@ pub fn config_installer_paths(config_path: &str, overrides: HashMap<String, Stri
             return exit::CONFIG;
         }
     };
-    let values = [
-        paths.workspace,
-        paths.store_path,
-        paths.config_file,
-        paths.antares_upper_root,
-        paths.antares_cl_root,
-        paths.antares_mount_root,
-        paths.antares_state_file,
-    ];
+    let values = [paths.store_path, paths.workspace_root, paths.cache_root];
     let mut stdout = io::stdout().lock();
     for value in values {
         if value.as_bytes().contains(&0) {
@@ -376,19 +416,11 @@ pub fn config_installer_paths(config_path: &str, overrides: HashMap<String, Stri
 
 /// Template used by `scorpio config init`.
 const CONFIG_TEMPLATE: &str = r#"# ScorpioFS configuration. Every key can be overridden by SCORPIO_<KEY> env vars
-# and on the CLI; precedence is CLI > env > this file > built-in defaults.
-base_url = "http://localhost:8000"
-lfs_url = "http://localhost:8000/lfs"
-workspace = "/tmp/scorpio-megadir/mount"
+# precedence is CLI > env > this file > built-in defaults.
+mst2_base_url = "http://127.0.0.1:19700"
+mst2_auth_token = ""
 store_path = "/tmp/scorpio-megadir/store"
-config_file = "config.toml"
-git_author = "MEGA"
-git_email = "admin@mega.org"
 log_level = "info"
-antares_upper_root = "/tmp/scorpio-megadir/antares/upper"
-antares_cl_root = "/tmp/scorpio-megadir/antares/cl"
-antares_mount_root = "/tmp/scorpio-megadir/antares/mnt"
-antares_state_file = "/tmp/scorpio-megadir/antares/state.toml"
 "#;
 
 /// Wait for SIGTERM/SIGINT (Unix) or Ctrl-C (other platforms).
@@ -427,9 +459,3 @@ async fn shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
     }
 }
-
-#[path = "cli_legacy.rs"]
-pub mod legacy;
-pub use legacy::{
-    antares_list, antares_mount, antares_overrides, antares_serve, antares_umount, http_mount,
-};

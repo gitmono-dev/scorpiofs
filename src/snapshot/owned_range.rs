@@ -230,9 +230,14 @@ impl OwnedChunkedFile {
             ));
         }
         let chunks = ChunkCache::new(reader)?;
+        // Opening a range reader reaches the fixed-view service to obtain its
+        // map.  Keep the reader's independent retention claim current at this
+        // boundary rather than relying on the caller's prior operation.
+        reader.ensure_lease().await?;
+        let request_path = super::reader::ScopeRequestPath(&file.rel_path).to_string();
         let map = reader
             .client()
-            .chunk_map(reader.snapshot_id(), &file.rel_path, &file.content_digest)
+            .chunk_map(reader.snapshot_id(), &request_path, &file.content_digest)
             .await?;
         if map.file_size != file.size {
             return Err(invalid("chunk map differs from fixed-root size"));
@@ -367,16 +372,7 @@ impl OwnedChunkedFile {
             chunk_index: u64,
         }
         fn scope_path<S: serde::Serializer>(path: &&str, serializer: S) -> Result<S::Ok, S::Error> {
-            struct Path<'a>(&'a str);
-            impl fmt::Display for Path<'_> {
-                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    if !self.0.starts_with('/') {
-                        f.write_str("/")?;
-                    }
-                    f.write_str(self.0)
-                }
-            }
-            serializer.collect_str(&Path(path))
+            serializer.collect_str(&super::reader::ScopeRequestPath(path))
         }
         fn decimal<S: serde::Serializer>(index: &u64, serializer: S) -> Result<S::Ok, S::Error> {
             serializer.collect_str(index)
@@ -400,6 +396,7 @@ impl OwnedChunkedFile {
                 encoding: self.reader.encoding_hint(),
             },
         )?;
+        self.reader.ensure_lease().await?;
         let mut seen = false;
         let receipt = consume_frames(
             self.reader.client(),
@@ -448,12 +445,14 @@ impl OwnedChunkedFile {
         if let Some(digests) = self.leaves.lock().await.get(page) {
             return Ok(digests);
         }
+        self.reader.ensure_lease().await?;
+        let request_path = super::reader::ScopeRequestPath(&self.file.rel_path).to_string();
         let leaf = self
             .reader
             .client()
             .chunk_map_page(
                 self.reader.snapshot_id(),
-                &self.file.rel_path,
+                &request_path,
                 &self.file.content_digest,
                 &self.map,
                 page,

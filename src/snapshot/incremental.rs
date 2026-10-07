@@ -27,7 +27,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -35,7 +35,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{
-    client::Mst2Client, closure::decode_page, frames::MetadataPageItem, reader::SnapshotPageSource,
+    closure::decode_page, frames::MetadataPageItem, reader::SnapshotPageSource, secure_fs,
     SnapshotClosureMeters, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
     ValidatedSnapshotClosure,
 };
@@ -96,7 +96,9 @@ pub struct SyncMeters {
     /// Serialized bytes published by those transactions.
     pub closure_index_write_bytes: u64,
     /// Scope-directory scans for pins backed by a local COMPLETE dependency
-    /// audit, not server authorization or GC-lease validation.
+    /// audit, not server authorization or GC-lease validation. These scans
+    /// include whole-CAS verification; an optional store meter records its
+    /// actual work under CompletionAudit independently of page reuse counts.
     pub pin_set_reads: u64,
     /// Actual local cached-page hash calls, including repeated checks of
     /// one page and checks that discover corrupt bytes. Missing pages and
@@ -159,7 +161,7 @@ impl ScopeCache {
     /// the scope live in subdirectories, so pin liveness is discoverable.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
         let dir = dir.into();
-        fs::create_dir_all(dir.join("pages")).map_err(io_err)?;
+        secure_fs::create_dir_all_no_symlink(&dir.join("pages")).map_err(io_err)?;
         Ok(ScopeCache { dir })
     }
 
@@ -185,7 +187,7 @@ impl ScopeCache {
         meters: &mut SyncMeters,
     ) -> Result<HashMap<String, ClosureRecord>, SnapshotError> {
         meters.closure_index_reads += 1;
-        let bytes = match fs::read(self.closures_path()) {
+        let bytes = match secure_fs::read(&self.closures_path()) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(e) => return Err(io_err(e)),
@@ -224,13 +226,7 @@ impl ScopeCache {
     fn try_index_lock(&self) -> Result<Option<IndexLock>, SnapshotError> {
         // Lock a stable inode, not closures.json which publication replaces.
         // No blocking lock call may stall the async task that owns the lock.
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.dir.join("closures.lock"))
-            .map_err(io_err)?;
+        let lock = secure_fs::open_rw_create(&self.dir.join("closures.lock")).map_err(io_err)?;
         match lock.try_lock() {
             Ok(()) => Ok(Some(IndexLock { file: lock })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
@@ -251,6 +247,14 @@ impl ScopeCache {
         &self,
         meters: &mut SyncMeters,
     ) -> Result<ClosureTransaction, SnapshotError> {
+        self.sync_transaction_with_pin_meters(meters, None).await
+    }
+
+    async fn sync_transaction_with_pin_meters(
+        &self,
+        meters: &mut SyncMeters,
+        pin_meters: Option<&super::durable::CasVerificationMeters>,
+    ) -> Result<ClosureTransaction, SnapshotError> {
         let lock = loop {
             if let Some(lock) = self.try_index_lock()? {
                 break lock;
@@ -259,10 +263,24 @@ impl ScopeCache {
         };
         let records = self.load_records_counted(meters)?;
         meters.pin_set_reads += 1;
+        let live_pins = super::stage::trace_sync("metadata_reuse_pin_inventory", || {
+            self.pin_inventory(None, pin_meters).map(|inventory| {
+                inventory
+                    .into_iter()
+                    .filter_map(|(_, audit)| {
+                        if let super::workspace_pins::PinAudit::Active(id) = audit {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+        })?;
         Ok(ClosureTransaction {
             _lock: lock,
             records,
-            live_pins: self.live_pins().into_iter().collect(),
+            live_pins,
             dirty: false,
         })
     }
@@ -326,8 +344,8 @@ impl ScopeCache {
     }
 
     /// Snapshot ids holding a local pin in this scope.
-    pub fn live_pins(&self) -> Vec<String> {
-        self.try_live_pins().unwrap_or_default()
+    pub fn live_pins(&self) -> Result<Vec<String>, SnapshotError> {
+        self.try_live_pins()
     }
 
     pub fn try_live_pins(&self) -> Result<Vec<String>, SnapshotError> {
@@ -422,7 +440,7 @@ impl ScopeCache {
             Err(_) => return Ok(None),
         };
         let path = self.page_path(&want);
-        let bytes = match fs::read(&path) {
+        let bytes = match secure_fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(e)),
@@ -456,6 +474,7 @@ pub struct IncrementalSync<'a> {
     page_pool: BTreeMap<String, Vec<u8>>,
     closure_meters: SnapshotClosureMeters,
     collect_snapshot_pages: bool,
+    pin_verification_meters: Option<super::durable::CasVerificationMeters>,
 }
 
 impl<'a> IncrementalSync<'a> {
@@ -471,6 +490,7 @@ impl<'a> IncrementalSync<'a> {
             page_pool: BTreeMap::new(),
             closure_meters: SnapshotClosureMeters::default(),
             collect_snapshot_pages: false,
+            pin_verification_meters: None,
         }
     }
 
@@ -481,6 +501,14 @@ impl<'a> IncrementalSync<'a> {
     /// Root-proof work is additional to acquisition's `traversal_nodes`.
     pub fn closure_meters(&self) -> SnapshotClosureMeters {
         self.closure_meters
+    }
+
+    pub(crate) fn with_pin_verification_meters(
+        mut self,
+        meters: Option<super::durable::CasVerificationMeters>,
+    ) -> Self {
+        self.pin_verification_meters = meters;
+        self
     }
 
     fn reset(&mut self) -> Result<(), SnapshotError> {
@@ -509,7 +537,13 @@ impl<'a> IncrementalSync<'a> {
             ));
         }
         self.reader.ensure_lease().await?;
-        let mut transaction = self.cache.sync_transaction(&mut self.meters).await?;
+        let mut transaction = self
+            .cache
+            .sync_transaction_with_pin_meters(
+                &mut self.meters,
+                self.pin_verification_meters.as_ref(),
+            )
+            .await?;
         self.reader.ensure_lease().await?;
         self.acquire(&mut transaction, true).await?;
         let reader = self.reader;
@@ -1043,7 +1077,7 @@ fn io_err(e: std::io::Error) -> SnapshotError {
 
 /// Temp-file + rename so a crash never leaves a half-written record or page.
 fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError> {
-    fs::create_dir_all(dir).map_err(io_err)?;
+    secure_fs::create_dir_all_no_symlink(dir).map_err(io_err)?;
     let tmp = dir.join(format!(
         ".{name}.tmp.{}-{}",
         std::process::id(),
@@ -1051,7 +1085,7 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
     ));
     let result = (|| {
         use std::io::Write as _;
-        let mut f = fs::File::create(&tmp).map_err(io_err)?;
+        let mut f = secure_fs::open_create_new(&tmp).map_err(io_err)?;
         f.write_all(data).map_err(io_err)?;
         f.sync_all().map_err(io_err)?;
         #[cfg(test)]
@@ -1065,10 +1099,6 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
     }
     result
 }
-
-/// Unused-import guard for the type used only in signatures above.
-#[allow(dead_code)]
-fn _client_marker(_: &Mst2Client) {}
 
 #[cfg(test)]
 mod tests {
@@ -1178,7 +1208,7 @@ mod tests {
     async fn live_pins_require_a_committed_dependency_audit() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = ScopeCache::open(tmp.path()).unwrap();
-        assert!(cache.live_pins().is_empty());
+        assert!(cache.live_pins().unwrap().is_empty());
         let id = format!("sha256:{}", "ab".repeat(32));
         let view = tmp.path().join(id.trim_start_matches("sha256:"));
         std::fs::create_dir_all(&view).unwrap();
@@ -1188,7 +1218,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            cache.live_pins().is_empty(),
+            cache.live_pins().unwrap().is_empty(),
             "a prepare pin cannot authorize reuse"
         );
         let store =
@@ -1204,10 +1234,10 @@ mod tests {
             .hydrate_with(&meta, &[], |_| async { Ok(Vec::new()) })
             .await
             .unwrap();
-        assert_eq!(cache.live_pins(), vec![id]);
+        assert_eq!(cache.live_pins().unwrap(), vec![id]);
         fs::remove_file(view.join("DURABLE_COMPLETE")).unwrap();
         assert!(
-            cache.live_pins().is_empty(),
+            cache.live_pins().unwrap().is_empty(),
             "an orphan pin cannot authorize reuse"
         );
     }

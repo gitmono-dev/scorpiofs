@@ -713,3 +713,24 @@ async fn registry_paths_do_not_follow_an_owner_symlink_outside_the_scope() {
     assert!(store.release_local_pin().is_err());
     assert!(moved.join("DURABLE_COMPLETE").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn registry_lock_rejects_a_final_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    let store = f.owner(2);
+    let binding = store.workspace_binding().unwrap().unwrap();
+    let scope = binding.validate_store(&store).unwrap();
+    let lock = scope
+        .join(REGISTRY_DIR)
+        .join(format!("{}.lock", binding.workspace_id()));
+    let outside = f.temp.path().join("outside-registry-lock");
+    fs::write(&outside, b"sentinel").unwrap();
+    fs::remove_file(&lock).unwrap();
+    symlink(&outside, &lock).unwrap();
+
+    assert!(register(&store, &binding, RegistrationState::Active).is_err());
+    assert_eq!(fs::read(&outside).unwrap(), b"sentinel");
+}

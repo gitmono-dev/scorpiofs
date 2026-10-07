@@ -3,7 +3,7 @@
 
 Default is plan-only. Execute never starts/stops services, creates cloud or DB
 resources, changes server configuration, force-pushes, or deletes old results.
-Build examples/mst2_update_measure.rs first. Tokens and PostgreSQL credentials
+Build the shipped scorpio binary first. Tokens and PostgreSQL credentials
 are inherited through M2_TOKEN/M2_GIT_TOKEN and PG* environment variables.
 """
 
@@ -29,6 +29,85 @@ try:
     import tomllib
 except ModuleNotFoundError:
     from pip._vendor import tomli as tomllib
+
+
+SCENARIOS = {"v1": "cold", "v2": "single-file", "v3": "subtree-rename",
+             "v4": "batch-file-update"}
+
+
+# Duplicated deliberately at this boundary: the benchmark must remain able
+# to serialize a safe record even when the worker module failed to import.
+# Unknown values are discarded rather than copied from an exception object.
+SAFE_WORKER_ERROR_CODES = frozenset({
+    "worker_error", "worker_input_invalid", "worker_http_request_too_large",
+    "worker_http_redirect_rejected", "worker_http_body_too_large",
+    "worker_http_content_length_invalid", "worker_http_body_truncated",
+    "worker_http_status_rejected", "worker_http_status_4xx",
+    "worker_http_status_5xx", "worker_http_status_other",
+    "worker_http_response_invalid",
+    "worker_http_request_failed", "worker_json_invalid",
+    "workspace_status_invalid", "workspace_mount_invalid",
+    "workspace_identity_invalid", "workspace_hydration_failed",
+    "workspace_retention_invalid", "workspace_oracle_failed",
+    "worker_process_invalid", "worker_command_failed",
+    "worker_receipt_invalid", "worker_cleanup_invalid", "git_baseline_invalid",
+})
+SAFE_WORKER_STAGES = frozenset({
+    "create", "hydrate", "poll", "oracle", "retained", "git", "destroy", "cleanup",
+})
+SAFE_RETENTION_SUBSTAGES = frozenset({
+    "retain_path", "upper_check", "sentinel_write", "retained_fd",
+    "old_view_oracle", "old_view_fd", "old_view_sentinel", "final_view_oracle",
+})
+SAFE_HYDRATION_SUBSTAGES = frozenset({
+    "metadata_closure", "cas_resume_audit", "small_object_fetch",
+    "large_content_fetch", "large_chunk_map", "large_chunk_read",
+    "large_cas_write", "hydration_commit", "snapshot_links",
+    "dependency_audit", "hydration_task",
+})
+SAFE_BACKEND_ERROR_CODES = frozenset({
+    "INVALID_CONFIG", "SNAPSHOT_ERROR", "WORKSPACE_BUSY", "WORKSPACE_DIRTY",
+    "WORKSPACE_IO", "WORKSPACE_NOT_FOUND", "WORKSPACE_NOT_READY",
+    "WORKSPACE_UNKNOWN",
+})
+SAFE_SNAPSHOT_CODES = frozenset({
+    "ScopeInvalid", "InvalidRequest", "LimitExceeded", "Unauthenticated",
+    "ScopeForbidden", "ViewNotFound", "SnapshotNotReady", "SnapshotGone",
+    "PathNotFound", "NotDirectory", "UnsupportedEntry", "LeaseUnknown",
+    "LeaseExpired", "CursorInvalid", "CursorStale", "ProofBudgetExceeded",
+    "DigestMismatch", "IntegrityError", "ObjectUnavailable", "RangeNotSupported",
+    "SymlinkTraversal", "DurableViewConflict", "TemporaryUnavailable", "Internal",
+})
+
+
+def _safe_worker_error_code(error):
+    code = getattr(error, "error_code", None)
+    return code if code in SAFE_WORKER_ERROR_CODES else None
+
+
+def _safe_worker_stage(error):
+    stage = getattr(error, "worker_stage", None)
+    return stage if type(stage) is str and stage in SAFE_WORKER_STAGES else None
+
+
+def _safe_retention_substage(error):
+    substage = getattr(error, "retention_substage", None)
+    return substage if type(substage) is str and substage in SAFE_RETENTION_SUBSTAGES else None
+
+
+def _safe_hydration_substage(error):
+    substage = getattr(error, "hydration_substage", None)
+    return substage if type(substage) is str and substage in SAFE_HYDRATION_SUBSTAGES else None
+
+
+def _safe_backend_error_code(error):
+    code = getattr(error, "backend_code", None)
+    return code if code in SAFE_BACKEND_ERROR_CODES else None
+
+
+def _safe_snapshot_code(error):
+    code = getattr(error, "snapshot_code", None)
+    return code if code in SAFE_SNAPSHOT_CODES else None
 
 
 IDENTITY_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
@@ -68,40 +147,11 @@ SELECT COALESCE((SELECT row_to_json(x) FROM (
 COMMIT;"""
 
 
-SNAPSHOT_ERROR_CODES = frozenset({
-    "ScopeInvalid", "InvalidRequest", "LimitExceeded", "Unauthenticated", "ScopeForbidden",
-    "ViewNotFound", "SnapshotNotReady", "SnapshotGone", "PathNotFound", "NotDirectory",
-    "UnsupportedEntry", "LeaseUnknown", "LeaseExpired", "CursorInvalid", "CursorStale",
-    "ProofBudgetExceeded", "DigestMismatch", "IntegrityError", "ObjectUnavailable",
-    "RangeNotSupported", "SymlinkTraversal", "DurableViewConflict", "TemporaryUnavailable", "Internal",
-})
-MEASUREMENT_STAGES = frozenset({
-    "arguments", "resolve", "cache_setup", "metadata", "metadata_oracle", "hydrate",
-    "completion_audit", "old_complete_view_audit",
-})
-
-
 class CommandFailure(RuntimeError):
     """Closed diagnostic fields; never command arguments or child messages."""
 
-    def __init__(self, program, status, stderr):
+    def __init__(self, program, status, _stderr):
         self.details = {"command": program, "exit_status": status}
-        if program == "mst2_update_measure" and len(stderr) <= 4096:
-            try:
-                failure = json.loads(stderr)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                failure = None
-            if (isinstance(failure, dict)
-                    and set(failure) in ({"record", "stage"}, {"record", "stage", "snapshot_error_code"})
-                    and failure["record"] == "measurement_failure"
-                    and isinstance(failure["stage"], str)
-                    and failure["stage"] in MEASUREMENT_STAGES
-                    and ("snapshot_error_code" not in failure
-                         or (isinstance(failure["snapshot_error_code"], str)
-                             and failure["snapshot_error_code"] in SNAPSHOT_ERROR_CODES))):
-                self.details["measurement_stage"] = failure["stage"]
-                if "snapshot_error_code" in failure:
-                    self.details["snapshot_error_code"] = failure["snapshot_error_code"]
         super().__init__(program + " failed")
 
 
@@ -112,6 +162,15 @@ class PhaseFailure(AssertionError):
         self.phase = phase
         self.failure_type = type(error).__name__
         self.details = error.details if isinstance(error, CommandFailure) else {}
+        # WorkerError exposes only a closed, non-sensitive code.  Keep this
+        # separate from ``details`` so existing CommandFailure records remain
+        # byte-for-byte compatible.
+        self.error_code = _safe_worker_error_code(error)
+        self.worker_stage = _safe_worker_stage(error)
+        self.retention_substage = _safe_retention_substage(error)
+        self.hydration_substage = _safe_hydration_substage(error)
+        self.backend_code = _safe_backend_error_code(error)
+        self.snapshot_code = _safe_snapshot_code(error)
         super().__init__(phase + " failed")
 
 
@@ -129,9 +188,40 @@ def failure_record(error):
     record = {"execution_failed": True, "error_type": type(error).__name__}
     if isinstance(error, PhaseFailure):
         record.update(error_type=error.failure_type, phase=error.phase)
+        if error.error_code is not None:
+            record["error_code"] = error.error_code
+        if error.worker_stage is not None:
+            record["worker_stage"] = error.worker_stage
+        if error.retention_substage is not None:
+            record["retention_substage"] = error.retention_substage
+        if error.hydration_substage is not None:
+            record["hydration_substage"] = error.hydration_substage
+        if error.backend_code is not None:
+            record["backend_code"] = error.backend_code
+        if error.snapshot_code is not None:
+            record["snapshot_code"] = error.snapshot_code
         record.update(error.details)
     elif isinstance(error, CommandFailure):
         record.update(error.details)
+    else:
+        code = _safe_worker_error_code(error)
+        if code is not None:
+            record["error_code"] = code
+        stage = _safe_worker_stage(error)
+        if stage is not None:
+            record["worker_stage"] = stage
+        retention_substage = _safe_retention_substage(error)
+        if retention_substage is not None:
+            record["retention_substage"] = retention_substage
+        hydration_substage = _safe_hydration_substage(error)
+        if hydration_substage is not None:
+            record["hydration_substage"] = hydration_substage
+        backend_code = _safe_backend_error_code(error)
+        if backend_code is not None:
+            record["backend_code"] = backend_code
+        snapshot_code = _safe_snapshot_code(error)
+        if snapshot_code is not None:
+            record["snapshot_code"] = snapshot_code
     return record
 
 
@@ -153,7 +243,10 @@ def command(args, deadline, env=None, data=None):
         args, min(deadline, time.monotonic() + 1800), env=env or clean_env(), data=data)
     if status:
         name = Path(str(args[0])).name.removesuffix(".exe")
-        program = name if name in {"git", "psql", "docker", "mst2_update_measure"} else "external_command"
+        # The shipped server is an owned executable in the setup phase. Keep
+        # its label closed so safe failure evidence identifies the failing
+        # command without copying arguments, paths, or child stderr.
+        program = name if name in {"git", "psql", "docker", "mega2", "scorpio"} else "external_command"
         raise CommandFailure(program, status, error_output)
     return out
 
@@ -414,12 +507,22 @@ def verify_worktree(worktree, expected, deadline=None):
 
 
 def create_version(repo, round_number, version, smoke, deadline):
+    if version not in SCENARIOS:
+        raise ValueError("unknown fixed commit-update scenario")
     prefix = f"r{round_number:02}"
     user = clean_env({"GIT_AUTHOR_NAME": "MST2 benchmark", "GIT_COMMITTER_NAME": "MST2 benchmark",
                       "GIT_AUTHOR_EMAIL": "benchmark@example.invalid", "GIT_COMMITTER_EMAIL": "benchmark@example.invalid"})
     if version == "v1":
         git(repo, deadline, "read-tree", "--empty")
-        modules, buckets, files, size = (8, 1, 8, 1024) if smoke else (64, 8, 32, 16384)
+        if smoke:
+            modules, buckets, files, size = 8, 1, 8, 1024
+        else:
+            # Keep medium large enough to exercise metadata fan-out, retained
+            # views, and the Git oracle while staying practical for the shared
+            # four-hour cloud budget.  This is 1,024 generated files (about
+            # 8 MiB) plus the wide-directory and large-file probes below;
+            # m001 and m007 remain present for the v3 rename and alias checks.
+            modules, buckets, files, size = 16, 4, 16, 8192
         for module in range(modules):
             for bucket in range(buckets):
                 directory = repo / prefix / f"m{module:03}" / f"d{bucket:02}"
@@ -443,8 +546,28 @@ def create_version(repo, round_number, version, smoke, deadline):
         body[0] ^= 1
         path.write_bytes(body)
         git(repo, deadline, "add", "--", f"{prefix}/m000/d00/f000")
-    else:
+    elif version == "v3":
         git(repo, deadline, "mv", "--", f"{prefix}/m001", f"{prefix}/renamed-m001")
+    elif version == "v4":
+        # Rewrite existing bodies across module and directory boundaries.
+        # Medium adds 128 distinct 8 KiB blobs, without growing the checkout;
+        # smoke rewrites 16 1 KiB blobs. The renamed subtree and m007 alias
+        # participate, so retained views must preserve both their old paths
+        # and old bytes after this publication.
+        changed = []
+        for module in range(8):
+            name = "renamed-m001" if module == 1 else f"m{module:03}"
+            for bucket in range(1 if smoke else 4):
+                for number in range(2 if smoke else 4):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("batch fixture generation exceeded the shared deadline")
+                    rel = f"{prefix}/{name}/d{bucket:02}/f{number:03}"
+                    path = repo / rel
+                    size = path.stat().st_size
+                    block = hashlib.sha256(("batch:" + rel).encode()).digest()
+                    path.write_bytes(block * (size // len(block)))
+                    changed.append(rel)
+        git(repo, deadline, "add", "--", *changed)
     parent = git(repo, deadline, "rev-parse", "HEAD").decode().strip()
     tree = git(repo, deadline, "write-tree").decode().strip()
     # Preserve raw empty directories and a logical directory alias in every
@@ -486,256 +609,9 @@ def driver_binding(options):
 
 
 def execute(options):
-    if sys.platform != "linux" or not options.isolated_deployment:
-        raise ValueError("--execute requires Linux and explicit --isolated-deployment")
-    if (options.database in ("mega2", "mega2_test", "mono", "postgres")
-            or not re.fullmatch(r"[a-z][a-z0-9_]*", options.database)):
-        raise ValueError("an explicitly isolated benchmark database is required")
-    if uuid.UUID(options.instance_id).int == 0 or str(uuid.UUID(options.instance_id)) != options.instance_id:
-        raise ValueError("instance UUID must be canonical and nonnil")
-    if not re.fullmatch(r"[0-9a-f]{40}", options.expect_initial_commit):
-        raise ValueError("expected initial project commit must be a fixed SHA-1")
-    endpoint_pair(options.base_url, options.git_url)
-    projection = getattr(options, "projection_traces", False)
-    if projection and (options.publication_mode != "native"
-                       or not callable(getattr(options, "finalize_projection", None))):
-        raise ValueError("projection collection requires the owned native runner and final drain")
-    budget = budget_module.from_options(options)
-    budget.require(options.rounds * budget_module.ROUND_SECONDS
-                   + budget_module.REPORT_RESERVE + budget_module.CLEANUP_RESERVE
-                   + budget_module.MARGIN)
-    started = time.monotonic()
-    # This one deadline includes all preflight, fixture, publish, client, Git,
-    # audit and repeated-round work. Never grant a fresh four hours per round.
-    measurement_limit = min(budget.measurement_deadline, started + options.deadline_seconds)
-    deadline = measurement_limit
-    owner = service_binding(options)
-    collector = projection_module.ProjectionCollector(owner["projection_cache"]) if projection else None
-    run_id = str(uuid.uuid4()) if projection else None
-    driver_binding(options)
-    root = options.run_root.parent.resolve(strict=True) / options.run_root.name
-    checkout = Path(__file__).resolve().parents[2]
-    if root.exists() or root.is_relative_to(checkout) or not root.parent.is_dir():
-        raise ValueError("use a nonexistent private run root outside the source checkout")
-    token = os.environ.get("M2_GIT_TOKEN", os.environ.get("M2_TOKEN", ""))
-    if not token or not os.environ.get("M2_TOKEN"):
-        raise ValueError("private M2_GIT_TOKEN/M2_TOKEN authentication is required")
-    git_env = clean_env({"GIT_CONFIG_COUNT": "3", "GIT_CONFIG_KEY_0": "http.extraHeader",
-                         "GIT_CONFIG_VALUE_0": "Authorization: Bearer " + token,
-                         "GIT_CONFIG_KEY_1": "http.followRedirects", "GIT_CONFIG_VALUE_1": "false",
-                         "GIT_CONFIG_KEY_2": "credential.helper", "GIT_CONFIG_VALUE_2": ""})
-    def tip():
-        output = command(["git", "ls-remote", options.git_url, "refs/heads/main"], deadline, env=git_env)
-        lines = output.decode().splitlines()
-        if len(lines) != 1 or lines[0].split()[1] != "refs/heads/main":
-            raise AssertionError("expected exactly one project main ref")
-        return lines[0].split()[0]
-    if tip() != options.expect_initial_commit:
-        raise AssertionError("isolated service target moved before any workload mutation")
-    with phase("initial_complete_identity"):
-        initial = query(IDENTITY_SQL, deadline)
-        project = next(row for row in initial if row["path"] == "/project")
-        identity = validate_identity(initial, options.expect_initial_commit, project["tree"], options.database)
-        if options.publication_mode == "native":
-            validate_native(query(NATIVE_SQL, deadline), identity, options.instance_id, False)
-    root.mkdir(mode=0o700)
-    (root / ".mst2-real-update-owned").write_text(root.name + "\n")
-    fixture = root / "fixture"
-    command(["git", "clone", "--no-checkout", "--single-branch", "--branch", "main",
-             options.git_url, str(fixture)], deadline, env=git_env)
-    if git(fixture, deadline, "rev-parse", "HEAD").decode().strip() != options.expect_initial_commit:
-        raise AssertionError("fixture clone differs from the inspected target")
-    records = []
-    current = options.expect_initial_commit
-    output = root / "measurements.jsonl"
-    def emit(record):
-        with output.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, sort_keys=True) + "\n")
-        print(json.dumps(record, sort_keys=True), flush=True)
-    emit({"record": "environment", "profile": options.profile, "rounds": options.rounds,
-          "publication_mode": options.publication_mode, "service_binding": owner,
-          "instrumentation_mode": "typed-projection-writer-v1" if projection else "disabled",
-          "driver_sha256": hashlib.sha256(options.driver.read_bytes()).hexdigest(),
-          "driver_source_sha256": hashlib.sha256((checkout / "examples/mst2_update_measure.rs").read_bytes()).hexdigest(),
-          "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-          "git_version": command(["git", "--version"], deadline).decode().strip(),
-          "cache_conditions": "fresh app/Git caches per round, warm V2/V3; OS cache uncontrolled; side order alternates",
-          "fixture_content": "distinct deterministic 32-byte blocks repeated to the configured file size; synthetic compressible source-like bytes",
-          "git_baseline": "cold V1 depth=1 fetch, ordinary incremental V2/V3 in the same worktree; core.fsync=all + fsync of Git store and worktree files/directories",
-          "started_utc": datetime.now(timezone.utc).isoformat(), "max_wall_seconds": min(options.deadline_seconds, 14400)})
-    for round_number in range(1, options.rounds + 1):
-        deadline = min(budget.round_deadline(round_number), measurement_limit)
-        group = root / f"round-{round_number:02}"
-        group.mkdir()
-        git_store, git_worktree = group / "git.git", group / "git-worktree"
-        command(["git", "init", "--bare", str(git_store)], deadline)
-        old = []
-        for version in ("v1", "v2", "v3"):
-            driver_binding(options)
-            if service_binding(options) != owner or tip() != current:
-                raise AssertionError("service/target identity changed before the next publication")
-            with phase("fixture_and_git_oracle"):
-                commit, tree = create_version(fixture, round_number, version, options.profile == "smoke", deadline)
-                expected = expected_manifest(fixture, commit, deadline)
-            expected_path = group / f"{version}-expected.json"
-            expected_path.write_text(json.dumps(expected))
-            publish_start = time.monotonic()
-            with phase("git_publication_push"):
-                git(fixture, deadline, "push", "--no-thin", options.git_url,
-                    f"{commit}:refs/heads/main", env=git_env)
-            push_ms = (time.monotonic() - publish_start) * 1000
-            with phase("updated_publication_identity"):
-                previous_identity = identity
-                identity = validate_identity(query(IDENTITY_SQL, deadline), commit, tree, options.database)
-                native = None
-                if options.publication_mode == "native":
-                    native = query(NATIVE_SQL, deadline)
-                    validate_native(native, identity, options.instance_id, True, previous_identity)
-            visible_ms = (time.monotonic() - publish_start) * 1000
-            current = commit
-            driver_env = clean_env({"M2_BASE": options.base_url, "M2_SCOPE": "/project",
-                                   "M2_STORE_ROOT": str(group / "scorpio-cache"),
-                                   "M2_EXPECTED_VIEW": identity["namespace_view_id"],
-                                   "M2_EXPECTED_INSTANCE": options.instance_id,
-                                   "M2_TOKEN": os.environ.get("M2_TOKEN", "")})
-            if native:
-                driver_env["M2_EXPECTED_SEQUENCE"] = str(native["sequence"])
-            logical_id = f"mst2:{run_id}:r{round_number}:{version}:resolve" if projection else None
-            if projection:
-                driver_env["M2_RESOLVE_TRACE_ID"] = logical_id
-            def scorpio_sync():
-                with phase("scorpio_sync"):
-                    got = json.loads(command([str(options.driver), "sync", str(expected_path)],
-                                             deadline, env=driver_env))
-                source_digest = "sha256:" + hashlib.sha256((checkout / "examples/mst2_update_measure.rs").read_bytes()).hexdigest()
-                if got.get("driver_source_digest") != source_digest:
-                    raise AssertionError("measurement binary was compiled from different driver source")
-                return got
-            def scorpio_oracle(got):
-                with phase("new_complete_view_audit"):
-                    command([str(options.driver), "audit", str(expected_path),
-                             got["store"], got["content_store"]], deadline)
-            def scorpio():
-                return durable_verified(scorpio_sync, scorpio_oracle)
-            def git_sync():
-                start = time.monotonic()
-                durable_git = ["git", "-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync",
-                               "--git-dir", str(git_store)]
-                # The compared service is a fixed current snapshot. A fresh
-                # full-history fetch would unfairly add earlier repeat bodies
-                # to Git's cold V1, while MST/2 does not fetch old snapshots.
-                # Mega2 rejects deepen+have; cold V1 alone needs depth=1.
-                # Ordinary V2/V3 stop at the preceding fetched commit.
-                depth = ["--depth=1"] if version == "v1" else []
-                with phase("git_baseline_fetch"):
-                    command(durable_git + ["fetch", *depth, "--no-tags", options.git_url, "refs/heads/main"], deadline, env=git_env)
-                fetched = command(["git", "--git-dir", str(git_store), "rev-parse", "FETCH_HEAD"], deadline).decode().strip()
-                if fetched != commit:
-                    raise AssertionError("Git comparison fetched a different commit")
-                fetch_ms = (time.monotonic() - start) * 1000
-                with phase("git_baseline_worktree"):
-                    if version == "v1":
-                        command(durable_git + ["worktree", "add", "--detach", str(git_worktree), commit], deadline)
-                    else:
-                        git(git_worktree, deadline, "-c", "core.fsync=all", "-c", "core.fsyncMethod=fsync", "reset", "--hard", commit)
-                ready_ms = (time.monotonic() - start) * 1000
-                with phase("git_baseline_flush"):
-                    flushed_store = fsync_tree(git_store, deadline)
-                    flushed_worktree = fsync_tree(git_worktree, deadline)
-                # Directory entries for both trees must survive publication.
-                fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                return {"fetch_ms": fetch_ms, "worktree_ready_ms": ready_ms,
-                        "durable_complete_ms": (time.monotonic() - start) * 1000,
-                        "git_store_flush": flushed_store, "worktree_flush": flushed_worktree}
-            def git_oracle(_):
-                with phase("git_byte_oracle"):
-                    verify_worktree(git_worktree, expected, deadline)
-            def baseline():
-                return durable_verified(git_sync, git_oracle)
-            # Alternate side order across repeat/scenario to limit systematic
-            # advantage from HTTP/object/page-cache warming on the server.
-            side_order = "scorpio-first" if (round_number + int(version[1])) % 2 == 0 else "git-first"
-            if side_order == "scorpio-first":
-                measured, git_measured = scorpio(), baseline()
-            else:
-                git_measured, measured = baseline(), scorpio()
-            trace = None
-            if projection:
-                # All timed side operations and immediate byte oracles ended.
-                # Durable trace parsing/waiting still consumes this round's wall budget.
-                with phase("projection_trace_collection"):
-                    trace = collector.collect(measured, native, identity, logical_id, deadline)
-            # Each side's new-view byte oracle ran immediately within that
-            # side's verified timer. Old-view checks are separate wall time.
-            with phase("old_complete_view_audit"):
-                for old_path, old_store, old_content in old:
-                    command([str(options.driver), "audit", str(old_path), old_store, old_content], deadline)
-            if version == "v2" and measured["fetched_content_units"] != 1:
-                raise AssertionError("single-file update must fetch exactly one new content unit")
-            if version == "v3" and measured["fetched_content_units"] != 0:
-                raise AssertionError("unchanged subtree rename must fetch no content")
-            after = validate_identity(query(IDENTITY_SQL, deadline), commit, tree, options.database)
-            if after != identity or tip() != commit or service_binding(options) != owner:
-                raise AssertionError("fixed service/commit changed across update timing")
-            old.append((expected_path, measured["store"], measured["content_store"]))
-            record = {"record": "round", "round": round_number, "version": version,
-                      "fixed_commit": commit, "identity": identity, "git_push_ms": push_ms,
-                      "git_ref_visible_ms": visible_ms,
-                      "publication_visible_ms": visible_ms if native else None,
-                      "publication_and_client_metadata_ready_ms": visible_ms + measured["metadata_ready_ms"] if native else None,
-                      "publication_and_client_durable_complete_ms": visible_ms + measured["durable_complete_ms"] if native else None,
-                      "publication_and_client_scope": "sum of publication observation and client segments; excludes interleaved Git baseline and harness oracle setup",
-                      "publication_timing_scope": "push start through read-only DB certificate observation; an upper bound, not internal server projection duration",
-                      "native_publication": native, "publication_mode": options.publication_mode,
-                      "server_projection": trace,
-                      "server_projection_rebuilt_pages": None, "server_projection_reused_pages": None,
-                      "server_projection_stats": "typed directory-root work; codec-internal radix work is NOT_EXPOSED" if projection else "NOT_EXPOSED",
-                      "durable_verified_scope": "each side operation through its immediate independent full-byte oracle; old-view audits excluded",
-                      "side_order": side_order, "scorpio": measured, "git": git_measured,
-                      "correctness": "PASS", "old_local_complete_views_equal": True,
-                      "old_live_reader_or_fuse_lease": "NOT_RUN",
-                      "fuse_mount": "NOT_RUN"}
-            records.append(record)
-            emit(record)
-        if time.monotonic() >= deadline:
-            raise TimeoutError("complete round exceeded its fixed budget")
-    if len(records) != options.rounds * 3:
-        raise AssertionError("all requested complete V1/V2/V3 rounds are required")
-    deadline = budget.report_deadline()
-    projection_writer_status = None
-    if projection:
-        with phase("projection_trace_finalization"):
-            options.finalize_projection(deadline)
-            projection_writer_status = collector.finish(options.rounds * 3, deadline)
-    for version in ("v1", "v2", "v3"):
-        if time.monotonic() >= deadline:
-            raise TimeoutError("summary exceeded its fixed report budget")
-        samples = [r for r in records if r["version"] == version]
-        summary = {"record": "summary", "version": version, "samples": len(samples)}
-        for metric, select in {
-                "publication_visible_ms": lambda r: r["publication_visible_ms"],
-                "publication_and_client_metadata_ready_ms": lambda r: r["publication_and_client_metadata_ready_ms"],
-                "publication_and_client_durable_complete_ms": lambda r: r["publication_and_client_durable_complete_ms"],
-                "resolve_ms": lambda r: r["scorpio"]["resolve_ms"],
-                "metadata_ready_ms": lambda r: r["scorpio"]["metadata_ready_ms"],
-                "durable_complete_ms": lambda r: r["scorpio"]["durable_complete_ms"],
-                "durable_verified_ms": lambda r: r["scorpio"]["durable_verified_ms"],
-                "git_durable_verified_ms": lambda r: r["git"]["durable_verified_ms"],
-                "git_durable_complete_ms": lambda r: r["git"]["durable_complete_ms"]}.items():
-            values = [select(r) for r in samples if select(r) is not None]
-            summary[metric] = {"p50": percentile(values, 50), "p95": percentile(values, 95)} if values else None
-        if projection:
-            for metric in ["projection_elapsed_micros", *sorted(projection_module.WORK_FIELDS)]:
-                values = [r["server_projection"]["payload"][metric] for r in samples]
-                summary[metric] = {"p50": percentile(values, 50), "p95": percentile(values, 95)}
-        emit(summary)
-    emit({"record": "complete", "round_scenarios": len(records),
-          "projection_writer_status": projection_writer_status,
-          "elapsed_seconds": time.monotonic() - started, "correctness": "PASS"})
+    # Execution uses only the shipped v3 daemon and retained native workspaces.
+    from workspace_update_bench import execute as execute_v3
+    return execute_v3(options)
 
 
 def parser():
@@ -751,12 +627,13 @@ def parser():
     p.add_argument("--driver", type=Path, required=True)
     p.add_argument("--driver-sha256", required=True)
     p.add_argument("--run-root", type=Path, required=True)
-    p.add_argument("--publication-mode", choices=("native", "on-demand"), default="native")
+    p.add_argument("--publication-mode", choices=("native",), default="native")
     p.add_argument("--projection-traces", action="store_true")
     p.add_argument("--profile", choices=("medium", "smoke"), default="medium")
     p.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     p.add_argument("--deadline-seconds", type=int, choices=range(60, 14401), default=14400)
     p.add_argument("--session-deadline-utc")
+    budget_module.add_recovery_argument(p)
     p.add_argument("--work-cleanup-deadline-monotonic", type=float,
                    default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     return p
@@ -767,10 +644,10 @@ if __name__ == "__main__":
     if not opts.execute:
         endpoint_pair(opts.base_url, opts.git_url)
         print(json.dumps({"execute": False, "profile": opts.profile, "rounds": opts.rounds,
-                          "scenarios": ["v1-cold", "v2-single-file", "v3-subtree-rename"],
+                          "scenarios": [version + "-" + scenario for version, scenario in SCENARIOS.items()],
                           "max_wall_seconds": min(opts.deadline_seconds, 14400),
                           "service_or_resource_changes": False,
-                          "git_baseline": "cold V1 depth=1 fetch, ordinary incremental V2/V3 fetch/reset in the same worktree, then explicit fsync",
+                          "git_baseline": "cold depth=1 fetch, incremental shared bare ODB fetch, new detached worktree per fixed commit, retained old worktrees, shared streamed oracle",
                           "publication_mode": opts.publication_mode}, indent=2))
     else:
         try:

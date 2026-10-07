@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -21,55 +21,28 @@ struct Cli {
     #[arg(long, global = true)]
     log_level: Option<String>,
 
-    /// Override the Antares per-job upper-layer root.
+    /// Override the MST/2 service URL for this invocation.
     #[arg(long, global = true)]
-    upper_root: Option<PathBuf>,
-    /// Override the Antares per-job CL-layer root.
+    mst2_base_url: Option<String>,
+
+    /// Override the v3 workspace store path for this invocation.
     #[arg(long, global = true)]
-    cl_root: Option<PathBuf>,
-    /// Override the Antares per-job mountpoint root.
-    #[arg(long, global = true)]
-    mount_root: Option<PathBuf>,
-    /// Override the Antares state file path.
-    #[arg(long, global = true)]
-    state_file: Option<PathBuf>,
+    store_path: Option<String>,
 
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run the workspace HTTP control daemon. Mounts are created by explicit requests.
-    Serve,
-    /// Mount an Antares job instance.
-    Mount {
-        /// Unique job identifier.
-        job_id: String,
-        /// Optional CL layer name.
-        #[arg(long)]
-        cl: Option<String>,
-    },
-    /// Unmount an Antares job instance.
-    Umount {
-        /// Job identifier to remove.
-        job_id: String,
-    },
-    /// List tracked Antares instances.
-    List,
-    /// Mount via a running HTTP daemon (recommended for build systems).
-    HttpMount {
-        /// Unique job identifier (recommended).
-        #[arg(long)]
-        job_id: Option<String>,
-        /// Monorepo path to mount (e.g. "/third-party/mega").
-        path: String,
-        /// Optional CL identifier.
-        #[arg(long)]
-        cl: Option<String>,
-        /// Daemon base URL (the request goes to `{endpoint}/mounts`).
-        #[arg(long, default_value = "http://127.0.0.1:2725/antares")]
-        endpoint: String,
+    Serve {
+        /// Write bounded workspace binding evidence to a new absolute JSONL file.
+        #[arg(long, requires = "workspace_observation_run_id")]
+        workspace_observation_jsonl: Option<PathBuf>,
+        /// Canonical non-nil UUID identifying this observation run.
+        #[arg(long, requires = "workspace_observation_jsonl")]
+        workspace_observation_run_id: Option<String>,
     },
     /// Control workspaces through the daemon that owns their mounts.
     Workspace {
@@ -149,37 +122,6 @@ impl WorkspaceAction {
     }
 }
 
-#[cfg(test)]
-mod compatibility_tests {
-    use super::*;
-
-    #[test]
-    fn legacy_commands_and_path_flags_remain_accepted_alongside_workspace_commands() {
-        for args in [
-            vec!["scorpio", "mount", "job", "--cl", "change"],
-            vec!["scorpio", "umount", "job"],
-            vec!["scorpio", "list"],
-            vec!["scorpio", "http-mount", "/project", "--job-id", "job"],
-            vec![
-                "scorpio",
-                "--upper-root",
-                "/tmp/upper",
-                "--cl-root",
-                "/tmp/cl",
-                "--mount-root",
-                "/tmp/mounts",
-                "--state-file",
-                "/tmp/state",
-                "list",
-            ],
-            vec!["scorpio", "workspace", "list"],
-            vec!["scorpio", "serve"],
-        ] {
-            Cli::try_parse_from(args).unwrap();
-        }
-    }
-}
-
 #[derive(Subcommand, Debug)]
 enum ConfigAction {
     /// Write a configuration template to a file.
@@ -208,41 +150,47 @@ async fn main() {
     // local storage or construct a second lifecycle owner.
     let cli = match cli {
         Cli {
-            command: Some(Commands::Workspace { endpoint, action }),
+            command: Commands::Workspace { endpoint, action },
             ..
         } => {
             std::process::exit(cli::workspace_request(&endpoint, action.into_command()).await);
         }
         cli => cli,
     };
-    let overrides = cli::antares_overrides(
-        cli.upper_root.clone(),
-        cli.cl_root.clone(),
-        cli.mount_root.clone(),
-        cli.state_file.clone(),
-    );
+    let mut overrides = HashMap::new();
+    if let Some(value) = &cli.mst2_base_url {
+        overrides.insert("mst2_base_url".to_owned(), value.clone());
+    }
+    if let Some(value) = &cli.store_path {
+        overrides.insert("store_path".to_owned(), value.clone());
+    }
+    if let Some(value) = &cli.log_level {
+        // Resolve the CLI value before parsing the persisted file so a stale
+        // or malformed configured level cannot shadow the explicit override.
+        overrides.insert("log_level".to_owned(), value.clone());
+    }
 
     // These commands need neither a loaded config nor logging; handle them
     // before `cli::init` so they work even when the config is missing/invalid.
     match &cli.command {
-        Some(Commands::Completions { shell }) => {
+        Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(*shell, &mut cmd, "scorpio", &mut std::io::stdout());
             return;
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::Init { path, force },
-        }) => {
+        } => {
             std::process::exit(cli::config_init(path, *force));
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::Validate,
-        }) => {
+        } => {
             std::process::exit(cli::config_validate(&cli.config_path, overrides.clone()));
         }
-        Some(Commands::Config {
+        Commands::Config {
             action: ConfigAction::InstallerPaths,
-        }) => {
+        } => {
             std::process::exit(cli::config_installer_paths(
                 &cli.config_path,
                 overrides.clone(),
@@ -256,33 +204,24 @@ async fn main() {
     }
 
     let code = match cli.command {
-        None => {
-            // Unconditional (not log-level gated) deprecation note for the
-            // legacy flag-only invocation form.
-            eprintln!(
-                "note: running `scorpio` without a subcommand is deprecated; use `scorpio serve`"
-            );
-            cli::serve(cli.http_addr).await
+        Commands::Serve {
+            workspace_observation_jsonl,
+            workspace_observation_run_id,
+        } => {
+            let observation = workspace_observation_jsonl
+                .zip(workspace_observation_run_id)
+                .map(|(path, run_id)| cli::ObservationFileOptions { path, run_id });
+            cli::serve_with_observation(cli.http_addr, observation).await
         }
-        Some(Commands::Serve) => cli::serve(cli.http_addr).await,
-        Some(Commands::Mount { job_id, cl }) => cli::antares_mount(&job_id, cl.as_deref()).await,
-        Some(Commands::Umount { job_id }) => cli::antares_umount(&job_id).await,
-        Some(Commands::List) => cli::antares_list().await,
-        Some(Commands::HttpMount {
-            job_id,
-            path,
-            cl,
-            endpoint,
-        }) => cli::http_mount(job_id.as_deref(), &path, cl.as_deref(), &endpoint).await,
-        Some(Commands::Workspace { .. }) => unreachable!("workspace handled before config init"),
-        Some(Commands::Config {
+        Commands::Workspace { .. } => unreachable!("workspace handled before config init"),
+        Commands::Config {
             action: ConfigAction::Show,
-        }) => cli::config_show(),
-        Some(Commands::Config { .. }) => {
+        } => cli::config_show(),
+        Commands::Config { .. } => {
             unreachable!("config init/validate/installer-paths handled before config init")
         }
-        Some(Commands::Doctor) => doctor::run().await,
-        Some(Commands::Completions { .. }) => unreachable!("handled before config init"),
+        Commands::Doctor => doctor::run().await,
+        Commands::Completions { .. } => unreachable!("handled before config init"),
     };
 
     std::process::exit(code);

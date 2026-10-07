@@ -22,7 +22,7 @@ use std::{
 use axum::{
     body::{Body, Bytes},
     extract::{Path as AxumPath, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -36,6 +36,7 @@ use scorpiofs::snapshot::{durable::digest_of, frames::parse_digest};
 use serde_json::{json, Value};
 
 const INSTANCE: &str = "11111111-2222-4333-8444-555555555555";
+const OBSERVATION_RUN_ID: &str = "11111111-2222-4333-8444-666666666666";
 const CONTENT: [&[u8]; 3] = [
     b"old fixed content",
     b"new fixed content",
@@ -124,6 +125,7 @@ struct Fixture {
     latest: AtomicUsize,
     reject_resolve: AtomicBool,
     requests: Mutex<Vec<String>>,
+    resolve_ids: Mutex<Vec<Option<String>>>,
     child_pages: AtomicUsize,
     blobs: AtomicUsize,
     block_child_metadata: AtomicBool,
@@ -143,6 +145,7 @@ impl Fixture {
             latest: AtomicUsize::new(0),
             reject_resolve: AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
+            resolve_ids: Mutex::new(Vec::new()),
             child_pages: AtomicUsize::new(0),
             blobs: AtomicUsize::new(0),
             block_child_metadata: AtomicBool::new(false),
@@ -178,14 +181,22 @@ async fn capabilities() -> Json<Value> {
     Json(serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap())
 }
 
-async fn resolve(State(f): State<Arc<Fixture>>, Json(request): Json<Value>) -> Json<Value> {
+async fn resolve(
+    State(f): State<Arc<Fixture>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
     assert_eq!(request["target"], json!({"kind": "latest"}));
     assert_eq!(request["scope"], "/project");
+    let request_id = headers
+        .get("x-request-id")
+        .map(|value| value.to_str().unwrap().to_owned());
+    f.resolve_ids.lock().unwrap().push(request_id.clone());
     if f.reject_resolve.load(Ordering::SeqCst) {
-        return Json(json!({"publication_sequence": null}));
+        return Json(json!({"publication_sequence": null})).into_response();
     }
     let v = &f.versions[f.latest.load(Ordering::SeqCst)];
-    Json(json!({
+    let mut response = Json(json!({
         "descriptor": {
             "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE,
             "namespace_view_id": digest(&[0x22; 32]), "scope": "/project",
@@ -197,6 +208,13 @@ async fn resolve(State(f): State<Arc<Fixture>>, Json(request): Json<Value>) -> J
         "writer_epoch": "1", "resolved_at": "2026-10-05T00:00:00Z",
         "delivery": request["delivery"]
     }))
+    .into_response();
+    if let Some(id) = request_id {
+        response
+            .headers_mut()
+            .insert("x-request-id", HeaderValue::from_str(&id).unwrap());
+    }
+    response
 }
 
 async fn metadata(
@@ -330,6 +348,25 @@ struct Launcher {
     base: String,
     mounts: Vec<PathBuf>,
     performance: bool,
+    observation_path: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationFooter {
+    record: String,
+    revision: u8,
+    run_id: String,
+    accepted_records: u64,
+    received_records: u64,
+    written_records: u64,
+    written_bytes: u64,
+    producers_closed: bool,
+    drained: bool,
+    daemon_exit_code: i32,
+    complete: bool,
+    first_error: Option<String>,
 }
 
 impl Drop for Launcher {
@@ -353,16 +390,31 @@ impl Drop for Launcher {
 
 impl Launcher {
     fn start(upstream: &str, addr: std::net::SocketAddr) -> Self {
-        Self::start_mode(upstream, addr, false)
+        Self::start_mode(upstream, addr, false, false)
     }
 
     #[cfg(target_os = "linux")]
-    fn start_performance(upstream: &str, addr: std::net::SocketAddr) -> Self {
-        Self::start_mode(upstream, addr, true)
+    fn start_observed_performance(upstream: &str, addr: std::net::SocketAddr) -> Self {
+        Self::start_mode(upstream, addr, true, true)
     }
 
-    fn start_mode(upstream: &str, addr: std::net::SocketAddr, performance: bool) -> Self {
+    fn start_mode(
+        upstream: &str,
+        addr: std::net::SocketAddr,
+        performance: bool,
+        observed: bool,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
+        let observation_path = observed.then(|| {
+            temp.path()
+                .canonicalize()
+                .unwrap()
+                .join("workspace-observations.jsonl")
+        });
+        if let Some(path) = &observation_path {
+            assert!(path.is_absolute());
+            assert!(!path.exists());
+        }
         let mut config = toml::Table::new();
         for (key, value) in [
             ("base_url", upstream),
@@ -413,6 +465,13 @@ impl Launcher {
         if performance {
             command.args(["--log-level", "scorpiofs::workspace::performance=debug"]);
         }
+        if let Some(path) = &observation_path {
+            command
+                .arg("--workspace-observation-jsonl")
+                .arg(path)
+                .arg("--workspace-observation-run-id")
+                .arg(OBSERVATION_RUN_ID);
+        }
         let child = command
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
@@ -424,11 +483,167 @@ impl Launcher {
             base: format!("http://{addr}"),
             mounts: Vec::new(),
             performance,
+            observation_path,
         }
     }
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.temp.path().join("launcher.log")).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_observation_records(&self, fixture: &Fixture, workspaces: &[Value]) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path = self.observation_path.as_ref().unwrap();
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::getuid() });
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        assert!(bytes.len() <= 8 * 1024 * 1024);
+        let lines: Vec<_> = bytes.split_inclusive(|byte| *byte == b'\n').collect();
+        assert_eq!(lines.len(), workspaces.len() + 1);
+        let footer_line = lines.last().unwrap();
+        assert!(footer_line.len() <= 4096);
+        let footer_value: Value = serde_json::from_slice(footer_line).unwrap();
+        assert!(footer_value.get("first_error").unwrap().is_null());
+        let footer: ObservationFooter = serde_json::from_slice(footer_line).unwrap();
+        assert_eq!(footer.record, "workspace_observation_footer");
+        assert_eq!(footer.revision, 1);
+        assert_eq!(footer.run_id, OBSERVATION_RUN_ID);
+        assert_eq!(footer.daemon_exit_code, 0);
+        assert!(footer.complete);
+        assert!(footer.producers_closed);
+        assert!(footer.drained);
+        assert!(footer.first_error.is_none());
+        for count in [
+            footer.accepted_records,
+            footer.received_records,
+            footer.written_records,
+        ] {
+            assert_eq!(count, workspaces.len() as u64);
+        }
+        let payload = &lines[..lines.len() - 1];
+        assert_eq!(
+            footer.written_bytes,
+            payload.iter().map(|line| line.len() as u64).sum::<u64>()
+        );
+        let cache = self
+            .temp
+            .path()
+            .join("dictionary/mst2-cache")
+            .canonicalize()
+            .unwrap();
+        let mut stores = std::collections::HashSet::new();
+        let mut content_store = None;
+        let mut final_attempts = Vec::new();
+        for (line, workspace) in payload.iter().zip(workspaces) {
+            assert!(line.len() <= 32 * 1024 + 1);
+            let binding: scorpiofs::workspace::WorkspaceResolveBinding =
+                serde_json::from_slice(line).unwrap();
+            assert_eq!(
+                serde_json::to_value(&binding).unwrap()["record"],
+                "workspace_resolve_binding"
+            );
+            assert_eq!(binding.revision, 1);
+            assert_eq!(binding.run_id, OBSERVATION_RUN_ID);
+            assert_eq!(
+                binding.workspace_id,
+                workspace["workspace_id"].as_str().unwrap()
+            );
+            assert_eq!(
+                binding.generation,
+                workspace["generation"].as_str().unwrap()
+            );
+            assert_eq!(
+                binding.snapshot_id,
+                workspace["snapshot_id"].as_str().unwrap()
+            );
+            let logical = format!("ws:{OBSERVATION_RUN_ID}:{}", binding.workspace_id);
+            let attempt = format!("{logical}:a1");
+            assert_eq!(binding.logical_request_id, logical);
+            assert_eq!(binding.resolve_trace_receipt.logical_request_id, logical);
+            assert_eq!(
+                binding.resolve_trace_receipt.attempt_ids.as_slice(),
+                std::slice::from_ref(&attempt)
+            );
+            assert_eq!(binding.resolve_trace_receipt.final_attempt_id, attempt);
+            assert_eq!(binding.resolve_trace_receipt.retry_count, 0);
+            final_attempts.push(Some(attempt));
+            assert_eq!(binding.instance_id, INSTANCE);
+            assert_eq!(binding.namespace_view_id, digest(&[0x22; 32]));
+            assert_eq!(binding.scope, "/project");
+            assert_eq!(binding.publication_sequence, 1);
+            let version = &fixture.versions[fixture.version(&binding.snapshot_id)];
+            let descriptor = ServingDescriptor {
+                instance_uuid: *uuid::Uuid::parse_str(INSTANCE).unwrap().as_bytes(),
+                namespace_view_id: [0x22; 32],
+                scope: "/project".into(),
+                metadata_root: version.root,
+            };
+            assert_eq!(
+                binding.descriptor_bytes_hex,
+                hex::encode(descriptor.encode().unwrap())
+            );
+            assert_eq!(
+                digest(&descriptor.snapshot_id().unwrap()),
+                binding.snapshot_id
+            );
+            assert!(binding.store.starts_with(&cache));
+            assert_eq!(binding.store, binding.store.canonicalize().unwrap());
+            assert_eq!(
+                binding.store.file_name().unwrap(),
+                binding.workspace_id.as_str()
+            );
+            let owners = binding.store.parent().unwrap();
+            assert_eq!(owners.file_name().unwrap(), "owners");
+            let view = owners.parent().unwrap();
+            assert_eq!(
+                view.file_name().unwrap(),
+                binding.snapshot_id.strip_prefix("sha256:").unwrap()
+            );
+            let scope = view.parent().unwrap();
+            assert_eq!(
+                scope.parent().unwrap().parent().unwrap(),
+                cache.join("snapshots")
+            );
+            assert_eq!(binding.content_store, scope.join("blobs"));
+            assert_eq!(
+                binding.content_store,
+                binding.content_store.canonicalize().unwrap()
+            );
+            let persisted: scorpiofs::snapshot::WorkspaceBinding = serde_json::from_slice(
+                &std::fs::read(binding.store.join("workspace.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(persisted.workspace_id(), binding.workspace_id);
+            assert_eq!(persisted.snapshot_id(), binding.snapshot_id);
+            assert!(stores.insert(binding.store));
+            if let Some(expected) = &content_store {
+                assert_eq!(&binding.content_store, expected);
+            } else {
+                content_store = Some(binding.content_store);
+            }
+        }
+        assert_eq!(*fixture.resolve_ids.lock().unwrap(), final_attempts);
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == "/api/v2/snapshots/resolve")
+                .count(),
+            workspaces.len(),
+            "the observation sink must not resolve again for labels"
+        );
+        eprintln!(
+            "SHIPPED_DAEMON_OBSERVATION_SINK_RUN: actual daemon emitted its only resolve binding for each of {} independent owners; {}",
+            workspaces.len(),
+            std::str::from_utf8(footer_line).unwrap().trim_end()
+        );
     }
 
     fn assert_performance_disabled(&self) {
@@ -565,10 +780,16 @@ impl Launcher {
     }
 
     async fn stop(&mut self) {
-        assert_eq!(
-            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) },
-            0
-        );
+        self.stop_with_signal(libc::SIGTERM).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn stop_interrupt(&mut self) {
+        self.stop_with_signal(libc::SIGINT).await;
+    }
+
+    async fn stop_with_signal(&mut self, signal: i32) {
+        assert_eq!(unsafe { libc::kill(self.child.id() as i32, signal) }, 0);
         let status = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if let Some(status) = self.child.try_wait().unwrap() {
@@ -583,10 +804,32 @@ impl Launcher {
         if !self.performance {
             self.assert_performance_disabled();
         }
+        if self.observation_path.is_none() {
+            assert!(!self
+                .temp
+                .path()
+                .join("workspace-observations.jsonl")
+                .exists());
+        }
     }
 
     fn assert_no_dictionary(&self) {
-        for entry in std::fs::read_dir(self.temp.path().join("dictionary")).unwrap() {
+        assert_eq!(
+            std::fs::read_to_string(self.temp.path().join("invalid-legacy-state.toml")).unwrap(),
+            "this is not TOML"
+        );
+        for name in ["unused-root", "upper", "cl", "mounts", "antares-state.toml"] {
+            assert!(
+                !self.temp.path().join(name).exists(),
+                "retired path created: {name}"
+            );
+        }
+        let root = self.temp.path().join("dictionary");
+        // Pure config loading leaves the store absent on HTTP bind failure.
+        if !root.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(root).unwrap() {
             let name = entry.unwrap().file_name();
             assert!(
                 name == "workspaces-v3" || name == "mst2-cache",
@@ -768,6 +1011,7 @@ async fn launcher_starts_without_root_mount_or_dictionary_and_removes_legacy_rou
     assert_eq!(entries[0]["mount_state"], "failed");
     assert_eq!(entries[0]["metadata_ready"], false);
     assert!(entries[0]["snapshot_id"].is_null());
+    assert_eq!(*f.resolve_ids.lock().unwrap(), [None]);
     launcher.stop().await;
 }
 
@@ -790,6 +1034,7 @@ async fn bind_failure_precedes_dictionary_and_workspace_initialization() {
     assert_eq!(status.code(), Some(4), "{}", launcher.log());
     launcher.assert_performance_disabled();
     assert!(f.requests.lock().unwrap().is_empty());
+    assert!(!launcher.temp.path().join("dictionary").exists());
     launcher.assert_no_dictionary();
 }
 
@@ -807,11 +1052,12 @@ fn mounted(path: &Path) -> bool {
 async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown() {
     let f = Arc::new(Fixture::new());
     let (upstream, _server) = fixture_server(f.clone()).await;
-    let mut launcher = Launcher::start_performance(&upstream, address());
+    let mut launcher = Launcher::start_observed_performance(&upstream, address());
     let client = client();
     launcher.ready(&client).await;
     let mut ids = Vec::new();
     let mut generations = Vec::new();
+    let mut observed_workspaces = Vec::new();
     let mut old_fd = None;
     for index in 0..2 {
         f.latest.store(index, Ordering::SeqCst);
@@ -822,6 +1068,7 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
             launcher.log()
         );
         let body: Value = serde_json::from_slice(&response.stdout).unwrap();
+        observed_workspaces.push(body.clone());
         ids.push(body["workspace_id"].as_str().unwrap().to_owned());
         generations.push(body["generation"].as_str().unwrap().to_owned());
         assert_eq!(body["snapshot_id"], f.versions[index].sid);
@@ -837,6 +1084,18 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
         assert!(path.starts_with(launcher.temp.path().join("dictionary/workspaces-v3")));
         launcher.mounts.push(path.clone());
         assert!(mounted(&path));
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let mount = mountinfo
+            .lines()
+            .find(|line| line.split_whitespace().nth(4) == path.to_str())
+            .unwrap();
+        let (_, filesystem) = mount.split_once(" - ").unwrap();
+        let fields: Vec<_> = filesystem.split_whitespace().collect();
+        assert_eq!(fields[0], "fuse");
+        assert_eq!(fields[1], "scorpiofs-v3");
+        let expected_uid = format!("user_id={}", unsafe { libc::getuid() });
+        assert!(fields[2].split(',').any(|option| option == expected_uid));
+        println!("V3_KERNEL_MOUNT_IDENTITY_RUN");
         if index == 0 {
             // Keep this handle and dirty upper alive before changing latest
             // and admitting the second snapshot.
@@ -980,6 +1239,7 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
         .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"full","upper_policy":"private"}))
         .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     let third_id = third["workspace_id"].as_str().unwrap();
+    observed_workspaces.push(third.clone());
     let third_mount = PathBuf::from(third["mountpoint"].as_str().unwrap());
     launcher.mounts.push(third_mount.clone());
     assert!(mounted(&third_mount));
@@ -1077,6 +1337,7 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
         .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"lazy","upper_policy":"private"}))
         .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     let fourth_id = fourth["workspace_id"].as_str().unwrap();
+    observed_workspaces.push(fourth.clone());
     let fourth_mount = PathBuf::from(fourth["mountpoint"].as_str().unwrap());
     launcher.mounts.push(fourth_mount.clone());
     std::fs::write(
@@ -1110,6 +1371,7 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
         .json(&json!({"target":{"kind":"latest"},"scope":"/project","delivery":"full","upper_policy":"private"}))
         .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     let pending_id = pending["workspace_id"].as_str().unwrap();
+    observed_workspaces.push(pending.clone());
     let pending_mount = PathBuf::from(pending["mountpoint"].as_str().unwrap());
     launcher.mounts.push(pending_mount.clone());
     assert_eq!(pending["snapshot_id"], f.versions[2].sid);
@@ -1247,7 +1509,9 @@ async fn explicit_snapshot_mounts_keep_old_handles_and_dirty_upper_on_shutdown()
     assert!(!pending_mount.parent().unwrap().exists());
     eprintln!("RUNNING_HYDRATION_CANCEL_RUN: actual pending OBJECT cancelled through service; fixed owner retried to FullSnapshot");
     drop(old_fd);
-    launcher.stop().await;
+    launcher.stop_interrupt().await;
+    assert_eq!(observed_workspaces.len(), 5);
+    launcher.assert_observation_records(&f, &observed_workspaces);
     launcher.assert_performance_records(&third);
     assert!(!mounted(&old));
     assert!(!mounted(&new));

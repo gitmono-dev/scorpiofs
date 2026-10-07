@@ -10,6 +10,15 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  workspace-evidence:
+    name: Workspace v3 evidence checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check actual POSIX evidence and streamed content oracle
+        run: python3 -B -m unittest discover -s tests/mst2-e2e -p 'test_workspace_update_*.py' -v
+
   fmt:
     name: Format Check
     runs-on: ubuntu-latest
@@ -128,12 +137,8 @@ jobs:
           python3 -B tests/mst2-e2e/test_commit_update_bench.py -v
           python3 -B tests/mst2-e2e/test_commit_update_budget.py -v
           python3 -B tests/mst2-e2e/test_commit_update_projection.py -v
+          python3 -B -m unittest discover -s tests/mst2-e2e -p 'test_workspace_update_*.py' -v
 
-      - name: Check measurement driver old-view audit
-        run: |
-          cargo build --locked --release --example mst2_update_measure
-          MST2_MEASURE_DRIVER="$GITHUB_WORKSPACE/target/release/examples/mst2_update_measure" \
-            cargo test --locked --release --example mst2_update_measure
 
   docker:
     name: Docker image
@@ -165,18 +170,20 @@ jobs:
           # The workspace binary runs through the entrypoint.
           docker run --rm scorpiofs:ci --version
           docker run --rm scorpiofs:ci workspace --help
-          docker run --rm --entrypoint sh scorpiofs:ci -c 'test -x /usr/local/bin/antares'
+          docker run --rm --entrypoint sh scorpiofs:ci -c 'test ! -e /usr/local/bin/antares'
 
-          # The entrypoint must refuse `serve` without backend URLs.
+          # The entrypoint must refuse `serve` without the actual MST/2 URL.
           if docker run --rm scorpiofs:ci serve; then
-            echo "entrypoint accepted serve without SCORPIO_BASE_URL/SCORPIO_LFS_URL" >&2
+            echo "entrypoint accepted serve without SCORPIO_MST2_BASE_URL" >&2
             exit 1
           fi
 
+          # The shipped CLI endpoint flag is also an explicit live endpoint.
+          docker run --rm scorpiofs:ci --mst2-base-url http://mega.example:8000 config validate
+
           # The baked config plus the image ENV overrides must validate.
           docker run --rm \
-            -e SCORPIO_BASE_URL=http://mega.example:8000 \
-            -e SCORPIO_LFS_URL=http://mega.example:8000/api/v1/lfs \
+            -e SCORPIO_MST2_BASE_URL=http://mega.example:8000 \
             scorpiofs:ci config validate
 
           # FUSE prerequisites inside the container (the same device/cap/apparmor
@@ -184,6 +191,5 @@ jobs:
           # non-writable runtime dirs; an unreachable mega server is only a warning.
           docker run --rm \
             --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
-            -e SCORPIO_BASE_URL=http://mega.example:8000 \
-            -e SCORPIO_LFS_URL=http://mega.example:8000/api/v1/lfs \
+            -e SCORPIO_MST2_BASE_URL=http://mega.example:8000 \
             scorpiofs:ci doctor

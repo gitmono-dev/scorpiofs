@@ -2,9 +2,8 @@
 //!
 //! Minimal, self-contained mount over [`SnapshotReader`]: every name maps
 //! through the fixed view (no live-ref following); file content comes from
-//! digest-verified blob reads cached in memory. The Antares overlay also uses
-//! this view as its read-only lower layer; writes
-//! stay in the upper layer.
+//! digest-verified blob reads cached in memory. A workspace OverlayFs uses
+//! this view as its read-only lower layer; writes stay in its private upper.
 //!
 //! Symlinks are served with real symlink semantics (spec 07 §1): the view
 //! exposes them as `fs_kind = "symlink"` whose content is the target bytes,
@@ -156,22 +155,6 @@ impl Mst2Fuse {
         Self::build(Some(reader), Some(store), manifest)
     }
 
-    /// Build over a reader, a store and an already-computed manifest (the
-    /// incremental sync's result), so the tree is not walked twice.
-    pub fn from_manifest(
-        reader: SnapshotReader,
-        store: Arc<DurableStore>,
-        manifest: Vec<SnapshotFile>,
-    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
-        store.bind_reader(&reader)?;
-        for file in &manifest {
-            reader
-                .authorized_context()
-                .validate_relative_path(&file.rel_path)?;
-        }
-        Self::build(Some(reader), Some(store), manifest)
-    }
-
     /// Reopen a completed, pinned hydration with no server contact at all.
     /// The manifest comes from the store, and every read re-verifies against
     /// the digest the view advertised when it was hydrated.
@@ -213,6 +196,19 @@ impl Mst2Fuse {
     pub fn from_snapshot_store(
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        let closure = store.snapshot_manifest()?;
+        Self::build_snapshot_closure(None, Some(store), &closure)
+    }
+
+    /// Reopen a complete snapshot without contacting the service, but only
+    /// when the caller presents the exact server-issued grant and local actor
+    /// domain that were committed with the store.
+    pub fn from_snapshot_store_with_grant(
+        store: Arc<DurableStore>,
+        grant: &crate::snapshot::OfflineGrant,
+        actor_domain_id: &str,
+    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        store.validate_offline_grant(grant, actor_domain_id)?;
         let closure = store.snapshot_manifest()?;
         Self::build_snapshot_closure(None, Some(store), &closure)
     }
@@ -914,19 +910,6 @@ impl Mst2Fuse {
         }
     }
 
-    /// Digest lookup retained for the explicit legacy mount/rebase API.
-    pub(crate) async fn digest_for_path(&self, rel_path: &str) -> Option<String> {
-        match self.path_state(rel_path).await.ok()? {
-            SnapshotPathState::Present(SnapshotNodeIdentity::Regular {
-                content_digest, ..
-            })
-            | SnapshotPathState::Present(SnapshotNodeIdentity::Symlink {
-                content_digest, ..
-            }) => Some(content_digest),
-            _ => None,
-        }
-    }
-
     /// Complete, ordered immediate children. Logical child directories are
     /// not expanded; opaque upper diff can inspect only metadata it needs.
     pub async fn directory_entries(
@@ -1574,9 +1557,8 @@ impl Filesystem for Mst2Fuse {
     // ---- Read-only layer: deny every mutation with EROFS (spec 12 §7).
     //
     // The snapshot view is immutable; writes belong to the upper layer of the
-    // overlay. Answering EROFS (not the trait default ENOSYS) keeps the
-    // behaviour identical to the Dicfuse lower layer, so the union filesystem
-    // and the kernel treat this layer as read-only rather than unsupported.
+    // overlay. Answering EROFS (not the trait default ENOSYS) lets the union
+    // filesystem and kernel treat this layer as read-only rather than unsupported.
 
     async fn setattr(
         &self,

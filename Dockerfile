@@ -31,9 +31,8 @@ ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=scorpiofs-cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=scorpiofs-cargo-git-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=scorpiofs-target-${TARGETARCH},sharing=locked \
-    cargo build --release --locked --bins \
-    && install -D -m0755 /src/target/release/scorpio /out/scorpio \
-    && install -D -m0755 /src/target/release/antares /out/antares
+    cargo build --release --locked --bin scorpio \
+    && install -D -m0755 /src/target/release/scorpio /out/scorpio
 
 # ---- runtime stage -----------------------------------------------------------
 # debian:bookworm-slim (not distroless, version-pinned) so the FUSE userspace
@@ -54,24 +53,17 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/scorpio /usr/local/bin/scorpio
-COPY --from=build /out/antares /usr/local/bin/antares
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # A baseline config file must exist (it is parsed before env overrides apply).
 # Its values are overridden by the SCORPIO_* environment variables below and at
-# `docker run -e ...` time. base_url / lfs_url are intentionally NOT baked here
+# `docker run -e ...` time. The real MST/2 endpoint is supplied at runtime
 # (no sensible default) and MUST be provided at run time.
 COPY scorpio.toml.example /etc/scorpiofs/scorpio.toml
 
 # Runtime directories live under /var/lib/scorpiofs and are env-overridable.
-ENV SCORPIO_WORKSPACE=/var/lib/scorpiofs/mount \
-    SCORPIO_STORE_PATH=/var/lib/scorpiofs/store \
-    SCORPIO_CONFIG_FILE=/var/lib/scorpiofs/config.toml \
-    SCORPIO_ANTARES_UPPER_ROOT=/var/lib/scorpiofs/antares/upper \
-    SCORPIO_ANTARES_CL_ROOT=/var/lib/scorpiofs/antares/cl \
-    SCORPIO_ANTARES_MOUNT_ROOT=/var/lib/scorpiofs/antares/mnt \
-    SCORPIO_ANTARES_STATE_FILE=/var/lib/scorpiofs/antares/state.toml
+ENV SCORPIO_STORE_PATH=/var/lib/scorpiofs/store
 
 # Pre-create the runtime tree so `scorpio doctor` passes its directory checks
 # out of the box and a fresh named volume mounted at /var/lib/scorpiofs starts
@@ -79,11 +71,9 @@ ENV SCORPIO_WORKSPACE=/var/lib/scorpiofs/mount \
 # No `VOLUME` directive on purpose: the compose file decides whether state is
 # persisted, so plain `docker run` never leaves anonymous volumes behind.
 RUN install -d -m0755 \
-        /var/lib/scorpiofs/mount \
         /var/lib/scorpiofs/store \
-        /var/lib/scorpiofs/antares/upper \
-        /var/lib/scorpiofs/antares/cl \
-        /var/lib/scorpiofs/antares/mnt
+        /var/lib/scorpiofs/store/workspaces-v3 \
+        /var/lib/scorpiofs/store/mst2-cache
 
 EXPOSE 2725
 
@@ -95,13 +85,13 @@ EXPOSE 2725
 # have a firewall / reverse proxy — the HTTP API is unauthenticated):
 #   docker run --device /dev/fuse --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
 #              --security-opt apparmor:unconfined \
-#              -e SCORPIO_BASE_URL=http://mega:8000 -e SCORPIO_LFS_URL=http://mega:8000/lfs \
+#              -e SCORPIO_MST2_BASE_URL=http://mega:8000 \
 #              -p 127.0.0.1:2725:2725 scorpiofs
 # Not every Docker host can run FUSE; see deploy/README.md.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://localhost:2725/health || exit 1
 
-# The entrypoint requires SCORPIO_BASE_URL/SCORPIO_LFS_URL before `serve`, so a
+# The entrypoint requires SCORPIO_MST2_BASE_URL before `serve`, so a
 # misconfigured container fails loudly instead of silently pointing at localhost.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["serve", "--http-addr", "0.0.0.0:2725"]

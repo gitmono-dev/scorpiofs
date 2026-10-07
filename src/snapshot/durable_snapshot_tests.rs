@@ -10,6 +10,50 @@ use super::{
     *,
 };
 
+#[tokio::test]
+async fn offline_grant_is_bound_to_complete_pin_and_actor_domain() {
+    let (closure, raw, view) = fixture(2);
+    let temp = tempfile::tempdir().unwrap();
+    let store = DurableStore::open(temp.path()).unwrap();
+    store
+        .hydrate_snapshot_with(&view, &closure, |file| {
+            std::future::ready(Ok(raw[&file.content_digest].clone()))
+        })
+        .await
+        .unwrap();
+    let grant = OfflineGrant {
+        grant_id: "export-1".into(),
+        snapshot_id: view.snapshot_id.clone(),
+        actor_domain_id: "mount-domain".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        policy: "trusted_local_export_v1".into(),
+    };
+    let transaction = store.transaction().unwrap();
+    store
+        .finish_hydration_commit(
+            &view,
+            closure.files(),
+            Some(&closure),
+            Some(&grant),
+            (0, 2, 0),
+        )
+        .unwrap();
+    drop(transaction);
+    assert_eq!(store.offline_grant().unwrap(), Some(grant.clone()));
+    store
+        .validate_offline_grant(&grant, "mount-domain")
+        .unwrap();
+    assert_eq!(
+        store
+            .validate_offline_grant(&grant, "another-domain")
+            .unwrap_err()
+            .code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    fs::write(store.root().join(OFFLINE_GRANT_FILE), b"tampered").unwrap();
+    assert!(!store.is_complete().unwrap());
+}
+
 fn add_directory_pages(entries: &[Entry], pages: &mut BTreeMap<String, Vec<u8>>) -> [u8; 32] {
     let root = Page::build(entries).unwrap();
     let id = page_id(&root);

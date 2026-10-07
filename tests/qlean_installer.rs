@@ -54,15 +54,12 @@ fn stage_fixture() -> Result<tempfile::TempDir> {
         fs::copy(&source, &destination).with_context(|| format!("could not stage {relative}"))?;
     }
 
-    for binary in ["scorpio", "antares"] {
-        let source = target_dir.join("release").join(binary);
-        let destination = staging.path().join(binary);
-        if !source.is_file() {
-            bail!("missing {source:?}; build the release binaries before running the Qlean test");
-        }
-        fs::copy(&source, &destination)
-            .with_context(|| format!("could not stage release binary {binary}"))?;
+    let source = target_dir.join("release/scorpio");
+    if !source.is_file() {
+        bail!("missing {source:?}; build the release binary before running the Qlean test");
     }
+    fs::copy(&source, staging.path().join("scorpio"))
+        .context("could not stage the scorpio release binary")?;
 
     // The workflow obtains this exact artifact path from Cargo's compiler
     // output. Do not select a possibly stale test executable by globbing.
@@ -103,12 +100,14 @@ async fn run_workspace_kernel_checked(vm: &mut qlean::Machine, command: &str) ->
     let combined = format!("{stdout}\n{stderr}");
     let named_result = format!("test {WORKSPACE_KERNEL_TEST} ... ok");
     let markers = [
+        "V3_KERNEL_MOUNT_IDENTITY_RUN",
         "PRE_TRANSACTION_HYDRATION_OBSERVE_RUN:",
         "RUNNING_HYDRATION_OBSERVE_RUN:",
         "RUNNING_HYDRATION_CANCEL_RUN:",
         "SHIPPED_DAEMON_STAGE_METERS_RUN:",
         "SHIPPED_DAEMON_METERS_RUN:",
         "SHIPPED_DAEMON_RELEASE_METERS_RUN:",
+        "SHIPPED_DAEMON_OBSERVATION_SINK_RUN:",
     ];
     let diagnostics: Vec<_> = markers
         .iter()
@@ -167,14 +166,14 @@ async fn installer_runs_inside_an_isolated_vm() -> Result<()> {
             run_checked(
                 vm,
                 &format!(
-                    "chmod 0755 {root}/install.sh {root}/script/test_installer.sh {root}/script/test_installer_systemd.sh {root}/scorpio {root}/antares {root}/workspace-launcher-tests"
+                    "chmod 0755 {root}/install.sh {root}/script/test_installer.sh {root}/script/test_installer_systemd.sh {root}/scorpio {root}/workspace-launcher-tests"
                 ),
             )
             .await?;
             run_checked(
                 vm,
                 &format!(
-                    "mkdir -p {root}/release/{VERSION}/scorpiofs-{VERSION}-{TARGET} && cp {root}/scorpio {root}/release/{VERSION}/scorpiofs-{VERSION}-{TARGET}/scorpio && cp {root}/antares {root}/release/{VERSION}/scorpiofs-{VERSION}-{TARGET}/antares && tar -C {root}/release/{VERSION} -czf {root}/release/{VERSION}/scorpiofs-{VERSION}-{TARGET}.tar.gz scorpiofs-{VERSION}-{TARGET} && (cd {root}/release/{VERSION} && sha256sum scorpiofs-{VERSION}-{TARGET}.tar.gz > scorpiofs-{VERSION}-{TARGET}.tar.gz.sha256)"
+                    "mkdir -p {root}/release/{VERSION}/scorpiofs-{VERSION}-{TARGET} && cp {root}/scorpio {root}/release/{VERSION}/scorpiofs-{VERSION}-{TARGET}/scorpio && tar -C {root}/release/{VERSION} -czf {root}/release/{VERSION}/scorpiofs-{VERSION}-{TARGET}.tar.gz scorpiofs-{VERSION}-{TARGET} && (cd {root}/release/{VERSION} && sha256sum scorpiofs-{VERSION}-{TARGET}.tar.gz > scorpiofs-{VERSION}-{TARGET}.tar.gz.sha256)"
                 ),
             )
             .await?;

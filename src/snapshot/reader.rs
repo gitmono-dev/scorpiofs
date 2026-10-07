@@ -18,7 +18,9 @@ use crate::snapshot::{
     client::Mst2Client,
     closure::{decode_page, ValidatedSnapshotClosure},
     frames::MetadataPageItem,
-    types::{Capabilities, Descriptor, DirEntry, LookupResult, SnapshotError, SnapshotErrorCode},
+    types::{
+        Capabilities, Descriptor, LookupResult, OfflineGrant, SnapshotError, SnapshotErrorCode,
+    },
 };
 
 /// Batch cap for one `metadata/pages` request: the server accepts 1..64.
@@ -58,6 +60,19 @@ pub struct SnapshotFile {
     pub fs_kind: String,
     pub size: u64,
     pub content_digest: String,
+}
+
+/// An already validated local path in the scope-relative HTTP form. Local
+/// manifests omit the leading slash; every content endpoint requires it.
+pub(crate) struct ScopeRequestPath<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for ScopeRequestPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.0.starts_with('/') {
+            f.write_str("/")?;
+        }
+        f.write_str(self.0)
+    }
 }
 
 /// Keeps the fixed view's retention lease alive across every operation that
@@ -360,6 +375,10 @@ pub struct SnapshotReader {
     advertisement: super::capabilities::CapabilityAdvertisement,
     delivery: super::ResolveDelivery,
     lease: Arc<LeaseKeeper>,
+    /// Optional server-issued trusted-local export capability.  It is kept
+    /// separate from the retention lease: a lease preserves bytes, while
+    /// this grant is the only input that can authorize an offline reopen.
+    offline_grant: Option<OfflineGrant>,
     pub(crate) content_scope: Arc<super::content::ContentBudget>,
     pub(crate) content_membership: Arc<tokio::sync::OnceCell<HashMap<String, SnapshotFile>>>,
     pub(crate) path_membership: Arc<super::proven_file::PathMembership>,
@@ -507,6 +526,24 @@ impl SnapshotReader {
             &res.authorization_epoch,
             &res.publication_sequence,
         )?;
+        let offline_grant = match res.offline_grant {
+            Some(grant) => {
+                let canonical_export = matches!(
+                    &advertisement,
+                    super::capabilities::CapabilityAdvertisement::Canonical(caps)
+                        if caps.features().offline_export
+                );
+                if !canonical_export {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::IntegrityError,
+                        "offline grant returned without the offline_export capability",
+                    ));
+                }
+                grant.validate_for(context.descriptor().snapshot_id.as_str(), None)?;
+                Some(grant)
+            }
+            None => None,
+        };
         // Retention is bound independently of the actor's bearer credential.
         // Cloned clients resolving another view cannot overwrite this pair.
         let client = client.with_snapshot_lease(&res.lease_id);
@@ -533,6 +570,7 @@ impl SnapshotReader {
                 advertisement,
                 delivery: request.delivery,
                 lease,
+                offline_grant,
                 content_scope: super::content::ContentBudget::new(
                     super::ContentBudgetLimits::default(),
                 ),
@@ -577,6 +615,14 @@ impl SnapshotReader {
 
     pub fn lease_id(&self) -> &str {
         &self.lease_id
+    }
+
+    /// The optional, closed offline-export grant returned by canonical
+    /// resolve.  A value here is only a persisted capability candidate; an
+    /// offline mount must validate it against its local actor domain and
+    /// current clock before opening the store.
+    pub fn offline_grant(&self) -> Option<&OfflineGrant> {
+        self.offline_grant.as_ref()
     }
 
     pub fn authorized_context(&self) -> &AuthorizedSnapshotContext {
@@ -629,13 +675,7 @@ impl SnapshotReader {
     /// capacity credits and fixed-root membership checks.
     pub async fn read_file(&self, rel_path: &str, digest: &str) -> Result<Vec<u8>, SnapshotError> {
         self.context.validate_relative_path(rel_path)?;
-        let request_path = if rel_path.is_empty() || rel_path == "/" {
-            "/".to_string()
-        } else if rel_path.starts_with('/') {
-            rel_path.to_string()
-        } else {
-            format!("/{rel_path}")
-        };
+        let request_path = ScopeRequestPath(rel_path).to_string();
         self.ensure_lease().await?;
         self.client
             .blob_verified(self.snapshot_id(), &request_path, digest)
@@ -651,11 +691,15 @@ impl SnapshotReader {
         limit: u32,
     ) -> Result<crate::snapshot::types::DirectoryResponse, SnapshotError> {
         self.context.validate_relative_path(dir)?;
-        self.ensure_lease().await?;
         let mut cursor: Option<String> = None;
         let mut merged: Option<crate::snapshot::types::DirectoryResponse> = None;
         let mut progress = super::directory::Progress::default();
         loop {
+            // A paginated directory enumeration is one logical operation,
+            // but every page is a separate request.  Renew immediately before
+            // each request so a slow wide directory cannot issue a request
+            // after its fixed reader lease has expired.
+            self.ensure_lease().await?;
             let page = self
                 .client
                 .directory(self.snapshot_id(), dir, limit, cursor.as_deref())
@@ -881,7 +925,6 @@ impl SnapshotReader {
     /// baseline for the page walk (spec 11 §6: both transports must produce
     /// the same entry set for the same view).
     pub async fn file_manifest_directory(&self) -> Result<Vec<SnapshotFile>, SnapshotError> {
-        self.ensure_lease().await?;
         let mut out = Vec::new();
         self.walk_dir("/", &self.descriptor().metadata_root, &mut out)
             .await?;
@@ -898,6 +941,10 @@ impl SnapshotReader {
         let mut cursor: Option<String> = None;
         let mut progress = super::directory::Progress::for_root(expected_root);
         loop {
+            // `walk_dir` may span many paginated requests and recursive
+            // directories.  Check the independent lease at each network
+            // boundary instead of relying on the check for the first page.
+            self.ensure_lease().await?;
             let page = self
                 .client
                 .directory(self.snapshot_id(), dir, 256, cursor.as_deref())
@@ -962,11 +1009,7 @@ impl SnapshotReader {
         self.context.validate_relative_path(rel_path)?;
         self.ensure_lease().await?;
         let sid = self.snapshot_id();
-        let request_path = if rel_path.starts_with('/') {
-            rel_path.to_string()
-        } else {
-            format!("/{rel_path}")
-        };
+        let request_path = ScopeRequestPath(rel_path).to_string();
         if size <= 256 * 1024 {
             let map = self
                 .client
@@ -1000,6 +1043,7 @@ impl SnapshotReader {
 
         // Large file: verify the map binding, every leaf proof, every chunk
         // hash, then the whole-file hash.
+        self.ensure_lease().await?;
         let map = self.client.chunk_map(sid, &request_path, digest).await?;
         if map.file_size != size {
             return Err(SnapshotError::new(
@@ -1009,6 +1053,7 @@ impl SnapshotReader {
         }
         let mut chunk_hashes: Vec<[u8; 32]> = Vec::with_capacity(map.chunk_count as usize);
         for page_index in 0..map.page_count {
+            self.ensure_lease().await?;
             let leaf = self
                 .client
                 .chunk_map_page(sid, &request_path, digest, &map, page_index)
@@ -1028,6 +1073,7 @@ impl SnapshotReader {
         let map_id = map.map_id.clone();
         let mut out: Vec<Option<Vec<u8>>> = (0..map.chunk_count).map(|_| None).collect();
         for start in (0..map.chunk_count).step_by(128) {
+            self.ensure_lease().await?;
             let items: Vec<crate::snapshot::frames::ChunkRequest> = (start
                 ..(start + 128).min(map.chunk_count))
                 .map(|i| crate::snapshot::frames::ChunkRequest {
@@ -1140,11 +1186,7 @@ impl SnapshotReader {
             size,
             std::mem::size_of::<VerifiedContent>(),
         )?;
-        let request_path = if file.rel_path.starts_with('/') {
-            file.rel_path.clone()
-        } else {
-            format!("/{}", file.rel_path)
-        };
+        let request_path = ScopeRequestPath(&file.rel_path).to_string();
         if !use_frames {
             let receipt = owned_transport::raw_content(
                 &self.client,
@@ -1213,6 +1255,7 @@ impl SnapshotReader {
             return VerifiedContent::publish(output, size, &digest, receipt.into_content());
         }
 
+        self.ensure_lease().await?;
         let map = self
             .client
             .chunk_map(self.snapshot_id(), &request_path, &file.content_digest)
@@ -1228,6 +1271,7 @@ impl SnapshotReader {
         let mut hashes = [[0u8; 32]; 64];
         let mut covered_hashes = 0usize;
         for page in 0..map.page_count {
+            self.ensure_lease().await?;
             let leaf = self
                 .client
                 .chunk_map_page(
@@ -1371,10 +1415,6 @@ impl SnapshotReader {
             .collect())
     }
 }
-
-/// Kept for potential future use of directory entry inspection.
-#[allow(dead_code)]
-fn _entry_marker(_e: &DirEntry) {}
 
 /// Discover logical child directories; files are derived only after the
 /// complete page graph has passed the closure validator.

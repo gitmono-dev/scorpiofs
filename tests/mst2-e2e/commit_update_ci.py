@@ -156,6 +156,56 @@ COMMIT;"""
             "production_service_init_wired": False}
 
 
+def bootstrap_ready_baseline(root, base, env, instance, deadline):
+    """Publish one real setup commit so the first workspace has a READY view.
+
+    Native resolve deliberately rejects an INITIALIZING head.  The maintenance
+    bootstrap above only creates that guarded head; a real Git push must create
+    its first certificate and transition it to READY before ScorpioFS can mount
+    the baseline workspace.  This setup commit is outside the measured matrix;
+    the first measured push still exercises the normal commit-update path.
+    """
+    git_token = env.get("M2_GIT_TOKEN")
+    if not git_token:
+        raise ValueError("native baseline requires the owned Git token")
+    git_env = bench.clean_env({
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": "Authorization: Bearer " + git_token,
+        "GIT_CONFIG_KEY_1": "http.followRedirects",
+        "GIT_CONFIG_VALUE_1": "false",
+        "GIT_CONFIG_KEY_2": "credential.helper",
+        "GIT_CONFIG_VALUE_2": "",
+    })
+    checkout = root / "native-baseline"
+    if checkout.exists() or checkout.is_symlink():
+        raise AssertionError("native baseline checkout path already exists")
+    bench.command(["git", "clone", "--no-checkout", "--single-branch", "--branch", "main",
+                   base + "/project", str(checkout)], deadline, env=git_env)
+    bench.git(checkout, deadline, "config", "user.name", "MST2 setup baseline", env=git_env)
+    bench.git(checkout, deadline, "config", "user.email", "mst2-setup@example.invalid", env=git_env)
+    bench.git(checkout, deadline, "commit", "--allow-empty", "-m", "MST2 setup baseline",
+              env=git_env)
+    commit = bench.git(checkout, deadline, "rev-parse", "HEAD", env=git_env).decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise AssertionError("native baseline commit is not canonical SHA-1")
+    bench.git(checkout, deadline, "push", "--no-thin", "origin",
+              f"{commit}:refs/heads/main", env=git_env)
+
+    while time.monotonic() < deadline:
+        native = bench.query(bench.NATIVE_SQL, deadline, env=env)
+        if native and native.get("state") == "READY":
+            rows = bench.query(bench.IDENTITY_SQL, deadline, env=env)
+            identity = bench.validate_identity(rows, commit,
+                                                bench.git(checkout, deadline, "rev-parse", "HEAD^{tree}", env=git_env).decode().strip(),
+                                                env["PGDATABASE"])
+            bench.validate_native(native, identity, instance, True)
+            return {"record": "owned_native_baseline", "commit": commit,
+                    "sequence": native["sequence"], "correctness": "PASS"}
+        time.sleep(min(.2, max(0, deadline - time.monotonic())))
+    raise TimeoutError("native baseline publication did not become READY before setup deadline")
+
+
 def dependencies(source, project, ports, deadline):
     raw = bench.command(["docker", "compose", "-f", str(source / "docker/docker-compose.test.yml"),
                          "config", "--format", "json"], deadline)
@@ -173,6 +223,37 @@ def dependencies(source, project, ports, deadline):
     return {"services": selected, "networks": {"default": {"name": project + "-network"}}}
 
 
+def verify_workspace_cleanup(measurements, deadline):
+    # Normal execution owns and joins the worker/daemon children before this
+    # server cleanup. A fallback must not claim PASS if abrupt interruption
+    # bypassed those owners; persisted PID text is not signal authority.
+    if measurements.exists():
+        from workspace_update_daemon import mounts_under
+        if measurements.is_symlink() or mounts_under(measurements):
+            raise AssertionError("owned workspace cleanup left native mounts")
+        for round_root in measurements.iterdir():
+            if not re.fullmatch(r"round-[0-9]{2}", round_root.name):
+                continue
+            if round_root.is_symlink() or not round_root.is_dir():
+                raise AssertionError("owned round cleanup path changed")
+            for name in ("owned-workspace-daemon.json", "owned-workspace-worker.json"):
+                receipt = round_root / name
+                if not receipt.exists():
+                    raise AssertionError("owned workspace cleanup receipt is missing")
+                if receipt.exists():
+                    if receipt.is_symlink() or not receipt.is_file() or receipt.stat().st_size > 4096:
+                        raise AssertionError("owned workspace cleanup receipt changed")
+                    record = json.loads(receipt.read_text())
+                    if (set(record) != {"pid", "starttime", "cleanup_complete"}
+                            or type(record["pid"]) is not int or record["pid"] <= 0
+                            or type(record["starttime"]) is not str or not record["starttime"].isdecimal()
+                            or record["cleanup_complete"] is not True
+                            or budget_module.group_members(record["pid"], record["starttime"])):
+                        raise AssertionError("owned workspace cleanup was incomplete")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("owned workspace cleanup verification exceeded its original deadline")
+
+
 def stop_owned(root, project, deadline, process=None):
     state_path = root / "owned.json"
     if not state_path.exists():
@@ -183,6 +264,11 @@ def stop_owned(root, project, deadline, process=None):
     compose = root / "dependencies.json"
     if hashlib.sha256(compose.read_bytes()).hexdigest() != state["compose_sha256"]:
         raise AssertionError("cleanup Compose configuration differs from owned startup")
+    workspace_error = None
+    try:
+        verify_workspace_cleanup(root / "measurements", deadline)
+    except Exception as error:
+        workspace_error = error
     service = state.get("service")
     if service:
         pid = service["pid"]
@@ -215,6 +301,8 @@ def stop_owned(root, project, deadline, process=None):
     state_path.write_text(json.dumps(state))
     if time.monotonic() >= deadline:
         raise TimeoutError("owned cleanup metadata exceeded original deadline")
+    if workspace_error is not None:
+        raise workspace_error
     print(json.dumps({"record": "owned_cleanup", "project": project, "correctness": "PASS"}), flush=True)
 
 
@@ -259,6 +347,47 @@ def graceful_owned(root, project, deadline, process):
     state_path.write_text(json.dumps(state))
 
 
+def persist_failure_record(run_root, error):
+    """Persist a closed failure record without touching private diagnostics.
+
+    The benchmark measurements directory is preferred once it exists.  Early
+    setup failures fall back to the owned run root so the workflow can collect
+    one small, safe artifact even when the measurement directory was never
+    created.  Refuse symlinks and use ``O_NOFOLLOW`` for the final file.
+    """
+    record = bench.failure_record(error)
+    root = Path(run_root)
+    try:
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            return
+        measurements = root / "measurements"
+        if (measurements.exists() and measurements.is_dir()
+                and not measurements.is_symlink()):
+            parent = measurements
+        else:
+            parent = root
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if parent.is_symlink() or not parent.is_dir():
+            return
+        target = parent / "failure.json"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(target), flags, 0o600)
+        try:
+            payload = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=True).encode("ascii")
+            view = memoryview(payload + b"\n")
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    return
+                view = view[written:]
+        finally:
+            os.close(fd)
+    except (OSError, TypeError, ValueError):
+        # Reporting must never hide the original benchmark failure.
+        return
+
+
 def execute(options):
     root, project = hosted_root(options.run_root)
     if root.exists():
@@ -297,12 +426,16 @@ def execute(options):
     process = None
     log = None
     try:
-        bench.command(["docker", "compose", "-p", project, "-f", str(compose_path),
-                       "up", "-d", "--wait", "--wait-timeout", "180"], min(deadline, time.monotonic() + 240))
+        with bench.phase("dependency_startup"):
+            bench.command(["docker", "compose", "-p", project, "-f", str(compose_path),
+                           "up", "-d", "--wait", "--wait-timeout", "180"],
+                          min(deadline, time.monotonic() + 240))
         db = "mst2_bench_" + uuid.uuid4().hex
         env = bench.clean_env({"PGHOST": "127.0.0.1", "PGPORT": str(ports["postgres"]),
                                "PGUSER": "mega2", "PGPASSWORD": "mega2_test_password", "PGDATABASE": "mega2"})
-        bench.command(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE " + db], deadline, env=env)
+        with bench.phase("database_create"):
+            bench.command(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE " + db],
+                          deadline, env=env)
         env["PGDATABASE"] = db
         git_token, token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         for name, secret in (("git-token", git_token), ("mst2-token", token)):
@@ -335,14 +468,17 @@ def execute(options):
         service_env = bench.clean_env({"MEGA_BASE_DIR": config["base_dir"], "MEGA_CACHE_DIR": str(root / "cache"),
                                        "MEGA_GIT_OBJECT_CACHE_PREFIX": project})
         prefix = [str(binary), "--config", str(config_path)]
-        bench.command(prefix + ["config", "validate"], deadline, env=service_env)
-        bench.command(prefix + ["service", "init", "--yes"], deadline, env=service_env)
+        with bench.phase("server_config_validate"):
+            bench.command(prefix + ["config", "validate"], deadline, env=service_env)
+        with bench.phase("server_service_init"):
+            bench.command(prefix + ["service", "init", "--yes"], deadline, env=service_env)
         with bench.phase("owned_native_initialization"):
             print(json.dumps(initialize_owned_native(db, instance, env, deadline)), flush=True)
         log = (root / "service-private.log").open("wb")
-        process = budget_module.PinnedProcess(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
-                                   stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                   env=service_env, start_new_session=True)
+        with bench.phase("server_process_start"):
+            process = budget_module.PinnedProcess(prefix + ["service", "http", "--host", "127.0.0.1", "-p", str(ports["http"])],
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                       env=service_env, start_new_session=True)
         started = None
         try:
             started = budget_module.process_start(process.pid)
@@ -359,21 +495,39 @@ def execute(options):
             raise
         base = f"http://127.0.0.1:{ports['http']}"
         ready_until = min(deadline, time.monotonic() + 180)
-        while True:
-            if owned_service_exit(process) is not None or time.monotonic() >= ready_until:
-                raise RuntimeError("owned service failed readiness")
-            try:
-                with urlopen(base + "/api/v2/snapshots/capabilities",
-                             timeout=min(2, max(.001, ready_until - time.monotonic()))) as response:
-                    if response.status == 200:
-                        break
-            except OSError:
-                pass
-            time.sleep(min(.2, max(0, ready_until - time.monotonic())))
-        initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"], deadline).decode().split()
+        with bench.phase("server_readiness"):
+            while True:
+                if owned_service_exit(process) is not None or time.monotonic() >= ready_until:
+                    raise RuntimeError("owned service failed readiness")
+                try:
+                    with urlopen(base + "/api/v2/snapshots/capabilities",
+                                 timeout=min(2, max(.001, ready_until - time.monotonic()))) as response:
+                        if response.status == 200:
+                            break
+                except OSError:
+                    pass
+                time.sleep(min(.2, max(0, ready_until - time.monotonic())))
+        with bench.phase("initial_git_identity_seed"):
+            initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"], deadline).decode().split()
         if len(initial) != 2 or initial[1] != "refs/heads/main":
             raise AssertionError("owned service did not initialize exactly one project main")
         env.update(M2_TOKEN=token, M2_GIT_TOKEN=git_token)
+        with bench.phase("owned_native_baseline"):
+            baseline = bootstrap_ready_baseline(root, base, env, instance, deadline)
+            print(json.dumps(baseline), flush=True)
+        with bench.phase("initial_git_identity"):
+            initial = bench.command(["git", "ls-remote", base + "/project", "refs/heads/main"],
+                                    deadline, env=bench.clean_env({
+                                        "GIT_CONFIG_COUNT": "3",
+                                        "GIT_CONFIG_KEY_0": "http.extraHeader",
+                                        "GIT_CONFIG_VALUE_0": "Authorization: Bearer " + git_token,
+                                        "GIT_CONFIG_KEY_1": "http.followRedirects",
+                                        "GIT_CONFIG_VALUE_1": "false",
+                                        "GIT_CONFIG_KEY_2": "credential.helper",
+                                        "GIT_CONFIG_VALUE_2": "",
+                                    })).decode().split()
+        if len(initial) != 2 or initial[1] != "refs/heads/main" or initial[0] != baseline["commit"]:
+            raise AssertionError("native baseline did not publish exactly one project main")
         budget.require(options.rounds * budget_module.ROUND_SECONDS
                        + budget_module.REPORT_RESERVE + budget_module.CLEANUP_RESERVE
                        + budget_module.MARGIN)
@@ -419,6 +573,7 @@ if __name__ == "__main__":
     parser.add_argument("--driver-sha256")
     parser.add_argument("--session-deadline-utc")
     parser.add_argument("--session-started-utc")
+    budget_module.add_recovery_argument(parser)
     parser.add_argument("--work-cleanup-deadline-monotonic", type=float,
                         default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     parser.add_argument("--profile", choices=("smoke", "medium"), default="medium")
@@ -445,5 +600,6 @@ if __name__ == "__main__":
             signal.signal(signal.SIGTERM, interrupted)
             execute(opts)
     except (Exception, KeyboardInterrupt) as error:
+        persist_failure_record(opts.run_root, error)
         print(json.dumps(bench.failure_record(error)), file=sys.stderr)
         raise SystemExit(1)

@@ -567,7 +567,13 @@ impl WorkspaceService {
         {
             runtime.hydration_state = HydrationState::Idle;
         }
-        let dirty_state = if scan {
+        // Hydration owns the lower snapshot and may materialize many files at
+        // once. A status poll during that task must not repeatedly walk the
+        // entire private upper; the durable pin result remains Unknown until
+        // reconcile_hydrate joins the task, after which the next status does a
+        // complete dirty scan. This keeps polling overhead out of the update
+        // latency while preserving the final dirty-state proof.
+        let dirty_state = if scan && runtime.hydrate.is_none() {
             match trace_async("upper_scan", self.dirty(workspace, runtime)).await {
                 Ok(state) => state,
                 Err(error) => {
@@ -834,12 +840,18 @@ async fn reconcile_hydrate(runtime: &mut Runtime, cancel: bool) {
         }
         Ok(Ok(_)) => HydrationState::Idle,
         Ok(Err(error)) => {
-            runtime.last_error = Some(error.to_string());
+            let stage =
+                crate::snapshot::durable::hydration_error_label(&error).unwrap_or("hydration_task");
+            // Keep the stable snapshot code for automation while exposing only
+            // the bounded phase label. The underlying message may contain a
+            // path, digest, or remote response and must not cross the status
+            // boundary.
+            runtime.last_error = Some(format!("{:?}: {stage}", error.code));
             HydrationState::Failed
         }
         Err(error) if error.is_cancelled() => HydrationState::Cancelled,
-        Err(error) => {
-            runtime.last_error = Some(error.to_string());
+        Err(_error) => {
+            runtime.last_error = Some("Internal: hydration_task".to_owned());
             HydrationState::Failed
         }
     };

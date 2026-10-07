@@ -20,6 +20,7 @@ SPEC.loader.exec_module(BENCH)
 CI_SPEC = importlib.util.spec_from_file_location("real_bench_ci", SOURCE.with_name("commit_update_ci.py"))
 CI = importlib.util.module_from_spec(CI_SPEC)
 CI_SPEC.loader.exec_module(CI)
+from workspace_update_worker import WorkerError
 
 
 class CommitUpdateBenchTests(unittest.TestCase):
@@ -87,26 +88,119 @@ class CommitUpdateBenchTests(unittest.TestCase):
                     raise KeyError("private-connection-string")
         self.assertEqual(BENCH.failure_record(nested.exception)["phase"], "updated_publication_identity")
 
-    def test_command_failure_keeps_only_closed_typed_snapshot_diagnostics(self):
-        private = b'{"record":"measurement_failure","stage":"metadata","snapshot_error_code":"IntegrityError"}\n'
+    def test_worker_failure_record_carries_only_a_closed_error_code(self):
+        private = "private-token /run/secret response body"
+        inner = BENCH.PhaseFailure(
+            "shipped_workspace_and_git_measurement",
+            WorkerError(private, error_code="worker_http_status_rejected"),
+        )
+        outer = BENCH.PhaseFailure("commit_update_benchmark", inner)
+        self.assertEqual(BENCH.failure_record(outer)["error_code"],
+                         "worker_http_status_rejected")
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("commit_update_benchmark"):
+                with BENCH.phase("shipped_workspace_and_git_measurement"):
+                    raise WorkerError(private, error_code="worker_http_status_rejected")
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["error_code"], "worker_http_status_rejected")
+        self.assertNotIn(private, json.dumps(record))
+        self.assertNotIn("/run/secret", json.dumps(record))
+
+        unknown = WorkerError(private, error_code="private-code")
+        self.assertEqual(unknown.error_code, "worker_error")
+        self.assertEqual(BENCH.failure_record(unknown)["error_code"], "worker_error")
+
+    def test_worker_failure_record_carries_only_a_closed_substage(self):
+        private = "private-token /run/secret response body"
+        error = WorkerError(private, error_code="worker_http_status_5xx")
+        error.worker_stage = "poll"
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("commit_update_benchmark"):
+                with BENCH.phase("shipped_workspace_and_git_measurement"):
+                    raise error
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["error_code"], "worker_http_status_5xx")
+        self.assertEqual(record["worker_stage"], "poll")
+        self.assertNotIn(private, json.dumps(record))
+        self.assertNotIn("/run/secret", json.dumps(record))
+
+        error.worker_stage = "private-path"
+        self.assertNotIn("worker_stage", BENCH.failure_record(error))
+
+    def test_worker_failure_record_carries_only_a_closed_retention_substage(self):
+        private = "private-token /run/secret response body"
+        error = WorkerError(private, error_code="worker_error", retention_substage="old_view_oracle")
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("shipped_workspace_and_git_measurement"):
+                raise error
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["retention_substage"], "old_view_oracle")
+        self.assertNotIn(private, json.dumps(record))
+        error.retention_substage = "private-path"
+        self.assertNotIn("retention_substage", BENCH.failure_record(error))
+
+    def test_worker_failure_record_carries_only_a_closed_hydration_substage(self):
+        private = "private-token /run/secret response body"
+        error = WorkerError(private, error_code="worker_http_status_5xx",
+                            hydration_substage="dependency_audit")
+        with self.assertRaises(BENCH.PhaseFailure) as failed:
+            with BENCH.phase("shipped_workspace_and_git_measurement"):
+                raise error
+        record = BENCH.failure_record(failed.exception)
+        self.assertEqual(record["hydration_substage"], "dependency_audit")
+        self.assertNotIn(private, json.dumps(record))
+        error.hydration_substage = "private-path"
+        self.assertNotIn("hydration_substage", BENCH.failure_record(error))
+
+    def test_worker_failure_record_carries_only_a_closed_backend_code(self):
+        error = WorkerError("private response body", error_code="worker_http_status_5xx",
+                            backend_code="SNAPSHOT_ERROR", snapshot_code="ObjectUnavailable")
+        record = BENCH.failure_record(error)
+        self.assertEqual(record["backend_code"], "SNAPSHOT_ERROR")
+        self.assertEqual(record["snapshot_code"], "ObjectUnavailable")
+        self.assertNotIn("private response body", json.dumps(record))
+        unknown = WorkerError("private response body", backend_code="private-token")
+        self.assertNotIn("backend_code", BENCH.failure_record(unknown))
+        unknown = WorkerError("private response body", snapshot_code="private-token")
+        self.assertNotIn("snapshot_code", BENCH.failure_record(unknown))
+
+    def test_worker_failure_record_carries_only_a_closed_snapshot_code(self):
+        error = WorkerError("workspace id: ObjectUnavailable: private response body",
+                            error_code="worker_http_status_5xx", snapshot_code="ObjectUnavailable")
+        record = BENCH.failure_record(error)
+        self.assertEqual(record["snapshot_code"], "ObjectUnavailable")
+        self.assertNotIn("private response body", json.dumps(record))
+        self.assertNotIn("workspace id", json.dumps(record))
+
+    def test_ci_persists_only_safe_failure_record(self):
+        private = "private-token /run/secret response body"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            measurements = root / "measurements"
+            measurements.mkdir()
+            CI.persist_failure_record(root, WorkerError(private,
+                                                        error_code="worker_http_status_rejected"))
+            path = measurements / "failure.json"
+            self.assertTrue(path.is_file())
+            raw = path.read_text(encoding="ascii")
+            self.assertNotIn(private, raw)
+            self.assertNotIn("/run/secret", raw)
+            self.assertEqual(json.loads(raw), {
+                "error_code": "worker_http_status_rejected",
+                "error_type": "WorkerError",
+                "execution_failed": True,
+            })
+
+    def test_command_failure_keeps_only_closed_fields(self):
+        private = b'private-token and child stderr must never be copied into the record\n'
         with self.assertRaises(BENCH.PhaseFailure) as failed:
             with BENCH.phase("scorpio_sync"):
-                raise BENCH.CommandFailure("mst2_update_measure", 1, private)
+                raise BENCH.CommandFailure("scorpio", 1, private)
         self.assertEqual(BENCH.failure_record(failed.exception), {
             "execution_failed": True, "error_type": "CommandFailure", "phase": "scorpio_sync",
-            "command": "mst2_update_measure", "exit_status": 1, "measurement_stage": "metadata",
-            "snapshot_error_code": "IntegrityError",
+            "command": "scorpio", "exit_status": 1,
         })
         self.assertNotIn("private-token", json.dumps(BENCH.failure_record(failed.exception)))
-        for stderr in [b"private-token", b"Error: SnapshotError { code: IntegrityError, message: x }",
-                       b'{"record":"measurement_failure","stage":"metadata","snapshot_error_code":"Unknown"}',
-                       b'{"record":"measurement_failure","stage":"secret-stage"}',
-                       b'{"record":"measurement_failure","stage":"metadata","message":"private-token"}',
-                       private + b"private-token", b"[]", b"null", b"\xff", b" " * 4097]:
-            error = BENCH.CommandFailure("mst2_update_measure", 1, stderr)
-            self.assertNotIn("snapshot_error_code", BENCH.failure_record(error))
-            self.assertNotIn("measurement_stage", BENCH.failure_record(error))
-        # Git/SQL messages cannot impersonate a driver's typed error.
         error = BENCH.CommandFailure("git", 128, private)
         self.assertEqual(BENCH.failure_record(error), {
             "execution_failed": True, "error_type": "CommandFailure", "command": "git", "exit_status": 128,
@@ -123,31 +217,62 @@ class CommitUpdateBenchTests(unittest.TestCase):
             self.assertIsNone(BENCH.query(BENCH.NATIVE_SQL, time.monotonic() + 30))
 
     def test_workflow_recovery_preserves_deadline_and_rejects_extension_before_setup(self):
-        workflow = SOURCE.parents[2] / ".github/workflows/mst2-real-update.yml"
-        script = textwrap.dedent(workflow.read_text().split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
-        deadline = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        workflow = SOURCE.parents[2] / ".github/workflows/mst2-workspace-update.yml"
+        script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+        started = datetime.now(timezone.utc) - timedelta(minutes=1)
+        deadline = (started + timedelta(minutes=235)).isoformat()
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "github-env"
             env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
-                       GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2", RESUME_SPEC="",
-                       DEADLINE_INPUT=deadline, TIMEOUT_INPUT="19")
-            subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
-            self.assertIn("MST2_SESSION_DEADLINE=" + deadline, output.read_text())
-            output.unlink()
-            spec = json.dumps({"session_deadline_utc": deadline, "timeout_minutes": 19})
-            subprocess.run([os.sys.executable, "-c", script], check=True,
-                           env=dict(env, DEADLINE_INPUT="", TIMEOUT_INPUT="", RESUME_SPEC=spec), capture_output=True)
-            self.assertIn("MST2_SESSION_DEADLINE=" + deadline, output.read_text())
-            output.unlink()
-            for bad in [dict(env, TIMEOUT_INPUT="21"),
+                       GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
+                       STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
+                       PYTHONPATH=str(SOURCE.parent), RECOVERY_INPUT="false")
+            for _ in range(2):
+                subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
+                self.assertIn("MST2_SESSION_STARTED=" + started.isoformat(), output.read_text())
+                self.assertIn("MST2_SESSION_DEADLINE=" + deadline, output.read_text())
+                output.unlink()
+            for bad in [dict(env, DEADLINE_INPUT=(started + timedelta(minutes=236)).isoformat()),
+                        dict(env, STARTED_INPUT=(started - timedelta(minutes=20)).isoformat(),
+                             DEADLINE_INPUT=(started + timedelta(minutes=215)).isoformat()),
                         dict(env, DEADLINE_INPUT="2000-01-01T00:00:00Z"),
                         dict(env, DEADLINE_INPUT="2099-01-01T00:00:00Z"),
                         dict(env, DEADLINE_INPUT=deadline[:-6]),
                         dict(env, DEADLINE_INPUT=deadline[:-6] + "+08:00"),
-                        dict(env, DEADLINE_INPUT="", RESUME_SPEC='{"timeout_minutes":19}')]:
+                        dict(env, STARTED_INPUT="")]:
                 result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(output.exists())
+
+    def test_explicit_recovery_keeps_the_original_window_after_queue_freshness_expires(self):
+        started = datetime.now(timezone.utc) - timedelta(minutes=20)
+        deadline = (started + timedelta(minutes=235)).isoformat()
+        for name in ("mst2-real-update.yml", "mst2-workspace-update.yml"):
+            workflow = SOURCE.parents[2] / ".github/workflows" / name
+            script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+            with tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "github-env"
+                env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
+                           GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                           STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
+                           PYTHONPATH=str(SOURCE.parent), RECOVERY_INPUT="true")
+                for _ in range(2):
+                    subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
+                    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                    self.assertEqual(values["MST2_SESSION_STARTED"], started.isoformat())
+                    self.assertEqual(values["MST2_SESSION_DEADLINE"], deadline)
+                    remaining = float(values["MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"]) - time.monotonic()
+                    self.assertGreater(remaining, 199 * 60)
+                    self.assertLessEqual(remaining, 200 * 60)
+                    output.unlink()
+                overdue = datetime.now(timezone.utc) - timedelta(minutes=221)
+                for bad in (dict(env, RECOVERY_INPUT="false"), dict(env, RECOVERY_INPUT="yes"),
+                            dict(env, DEADLINE_INPUT=(started + timedelta(minutes=236)).isoformat()),
+                            dict(env, STARTED_INPUT=overdue.isoformat(),
+                                 DEADLINE_INPUT=(overdue + timedelta(minutes=235)).isoformat())):
+                    result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
 
     def test_ci_setup_plan_cannot_create_local_resources(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -309,6 +434,53 @@ class CommitUpdateBenchTests(unittest.TestCase):
             (root / "extra").write_bytes(b"extra")
             with self.assertRaises(AssertionError):
                 BENCH.verify_worktree(root, expected)
+
+    def test_batch_publication_rewrites_many_existing_blobs_and_preserves_old_commit(self):
+        for smoke, blob_count, directory_count, file_size in ((True, 16, 8, 1024),
+                                                             (False, 128, 32, 8192)):
+            with self.subTest(smoke=smoke), tempfile.TemporaryDirectory() as temp:
+                repo = Path(temp) / "fixture"
+                deadline = time.monotonic() + 120
+                subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+                env = BENCH.clean_env({"GIT_AUTHOR_NAME": "test", "GIT_COMMITTER_NAME": "test",
+                                       "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                                       "GIT_COMMITTER_EMAIL": "test@example.invalid"})
+                BENCH.git(repo, deadline, "commit", "--allow-empty", "-qm", "seed", env=env)
+                for version in ("v1", "v2", "v3"):
+                    old_commit, _ = BENCH.create_version(repo, 1, version, smoke, deadline)
+                before = BENCH.expected_manifest(repo, old_commit, deadline)
+                commit, _ = BENCH.create_version(repo, 1, "v4", smoke, deadline)
+                after = BENCH.expected_manifest(repo, commit, deadline)
+                old = {file["rel_path"]: file for file in before["files"]}
+                new = {file["rel_path"]: file for file in after["files"]}
+                self.assertEqual(old.keys(), new.keys())
+                self.assertEqual(before["directories"], after["directories"])
+                changed = {path for path in old if old[path] != new[path]}
+                sources = {path for path in changed if path.startswith("r01/")}
+                aliases = changed - sources
+                self.assertEqual(len(sources), blob_count)
+                self.assertEqual(len({path.split("/")[1] for path in sources}), 8)
+                self.assertEqual(len({str(Path(path).parent) for path in sources}), directory_count)
+                self.assertEqual(len({new[path]["content_digest"] for path in changed}), blob_count)
+                self.assertEqual(sum(new[path]["size"] for path in sources), blob_count * file_size)
+                self.assertTrue(any(path.startswith("r01/renamed-m001/") for path in sources))
+                self.assertTrue(aliases)
+                for path in changed:
+                    self.assertEqual(old[path]["fs_kind"], new[path]["fs_kind"])
+                    self.assertEqual(old[path]["size"], new[path]["size"])
+                for path in aliases:
+                    self.assertTrue(path.startswith("alias-r01-m007/"))
+                    source = "r01/m007/" + path.split("/", 1)[1]
+                    self.assertEqual(new[path]["content_digest"], new[source]["content_digest"])
+                self.assertEqual(new["r01/large.bin"], old["r01/large.bin"])
+                self.assertEqual(new["r01/wide/f000"], old["r01/wide/f000"])
+                # Independently inspect Git changes: no additions, deletions,
+                # renames or mode changes may turn this into another workload.
+                diff = BENCH.git(repo, deadline, "diff-tree", "--no-commit-id", "--name-status",
+                                 "-r", old_commit, commit).decode().splitlines()
+                self.assertEqual({line.split("\t", 1)[1] for line in diff}, changed)
+                self.assertTrue(all(line.startswith("M\t") for line in diff))
+                self.assertEqual(BENCH.expected_manifest(repo, old_commit, deadline), before)
 
     def test_timeout_terminates_whole_child_group_then_kills_if_term_is_ignored(self):
         class Hung:
