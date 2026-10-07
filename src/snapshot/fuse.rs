@@ -32,6 +32,7 @@ use crate::{
         capabilities::CapabilityAdvertisement,
         cas_content::VerifiedCasContent,
         cas_range::VerifiedCasRange,
+        cas_worker::{CasReadScope, RequestMeters, WorkResult},
         closure::{verify_directory_pages, ValidatedSnapshotClosure},
         durable::{DurableStore, LocalCasRangeMeters},
         fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission, StoreRangeCache},
@@ -853,6 +854,16 @@ impl Mst2Fuse {
         }
     }
 
+    fn store_workers(&self) -> Result<Arc<CasReadScope>> {
+        self.state
+            .lock()
+            .unwrap()
+            .store_ranges
+            .as_ref()
+            .map(|cache| cache.workers.clone())
+            .ok_or_else(|| Errno::from(libc::EIO))
+    }
+
     // This observes the current local grant and any latched terminal failure;
     // it is not a fresh remote authorization decision or a metadata fetch.
     fn check_metadata_lease(&self) -> std::result::Result<(), SnapshotError> {
@@ -889,18 +900,39 @@ impl Mst2Fuse {
             .as_mut()
             .ok_or_else(|| Errno::from(libc::EIO))?
             .get(key);
-        let content = match cached {
-            Some(content) => content,
+        let (content, admission) = match cached {
+            Some(content) => (content, admission),
             None => {
-                let store = self.store.as_ref().ok_or_else(|| Errno::from(libc::EIO))?;
-                match VerifiedCasContent::read(
-                    store,
-                    &node.digest,
-                    node.size,
-                    &reader.content_scope,
-                )
-                .map_err(io_err)?
-                {
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| Errno::from(libc::EIO))?
+                    .clone();
+                let digest = node.digest.clone();
+                let size = node.size;
+                let budget = reader.content_scope.clone();
+                let completion = self
+                    .store_workers()?
+                    .run(
+                        reader.clone(),
+                        admission,
+                        RequestMeters {
+                            kind: "small_whole",
+                            wanted: size,
+                        },
+                        move || {
+                            WorkResult::local(
+                                VerifiedCasContent::read(&store, &digest, size, &budget),
+                                None,
+                            )
+                        },
+                    )
+                    .await
+                    .map_err(io_err)?;
+                let local = completion.result.map_err(io_err)?;
+                // The queue and local read may outlive the original lease.
+                proven.validate(reader).await.map_err(io_err)?;
+                let content = match local {
                     Some(content) => StoreContent::Cas(content),
                     None => StoreContent::Wire(
                         reader
@@ -908,7 +940,8 @@ impl Mst2Fuse {
                             .await
                             .map_err(io_err)?,
                     ),
-                }
+                };
+                (content, completion.admission)
             }
         };
         if content.len() as u64 != node.size
@@ -963,25 +996,48 @@ impl Mst2Fuse {
         }
         let wanted = requested.min(node.size - offset);
         let admission = ReplyAdmission::new(reader).map_err(io_err)?;
-        let store = self.store.as_ref().ok_or_else(|| Errno::from(libc::EIO))?;
-        let mut meters = LocalCasRangeMeters::default();
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .clone();
+        let digest = node.digest.clone();
+        let size = node.size;
+        let budget = reader.content_scope.clone();
         // Always prefer local CAS, including when a wire handle is cached.
         // Only the primitive's safe-open NotFound permits wire fallback.
-        if let Some(owner) = VerifiedCasRange::read(
-            store,
-            &node.digest,
-            node.size,
-            offset,
-            wanted,
-            &reader.content_scope,
-            &mut meters,
-        )
-        .map_err(io_err)?
-        {
+        let completion = self
+            .store_workers()?
+            .run(
+                reader.clone(),
+                admission,
+                RequestMeters {
+                    kind: "large_range",
+                    wanted,
+                },
+                move || {
+                    let mut meters = LocalCasRangeMeters::default();
+                    let result = VerifiedCasRange::read(
+                        &store,
+                        &digest,
+                        size,
+                        offset,
+                        wanted,
+                        &budget,
+                        &mut meters,
+                    );
+                    WorkResult::local(result, Some(meters))
+                },
+            )
+            .await
+            .map_err(io_err)?;
+        let local = completion.result.map_err(io_err)?;
+        proven.validate(reader).await.map_err(io_err)?;
+        let admission = completion.admission;
+        if let Some(owner) = local {
             if owner.len() as u64 != wanted {
                 return Err(Errno::from(libc::EIO));
             }
-            proven.validate(reader).await.map_err(io_err)?;
             return Ok(ReplyData {
                 data: admission.cas_range(owner).map_err(io_err)?,
             });

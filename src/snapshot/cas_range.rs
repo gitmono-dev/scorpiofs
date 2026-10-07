@@ -52,6 +52,11 @@ pub(crate) struct VerifiedCasRange {
     buffer: AccountedBuffer,
 }
 
+#[cfg(test)]
+type AdmittedPause = Option<Box<dyn FnOnce() + Send>>;
+#[cfg(not(test))]
+type AdmittedPause = ();
+
 impl VerifiedCasRange {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read(
@@ -62,6 +67,53 @@ impl VerifiedCasRange {
         requested: u64,
         budget: &ContentBudget,
         meters: &mut LocalCasRangeMeters,
+    ) -> Result<Option<Arc<Self>>, SnapshotError> {
+        Self::read_admitted(
+            store,
+            digest,
+            expected_size,
+            offset,
+            requested,
+            budget,
+            meters,
+            Default::default(),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn read_paused(
+        store: &DurableStore,
+        digest: &str,
+        expected_size: u64,
+        offset: u64,
+        requested: u64,
+        budget: &ContentBudget,
+        meters: &mut LocalCasRangeMeters,
+        pause: impl FnOnce() + Send + 'static,
+    ) -> Result<Option<Arc<Self>>, SnapshotError> {
+        Self::read_admitted(
+            store,
+            digest,
+            expected_size,
+            offset,
+            requested,
+            budget,
+            meters,
+            Some(Box::new(pause)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_admitted(
+        store: &DurableStore,
+        digest: &str,
+        expected_size: u64,
+        offset: u64,
+        requested: u64,
+        budget: &ContentBudget,
+        meters: &mut LocalCasRangeMeters,
+        _pause: AdmittedPause,
     ) -> Result<Option<Arc<Self>>, SnapshotError> {
         *meters = LocalCasRangeMeters::default();
         let fixed_digest = parse_digest(digest)?;
@@ -81,6 +133,10 @@ impl VerifiedCasRange {
         let mut buffer =
             AccountedBuffer::new(budget, BudgetClass::Output, wanted, size_of::<Self>())?;
         let mut scratch = RangeScratch::new(budget, expected_size.min(CHUNK_SIZE) as usize)?;
+        #[cfg(test)]
+        if let Some(pause) = _pause {
+            pause();
+        }
         // Both allocations are admitted before CAS open or canonicalization.
         let path = store.content_dir().join(hex::encode(fixed_digest));
         if !cas_index::read_indexed_into(

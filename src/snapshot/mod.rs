@@ -11,6 +11,7 @@ pub mod capabilities;
 mod cas_content;
 mod cas_index;
 mod cas_range;
+mod cas_worker;
 mod chunk_wire;
 pub mod client;
 pub mod closure;
