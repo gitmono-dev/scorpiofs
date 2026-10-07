@@ -11,7 +11,7 @@
 //! decides how to traverse it. Opening a symlink inode directly is ELOOP.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -558,7 +558,8 @@ impl Mst2Fuse {
         // not certify namespace absence: the complete canonical partition
         // and every child's actual count are proved before publishing nodes.
         let mut proof_pages = BTreeMap::new();
-        let mut routes: Vec<(Vec<u8>, String)> = vec![(Vec::new(), page_id.clone())];
+        let mut routes: VecDeque<(Vec<u8>, String)> =
+            VecDeque::from([(Vec::new(), page_id.clone())]);
         let mut route_ids = HashMap::new();
         let mut seen = HashSet::new();
         seen.insert(page_id.clone());
@@ -656,7 +657,7 @@ impl Mst2Fuse {
                                         "lazy directory radix page budget exceeded",
                                     ));
                                 }
-                                routes.push((next, child_id));
+                                routes.push_back((next, child_id));
                             }
                         }
                     }
