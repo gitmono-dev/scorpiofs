@@ -30,7 +30,7 @@
 //! The pin-backed record reuse rules above apply to the file-only `sync` API.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs::{self, File},
     path::{Path, PathBuf},
     time::Duration,
