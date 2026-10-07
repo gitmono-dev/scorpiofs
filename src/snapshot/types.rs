@@ -171,6 +171,85 @@ pub struct ResolveResponse {
     /// establish an authorized cache domain.
     #[serde(default)]
     pub authorization_epoch: String,
+    /// Optional server-issued authority for a trusted local export.  The
+    /// response parser validates its shape, while callers must still verify
+    /// the actor/domain binding and expiry before opening a local store.
+    #[serde(default)]
+    pub offline_grant: Option<OfflineGrant>,
+}
+
+/// Closed offline-export capability returned by canonical resolve.
+///
+/// Possessing a complete local CAS is not an authorization grant.  This DTO
+/// is persisted only when it came from an authenticated resolve response and
+/// must be checked against the fixed snapshot, actor domain and expiry on
+/// every offline reopen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineGrant {
+    pub grant_id: String,
+    pub snapshot_id: String,
+    pub actor_domain_id: String,
+    pub expires_at: String,
+    pub policy: String,
+}
+
+impl OfflineGrant {
+    pub fn grant_id(&self) -> &str {
+        &self.grant_id
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    pub fn actor_domain_id(&self) -> &str {
+        &self.actor_domain_id
+    }
+
+    pub fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+
+    pub fn policy(&self) -> &str {
+        &self.policy
+    }
+
+    /// Validate the fixed-view binding carried by a grant.  The actor domain
+    /// is optional here because the resolve layer has not yet opened the
+    /// local cache; offline reopen passes the concrete cache/mount domain.
+    pub(crate) fn validate_for(
+        &self,
+        snapshot_id: &str,
+        actor_domain_id: Option<&str>,
+    ) -> Result<(), SnapshotError> {
+        if self.grant_id.is_empty()
+            || self.grant_id.chars().count() > 512
+            || self.actor_domain_id.is_empty()
+            || self.actor_domain_id.chars().count() > 512
+            || self.snapshot_id != snapshot_id
+            || actor_domain_id.is_some_and(|expected| expected != self.actor_domain_id)
+            || self.policy != "trusted_local_export_v1"
+        {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::ScopeForbidden,
+                "offline grant is bound to a different snapshot or actor domain",
+            ));
+        }
+        crate::snapshot::resolve_wire::timestamp(&self.expires_at).map_err(|_| {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "offline grant expiry is not RFC3339",
+            )
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn expired(&self) -> bool {
+        crate::snapshot::resolve_wire::timestamp(&self.expires_at)
+            .map(|expiry| expiry <= time::OffsetDateTime::now_utc())
+            .unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -251,7 +251,10 @@ async fn optional_offline_hints_are_closed_bound_data_and_never_an_export_permis
     value["offline_grant"] = json!({"grant_id":"grant", "snapshot_id":value["descriptor"]["snapshot_id"],
         "actor_domain_id":"actor", "expires_at":"2026-09-15T13:00:00Z", "policy":"trusted_local_export_v1"});
     let server = Server::start(value.to_string()).await;
-    assert!(server.client.resolve(SCOPE, 600).await.is_ok());
+    let response = server.client.resolve(SCOPE, 600).await.unwrap();
+    let grant = response.offline_grant.expect("closed grant is retained");
+    assert_eq!(grant.grant_id(), "grant");
+    assert_eq!(grant.actor_domain_id(), "actor");
     for field in [
         "grant_id",
         "snapshot_id",
