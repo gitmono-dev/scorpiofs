@@ -1,4 +1,4 @@
-"""Owned backend foundation; not yet wired into the benchmark or workflow.
+"""Owned independent backend lifetimes for the isolated v3 campaign.
 
 Each backend owns a complete disposable dependency stack and native writer.
 The caller must publish one common canonical seed through ordinary Git before
@@ -147,8 +147,8 @@ class RuntimeBinding:
 class BackendGroup:
     """Register every owner before its first startup side effect.
 
-    There is deliberately no CLI/dispatch flag in this foundation. Existing
-    legacy single-backend execution is unchanged until the orchestrator lands.
+    The isolated campaign owns this group across fair and diagnostic phases.
+    Historical single-backend harness modes keep their own original lifecycle.
     """
 
     def __init__(self, options, budget):
@@ -309,7 +309,8 @@ class OwnedBackend:
                 "root": str(self.root), "state": self.state,
                 "operation_deadline_monotonic": self.operation_deadline,
                 "service_pid": self.process.pid if self.process is not None else None,
-                "service_starttime": self.started}
+                "service_starttime": self.started,
+                "initial_path_commit": getattr(self, "initial_commit", None)}
 
     def _transition(self, state):
         previous = self.state
@@ -470,7 +471,18 @@ class OwnedBackend:
                                             "MEGA_GIT_OBJECT_CACHE_PREFIX": self.project})
         prefix = [str(self.binary), "--config", str(config_path)]
         common.command(prefix + ["config", "validate"], deadline, env=self.service_env)
-        common.command(prefix + ["service", "init", "--yes"], deadline, env=self.service_env)
+        timestamp = getattr(self.group.options, "bootstrap_commit_time", None)
+        init_args = ["service", "init", "--yes"]
+        if timestamp is not None:
+            if type(timestamp) is not int or not 0 <= timestamp <= (1 << 32) - 1:
+                raise ValueError("canonical bootstrap time must be a uint32")
+            help_text = common.command(prefix + ["service", "init", "--help"], deadline,
+                                       env=self.service_env)
+            if (len(help_text) > 65536 or re.search(
+                    rb"(?m)^\s+--commit-time(?:\s|$)", help_text) is None):
+                raise AssertionError("fixed server lacks reproducible bootstrap capability")
+            init_args += ["--commit-time", str(timestamp)]
+        common.command(prefix + init_args, deadline, env=self.service_env)
         # Existing maintenance bootstrap installs only INITIALIZING, never a
         # READY certificate. Common semantic seed publication is normal Git.
         ci.initialize_owned_native(self.database, self.instance_id, env, deadline)
@@ -663,10 +675,12 @@ class OwnedBackend:
         self.startup_abort_pending = False
         _check(deadline)
 
-    def stop(self, deadline):
+    def stop(self, deadline, *, operation_deadline=None):
         _check(deadline)
         if deadline != self.group.cleanup_deadline:
             raise ValueError("backend cleanup cannot move the original anchor")
+        limit = deadline if operation_deadline is None else min(deadline, operation_deadline)
+        _check(limit)
         if self.state == "retired":
             return
         try:
@@ -674,13 +688,14 @@ class OwnedBackend:
             if self.startup_abort_pending:
                 # This unreaped direct child remains signal authority even
                 # when persisting its on-disk PID binding failed at startup.
-                self._abort_startup(deadline)
+                self._abort_startup(limit)
             self._verify_owned()
-            ci.stop_owned(self.root, self.project, deadline, self.process)
-            _check(deadline)
+            ci.stop_owned(self.root, self.project, limit, self.process)
+            _check(limit)
             if self.owned_digest is not None:
                 self.owned_digest = _digest(self.root / "owned.json")
             self._transition("retired")
+            _check(limit)
         finally:
             if self.log is not None:
                 self.log.close()

@@ -104,6 +104,29 @@ class ProjectionCollectionTests(unittest.TestCase):
         self.write([self.payload], closed=True)
         self.assertTrue(collector.finish(1, time.monotonic() + 1)["closed"])
 
+    def test_campaign_closed_evidence_reads_actual_sink_and_preserves_registered_receipt(self):
+        self.write([self.payload])
+        collector = projection.ProjectionCollector(self.cache)
+        self.collect(collector)
+        original_receipt = json.loads(json.dumps(self.measured["resolve_trace_receipt"]))
+        self.measured["resolve_trace_receipt"]["attempt_ids"].append("caller-tampering")
+        self.write([self.payload], closed=True)
+        evidence = collector.closed_evidence(1, time.monotonic() + 1)
+        self.assertEqual(evidence["records_jsonl"].encode(), (self.root / "records.jsonl").read_bytes())
+        self.assertEqual(evidence["status_json"].encode(), (self.root / "status.json").read_bytes())
+        self.assertEqual(evidence["registered_receipts"], [original_receipt])
+        self.assertEqual(evidence["expected_final_count"], 1)
+
+    def test_campaign_closed_evidence_cannot_be_taken_from_live_writer_or_missing_final(self):
+        self.write([self.payload])
+        collector = projection.ProjectionCollector(self.cache)
+        self.collect(collector)
+        with self.assertRaises(projection.TraceRejected):
+            collector.closed_evidence(1, time.monotonic() + .02)
+        self.write([self.payload], closed=True)
+        with self.assertRaises(projection.TraceRejected):
+            collector.closed_evidence(4, time.monotonic() + 1)
+
     def test_previous_success_with_lost_response_is_only_prior_attempt_diagnostic(self):
         first = dict(self.payload)
         first["root_commit_oid"] = "sha1:" + "d" * 40

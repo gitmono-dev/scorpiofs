@@ -1,9 +1,9 @@
-"""Independent-backend proof foundation; not a campaign completion validator.
+"""Independent-backend semantic and provenance proofs for the v3 campaign.
 
 Capture the actual publication before advancing its head, then validate the
-closed typed sink after its writer retires.  No benchmark/workflow uses this
-module yet.  Workspace/worker sink closure and full oracle execution remain
-obligations of the future campaign caller; a digest is not an oracle run.
+closed typed sink after its writer retires. Workspace/worker sink closure and
+full oracle execution are separate campaign obligations; a digest is not an
+oracle run. Pure replay validators never mint live runtime authority.
 """
 
 from datetime import datetime, timezone
@@ -24,7 +24,7 @@ SCRIPT_PATHS = frozenset({
     *{"tests/mst2-e2e/commit_update_" + name + ".py"
       for name in ("bench", "budget", "ci", "projection")},
     *{"tests/mst2-e2e/workspace_update_" + name + ".py"
-      for name in ("backend", "backend_proof", "bench", "build", "daemon",
+      for name in ("backend", "backend_proof", "bench", "build", "campaign", "campaign_export", "daemon",
                    "observation", "oracle", "profile", "resources", "worker")},
 })
 SOURCE_FIELDS = frozenset({
@@ -243,12 +243,12 @@ def capture_lane_runtime(backend, client_build_receipt, source_expectations, dea
             require(type(runtime[key]) is str and 1 <= len(runtime[key]) <= 4096
                     and not any(c in runtime[key] for c in "\r\n\0"))
         projection.canonical_uuid(runtime["instance_id"])
-        for key in ("config_sha256", "compose_sha256"):
-            hex_digest(runtime[key])
         integer(runtime["service_pid"], positive=True)
         projection.canonical_uuid(runtime["projection_sink_instance"])
         integer(runtime["projection_sink_device"])
         integer(runtime["projection_sink_inode"], positive=True)
+        hex_digest(runtime["config_sha256"])
+        hex_digest(runtime["compose_sha256"])
         exact(runtime["projection_sink_root"], runtime["cache_dir"].rstrip("/")
               + "/logs/mst2-native-projection/" + runtime["projection_sink_instance"])
         require(type(runtime["service_starttime"]) is str
@@ -381,8 +381,45 @@ def validate_lane_measurement(record, captured):
     """Close one lane proof against its captured actual immutable publication."""
     try:
         require(type(captured) is CapturedLane)
-        capture = captured.evidence
+        return _receipt(LaneProof, validate_lane_values(record, captured.evidence))
+    except (AssertionError, AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        reject()
+
+
+def validate_lane_values(record, capture):
+    """Replay values without minting a live runtime or measurement capability."""
+    try:
+        shape(capture, {"runtime", "sources", "client_build", "client_build_receipt_sha256"})
         runtime = capture["runtime"]
+        shape(runtime, RUNTIME_FIELDS)
+        integer(runtime["revision"], 1, True)
+        integer(runtime["round"], 3, True)
+        require(runtime["phase"] in ("fair", "diagnostic") and runtime["client"] in ("a", "b"))
+        require(runtime["phase"] != "diagnostic" or runtime["round"] == 1 and runtime["client"] == "b")
+        for key in ("config_sha256", "compose_sha256"):
+            hex_digest(runtime[key])
+        integer(runtime["service_pid"], positive=True)
+        integer(runtime["projection_sink_device"])
+        integer(runtime["projection_sink_inode"], positive=True)
+        require(type(runtime["service_starttime"]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", runtime["service_starttime"]))
+        for key in ("project", "database", "base_url", "git_url", "cache_prefix", "base_dir", "cache_dir", "pack_cache_dir", "projection_sink_root"):
+            require(type(runtime[key]) is str and 1 <= len(runtime[key]) <= 4096 and not any(c in runtime[key] for c in "\r\n\0"))
+        require(type(runtime["dependency_container_ids"]) is list and len(runtime["dependency_container_ids"]) == 4
+                and len(set(runtime["dependency_container_ids"])) == 4)
+        for value in runtime["dependency_container_ids"]:
+            hex_digest(value)
+        projection.canonical_uuid(runtime["instance_id"])
+        projection.canonical_uuid(runtime["projection_sink_instance"])
+        exact(runtime["projection_sink_root"], runtime["cache_dir"].rstrip("/") + "/logs/mst2-native-projection/" + runtime["projection_sink_instance"])
+        sources(capture["sources"])
+        hex_digest(capture["client_build_receipt_sha256"])
+        shape(capture["client_build"], builds.FIELDS)
+        for key in ("server_source_sha", "server_source_tree", "server_binary_sha256", "server_cargo_lock_sha256"):
+            exact(runtime[key], capture["sources"][key])
+        for source_key, build_key in (("client_source_sha", "source_sha"), ("client_cargo_lock_sha256", "cargo_lock_sha256"),
+                ("client_binary_sha256", "binary_sha256"), ("rustc_version", "rustc_version"), ("cargo_version", "cargo_version")):
+            exact(capture["sources"][source_key], capture["client_build"][build_key])
+        exact(capture["client_build"]["label"], runtime["client"])
         shape(record, LANE_FIELDS)
         integer(record["revision"], 1, True)
         integer(record["version"], 4, True)
@@ -417,8 +454,8 @@ def validate_lane_measurement(record, captured):
                     "scope": binding["scope"], "oracle_manifest_sha256": record["oracle_manifest_sha256"],
                     "metadata_root": sink["payload"]["metadata_root"],
                     "policy": {key: sink["payload"][key] for key in POLICY_FIELDS}}
-        return _receipt(LaneProof, {"lane": record, "capture": capture,
-                        "semantic": semantic, "closed_projection": sink})
+        return {"lane": record, "capture": capture,
+                "semantic": semantic, "closed_projection": sink}
     except (AssertionError, AttributeError, KeyError, TypeError, ValueError, OverflowError):
         reject()
 
@@ -427,7 +464,16 @@ def compare_pair(first, second):
     """Accept semantic equality after each lane's semantic/provenance proof."""
     try:
         require(type(first) is LaneProof and type(second) is LaneProof)
-        left, right = first.evidence, second.evidence
+        return compare_pair_values(first.evidence, second.evidence)
+    except (AssertionError, AttributeError, KeyError, TypeError, ValueError):
+        reject()
+
+
+def compare_pair_values(left, right):
+    """Replay the complete pair checks without granting live owner authority."""
+    try:
+        exact(left, validate_lane_values(left["lane"], left["capture"]))
+        exact(right, validate_lane_values(right["lane"], right["capture"]))
         require({left["lane"]["client"], right["lane"]["client"]} == {"a", "b"})
         for key in ("phase", "round", "version"):
             exact(left["lane"][key], right["lane"][key])
