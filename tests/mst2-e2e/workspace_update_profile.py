@@ -18,7 +18,8 @@ U64_MAX = (1 << 64) - 1
 METRICS = (
     "owner_cache_hit", "owner_cache_miss", "cache_get_probes", "cache_insert_probes",
     "cache_evictions", "node_file_clones", "node_directory_clones",
-    "directory_load_skipped", "directory_load", "metadata_local_pages", "metadata_wire_pages",
+    "directory_load_skipped", "directory_load", "directory_reply_entries_built",
+    "directory_reply_name_bytes", "metadata_local_pages", "metadata_wire_pages",
     "small_cas_calls", "small_cas_read_attempts", "small_cas_read_bytes", "small_cas_read_eof",
     "small_cas_read_interrupted", "small_cas_whole_hash_bytes", "small_cas_append_bytes",
     "large_cas_calls", "large_cas_append_bytes", "large_cas_read_bytes", "large_whole_hash_bytes",

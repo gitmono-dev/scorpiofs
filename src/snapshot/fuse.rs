@@ -25,7 +25,7 @@ use asyncfuse::{
     Errno, FileType, Inode, Result,
 };
 use bytes::Bytes;
-use futures::stream::iter;
+use futures::stream::try_unfold;
 
 use crate::{
     snapshot::{
@@ -35,6 +35,7 @@ use crate::{
         closure::{verify_directory_pages, ValidatedSnapshotClosure},
         content::ContentBudget,
         durable::{DurableStore, LocalCasRangeMeters},
+        fixed_directory_index::{DirectoryEntries, FixedDirectoryIndex},
         fuse_owned::{
             ContentEntry, OnlineContentEntry, OnlineFuseCache, OnlineRangeEntry, OwnedFuseCache,
             RangeEntry, ReplyAdmission, StoreRangeCache,
@@ -61,7 +62,7 @@ pub(crate) struct DirNode {
     #[allow(dead_code)]
     path: String,
     /// child basename -> inode
-    children: BTreeMap<String, u64>,
+    children: FixedDirectoryIndex,
     /// inode of the parent directory (`..`); the root is its own parent.
     parent: u64,
     /// Lazy mounts: has this directory's page been fetched and its children
@@ -154,9 +155,44 @@ fn is_symlink(node: &Node) -> bool {
 /// `readdir` and `readdirplus` reply shapes.
 struct ListEntry {
     inode: u64,
-    kind: FileType,
+    kind: Option<FileType>,
     name: String,
     offset: i64,
+}
+
+struct DirectoryListing {
+    entries: DirectoryEntries,
+    inode: u64,
+    parent: u64,
+    next: usize,
+}
+
+impl DirectoryListing {
+    fn next(&mut self) -> Option<ListEntry> {
+        let (inode, name, kind) = match self.next {
+            0 => (self.inode, ".".to_owned(), Some(FileType::Directory)),
+            1 => (self.parent, "..".to_owned(), Some(FileType::Directory)),
+            index => {
+                let (name, inode) = self.entries.get(index - 2)?;
+                (*inode, name.clone(), None)
+            }
+        };
+        self.next += 1;
+        Some(ListEntry {
+            inode,
+            kind,
+            name,
+            offset: self.next as i64,
+        })
+    }
+}
+
+fn seal_directory_indices(state: &mut State) {
+    for node in state.nodes.values_mut() {
+        if let Node::Dir(directory) = node {
+            directory.children.seal();
+        }
+    }
 }
 
 /// Read-only FUSE filesystem over one resolved snapshot.
@@ -445,7 +481,7 @@ impl Mst2Fuse {
             ROOT_INODE,
             Node::Dir(DirNode {
                 path: String::new(),
-                children: BTreeMap::new(),
+                children: FixedDirectoryIndex::default(),
                 parent: ROOT_INODE,
                 loaded: false,
                 page_id: Some(root_page_id.clone()),
@@ -680,6 +716,7 @@ impl Mst2Fuse {
         }
         Self::apply_page_entries(&mut state, inode, &path, &all_entries)?;
         if let Node::Dir(d) = state.nodes.get_mut(&inode).expect("inode exists") {
+            d.children.seal();
             d.loaded = true;
         }
         Ok(())
@@ -722,7 +759,7 @@ impl Mst2Fuse {
             let node = match e.kind {
                 mst2_codec::metapage::EntryKind::Directory => Node::Dir(DirNode {
                     path: full,
-                    children: BTreeMap::new(),
+                    children: FixedDirectoryIndex::default(),
                     parent: parent_inode,
                     loaded: false,
                     page_id: Some(format!(
@@ -748,7 +785,7 @@ impl Mst2Fuse {
             };
             state.nodes.insert(inode, node);
             if let Some(Node::Dir(d)) = state.nodes.get_mut(&parent_inode) {
-                d.children.insert(name, inode);
+                d.children.insert(name, inode)?;
             }
         }
         Ok(())
@@ -803,7 +840,7 @@ impl Mst2Fuse {
             ROOT_INODE,
             Node::Dir(DirNode {
                 path: String::new(),
-                children: BTreeMap::new(),
+                children: FixedDirectoryIndex::default(),
                 parent: ROOT_INODE,
                 loaded: true,
                 page_id: None,
@@ -823,6 +860,7 @@ impl Mst2Fuse {
                 )?;
             }
         }
+        seal_directory_indices(&mut state);
         Ok(Mst2Fuse {
             read_profile: None,
             reader,
@@ -876,7 +914,7 @@ impl Mst2Fuse {
                 inode,
                 Node::Dir(DirNode {
                     path: path.to_string(),
-                    children: BTreeMap::new(),
+                    children: FixedDirectoryIndex::default(),
                     parent,
                     loaded: true,
                     page_id: Some(directory.directory_root.clone()),
@@ -888,7 +926,7 @@ impl Mst2Fuse {
                 };
                 if parent_dir
                     .children
-                    .insert(name.to_string(), inode)
+                    .insert(name.to_string(), inode)?
                     .is_some()
                 {
                     return Err(invalid(format!("duplicate snapshot entry {path:?}")));
@@ -913,7 +951,7 @@ impl Mst2Fuse {
             }
             state.next_inode += 1;
             let inode = state.next_inode;
-            parent_dir.children.insert(name.to_string(), inode);
+            parent_dir.children.insert(name.to_string(), inode)?;
             state.nodes.insert(
                 inode,
                 Node::File(FileNode {
@@ -925,6 +963,7 @@ impl Mst2Fuse {
                 }),
             );
         }
+        seal_directory_indices(&mut state);
         Ok(Mst2Fuse {
             read_profile: None,
             reader,
@@ -944,47 +983,27 @@ impl Mst2Fuse {
     /// One directory listing from `offset` on, in the offset convention both
     /// `readdir` and `readdirplus` use: entry `n` carries the offset of entry
     /// `n + 1`, so the kernel resumes without duplicates.
-    fn listing(&self, inode: Inode, offset: i64) -> Result<Vec<ListEntry>> {
+    fn listing(&self, inode: Inode, offset: i64) -> Result<DirectoryListing> {
         let state = self.state.lock().unwrap();
         let d = match state.nodes.get(&inode) {
             Some(Node::Dir(d)) => d,
             _ => return Err(Errno::from(libc::ENOTDIR)),
         };
-        let parent = d.parent;
+        let entries = d.children.snapshot().map_err(io_err)?;
+        let next = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+        Ok(DirectoryListing {
+            next: next.min(entries.len() + 2),
+            entries,
+            inode,
+            parent: d.parent,
+        })
+    }
 
-        let mut out = Vec::new();
-        if offset < 1 {
-            out.push(ListEntry {
-                inode,
-                kind: FileType::Directory,
-                name: ".".into(),
-                offset: 1,
-            });
+    fn record_directory_reply(&self, entry: &ListEntry) {
+        if let Some(profile) = &self.read_profile {
+            profile.add(Metric::DirectoryReplyEntriesBuilt, 1);
+            profile.add(Metric::DirectoryReplyNameBytes, entry.name.len() as u64);
         }
-        if offset < 2 {
-            out.push(ListEntry {
-                inode: parent,
-                kind: FileType::Directory,
-                name: "..".into(),
-                offset: 2,
-            });
-        }
-        for (i, (name, ino)) in d.children.iter().enumerate() {
-            let off = (i + 3) as i64;
-            if off > offset {
-                out.push(ListEntry {
-                    inode: *ino,
-                    kind: state
-                        .nodes
-                        .get(ino)
-                        .map(entry_kind)
-                        .unwrap_or(FileType::RegularFile),
-                    name: name.clone(),
-                    offset: off,
-                });
-            }
-        }
-        Ok(out)
     }
 
     async fn read_local(
@@ -1917,8 +1936,9 @@ impl Mst2Fuse {
                 ));
             }
         };
-        let mut entries = Vec::with_capacity(directory.children.len());
-        for (name, inode) in &directory.children {
+        let children = directory.children.snapshot()?;
+        let mut entries = Vec::with_capacity(children.len());
+        for (name, inode) in children.iter() {
             let node = state.nodes.get(inode).ok_or_else(|| {
                 SnapshotError::new(
                     SnapshotErrorCode::IntegrityError,
@@ -2104,7 +2124,7 @@ fn ensure_child(
     } else {
         Node::Dir(DirNode {
             path: full,
-            children: BTreeMap::new(),
+            children: FixedDirectoryIndex::default(),
             parent: parent_inode,
             loaded: true,
             page_id: None,
@@ -2112,7 +2132,7 @@ fn ensure_child(
     };
     state.nodes.insert(inode, node);
     if let Some(Node::Dir(d)) = state.nodes.get_mut(&parent_inode) {
-        d.children.insert(name.to_string(), inode);
+        d.children.insert(name.to_string(), inode)?;
     }
     Ok(inode)
 }
@@ -2222,20 +2242,33 @@ impl Filesystem for Mst2Fuse {
     {
         self.ensure_loaded(inode).await?;
         let listing = self.listing(inode, offset)?;
-        let entries: Vec<Result<DirectoryEntry>> = listing
-            .into_iter()
-            .map(|e| {
-                Ok(DirectoryEntry {
-                    inode: e.inode,
-                    kind: e.kind,
-                    name: e.name.into(),
-                    offset: e.offset,
-                })
-            })
-            .collect();
         self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyDirectory {
-            entries: iter(entries),
+            entries: try_unfold(listing, move |mut listing| async move {
+                self.check_metadata_lease().map_err(io_err)?;
+                let Some(e) = listing.next() else {
+                    return Ok(None);
+                };
+                let kind = e.kind.unwrap_or_else(|| {
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .nodes
+                        .get(&e.inode)
+                        .map(entry_kind)
+                        .unwrap_or(FileType::RegularFile)
+                });
+                self.record_directory_reply(&e);
+                Ok(Some((
+                    DirectoryEntry {
+                        inode: e.inode,
+                        kind,
+                        name: e.name.into(),
+                        offset: e.offset,
+                    },
+                    listing,
+                )))
+            }),
         })
     }
 
@@ -2254,25 +2287,29 @@ impl Filesystem for Mst2Fuse {
     > {
         self.ensure_loaded(inode).await?;
         let listing = self.listing(inode, offset as i64)?;
-        let mut entries: Vec<Result<DirectoryEntryPlus>> = Vec::with_capacity(listing.len());
-        for e in listing {
-            // "." and ".." are the directory itself; children resolve through
-            // the same inode table, so attributes come from one place.
-            let attr = self.node_attr(e.inode)?;
-            entries.push(Ok(DirectoryEntryPlus {
-                inode: e.inode,
-                generation: 0,
-                kind: e.kind,
-                name: e.name.into(),
-                offset: e.offset,
-                attr,
-                entry_ttl: TTL,
-                attr_ttl: TTL,
-            }));
-        }
         self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyDirectoryPlus {
-            entries: iter(entries),
+            entries: try_unfold(listing, move |mut listing| async move {
+                self.check_metadata_lease().map_err(io_err)?;
+                let Some(e) = listing.next() else {
+                    return Ok(None);
+                };
+                let attr = self.node_attr(e.inode)?;
+                self.record_directory_reply(&e);
+                Ok(Some((
+                    DirectoryEntryPlus {
+                        inode: e.inode,
+                        generation: 0,
+                        kind: e.kind.unwrap_or(attr.kind),
+                        name: e.name.into(),
+                        offset: e.offset,
+                        attr,
+                        entry_ttl: TTL,
+                        attr_ttl: TTL,
+                    },
+                    listing,
+                )))
+            }),
         })
     }
 
