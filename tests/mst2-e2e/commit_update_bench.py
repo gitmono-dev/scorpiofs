@@ -633,6 +633,7 @@ def parser():
     p.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     p.add_argument("--deadline-seconds", type=int, choices=range(60, 14401), default=14400)
     p.add_argument("--session-deadline-utc")
+    budget_module.add_recovery_argument(p)
     p.add_argument("--work-cleanup-deadline-monotonic", type=float,
                    default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     return p

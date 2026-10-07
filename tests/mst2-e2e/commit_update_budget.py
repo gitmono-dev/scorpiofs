@@ -20,6 +20,22 @@ MARGIN = 10 * 60
 ROUND_SECONDS = 25 * 60
 STAGES = {"server-build": 35 * 60, "client-build": 20 * 60,
           "fences": 10 * 60, "setup": 10 * 60}
+STAGE_MINIMUM = {"server-build": 5 * 60, "client-build": 5 * 60,
+                 "fences": 60, "setup": 60}
+
+
+def recovery_flag(value):
+    if type(value) is bool:
+        return value
+    if type(value) is str and value in ("true", "false"):
+        return value == "true"
+    raise ValueError("original-window recovery must be true or false")
+
+
+def add_recovery_argument(parser):
+    parser.add_argument("--recover-original-window", nargs="?", const=True, type=recovery_flag,
+                        default=os.environ.get("RECOVERY_INPUT", "false"),
+                        help="explicitly recover within the original absolute session window")
 
 
 def utc(value):
@@ -30,24 +46,30 @@ def utc(value):
 
 
 class SessionBudget:
-    def __init__(self, deadline_utc, rounds, cleanup_deadline=None):
+    def __init__(self, deadline_utc, rounds, cleanup_deadline=None, recover_original_window=False):
+        if type(recover_original_window) is not bool:
+            raise ValueError("session recovery requires an explicit boolean")
         absolute = utc(deadline_utc)
         if isinstance(rounds, bool) or not 3 <= rounds <= 10:
             raise ValueError("at least three complete rounds are required")
         # Workflow establishes this monotonic anchor once, before builds. A
         # standalone invocation also converts its absolute UTC deadline once.
+        remaining = absolute.timestamp() - time.time()
+        now = time.monotonic()
+        if not 0 < remaining <= 235 * 60:
+            raise ValueError("session deadline exceeds the fixed window")
+        original_cleanup_limit = now + remaining - EXTERNAL_RESERVE
         if cleanup_deadline is None:
-            remaining = absolute.timestamp() - time.time()
-            if not 0 < remaining <= 235 * 60:
-                raise ValueError("session deadline exceeds the fixed window")
-            cleanup_deadline = time.monotonic() + remaining - EXTERNAL_RESERVE
+            cleanup_deadline = original_cleanup_limit
         if (not math.isfinite(cleanup_deadline)
-                or cleanup_deadline - time.monotonic() > 220 * 60):
+                or not 0 < cleanup_deadline - now <= 220 * 60
+                or cleanup_deadline > original_cleanup_limit + 1):
             raise ValueError("invalid work/cleanup deadline anchor")
         self.deadline_utc = absolute.isoformat()
         self.cleanup_deadline = cleanup_deadline
         self.measurement_deadline = cleanup_deadline - CLEANUP_RESERVE - REPORT_RESERVE
         self.rounds = rounds
+        self.recover_original_window = recover_original_window
 
     def require(self, seconds):
         if self.cleanup_deadline - time.monotonic() < seconds:
@@ -59,8 +81,17 @@ class SessionBudget:
         names = tuple(STAGES)
         later = sum(STAGES[name] for name in names[names.index(stage) + 1:])
         reserve = later + self.rounds * ROUND_SECONDS + REPORT_RESERVE + CLEANUP_RESERVE + MARGIN
-        self.require(STAGES[stage] + reserve)
-        return min(time.monotonic() + STAGES[stage], self.cleanup_deadline - reserve)
+        required = STAGE_MINIMUM[stage] if self.recover_original_window else STAGES[stage]
+        self.require(required + reserve)
+        now = time.monotonic()
+        cap = min(STAGES[stage], self.cleanup_deadline - now - reserve)
+        if cap < required:
+            raise TimeoutError("insufficient current-stage session budget")
+        print(json.dumps({"record": "session_stage_budget", "stage": stage,
+                          "recover_original_window": self.recover_original_window,
+                          "stage_cap_minutes": round(cap / 60, 3),
+                          "future_reserved_minutes": reserve / 60}), flush=True)
+        return now + cap
 
     def round_deadline(self, number):
         if not 1 <= number <= self.rounds:
@@ -77,11 +108,13 @@ class SessionBudget:
 
 
 def from_options(options):
+    recovery = recovery_flag(getattr(options, "recover_original_window",
+                                    os.environ.get("RECOVERY_INPUT", "false")))
     existing = getattr(options, "budget", None)
     if existing is not None:
         return existing
     return SessionBudget(options.session_deadline_utc, options.rounds,
-                         getattr(options, "work_cleanup_deadline_monotonic", None))
+                         getattr(options, "work_cleanup_deadline_monotonic", None), recovery)
 
 
 def group_members(pgid, started):
@@ -322,6 +355,7 @@ def main():
                         default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     parser.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     parser.add_argument("--stage", choices=tuple(STAGES), required=True)
+    add_recovery_argument(parser)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     options = parser.parse_args()
     if not options.session_deadline_utc:

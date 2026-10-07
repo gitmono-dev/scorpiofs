@@ -226,7 +226,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
             env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
                        GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
                        STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
-                       PYTHONPATH=str(SOURCE.parent))
+                       PYTHONPATH=str(SOURCE.parent), RECOVERY_INPUT="false")
             for _ in range(2):
                 subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
                 self.assertIn("MST2_SESSION_STARTED=" + started.isoformat(), output.read_text())
