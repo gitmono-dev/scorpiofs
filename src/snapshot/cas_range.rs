@@ -55,7 +55,10 @@ pub(crate) struct VerifiedCasRange {
 #[cfg(test)]
 type AdmittedPause = Option<Box<dyn FnOnce() + Send>>;
 #[cfg(not(test))]
-type AdmittedPause = ();
+#[derive(Default)]
+struct AdmittedPause {
+    _private: (),
+}
 
 impl VerifiedCasRange {
     #[allow(clippy::too_many_arguments)]
