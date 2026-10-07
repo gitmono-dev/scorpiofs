@@ -1,6 +1,9 @@
 //! Actual HTTP owners and real durable hydration, including update/recovery.
 
-use std::{collections::HashMap, fs};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs,
+};
 
 use super::*;
 use crate::snapshot::{
@@ -40,10 +43,22 @@ async fn real_workspace_update_reuses_owned_proof_but_keeps_full_cas_commit_audi
     .unwrap();
     let counter = BatchProofCounter::install(cold.content_dir());
     let report = bounded_hydrate(&cold, &cold_reader).await;
+    let cold_fixture = &server.fixture.versions[0];
+    let cold_unique: BTreeSet<&[u8]> = cold_fixture.bodies.values().map(Vec::as_slice).collect();
+    let cold_unique_bytes: u64 = cold_unique.iter().map(|body| body.len() as u64).sum();
+    let cold_logical_bytes: u64 = cold_fixture
+        .bodies
+        .values()
+        .map(|body| body.len() as u64)
+        .sum();
+    assert_eq!(cold_fixture.bodies.len(), 320);
+    assert_eq!(cold_unique.len(), 192);
+    assert_eq!(report.total_files, cold_fixture.bodies.len() as u64);
+    assert_eq!(report.bytes_total, cold_logical_bytes);
     assert_eq!(report.fetched, 192);
     assert_eq!(counter.counts().raw_hashes, 0);
     assert_eq!(counter.counts().verified_reuses, report.fetched);
-    assert_eq!(counter.counts().verified_reuse_bytes, report.bytes_total);
+    assert_eq!(counter.counts().verified_reuse_bytes, cold_unique_bytes);
     assert_full_snapshot(&cold, &cold_reader, &server.fixture.versions[0]);
 
     counter.reset();
@@ -56,9 +71,22 @@ async fn real_workspace_update_reuses_owned_proof_but_keeps_full_cas_commit_audi
     .unwrap();
     let meters = changed.enable_verification_meters();
     let report = bounded_hydrate(&changed, &changed_reader).await;
-    let changed_bytes = server.fixture.versions[1].bodies["/d0/f000"].len() as u64;
+    let changed_fixture = &server.fixture.versions[1];
+    let changed_unique: BTreeSet<&[u8]> =
+        changed_fixture.bodies.values().map(Vec::as_slice).collect();
+    let changed_unique_bytes: u64 = changed_unique.iter().map(|body| body.len() as u64).sum();
+    let changed_logical_bytes: u64 = changed_fixture
+        .bodies
+        .values()
+        .map(|body| body.len() as u64)
+        .sum();
+    let changed_bytes = changed_fixture.bodies["/d0/f000"].len() as u64;
+    assert_eq!(changed_fixture.bodies.len(), 320);
+    assert_eq!(changed_unique.len(), 192);
+    assert_eq!(report.total_files, changed_fixture.bodies.len() as u64);
+    assert_eq!(report.bytes_total, changed_logical_bytes);
     assert_eq!(report.fetched, 1);
-    assert_eq!(report.resumed, 191);
+    assert_eq!(report.resumed, changed_fixture.bodies.len() as u64 - 1);
     assert_eq!(
         counter.counts(),
         BatchProofCounts {
@@ -70,7 +98,7 @@ async fn real_workspace_update_reuses_owned_proof_but_keeps_full_cas_commit_audi
     let commit = meters.snapshot_for(CasVerificationReason::HydrationCommit);
     assert_eq!(commit.calls, 192);
     assert_eq!(commit.verified, 192);
-    assert_eq!(commit.read_bytes, report.bytes_total);
+    assert_eq!(commit.read_bytes, changed_unique_bytes);
     assert_eq!(changed_reader.content_usage().output_bytes, 0);
     assert_eq!(changed_reader.content_usage().construction_bytes, 0);
     assert_full_snapshot(&changed, &changed_reader, &server.fixture.versions[1]);
