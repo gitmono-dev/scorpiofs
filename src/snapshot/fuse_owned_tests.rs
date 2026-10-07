@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures::StreamExt;
 use libfuse_fs::unionfs::layer::Layer;
 use mst2_codec::{
     chunkmap::{ChunkLeaf, ChunkMap, CHUNK_SIZE},
