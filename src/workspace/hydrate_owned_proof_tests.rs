@@ -1,6 +1,6 @@
 //! Actual HTTP owners and real durable hydration, including update/recovery.
 
-use std::fs;
+use std::{collections::HashMap, fs};
 
 use super::*;
 use crate::snapshot::{
