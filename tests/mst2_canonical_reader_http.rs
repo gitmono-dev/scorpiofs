@@ -1,13 +1,17 @@
 //! Canonical discovery must drive the real fixed reader and both transports.
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 use axum::{
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -22,8 +26,8 @@ use scorpiofs::snapshot::{
     capabilities::CapabilityAdvertisement,
     durable::digest_of,
     frames::{parse_digest, MetadataPageItem},
-    ChunkedFile, CompletionKind, DurableStore, LocalPinState, Mst2Client, ResolveDelivery,
-    ResolveRequest, ResolveTarget, ScopeCache, SnapshotErrorCode, SnapshotReader,
+    ChunkedFile, CompletionKind, DurableStore, LocalPinState, Mst2Client, OwnedChunkedFile,
+    ResolveDelivery, ResolveRequest, ResolveTarget, ScopeCache, SnapshotErrorCode, SnapshotReader,
 };
 use serde_json::{json, Value};
 
@@ -62,6 +66,7 @@ struct Fixture {
     caps: Mutex<Value>,
     resolve_override: Mutex<Option<Value>>,
     legacy_flat_map: Mutex<bool>,
+    map_not_ready: AtomicUsize,
     calls: Mutex<Vec<(String, Value)>>,
     descriptor: ServingDescriptor,
     pages: BTreeMap<String, Vec<u8>>,
@@ -137,6 +142,7 @@ impl Fixture {
             caps: Mutex::new(caps),
             resolve_override: Mutex::new(None),
             legacy_flat_map: Mutex::new(false),
+            map_not_ready: AtomicUsize::new(0),
             calls: Mutex::new(vec![]),
             descriptor,
             pages,
@@ -314,9 +320,22 @@ async fn frames(
 async fn map(
     State(f): State<Arc<Fixture>>,
     Query(query): Query<BTreeMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
     assert_eq!(query["path"].trim_start_matches('/'), "large");
+    assert_eq!(query["expected_digest"], id(&f.map.file_content_id));
     f.record("chunk-map", json!(query));
+    if f.map_not_ready
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":{"code":"METADATA_NOT_READY","message":"fixed map is being prepared","request_id":"canonical-map","retryable":true}})),
+        )
+            .into_response();
+    }
     let descriptor = json!({"schema_version":2,"file_content_id":id(&f.map.file_content_id),"file_size":f.map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":f.map.chunk_count.to_string(),"page_count":"1","pages_root":id(&f.map.pages_root),"map_id":id(&f.map.map_id())});
     let mut body = json!({"snapshot_id":f.sid(),"path":query["path"],"map":descriptor});
     if *f.legacy_flat_map.lock().unwrap() {
@@ -325,7 +344,7 @@ async fn map(
             .unwrap()
             .extend(descriptor.as_object().unwrap().clone());
     }
-    Json(body)
+    Json(body).into_response()
 }
 async fn leaf(
     State(f): State<Arc<Fixture>>,
@@ -534,6 +553,95 @@ async fn canonical_ranges_use_page_index_and_split_actual_chunks_by_advertised_b
     );
     assert_eq!(s.calls("chunk-map/pages").len(), 2);
     assert_eq!(s.calls("resolve").len(), 1);
+}
+
+#[tokio::test]
+async fn canonical_owned_range_recovers_metadata_not_ready_without_resolving_another_view() {
+    let fixture = Fixture::new();
+    fixture.map_not_ready.store(1, Ordering::SeqCst);
+    let s = Server::start(fixture).await;
+    let reader = s.reader().await;
+    let closure = reader.snapshot_closure().await.unwrap();
+    reader.seed_content_membership(&closure).unwrap();
+    let file = closure
+        .files()
+        .iter()
+        .find(|file| file.rel_path == "large")
+        .unwrap();
+    let baseline = reader.content_usage();
+    let range = OwnedChunkedFile::open(&reader, "/large", &file.content_digest, file.size)
+        .await
+        .unwrap();
+    let bytes = range
+        .read_range_owned(CHUNK_SIZE as u64 - 2, 6)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_bytes(), [0x51; 6]);
+    assert_eq!(s.calls("chunk-map").len(), 2);
+    assert_eq!(s.client.retry_count(), 1);
+    assert_eq!(s.calls("chunk-map/pages").len(), 1);
+    assert_eq!(s.calls("chunks").len(), 2);
+    assert_eq!(s.calls("resolve").len(), 1);
+    assert_eq!(reader.snapshot_id(), s.f.sid());
+    assert_eq!(reader.lease_id(), "canonical-lease");
+    drop(bytes);
+    drop(range);
+    assert_eq!(reader.content_usage(), baseline);
+}
+
+#[tokio::test]
+async fn canonical_owned_range_metadata_not_ready_stops_at_the_attempt_budget_and_can_recover() {
+    let fixture = Fixture::new();
+    fixture.map_not_ready.store(usize::MAX, Ordering::SeqCst);
+    let mut s = Server::start(fixture).await;
+    s.client = s
+        .client
+        .clone()
+        .with_request_timeout(Duration::from_secs(3));
+    let reader = s.reader().await;
+    let closure = reader.snapshot_closure().await.unwrap();
+    reader.seed_content_membership(&closure).unwrap();
+    let file = closure
+        .files()
+        .iter()
+        .find(|file| file.rel_path == "large")
+        .unwrap();
+    let baseline = reader.content_usage();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        OwnedChunkedFile::open(&reader, "/large", &file.content_digest, file.size),
+    )
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
+    assert_eq!(error.code, SnapshotErrorCode::MetadataNotReady);
+    assert_eq!(error.http_status, 503);
+    assert_eq!(s.calls("chunk-map").len(), 4);
+    assert_eq!(s.client.retry_count(), 3);
+    assert!(s.calls("chunk-map/pages").is_empty());
+    assert!(s.calls("chunks").is_empty());
+    assert_eq!(reader.content_usage(), baseline);
+
+    s.f.map_not_ready.store(0, Ordering::SeqCst);
+    let range = OwnedChunkedFile::open(&reader, "/large", &file.content_digest, file.size)
+        .await
+        .unwrap();
+    let bytes = range
+        .read_range_owned(2 * CHUNK_SIZE as u64, 7)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_bytes(), [0x51; 7]);
+    assert_eq!(s.calls("chunk-map").len(), 5);
+    assert_eq!(s.client.retry_count(), 3);
+    assert_eq!(s.calls("chunk-map/pages").len(), 1);
+    assert_eq!(s.calls("chunks").len(), 1);
+    assert_eq!(s.calls("resolve").len(), 1);
+    assert_eq!(reader.snapshot_id(), s.f.sid());
+    assert_eq!(reader.lease_id(), "canonical-lease");
+    drop(bytes);
+    drop(range);
+    assert_eq!(reader.content_usage(), baseline);
 }
 
 #[tokio::test]

@@ -58,6 +58,8 @@ pub enum SnapshotErrorCode {
     ScopeForbidden,
     ViewNotFound,
     SnapshotNotReady,
+    /// Fixed-view metadata is temporarily unavailable (METADATA_NOT_READY, 503).
+    MetadataNotReady,
     /// The fixed view no longer exists (spec 14 §5 SNAPSHOT_GONE, 410).
     SnapshotGone,
     PathNotFound,
@@ -111,6 +113,7 @@ impl SnapshotErrorCode {
             "SCOPE_FORBIDDEN" => Self::ScopeForbidden,
             "VIEW_NOT_FOUND" => Self::ViewNotFound,
             "SNAPSHOT_NOT_READY" => Self::SnapshotNotReady,
+            "METADATA_NOT_READY" => Self::MetadataNotReady,
             "SNAPSHOT_GONE" => Self::SnapshotGone,
             "PATH_NOT_FOUND" => Self::PathNotFound,
             "NOT_DIRECTORY" => Self::NotDirectory,

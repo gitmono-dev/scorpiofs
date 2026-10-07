@@ -2491,6 +2491,7 @@ fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
         Unauthenticated | ScopeForbidden | LeaseUnknown => libc::EACCES,
         LeaseExpired | SnapshotGone => libc::ESTALE,
         NotDirectory => libc::ENOTDIR,
+        MetadataNotReady => libc::EAGAIN,
         DigestMismatch => libc::EIO,
         _ => libc::EIO,
     };

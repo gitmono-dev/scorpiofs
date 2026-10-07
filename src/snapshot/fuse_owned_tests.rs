@@ -12,7 +12,7 @@ use axum::{
     body::Body,
     extract::{Query, State as HttpState},
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -111,6 +111,7 @@ struct Fixture {
     metadata: Mutex<Vec<String>>,
     requests: AtomicUsize,
     map_requests: AtomicUsize,
+    map_not_ready: AtomicUsize,
     leaf_requests: AtomicUsize,
     chunk_requests: AtomicUsize,
     emitted: Arc<AtomicUsize>,
@@ -168,6 +169,7 @@ impl Fixture {
             metadata: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             map_requests: AtomicUsize::new(0),
+            map_not_ready: AtomicUsize::new(0),
             leaf_requests: AtomicUsize::new(0),
             chunk_requests: AtomicUsize::new(0),
             emitted: Arc::new(AtomicUsize::new(0)),
@@ -411,7 +413,7 @@ async fn raw(
 async fn map_response(
     HttpState(f): HttpState<Arc<Fixture>>,
     Query(query): Query<BTreeMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
     f.map_requests.fetch_add(1, Ordering::SeqCst);
     f.range_paths
         .lock()
@@ -420,11 +422,23 @@ async fn map_response(
     let map = &f.large.as_ref().unwrap().map;
     assert!(query["path"].trim_start_matches('/').starts_with("range"));
     assert_eq!(query["expected_digest"], id(&map.file_content_id));
+    if f.map_not_ready
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":{"code":"METADATA_NOT_READY","message":"fixed map is being prepared","request_id":"fuse-map","retryable":false}})),
+        )
+            .into_response();
+    }
     let mut value = json!({"snapshot_id":id(&f.descriptor.snapshot_id().unwrap()),"path":query["path"],"schema_version":2,"file_content_id":id(&map.file_content_id),"file_size":map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":map.chunk_count.to_string(),"page_count":map.page_count.to_string(),"pages_root":id(&map.pages_root),"map_id":id(&map.map_id())});
     if f.mode.load(Ordering::SeqCst) == 5 {
         value["file_size"] = json!((map.file_size + 1).to_string());
     }
-    Json(value)
+    Json(value).into_response()
 }
 async fn leaf_response(
     HttpState(f): HttpState<Arc<Fixture>>,
@@ -1792,6 +1806,60 @@ async fn actual_range_reply_retention_blocks_admission_until_the_last_bytes_drop
             .as_ref(),
         [2; 7]
     );
+    drop(fs);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn actual_metadata_not_ready_returns_eagain_without_publishing_or_latching_a_range() {
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::new(false, true).with_large();
+    fixture.map_not_ready.store(1, Ordering::SeqCst);
+    let server = Server::start(fixture, 8 * 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let file = inode(&fs, "range000").await;
+    let baseline = server.reader.content_usage();
+    assert_eq!(
+        i32::from(
+            fs.read(Request::default(), file, file, CHUNK_SIZE as u64 - 2, 5)
+                .await
+                .unwrap_err()
+        ),
+        -libc::EAGAIN
+    );
+    idle(&server.reader).await;
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.reader.content_usage(), baseline);
+    assert_eq!(
+        fs.state
+            .lock()
+            .unwrap()
+            .owned
+            .as_ref()
+            .unwrap()
+            .ranges
+            .len(),
+        0
+    );
+
+    server.fixture.map_not_ready.store(0, Ordering::SeqCst);
+    let reply = fs
+        .read(Request::default(), file, file, CHUNK_SIZE as u64 - 2, 5)
+        .await
+        .unwrap();
+    assert_eq!(reply.data.as_ref(), [0, 0, 1, 1, 1]);
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        server.reader.snapshot_id(),
+        id(&server.fixture.descriptor.snapshot_id().unwrap())
+    );
+    drop(reply);
     drop(fs);
     idle(&server.reader).await;
     assert_eq!(server.reader.content_usage().output_bytes, 0);
