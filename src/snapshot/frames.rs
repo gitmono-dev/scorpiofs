@@ -1275,8 +1275,9 @@ pub fn check_merkle_root(leaves: &[[u8; 32]], root: [u8; 32]) -> Result<(), Snap
 mod tests {
     #[test]
     fn chunk_len_matches_the_map_rules() {
-        use super::{parse_digest, VerifiedChunkMap};
         use mst2_codec::chunkmap::CHUNK_SIZE;
+
+        use super::{parse_digest, VerifiedChunkMap};
 
         let size = 2 * CHUNK_SIZE as u64 + 7;
         let id = "sha256:".to_string() + &"0".repeat(64);
