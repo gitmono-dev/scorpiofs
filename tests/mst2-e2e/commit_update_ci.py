@@ -573,6 +573,7 @@ if __name__ == "__main__":
     parser.add_argument("--driver-sha256")
     parser.add_argument("--session-deadline-utc")
     parser.add_argument("--session-started-utc")
+    budget_module.add_recovery_argument(parser)
     parser.add_argument("--work-cleanup-deadline-monotonic", type=float,
                         default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
     parser.add_argument("--profile", choices=("smoke", "medium"), default="medium")
