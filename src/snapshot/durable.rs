@@ -1122,6 +1122,8 @@ impl DurableStore {
         let mut resumed = 0u64;
         let mut repaired = 0u64;
         let mut bytes_total = 0u64;
+        let prefetch_chunks = stream_reader
+            .is_some_and(|source| source.reader().content_scope.can_prefetch_hydration());
 
         for f in manifest {
             // Content reuse (spec 11 §10.2): the CAS is content-addressed and
@@ -1162,7 +1164,7 @@ impl DurableStore {
                 f.size > crate::snapshot::OBJECT_CAP
                     && source.reader().capabilities().features.chunk_reads
             }) {
-                write_reader_blob(&self.content, source, f)
+                write_reader_blob(&self.content, source, f, prefetch_chunks)
                     .await
                     .map_err(|error| {
                         tag_hydration_error(error, HydrationSubstage::LargeContentFetch)
@@ -1367,6 +1369,10 @@ impl DurableStore {
             plan.push((file.clone(), Vec::new()));
         }
 
+        let prefetch_chunks = concurrency.max(1) <= 2
+            && (concurrency.max(1) == 1 || plan.len() == 1)
+            && stream_reader.is_some_and(|reader| reader.content_scope.can_prefetch_hydration());
+
         futures::stream::iter(plan)
             .map(Ok::<_, SnapshotError>)
             .try_for_each_concurrent(concurrency.max(1), |(f, aliases)| {
@@ -1400,6 +1406,7 @@ impl DurableStore {
                             &store.content,
                             HydrationRangeSource::FixedRoot(reader),
                             &f,
+                            prefetch_chunks,
                         )
                         .await?;
                     } else {
@@ -1728,6 +1735,13 @@ impl DurableStore {
         small.dedup_by(|a, b| a.content_digest == b.content_digest);
         large.sort_by(|a, b| a.content_digest.cmp(&b.content_digest));
         large.dedup_by(|a, b| a.content_digest == b.content_digest);
+        // Capture this hint before either lane can own paid buffers. A single
+        // needed large object can use both existing chunk request slots.
+        let prefetch_chunks = !large.is_empty()
+            && (large_concurrency.max(1) == 1 || large.len() == 1)
+            && batch_concurrency.max(1) <= 2
+            && large_concurrency.max(1) <= 2
+            && stream_reader.is_some_and(|reader| reader.content_scope.can_prefetch_hydration());
 
         // Group into batches under the server's per-request limits.
         let mut batches: Vec<Vec<SnapshotFile>> = Vec::new();
@@ -1825,6 +1839,7 @@ impl DurableStore {
                                 &store.content,
                                 HydrationRangeSource::FixedRoot(reader),
                                 &f,
+                                prefetch_chunks,
                             )
                             .await?;
                         } else {
@@ -3043,12 +3058,13 @@ async fn write_reader_blob(
     dir: &Path,
     source: HydrationRangeSource<'_>,
     file: &SnapshotFile,
+    prefetch_chunks: bool,
 ) -> Result<(), SnapshotError> {
     let source = source
         .open(file)
         .await
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkMap))?;
-    write_reader_blob_stream(dir, file, |offset, length| {
+    write_reader_blob_stream(dir, file, prefetch_chunks, |offset, length| {
         source.read_range_owned(offset, length)
     })
     .await
@@ -3057,6 +3073,7 @@ async fn write_reader_blob(
 async fn write_reader_blob_stream<F, Fut>(
     dir: &Path,
     file: &SnapshotFile,
+    prefetch_chunks: bool,
     mut read_range: F,
 ) -> Result<(), SnapshotError>
 where
@@ -3080,23 +3097,44 @@ where
     let mut offset = 0;
     while offset < file.size {
         let length = (file.size - offset).min(mst2_codec::chunkmap::CHUNK_SIZE as u64);
-        let bytes = read_range(offset, length)
-            .await
+        let next_offset = offset + length;
+        let (first, second) = if prefetch_chunks && next_offset < file.size {
+            let next_length =
+                (file.size - next_offset).min(mst2_codec::chunkmap::CHUNK_SIZE as u64);
+            let (first, second) = futures::try_join!(
+                read_range(offset, length),
+                read_range(next_offset, next_length)
+            )
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkRead))?;
-        if bytes.len() as u64 != length {
-            return Err(tag_hydration_error(
-                integrity_err("streamed chunk does not cover the expected file range"),
-                HydrationSubstage::LargeChunkRead,
-            ));
+            (
+                (offset, length, first),
+                Some((next_offset, next_length, second)),
+            )
+        } else {
+            let first = read_range(offset, length)
+                .await
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkRead))?;
+            ((offset, length, first), None)
+        };
+        // Returned owners retain their credits through their ordered write.
+        // try_join drops the pending sibling on error; no task outlives this
+        // writer or can publish its temporary file after cancellation.
+        for (range_offset, range_length, owner) in std::iter::once(first).chain(second) {
+            if range_offset != offset || owner.len() as u64 != range_length {
+                return Err(tag_hydration_error(
+                    integrity_err("streamed chunk does not cover the expected file range"),
+                    HydrationSubstage::LargeChunkRead,
+                ));
+            }
+            let bytes = owner.as_bytes();
+            hash.update(bytes);
+            output
+                .write_all(bytes)
+                .await
+                .map_err(io_err)
+                .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
+            offset += range_length;
         }
-        let bytes = bytes.as_bytes();
-        hash.update(bytes);
-        output
-            .write_all(bytes)
-            .await
-            .map_err(io_err)
-            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
-        offset += length;
     }
     if format!("sha256:{}", hex::encode(hash.finish().as_ref())) != file.content_digest {
         return Err(tag_hydration_error(
