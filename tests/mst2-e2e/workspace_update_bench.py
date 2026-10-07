@@ -76,6 +76,7 @@ def execute(options):
         print(json.dumps(record, sort_keys=True), flush=True)
 
     emit({"record": "environment", "profile": options.profile, "rounds": options.rounds,
+          "scenarios": common.SCENARIOS,
           "architecture": "workspace-v3", "publication_mode": "native", "service_binding": owner,
           "instrumentation_mode": "shipped-workspace-and-typed-projection-sinks",
           "scorpio_binary_sha256": file_digest(options.driver),
@@ -104,7 +105,7 @@ def execute(options):
             worker = WorkerSession(group, daemon.url, daemon.workspace_root, git_store,
                                    options.git_url, git_env, deadline=deadline,
                                    env=common.clean_env(), daemon_uid=daemon.uid)
-            for number, version in enumerate(("v1", "v2", "v3"), 1):
+            for number, version in enumerate(common.SCENARIOS, 1):
                 common.driver_binding(options)
                 daemon.check_owner(socket_required=True)
                 if common.service_binding(options) != owner or tip() != current:
@@ -145,6 +146,7 @@ def execute(options):
                 if after != identity or tip() != current or common.service_binding(options) != owner:
                     raise AssertionError("fixed commit or native service changed across measurements")
                 record = {"record": "round", "round": round_number, "version": version,
+                          "scenario": common.SCENARIOS[version],
                           "fixed_commit": commit, "identity": identity, "native_publication": native,
                           "git_push_ms": push_ms, "publication_visible_ms": visible_ms,
                           "publication_to_both_sides_verified_wall_ms": (wall_end - publish_start) * 1000,
@@ -190,17 +192,18 @@ def execute(options):
                     errors.append(error)
             if errors and sys.exc_info()[0] is None:
                 raise AssertionError("owned v3 round cleanup was incomplete") from None
-    if len(records) != options.rounds * 3:
-        raise AssertionError("the full requested cold/single/rename matrix is required")
+    if len(records) != options.rounds * len(common.SCENARIOS):
+        raise AssertionError("the full requested cold/single/rename/batch matrix is required")
     deadline = budget.report_deadline()
     options.finalize_projection(deadline)
     projection_status = projection.finish(len(records), deadline)
     for record in records:
         record["correctness"] = "PASS"
         emit(record)
-    for version in ("v1", "v2", "v3"):
+    for version in common.SCENARIOS:
         samples = [record for record in records if record["version"] == version]
-        summary = {"record": "summary", "version": version, "samples": len(samples)}
+        summary = {"record": "summary", "version": version,
+                   "scenario": common.SCENARIOS[version], "samples": len(samples)}
         metrics = {
             "publication_visible_ms": [r["publication_visible_ms"] for r in samples],
             "scorpio_metadata_ready_ms": [r["scorpio"]["metadata_ready_ms"] for r in samples],
