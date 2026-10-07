@@ -156,7 +156,22 @@ async fn metadata_only_promotion_preserves_live_lazy_reads_and_collects_retired_
         .await
         .unwrap();
     assert_eq!(reply.data.as_ref(), expected);
-    assert_eq!(fs::read(cas_path(&live, &expected)).unwrap(), expected);
+    assert_eq!(current.object_calls.load(Ordering::SeqCst), body_calls + 1);
+    assert_eq!(current.raw_calls.load(Ordering::SeqCst), 0);
+    assert!(!cas_path(&live, &expected).exists());
+    let again = fs
+        .read(
+            Request::default(),
+            changed,
+            changed,
+            0,
+            expected.len() as u32,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.data.as_ref(), expected);
+    assert_eq!(current.object_calls.load(Ordering::SeqCst), body_calls + 1);
+    assert_eq!(current.raw_calls.load(Ordering::SeqCst), 0);
     assert!(!live.root().join("DURABLE_COMPLETE").exists());
 }
 

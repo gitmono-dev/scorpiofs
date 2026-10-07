@@ -1624,8 +1624,10 @@ mod tests {
             let reader = SnapshotReader::resolve(Mst2Client::new(url), "/project", 600)
                 .await
                 .unwrap();
-            let mut limits = super::super::CacheLimits::default();
-            limits.max_scan_millis = 10_000;
+            let mut limits = super::super::CacheLimits {
+                max_scan_millis: 10_000,
+                ..Default::default()
+            };
             if byte_budget {
                 limits.max_metadata_bytes = 1;
             } else {
@@ -1633,14 +1635,15 @@ mod tests {
             }
             let error = reader.snapshot_closure_for_cache(limits).await.unwrap_err();
             assert_eq!(error.code, SnapshotErrorCode::LimitExceeded);
-            let requests = fixture.requested.lock().unwrap();
-            assert!(!requests.is_empty());
-            assert_eq!(
-                requests.len(),
-                1,
-                "expansion refuses before a second metadata request"
-            );
-            drop(requests);
+            {
+                let requests = fixture.requested.lock().unwrap();
+                assert!(!requests.is_empty());
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "expansion refuses before a second metadata request"
+                );
+            }
             server.abort();
             let _ = server.await;
         }
