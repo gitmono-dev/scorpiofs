@@ -28,9 +28,10 @@ use mst2_codec::{
     treeframe::{EndPayload, MetaPayload, ObjectPayload},
 };
 use scorpiofs::snapshot::{
-    durable::digest_of, frames::parse_digest, fuse::Mst2Fuse, DurableStore, FetchCoordinator,
-    IncrementalSync, MetadataProofLimits, Mst2Client, ScopeCache, SnapshotErrorCode, SnapshotFile,
-    SnapshotReader,
+    capabilities::CapabilityAdvertisement, durable::digest_of, frames::parse_digest,
+    fuse::Mst2Fuse, DurableStore, FetchCoordinator, IncrementalSync, MetadataProofLimits,
+    Mst2Client, ResolveDelivery, ResolveRequest, ResolveTarget, ScopeCache, SnapshotErrorCode,
+    SnapshotFile, SnapshotReader,
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -40,6 +41,7 @@ const NAMESPACE_VIEW_ID: [u8; 32] = [0x22; 32];
 
 #[derive(Default)]
 struct Fixture {
+    canonical: bool,
     root: [u8; 32],
     pages: HashMap<[u8; 32], Vec<u8>>,
     routes: HashMap<(String, Vec<u8>), [u8; 32]>,
@@ -238,6 +240,11 @@ fn wide_fixture() -> Fixture {
 }
 
 async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
+    if f.canonical {
+        return Json(
+            serde_json::from_str(include_str!("fixtures/mst2_capabilities_0_2_1.json")).unwrap(),
+        );
+    }
     Json(json!({
         "protocol_versions": [2], "metadata_codecs": [1], "frame_encodings": ["identity"],
         "features": {"resolve": true, "directory": true, "leases": true, "metadata_pages": true,
@@ -246,8 +253,8 @@ async fn capabilities(State(f): State<Arc<Fixture>>) -> Json<Value> {
     }))
 }
 
-async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
-    Json(json!({
+async fn resolve(State(f): State<Arc<Fixture>>, body: Bytes) -> Json<Value> {
+    let mut response = json!({
         "descriptor": {
             "schema_version": 2, "metadata_codec": 1, "instance_id": INSTANCE_ID,
             "namespace_view_id": id_string(&NAMESPACE_VIEW_ID), "scope": "/project",
@@ -256,7 +263,23 @@ async fn resolve(State(f): State<Arc<Fixture>>) -> Json<Value> {
         },
         "lease_id": "fixture-lease", "lease_expires_at": "2099-01-01T00:00:00Z",
         "publication_sequence": "1", "authorization_epoch": "1"
-    }))
+    });
+    if f.canonical {
+        // The owned v3 path uses the shipped typed latest/lazy request. Full
+        // metadata acquisition below remains distinct from body hydration.
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            request,
+            json!({
+                "target": {"kind": "latest"}, "scope": "/project", "delivery": "lazy",
+                "lease_seconds": 600, "supported_metadata_codecs": [1]
+            })
+        );
+        response["writer_epoch"] = json!("1");
+        response["resolved_at"] = json!("2026-09-15T00:00:00Z");
+        response["delivery"] = json!("lazy");
+    }
+    Json(response)
 }
 
 async fn metadata(
@@ -424,6 +447,11 @@ struct HttpFixture {
 }
 
 impl HttpFixture {
+    async fn start_canonical(mut fixture: Fixture) -> Self {
+        fixture.canonical = true;
+        Self::start(fixture).await
+    }
+
     async fn start(fixture: Fixture) -> Self {
         let fixture = Arc::new(fixture);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -467,6 +495,26 @@ impl HttpFixture {
         SnapshotReader::resolve(Mst2Client::new(&self.base), "/project", 600)
             .await
             .unwrap()
+    }
+
+    async fn canonical_reader(&self) -> SnapshotReader {
+        assert!(self.fixture.canonical);
+        let reader = SnapshotReader::resolve_request(
+            Mst2Client::new(&self.base),
+            &ResolveRequest {
+                target: ResolveTarget::Latest,
+                scope: "/project".into(),
+                delivery: ResolveDelivery::Lazy,
+                lease_seconds: 600,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            reader.capability_advertisement(),
+            CapabilityAdvertisement::Canonical(_)
+        ));
+        reader
     }
 }
 
@@ -515,8 +563,8 @@ fn cached_page_path(cache: &ScopeCache, id: &[u8; 32]) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn owned_lazy_fuse_reuses_synced_metadata_pages_without_expanding_unrelated_directories() {
-    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
-    let reader = http.reader().await;
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
     let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
     let closure = IncrementalSync::new(&reader, &cache)
@@ -589,8 +637,8 @@ async fn owned_lazy_fuse_reuses_synced_metadata_pages_without_expanding_unrelate
 
 #[tokio::test]
 async fn owned_lazy_fuse_fetches_only_missing_corrupt_and_oversized_page_hints() {
-    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
-    let reader = http.reader().await;
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
     let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
     IncrementalSync::new(&reader, &cache)
@@ -626,8 +674,8 @@ async fn owned_lazy_fuse_fetches_only_missing_corrupt_and_oversized_page_hints()
 
 #[tokio::test]
 async fn owned_lazy_fuse_does_not_publish_a_partial_directory_after_bad_wire() {
-    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
-    let reader = http.reader().await;
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
     let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
     IncrementalSync::new(&reader, &cache)
@@ -659,16 +707,16 @@ async fn owned_lazy_fuse_does_not_publish_a_partial_directory_after_bad_wire() {
 
 #[tokio::test]
 async fn owned_lazy_fuse_rejects_another_authority_before_reading_page_hints() {
-    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
-    let reader = http.reader().await;
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
     let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
     IncrementalSync::new(&reader, &cache)
         .sync_snapshot()
         .await
         .unwrap();
-    let other = HttpFixture::start(complete_fixture("a", b"target-one")).await;
-    let other_reader = other.reader().await;
+    let other = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let other_reader = other.canonical_reader().await;
     assert_eq!(reader.snapshot_id(), other_reader.snapshot_id());
     assert_ne!(
         reader.authorized_context().cache_domain(),
@@ -684,8 +732,8 @@ async fn owned_lazy_fuse_rejects_another_authority_before_reading_page_hints() {
 
 #[tokio::test]
 async fn lazy_fuse_without_an_owned_store_keeps_the_wire_page_path() {
-    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
-    let reader = http.reader().await;
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
     let (_owned, cache) = owned_fuse_page_cache(root.path(), &reader);
     IncrementalSync::new(&reader, &cache)
@@ -717,8 +765,8 @@ async fn lazy_fuse_without_an_owned_store_keeps_the_wire_page_path() {
 
 #[tokio::test]
 async fn owned_cached_pages_still_enforce_namespace_node_bounds() {
-    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
-    let reader = http.reader().await;
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
     let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
     IncrementalSync::new(&reader, &cache)
@@ -766,8 +814,8 @@ async fn owned_cached_pages_do_not_bypass_the_complete_directory_count_proof() {
     fixture.root = fixture.page("/", vec![], root_page);
     fixture.pages.remove(&old_root);
     fixture.pages.remove(&old_wide);
-    let http = HttpFixture::start(fixture).await;
-    let reader = http.reader().await;
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
     let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
     // These individually hash-valid bytes are deliberately just cache hints.
@@ -790,8 +838,8 @@ async fn owned_cached_pages_do_not_bypass_the_complete_directory_count_proof() {
 #[cfg(unix)]
 #[tokio::test]
 async fn owned_lazy_fuse_propagates_page_open_errors_without_wire_fallback() {
-    let http = HttpFixture::start(complete_fixture("a", b"target-one")).await;
-    let reader = http.reader().await;
+    let http = HttpFixture::start_canonical(complete_fixture("a", b"target-one")).await;
+    let reader = http.canonical_reader().await;
     let root = tempfile::tempdir().unwrap();
     let (store, cache) = owned_fuse_page_cache(root.path(), &reader);
     IncrementalSync::new(&reader, &cache)
