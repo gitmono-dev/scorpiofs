@@ -29,6 +29,9 @@ use tokio::sync::Notify;
 
 use super::{durability_tests::FaultGuard, *};
 
+#[path = "durable_online_tests.rs"]
+mod online_retirement;
+
 // This batch fixture exercises the coordinator's fixed final allocation while
 // the existing single-chunk fixture below keeps testing streaming CAS writes.
 async fn owned_chunks(
@@ -609,58 +612,32 @@ async fn hydrate_parallel(
     let fetch = move |file: SnapshotFile| {
         let source = source.clone();
         Box::pin(async move {
-            let bytes = if source.capabilities().features.chunk_reads {
-                source
-                    .read_file_frames(&file.rel_path, &file.content_digest, file.size)
-                    .await?
-            } else {
-                source
-                    .read_file(&file.rel_path, &file.content_digest)
-                    .await?
-            };
-            Ok(Arc::new(bytes))
-        }) as futures::future::BoxFuture<'static, Result<Arc<Vec<u8>>, SnapshotError>>
+            source
+                .read_content(&file, source.capabilities().features.chunk_reads)
+                .await
+        })
+            as futures::future::BoxFuture<
+                'static,
+                Result<Arc<crate::snapshot::VerifiedContent>, SnapshotError>,
+            >
     };
     match core {
         "concurrent" => {
             store
-                .hydrate_snapshot_concurrent(reader, closure, 2, fetch)
+                .hydrate_snapshot_concurrent_with_body(reader, closure, 2, fetch)
                 .await
         }
         "batch" => {
             let source = reader.clone();
             store
-                .hydrate_snapshot_batches(
+                .hydrate_snapshot_content_batches(
                     reader,
                     closure,
                     2,
                     2,
                     move |files| {
                         let source = source.clone();
-                        Box::pin(async move {
-                            let items: Vec<_> = files
-                                .iter()
-                                .map(|file| {
-                                    (format!("/{}", file.rel_path), file.content_digest.clone())
-                                })
-                                .collect();
-                            let objects = source
-                                .client()
-                                .objects(source.snapshot_id(), &items, source.encoding_hint())
-                                .await?;
-                            files
-                                .into_iter()
-                                .map(|file| {
-                                    let digest = crate::snapshot::frames::parse_digest(
-                                        &file.content_digest,
-                                    )?;
-                                    Ok((
-                                        file.content_digest,
-                                        Arc::new(objects.get(&digest).unwrap().clone()),
-                                    ))
-                                })
-                                .collect()
-                        })
+                        Box::pin(async move { source.read_content_batch(&files).await })
                     },
                     fetch,
                 )
@@ -810,7 +787,7 @@ async fn parallel_streams_mix_small_objects_and_large_aliases_with_old_complete_
         assert!(reopened.is_snapshot_complete().unwrap(), "{core}");
         assert_eq!(
             reopened
-                .pread_blob(&id(&fixture.whole), size - 4, 20)
+                .read_verified_blob_range(&id(&fixture.whole), size, size - 4, 20)
                 .unwrap()
                 .unwrap(),
             vec![pattern(65); 4]
@@ -974,15 +951,15 @@ async fn range_profile_rejects_above_eight_tib_before_request_and_accepts_bounda
     fixture.descriptor.metadata_root = page_id(&fixture.page);
     let (_server, fixture, reader, _store) = open_fixture(fixture, temp.path()).await;
     let digest = id(&fixture.advertised);
-    match crate::snapshot::ChunkedFile::open(&reader, "large.bin", &digest, size + 1).await {
+    match crate::snapshot::OwnedChunkedFile::open(&reader, "large.bin", &digest, size + 1).await {
         Ok(_) => panic!("over-profile range handle was accepted"),
         Err(error) => assert_eq!(error.code, SnapshotErrorCode::LimitExceeded),
     }
     assert_eq!(fixture.maps.load(Ordering::SeqCst), 0);
-    let handle = crate::snapshot::ChunkedFile::open(&reader, "large.bin", &digest, size)
+    let handle = crate::snapshot::OwnedChunkedFile::open(&reader, "large.bin", &digest, size)
         .await
         .unwrap();
-    assert_eq!(handle.size, size);
+    assert_eq!(handle.size(), size);
     assert_eq!(handle.map_id(), id(&fixture.map.map_id()));
     assert_eq!(fixture.maps.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.chunks.load(Ordering::SeqCst), 0);
@@ -1016,7 +993,7 @@ async fn large_online_stream_is_complete_reopens_and_resumes_without_fetching() 
     assert!(reopened.is_snapshot_complete().unwrap());
     let offset = CHUNK_SIZE as u64 - 3;
     let bytes = reopened
-        .pread_blob(&id(&fixture.whole), offset, 8)
+        .read_verified_blob_range(&id(&fixture.whole), size, offset, 8)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1034,7 +1011,7 @@ async fn large_online_stream_is_complete_reopens_and_resumes_without_fetching() 
     );
     assert_eq!(
         reopened
-            .pread_blob(&id(&fixture.whole), size - 4, 20)
+            .read_verified_blob_range(&id(&fixture.whole), size, size - 4, 20)
             .unwrap()
             .unwrap(),
         vec![pattern(65); 4]

@@ -2,8 +2,8 @@
 //! establish MTP2 membership or prove that a claimed EOF is cryptographic EOF.
 
 use super::{
+    content_profile::MAX_FILE_SIZE,
     frames::parse_count,
-    range::MAX_FILE_SIZE,
     types::{DirectoryResponse, SnapshotError, SnapshotErrorCode},
 };
 

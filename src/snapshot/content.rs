@@ -80,6 +80,7 @@ pub(crate) struct ContentBudget {
     output: Arc<Semaphore>,
     construction: Arc<Semaphore>,
     limits: ContentBudgetLimits,
+    cas_workers: OnceLock<Arc<super::cas_worker::CasReadScope>>,
 }
 
 #[derive(Clone, Copy)]
@@ -94,7 +95,14 @@ impl ContentBudget {
             output: Arc::new(Semaphore::new(limits.output_bytes / CREDIT)),
             construction: Arc::new(Semaphore::new(limits.construction_bytes / CREDIT)),
             limits,
+            cas_workers: OnceLock::new(),
         })
+    }
+
+    pub(crate) fn cas_workers(&self) -> Arc<super::cas_worker::CasReadScope> {
+        self.cas_workers
+            .get_or_init(super::cas_worker::CasReadScope::new)
+            .clone()
     }
 
     pub(crate) fn usage(&self) -> ContentBudgetUsage {

@@ -221,7 +221,7 @@ impl Mst2Client {
         let limit = self
             .profile
             .as_ref()
-            .map_or(super::range::MAX_FILE_SIZE, |caps| {
+            .map_or(super::content_profile::MAX_FILE_SIZE, |caps| {
                 caps.limits().max_file_bytes
             });
         if size > limit {

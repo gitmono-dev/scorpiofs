@@ -2,8 +2,8 @@
 //! or absence against the descriptor's metadata root.
 
 use super::{
+    content_profile::MAX_FILE_SIZE,
     frames::parse_count,
-    range::MAX_FILE_SIZE,
     types::{LookupNode, SnapshotError, SnapshotErrorCode},
 };
 

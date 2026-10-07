@@ -45,6 +45,7 @@ use tokio::io::AsyncWriteExt;
 pub use super::cas_index::LocalCasRangeMeters;
 use crate::snapshot::{
     closure::{SnapshotDirectory, ValidatedSnapshotClosure},
+    online_file::CompletedOnlineManifest,
     secure_fs, OfflineGrant, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader,
 };
 
@@ -197,6 +198,39 @@ struct FileRecord {
 struct SnapshotHydration<'a> {
     closure: &'a ValidatedSnapshotClosure,
     reader: Option<&'a SnapshotReader>,
+}
+
+/// Distinguish authenticated full-root facts from the completed online walk.
+/// Neither a callback manifest nor an arbitrary tuple can select this source.
+#[derive(Clone, Copy)]
+enum HydrationRangeSource<'a> {
+    FixedRoot(&'a SnapshotReader),
+    OnlineManifest(&'a SnapshotReader, &'a CompletedOnlineManifest),
+}
+
+impl<'a> HydrationRangeSource<'a> {
+    fn reader(self) -> &'a SnapshotReader {
+        match self {
+            Self::FixedRoot(reader) | Self::OnlineManifest(reader, _) => reader,
+        }
+    }
+
+    async fn open(self, file: &SnapshotFile) -> Result<super::OwnedChunkedFile, SnapshotError> {
+        match self {
+            Self::FixedRoot(reader) => {
+                super::OwnedChunkedFile::open(
+                    reader,
+                    &file.rel_path,
+                    &file.content_digest,
+                    file.size,
+                )
+                .await
+            }
+            Self::OnlineManifest(reader, manifest) => {
+                super::OwnedChunkedFile::open_online_path(reader, manifest.range_file(file)?).await
+            }
+        }
+    }
 }
 
 /// Resume hints may lag the durable CAS by one bounded chunk. Losing that
@@ -923,30 +957,43 @@ impl DurableStore {
             scope: reader.descriptor().scope.clone(),
             lease_id: reader.lease_id().to_string(),
         };
-        let manifest = if reader.capabilities().features.metadata_pages {
+        let online = if reader.capabilities().features.metadata_pages {
+            None
+        } else {
+            Some(CompletedOnlineManifest::walk(reader).await?)
+        };
+        let proved_files = if online.is_none() {
             let closure = reader.snapshot_closure().await?;
             reader.seed_content_membership(&closure)?;
             closure.files().to_vec()
         } else {
-            reader.file_manifest().await?
+            Vec::new()
         };
-        let legacy = super::FetchCoordinator::in_reader_content_scope(reader.clone(), 1);
+        let manifest = online
+            .as_ref()
+            .map_or(proved_files.as_slice(), CompletedOnlineManifest::files);
+        let source = online
+            .as_ref()
+            .map_or(HydrationRangeSource::FixedRoot(reader), |manifest| {
+                HydrationRangeSource::OnlineManifest(reader, manifest)
+            });
+        let online_fetch = super::FetchCoordinator::in_reader_content_scope(reader.clone(), 1);
         self.hydrate_file_closure(
             &view,
-            &manifest,
+            manifest,
             None,
             |f| {
                 let file = f.clone();
-                let legacy = legacy.clone();
+                let online_fetch = online_fetch.clone();
                 async move {
                     if reader.capabilities().features.metadata_pages {
                         reader.read_content(&file, false).await
                     } else {
-                        legacy.fetch_owned(file, false).await
+                        online_fetch.fetch_owned(file, false).await
                     }
                 }
             },
-            Some(reader),
+            Some(source),
         )
         .await
     }
@@ -982,7 +1029,7 @@ impl DurableStore {
                 let file = file.clone();
                 async move { reader.read_content(&file, use_frames).await }
             },
-            Some(reader),
+            Some(HydrationRangeSource::FixedRoot(reader)),
         )
         .await
     }
@@ -1060,7 +1107,7 @@ impl DurableStore {
         manifest: &[SnapshotFile],
         closure: Option<&ValidatedSnapshotClosure>,
         fetch: F,
-        stream_reader: Option<&SnapshotReader>,
+        stream_reader: Option<HydrationRangeSource<'_>>,
     ) -> Result<HydrateReport, SnapshotError>
     where
         F: Fn(&SnapshotFile) -> Fut,
@@ -1111,10 +1158,11 @@ impl DurableStore {
                 Err(e) => return Err(e),
             }
 
-            if let Some(reader) = stream_reader.filter(|reader| {
-                f.size > crate::snapshot::OBJECT_CAP && reader.capabilities().features.chunk_reads
+            if let Some(source) = stream_reader.filter(|source| {
+                f.size > crate::snapshot::OBJECT_CAP
+                    && source.reader().capabilities().features.chunk_reads
             }) {
-                write_reader_blob(&self.content, reader, f)
+                write_reader_blob(&self.content, source, f)
                     .await
                     .map_err(|error| {
                         tag_hydration_error(error, HydrationSubstage::LargeContentFetch)
@@ -1173,7 +1221,7 @@ impl DurableStore {
                 view,
                 manifest,
                 Some(closure),
-                stream_reader.and_then(|reader| reader.offline_grant()),
+                stream_reader.and_then(|source| source.reader().offline_grant()),
                 (fetched, resumed, repaired),
             ),
             None => self.finish_hydration(view, manifest, bytes_total, fetched, resumed, repaired),
@@ -1186,28 +1234,7 @@ impl DurableStore {
     /// identical content itself (single-flight); here we merge the durable
     /// side as well so the same content id is written and journaled once
     /// while every logical path is still recorded.
-    pub async fn hydrate_concurrent<F>(
-        &self,
-        view: &ViewMeta,
-        manifest: &[SnapshotFile],
-        concurrency: usize,
-        fetch: F,
-    ) -> Result<HydrateReport, SnapshotError>
-    where
-        F: Fn(
-                SnapshotFile,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-    {
-        self.hydrate_concurrent_with_body(view, manifest, concurrency, fetch)
-            .await
-    }
-
+    ///
     /// Hydrate from borrowed callback body bytes without a compatibility copy.
     /// This method adds no capacity accounting: reservations, if any, follow
     /// the body's origin and remain owned by that body. Caller-created bodies
@@ -1239,28 +1266,7 @@ impl DurableStore {
     /// With chunk reads available, files above OBJECT_CAP stream through the
     /// reader into verified durable CAS; their aliases share one fetch unit.
     /// Other files retain the supplied buffered fetch callback.
-    pub async fn hydrate_snapshot_concurrent<F>(
-        &self,
-        reader: &SnapshotReader,
-        closure: &ValidatedSnapshotClosure,
-        concurrency: usize,
-        fetch: F,
-    ) -> Result<HydrateReport, SnapshotError>
-    where
-        F: Fn(
-                SnapshotFile,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-    {
-        self.hydrate_snapshot_concurrent_with_body(reader, closure, concurrency, fetch)
-            .await
-    }
-
+    ///
     /// Hydrate from borrowed callback body bytes without a compatibility copy.
     /// This method adds no capacity accounting: reservations, if any, follow
     /// the body's origin and remain owned by that body. Caller-created bodies
@@ -1390,7 +1396,12 @@ impl DurableStore {
                         f.size > crate::snapshot::OBJECT_CAP
                             && reader.capabilities().features.chunk_reads
                     }) {
-                        write_reader_blob(&store.content, reader, &f).await?;
+                        write_reader_blob(
+                            &store.content,
+                            HydrationRangeSource::FixedRoot(reader),
+                            &f,
+                        )
+                        .await?;
                     } else {
                         let owner: std::sync::Arc<B> = fetch(f.clone()).await?;
                         let bytes = owner.as_ref().as_ref();
@@ -1446,7 +1457,7 @@ impl DurableStore {
     }
 
     /// Batched hydration: same verification, write-ahead, resume and journal
-    /// rules as [`hydrate_concurrent`], but small files (≤ [`OBJECT_CAP`]) are
+    /// rules as [`hydrate_concurrent_with_body`], but small files (≤ [`OBJECT_CAP`]) are
     /// fetched in OBJECT batches (≤128 unique digests, ≤7 MiB raw per request
     /// — spec 14 §4 batch limits with headroom) instead of one request per
     /// file. Large files still go through `fetch_large` (chunk-map + CHUNK).
@@ -1454,46 +1465,7 @@ impl DurableStore {
     /// `fetch_batch` receives the batch's files (deduplicated by digest) and
     /// must return every requested digest; missing digests are an error, and
     /// every returned byte is re-verified here regardless of transport claims.
-    pub async fn hydrate_batches<FBatch, FLarge>(
-        &self,
-        view: &ViewMeta,
-        manifest: &[SnapshotFile],
-        batch_concurrency: usize,
-        large_concurrency: usize,
-        fetch_batch: FBatch,
-        fetch_large: FLarge,
-    ) -> Result<HydrateReport, SnapshotError>
-    where
-        FBatch: Fn(
-                Vec<SnapshotFile>,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-        FLarge: Fn(
-                SnapshotFile,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-    {
-        self.hydrate_batches_with_body(
-            view,
-            manifest,
-            batch_concurrency,
-            large_concurrency,
-            fetch_batch,
-            fetch_large,
-        )
-        .await
-    }
-
+    ///
     /// Hydrate from borrowed callback body bytes without a compatibility copy.
     /// This method adds no capacity accounting: reservations, if any, follow
     /// the body's origin and remain owned by that body. Caller-created bodies
@@ -1544,46 +1516,7 @@ impl DurableStore {
     /// descriptor/page/content dependencies before one FullSnapshot marker.
     /// With chunk reads available, large files use the fixed reader's bounded
     /// verified stream; fetch_large remains the bounded compatibility fallback.
-    pub async fn hydrate_snapshot_batches<FBatch, FLarge>(
-        &self,
-        reader: &SnapshotReader,
-        closure: &ValidatedSnapshotClosure,
-        batch_concurrency: usize,
-        large_concurrency: usize,
-        fetch_batch: FBatch,
-        fetch_large: FLarge,
-    ) -> Result<HydrateReport, SnapshotError>
-    where
-        FBatch: Fn(
-                Vec<SnapshotFile>,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-        FLarge: Fn(
-                SnapshotFile,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-    {
-        self.hydrate_snapshot_batches_with_body(
-            reader,
-            closure,
-            batch_concurrency,
-            large_concurrency,
-            fetch_batch,
-            fetch_large,
-        )
-        .await
-    }
-
+    ///
     /// Hydrate from borrowed callback body bytes without a compatibility copy.
     /// This method adds no capacity accounting: reservations, if any, follow
     /// the body's origin and remain owned by that body. Caller-created bodies
@@ -1736,24 +1669,41 @@ impl DurableStore {
         // Paths sharing a digest are journaled individually but fetched once.
         let need = super::stage::trace_sync("cas_resume_audit", || {
             let mut need: Vec<SnapshotFile> = Vec::new();
+            // Reuse is a hint for this pass only. Alias paths share the same
+            // validated digest/size, so avoid re-reading their whole CAS body.
+            // The final dependency audit still rehashes and syncs every unique
+            // blob after fetching, including these cache hits.
+            let mut audited = HashMap::new();
             for f in manifest {
-                match store.verify_blob(&f.content_digest, f.size, CasVerificationReason::Resume) {
-                    Ok(true) => {
-                        resumed.fetch_add(1, Relaxed);
-                        bytes_total.fetch_add(f.size, Relaxed);
-                        journal.append(&FileRecord {
-                            rel_path: f.rel_path.clone(),
-                            digest: f.content_digest.clone(),
-                            size: f.size,
-                        })?;
+                let key = (f.content_digest.as_str(), f.size);
+                let (verified, damaged) = if let Some(result) = audited.get(&key) {
+                    *result
+                } else {
+                    let verified = store.verify_blob(
+                        &f.content_digest,
+                        f.size,
+                        CasVerificationReason::Resume,
+                    )?;
+                    let result = (
+                        verified,
+                        !verified && store.blob_path(&f.content_digest)?.exists(),
+                    );
+                    audited.insert(key, result);
+                    result
+                };
+                if verified {
+                    resumed.fetch_add(1, Relaxed);
+                    bytes_total.fetch_add(f.size, Relaxed);
+                    journal.append(&FileRecord {
+                        rel_path: f.rel_path.clone(),
+                        digest: f.content_digest.clone(),
+                        size: f.size,
+                    })?;
+                } else {
+                    if damaged {
+                        repaired.fetch_add(1, Relaxed);
                     }
-                    Ok(false) => {
-                        if store.blob_path(&f.content_digest)?.exists() {
-                            repaired.fetch_add(1, Relaxed);
-                        }
-                        need.push(f.clone());
-                    }
-                    Err(e) => return Err(e),
+                    need.push(f.clone());
                 }
             }
             Ok::<_, SnapshotError>(need)
@@ -1864,7 +1814,12 @@ impl DurableStore {
                         if let Some(reader) = stream_reader
                             .filter(|reader| reader.capabilities().features.chunk_reads)
                         {
-                            write_reader_blob(&store.content, reader, &f).await?;
+                            write_reader_blob(
+                                &store.content,
+                                HydrationRangeSource::FixedRoot(reader),
+                                &f,
+                            )
+                            .await?;
                         } else {
                             let owner: std::sync::Arc<BLarge> = fetch_large(f.clone()).await?;
                             let bytes = owner.as_ref().as_ref();
@@ -2631,40 +2586,6 @@ impl DurableStore {
         }
     }
 
-    /// Bounded range read of one CAS object: `None` when the object is not in
-    /// the store, `Some(bytes)` (exactly `len`, clamped to EOF) when it is.
-    ///
-    /// The digest is validated before it becomes a path. This primitive
-    /// bounds output but does not prove content integrity; FUSE uses
-    /// read_indexed_blob_range for local CAS content.
-    pub fn pread_blob(
-        &self,
-        digest: &str,
-        offset: u64,
-        len: usize,
-    ) -> Result<Option<Vec<u8>>, SnapshotError> {
-        let path = self.blob_path(digest)?;
-        let mut f = match secure_fs::open_regular(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io_err(e)),
-        };
-        use std::io::{Read, Seek, SeekFrom};
-        let file_len = f.metadata().map_err(io_err)?.len();
-        if offset >= file_len {
-            return Ok(Some(Vec::new()));
-        }
-        let want = (file_len - offset).min(len as u64);
-        let want = buffered_size(want)?;
-        f.seek(SeekFrom::Start(offset)).map_err(io_err)?;
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(want)
-            .map_err(|_| buffered_allocation_error())?;
-        buf.resize(want, 0);
-        f.read_exact(&mut buf).map_err(io_err)?;
-        Ok(Some(buf))
-    }
-
     /// Read a CAS range only after verifying its fixed size and whole digest.
     /// The returned bytes are copied from the same buffers that are hashed,
     /// so a separate read cannot race that verification. A single open file
@@ -2752,7 +2673,7 @@ impl DurableStore {
     }
 
     fn check_range_profile(expected_size: u64) -> Result<(), SnapshotError> {
-        if expected_size > crate::snapshot::range::MAX_FILE_SIZE {
+        if expected_size > crate::snapshot::content_profile::MAX_FILE_SIZE {
             return Err(SnapshotError::new(
                 SnapshotErrorCode::LimitExceeded,
                 "file size exceeds the 8 TiB serving profile",
@@ -3057,48 +2978,27 @@ pub(super) fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), Sn
 /// process may leave an unpublished temp, as with the buffered atomic writer.
 async fn write_reader_blob(
     dir: &Path,
-    reader: &SnapshotReader,
+    source: HydrationRangeSource<'_>,
     file: &SnapshotFile,
 ) -> Result<(), SnapshotError> {
-    // Keep canonical v3 hydration on the owned range implementation. The
-    // previous compatibility `ChunkedFile` reader returned a fresh Vec for
-    // every chunk, bypassing the reader's output budget and retaining no proof
-    // ownership across the write. Legacy advertisements may expose chunk
-    // reads without metadata/pages, so retain their established reader until
-    // that protocol profile is retired.
-    if reader.capabilities().features.metadata_pages {
-        let source = crate::snapshot::OwnedChunkedFile::open(
-            reader,
-            &file.rel_path,
-            &file.content_digest,
-            file.size,
-        )
+    let source = source
+        .open(file)
         .await
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkMap))?;
-        return write_reader_blob_stream(dir, file, |offset, length| {
-            source.read_range_owned(offset, length)
-        })
-        .await;
-    }
-    let source =
-        crate::snapshot::ChunkedFile::open(reader, &file.rel_path, &file.content_digest, file.size)
-            .await
-            .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkMap))?;
     write_reader_blob_stream(dir, file, |offset, length| {
-        source.read_range(offset, length)
+        source.read_range_owned(offset, length)
     })
     .await
 }
 
-async fn write_reader_blob_stream<F, Fut, B>(
+async fn write_reader_blob_stream<F, Fut>(
     dir: &Path,
     file: &SnapshotFile,
     mut read_range: F,
 ) -> Result<(), SnapshotError>
 where
     F: FnMut(u64, u64) -> Fut,
-    Fut: Future<Output = Result<B, SnapshotError>>,
-    B: BlobBytes,
+    Fut: Future<Output = Result<Arc<super::VerifiedRange>, SnapshotError>>,
 {
     create_dirs_durable(dir)
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
@@ -3120,13 +3020,13 @@ where
         let bytes = read_range(offset, length)
             .await
             .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeChunkRead))?;
-        if bytes.bytes().len() as u64 != length {
+        if bytes.len() as u64 != length {
             return Err(tag_hydration_error(
                 integrity_err("streamed chunk does not cover the expected file range"),
                 HydrationSubstage::LargeChunkRead,
             ));
         }
-        let bytes = bytes.bytes();
+        let bytes = bytes.as_bytes();
         hash.update(bytes);
         output
             .write_all(bytes)
@@ -3164,26 +3064,6 @@ where
         .map_err(io_err)
         .map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))?;
     sync_dir(dir).map_err(|error| tag_hydration_error(error, HydrationSubstage::LargeCasWrite))
-}
-
-/// Borrow the streamed body while keeping an owned range reservation alive.
-/// `Arc<VerifiedRange>` cannot implement `AsRef<[u8]>` through the standard
-/// library's `AsRef<T>` implementation, so the private adapter keeps the
-/// generic writer independent of the two source reader representations.
-trait BlobBytes {
-    fn bytes(&self) -> &[u8];
-}
-
-impl BlobBytes for Vec<u8> {
-    fn bytes(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl BlobBytes for Arc<crate::snapshot::VerifiedRange> {
-    fn bytes(&self) -> &[u8] {
-        self.as_bytes()
-    }
 }
 
 struct PendingBlob(PathBuf);

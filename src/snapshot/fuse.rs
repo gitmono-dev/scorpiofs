@@ -29,14 +29,23 @@ use futures::stream::iter;
 
 use crate::{
     snapshot::{
+        cas_content::VerifiedCasContent,
+        cas_range::VerifiedCasRange,
+        cas_worker::{CasReadScope, LocalCasAccess, RequestMeters, WorkResult},
         closure::{verify_directory_pages, ValidatedSnapshotClosure},
-        durable::DurableStore,
-        fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission},
-        FileMembershipError, MetadataProofLimits, OwnedChunkedFile, ProvenSnapshotFile,
-        SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode, SnapshotFile,
-        SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
+        content::ContentBudget,
+        durable::{DurableStore, LocalCasRangeMeters},
+        fuse_owned::{
+            ContentEntry, OnlineContentEntry, OnlineFuseCache, OnlineRangeEntry, OwnedFuseCache,
+            RangeEntry, ReplyAdmission, StoreRangeCache,
+        },
+        fuse_store::{ContentKey, StoreContent, StoreSmallCache},
+        online_file::OnlineSnapshotFile,
+        ContentBudgetLimits, FileMembershipError, MetadataProofLimits, OwnedChunkedFile,
+        ProvenSnapshotFile, ScopeCache, SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode,
+        SnapshotFile, SnapshotNodeIdentity, SnapshotPathState, SnapshotReader,
     },
-    util::file_attr::make_file_attr,
+    util::{file_attr::make_file_attr, mutation_fence::MutationPause},
 };
 
 pub(crate) const ROOT_INODE: u64 = 1;
@@ -65,6 +74,7 @@ pub(crate) struct FileNode {
     fs_kind: String,
     size: u64,
     digest: String,
+    online_file: Option<Arc<OnlineSnapshotFile>>,
 }
 
 #[derive(Clone)]
@@ -76,16 +86,22 @@ pub(crate) enum Node {
 struct State {
     next_inode: u64,
     nodes: HashMap<u64, Node>,
-    /// Whole-file content cache (small files, hydrated CAS objects).
-    contents: HashMap<u64, Arc<Vec<u8>>>,
-    /// Large files opened through the verified chunk reader (range reads).
-    chunked: HashMap<u64, Arc<crate::snapshot::range::ChunkedFile>>,
     /// Modern online mounts retain paid payload/reply owners in fixed slots.
     owned: Option<OwnedFuseCache>,
+    online: Option<OnlineFuseCache>,
+    /// Stored online/local mounts retain paid content independently of page hints.
+    store_small: Option<StoreSmallCache>,
+    store_ranges: Option<StoreRangeCache>,
     /// Lazy mounts: directory pages are fetched on first readdir/lookup.
     lazy: bool,
     /// None for legacy file-only manifests, which cannot prove namespace absence.
     namespace_scope: Option<String>,
+}
+
+struct LocalCasScope {
+    budget: Arc<ContentBudget>,
+    workers: Arc<CasReadScope>,
+    access: LocalCasAccess,
 }
 
 fn owned_cache(
@@ -96,6 +112,24 @@ fn owned_cache(
         .filter(|reader| store.is_none() && reader.capabilities().features.metadata_pages)
         .map(OwnedFuseCache::new)
         .transpose()
+}
+
+fn stored_caches(
+    reader: Option<&SnapshotReader>,
+    store: Option<&Arc<DurableStore>>,
+) -> std::result::Result<
+    (Option<StoreSmallCache>, Option<StoreRangeCache>),
+    crate::snapshot::SnapshotError,
+> {
+    let Some(reader) =
+        reader.filter(|reader| store.is_some() && reader.capabilities().features.metadata_pages)
+    else {
+        return Ok((None, None));
+    };
+    Ok((
+        Some(StoreSmallCache::new(&reader.content_scope)?),
+        Some(StoreRangeCache::new(reader)?),
+    ))
 }
 
 /// Kernel file type for one view entry. Symlinks are their own type, not
@@ -125,6 +159,10 @@ struct ListEntry {
 pub struct Mst2Fuse {
     reader: Option<SnapshotReader>,
     store: Option<Arc<DurableStore>>,
+    /// Hints only, in the real owned workspace's authorized scope directory.
+    scope_pages: Option<ScopeCache>,
+    /// Retained for all reads of one local mount; no reader or wire fallback.
+    local_cas: Option<LocalCasScope>,
     state: StdMutex<State>,
     metadata_limits: MetadataProofLimits,
 }
@@ -141,7 +179,7 @@ impl Mst2Fuse {
             return Self::build_snapshot_closure(Some(reader), None, &closure);
         }
         let manifest = reader.file_manifest().await?;
-        Self::build(Some(reader), None, manifest)
+        Self::build(Some(reader), None, manifest)?.with_online_paths()
     }
 
     /// Build over a reader *and* a durable store: content is served from the
@@ -151,18 +189,22 @@ impl Mst2Fuse {
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         store.bind_reader(&reader)?;
+        if reader.capabilities().features.metadata_pages {
+            let closure = reader.snapshot_closure().await?;
+            return Self::from_snapshot_manifest(reader, store, closure);
+        }
         let manifest = reader.file_manifest().await?;
-        Self::build(Some(reader), Some(store), manifest)
+        Self::build(Some(reader), Some(store), manifest)?.with_online_paths()
     }
 
     /// Reopen a completed, pinned hydration with no server contact at all.
-    /// The manifest comes from the store, and every read re-verifies against
-    /// the digest the view advertised when it was hydrated.
+    /// The caller establishes local access policy. Cold reads verify against
+    /// the fixed digest; paid immutable owners can serve repeated small reads.
     pub fn from_store(
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         let manifest = store.manifest()?;
-        Self::build(None, Some(store), manifest)
+        Self::build(None, Some(store), manifest)?.with_local_cas(LocalCasAccess::CallerEstablished)
     }
 
     /// Build from a verified complete snapshot closure without walking its
@@ -197,7 +239,8 @@ impl Mst2Fuse {
         store: Arc<DurableStore>,
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         let closure = store.snapshot_manifest()?;
-        Self::build_snapshot_closure(None, Some(store), &closure)
+        Self::build_snapshot_closure(None, Some(store), &closure)?
+            .with_local_cas(LocalCasAccess::CallerEstablished)
     }
 
     /// Reopen a complete snapshot without contacting the service, but only
@@ -210,7 +253,76 @@ impl Mst2Fuse {
     ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
         store.validate_offline_grant(grant, actor_domain_id)?;
         let closure = store.snapshot_manifest()?;
-        Self::build_snapshot_closure(None, Some(store), &closure)
+        Self::build_snapshot_closure(None, Some(store), &closure)?
+            .with_local_cas(LocalCasAccess::GrantCheckedOnReopen)
+    }
+
+    // Only the validated public local constructors enable this lane. A raw
+    // metadata fixture does not acquire local authority by containing a store.
+    fn with_local_cas(
+        mut self,
+        access: LocalCasAccess,
+    ) -> std::result::Result<Self, SnapshotError> {
+        if self.reader.is_some() || self.store.is_none() {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "local CAS scope requires a readerless stored mount",
+            ));
+        }
+        let budget = ContentBudget::new(ContentBudgetLimits::default());
+        let small = StoreSmallCache::new(&budget)?;
+        let workers = budget.cas_workers();
+        self.state.get_mut().unwrap().store_small = Some(small);
+        self.local_cas = Some(LocalCasScope {
+            budget,
+            workers,
+            access,
+        });
+        Ok(self)
+    }
+
+    // Called only after a public constructor's completed fixed-SID JSON
+    // manifest walk. Raw metadata builders cannot mint this online binding.
+    fn with_online_paths(mut self) -> std::result::Result<Self, SnapshotError> {
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "online manifest needs a reader",
+            )
+        })?;
+        if reader.capabilities().features.metadata_pages {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "metadata-pages readers require the real fixed-root owner path",
+            ));
+        }
+        reader.local_lease_status()?;
+        let cache = OnlineFuseCache::new(reader)?;
+        let state = self.state.get_mut().unwrap();
+        for node in state.nodes.values_mut() {
+            if let Node::File(file) = node {
+                file.online_file = Some(OnlineSnapshotFile::from_manifest_file(
+                    reader,
+                    SnapshotFile {
+                        rel_path: file.path.clone(),
+                        fs_kind: file.fs_kind.clone(),
+                        size: file.size,
+                        content_digest: file.digest.clone(),
+                    },
+                )?);
+            }
+        }
+        reader.local_lease_status()?;
+        state.online = Some(cache);
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(super) fn online_file_for_test(&self, inode: Inode) -> Option<Arc<OnlineSnapshotFile>> {
+        match self.state.lock().unwrap().nodes.get(&inode) {
+            Some(Node::File(file)) => file.online_file.clone(),
+            _ => None,
+        }
     }
 
     /// Lazy mount: the tree starts at the scope root's verified page tree,
@@ -243,13 +355,28 @@ impl Mst2Fuse {
         if let Some(store) = &store {
             store.bind_reader(&reader)?;
         }
+        let scope_pages = match &store {
+            Some(store) if store.workspace_binding()?.is_some() => {
+                let scope = store.content_dir().parent().ok_or_else(|| {
+                    SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        "workspace metadata cache has no scope",
+                    )
+                })?;
+                reader.authorized_context().bind_scope_cache(scope)?;
+                Some(ScopeCache::open(scope)?)
+            }
+            _ => None,
+        };
         let root_page_id = reader.descriptor().metadata_root.clone();
+        let (store_small, store_ranges) = stored_caches(Some(&reader), store.as_ref())?;
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
-            contents: HashMap::new(),
-            chunked: HashMap::new(),
             owned: owned_cache(Some(&reader), store.as_ref())?,
+            online: None,
+            store_small,
+            store_ranges,
             lazy: true,
             namespace_scope: Some(reader.descriptor().scope.clone()),
         };
@@ -266,6 +393,8 @@ impl Mst2Fuse {
         let view = Mst2Fuse {
             reader: Some(reader),
             store,
+            scope_pages,
+            local_cas: None,
             state: StdMutex::new(state),
             metadata_limits,
         };
@@ -279,6 +408,18 @@ impl Mst2Fuse {
     /// children themselves, so every fetch is bound to what the fixed view
     /// committed to.
     async fn ensure_dir_loaded(
+        &self,
+        inode: Inode,
+    ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
+        self.check_metadata_lease()?;
+        let result = self.load_directory(inode).await;
+        self.check_metadata_lease()?;
+        result
+    }
+
+    // Recorded nodes remain usable by a paused local upper scan. Loading a
+    // missing directory still requires the existing live lease at both ends.
+    async fn load_directory(
         &self,
         inode: Inode,
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
@@ -334,10 +475,26 @@ impl Mst2Fuse {
                 )
                 .collect();
             reader.ensure_lease().await?;
-            let pages = reader
-                .client
-                .metadata_pages(&sid, &items, reader.encoding_hint())
-                .await?;
+            let mut pages = Vec::new();
+            let mut missing = Vec::new();
+            for item in items {
+                let expected = item.expected_digest.as_ref().expect("fixed page digest");
+                if let Some(cache) = &self.scope_pages {
+                    if let Some(bytes) = cache.read_page_verified_bounded(expected)? {
+                        pages.push((crate::snapshot::frames::parse_digest(expected)?, bytes));
+                        continue;
+                    }
+                }
+                missing.push(item);
+            }
+            if !missing.is_empty() {
+                pages.extend(
+                    reader
+                        .client
+                        .metadata_pages(&sid, &missing, reader.encoding_hint())
+                        .await?,
+                );
+            }
             let mut allowed = HashSet::new();
             for (route, _) in &batch {
                 for depth in 0..=route.len() {
@@ -428,6 +585,8 @@ impl Mst2Fuse {
             }
         }
 
+        // Local hints retain the same live fixed-view authority as wire pages.
+        reader.ensure_lease().await?;
         let mut state = self.state.lock().unwrap();
         if matches!(state.nodes.get(&inode), Some(Node::Dir(d)) if d.loaded) {
             return Ok(());
@@ -507,6 +666,7 @@ impl Mst2Fuse {
                         fs_kind: fs_kind.to_string(),
                         size: e.size,
                         digest: format!("sha256:{}", crate::snapshot::frames::hex32(&e.content_id)),
+                        online_file: None,
                     })
                 }
             };
@@ -521,6 +681,7 @@ impl Mst2Fuse {
     /// Ensure a directory's children exist before lookup/readdir. No-op for
     /// eager mounts and already-loaded directories.
     async fn ensure_loaded(&self, inode: Inode) -> Result<()> {
+        self.check_metadata_lease().map_err(io_err)?;
         let need = {
             let state = self.state.lock().unwrap();
             state.lazy
@@ -529,12 +690,19 @@ impl Mst2Fuse {
                     _ => false,
                 }
         };
-        if need {
-            self.ensure_dir_loaded(inode)
-                .await
-                .map_err(|_| Errno::from(libc::EIO))?;
-        }
-        Ok(())
+        let result = if need {
+            self.ensure_dir_loaded(inode).await.map_err(|error| {
+                if self.store_reader().is_some() {
+                    io_err(error)
+                } else {
+                    Errno::from(libc::EIO)
+                }
+            })
+        } else {
+            Ok(())
+        };
+        self.check_metadata_lease().map_err(io_err)?;
+        result
     }
 
     pub(crate) fn build(
@@ -545,9 +713,10 @@ impl Mst2Fuse {
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
-            contents: HashMap::new(),
-            chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
+            online: None,
+            store_small: None,
+            store_ranges: None,
             lazy: false,
             namespace_scope: None,
         };
@@ -578,6 +747,8 @@ impl Mst2Fuse {
         Ok(Mst2Fuse {
             reader,
             store,
+            scope_pages: None,
+            local_cas: None,
             state: StdMutex::new(state),
             metadata_limits: MetadataProofLimits::default(),
         })
@@ -592,12 +763,14 @@ impl Mst2Fuse {
 
         let invalid =
             |message: String| SnapshotError::new(SnapshotErrorCode::IntegrityError, message);
+        let (store_small, store_ranges) = stored_caches(reader.as_ref(), store.as_ref())?;
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
-            contents: HashMap::new(),
-            chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
+            online: None,
+            store_small,
+            store_ranges,
             lazy: false,
             namespace_scope: Some(closure.descriptor().scope.clone()),
         };
@@ -668,12 +841,15 @@ impl Mst2Fuse {
                     fs_kind: file.fs_kind.clone(),
                     size: file.size,
                     digest: file.content_digest.clone(),
+                    online_file: None,
                 }),
             );
         }
         Ok(Mst2Fuse {
             reader,
             store,
+            scope_pages: None,
+            local_cas: None,
             state: StdMutex::new(state),
             metadata_limits: MetadataProofLimits::default(),
         })
@@ -739,28 +915,626 @@ impl Mst2Fuse {
         Ok(out)
     }
 
-    /// Content for one file: the verified local CAS when it holds it, the
-    /// live reader otherwise. Both paths end in a SHA-256 check against the
-    /// digest the fixed view advertised.
-    async fn fetch_content(&self, f: &FileNode) -> Result<Vec<u8>> {
-        if let Some(store) = &self.store {
-            match store.read_blob(&f.digest, f.size) {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) => {
-                    if self.reader.is_none() {
-                        return Err(io_err(e));
-                    }
-                }
-            }
+    async fn read_local(
+        &self,
+        scope: &LocalCasScope,
+        node: &FileNode,
+        offset: u64,
+        requested: u64,
+    ) -> Result<ReplyData> {
+        if node.fs_kind == "symlink" && !(1..=4095).contains(&node.size) {
+            return Err(Errno::from(libc::EIO));
         }
-        let reader = self.reader.as_ref().ok_or_else(|| Errno::from(libc::EIO))?;
-        reader.read_file(&f.path, &f.digest).await.map_err(io_err)
+        if requested == 0 || offset >= node.size {
+            return Ok(ReplyData { data: Bytes::new() });
+        }
+        let wanted = requested.min(node.size - offset);
+        if node.size <= crate::snapshot::OBJECT_CAP {
+            return self.read_local_small(scope, node, offset, wanted).await;
+        }
+        self.read_local_range(scope, node, offset, wanted).await
+    }
+
+    async fn read_local_small(
+        &self,
+        scope: &LocalCasScope,
+        node: &FileNode,
+        offset: u64,
+        wanted: u64,
+    ) -> Result<ReplyData> {
+        let key = ContentKey::new(&node.digest, node.size).map_err(io_err)?;
+        let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
+        let stop = usize::try_from(offset + wanted).map_err(|_| Errno::from(libc::EIO))?;
+        let admission = ReplyAdmission::reserve(&scope.budget).map_err(io_err)?;
+        let cached = self
+            .state
+            .lock()
+            .unwrap()
+            .store_small
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .get(key);
+        let (content, admission) = match cached {
+            Some(content) => (content, admission),
+            None => {
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| Errno::from(libc::EIO))?
+                    .clone();
+                let digest = node.digest.clone();
+                let size = node.size;
+                let budget = scope.budget.clone();
+                let completion = scope
+                    .workers
+                    .run_local(
+                        scope.access,
+                        admission,
+                        RequestMeters {
+                            kind: "small_whole",
+                            wanted: size,
+                        },
+                        move || {
+                            WorkResult::local(
+                                VerifiedCasContent::read(&store, &digest, size, &budget),
+                                None,
+                            )
+                        },
+                    )
+                    .await
+                    .map_err(io_err)?;
+                // Preserve the existing small/readlink missing-body errno.
+                // A local miss is terminal, never an online fallback.
+                let owner = completion
+                    .result
+                    .map_err(io_err)?
+                    .ok_or_else(|| Errno::from(libc::ENOENT))?;
+                (StoreContent::Cas(owner), completion.admission)
+            }
+        };
+        if content.len() as u64 != node.size
+            || (node.fs_kind == "symlink" && content.as_bytes().contains(&0))
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        let data = admission
+            .store_content(content.clone(), start, stop)
+            .map_err(io_err)?;
+        self.state
+            .lock()
+            .unwrap()
+            .store_small
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .insert(key, content)
+            .map_err(io_err)?;
+        Ok(ReplyData { data })
+    }
+
+    async fn read_local_range(
+        &self,
+        scope: &LocalCasScope,
+        node: &FileNode,
+        offset: u64,
+        wanted: u64,
+    ) -> Result<ReplyData> {
+        let admission = ReplyAdmission::reserve(&scope.budget).map_err(io_err)?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .clone();
+        let digest = node.digest.clone();
+        let size = node.size;
+        let budget = scope.budget.clone();
+        let completion = scope
+            .workers
+            .run_local(
+                scope.access,
+                admission,
+                RequestMeters {
+                    kind: "large_range",
+                    wanted,
+                },
+                move || {
+                    let mut meters = LocalCasRangeMeters::default();
+                    let result = VerifiedCasRange::read(
+                        &store,
+                        &digest,
+                        size,
+                        offset,
+                        wanted,
+                        &budget,
+                        &mut meters,
+                    );
+                    WorkResult::local(result, Some(meters))
+                },
+            )
+            .await
+            .map_err(io_err)?;
+        // A declared local large file with missing backing bytes stays EIO.
+        let owner = completion
+            .result
+            .map_err(io_err)?
+            .ok_or_else(|| Errno::from(libc::EIO))?;
+        if owner.len() as u64 != wanted {
+            return Err(Errno::from(libc::EIO));
+        }
+        Ok(ReplyData {
+            data: completion.admission.cas_range(owner).map_err(io_err)?,
+        })
     }
 
     fn owned_reader(&self) -> Option<&SnapshotReader> {
         self.reader
             .as_ref()
             .filter(|reader| self.store.is_none() && reader.capabilities().features.metadata_pages)
+    }
+
+    async fn online_node(
+        reader: &SnapshotReader,
+        node: &FileNode,
+    ) -> Result<Arc<OnlineSnapshotFile>> {
+        let file = node
+            .online_file
+            .as_ref()
+            .ok_or_else(|| Errno::from(libc::EIO))?;
+        let fixed = file.file();
+        if fixed.rel_path != node.path
+            || fixed.fs_kind != node.fs_kind
+            || fixed.size != node.size
+            || fixed.content_digest != node.digest
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        file.validate(reader).await.map_err(io_err)?;
+        Ok(file.clone())
+    }
+
+    async fn read_online(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        offset: u64,
+        requested: u64,
+    ) -> Result<ReplyData> {
+        let file = Self::online_node(reader, node).await?;
+        if node.fs_kind == "symlink" && !(1..=4095).contains(&node.size) {
+            return Err(Errno::from(libc::EIO));
+        }
+        if requested == 0 || offset >= node.size {
+            file.validate(reader).await.map_err(io_err)?;
+            return Ok(ReplyData { data: Bytes::new() });
+        }
+        let wanted = requested.min(node.size - offset);
+        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        if node.size <= crate::snapshot::OBJECT_CAP {
+            return self
+                .read_online_small(reader, inode, node, file, offset, wanted, admission)
+                .await;
+        }
+        self.read_online_range(reader, inode, node, file, offset, wanted, admission)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_online_small(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        file: Arc<OnlineSnapshotFile>,
+        offset: u64,
+        wanted: u64,
+        admission: ReplyAdmission,
+    ) -> Result<ReplyData> {
+        let (cached, workers, coordinator) = {
+            let mut state = self.state.lock().unwrap();
+            let cache = state
+                .online
+                .as_mut()
+                .ok_or_else(|| Errno::from(libc::EIO))?;
+            (
+                cache.contents.get(inode),
+                cache.workers.clone(),
+                cache.coordinator.clone(),
+            )
+        };
+        let (content, admission) = match cached {
+            Some(entry) => (entry.content, admission),
+            None => {
+                let (local, admission) = match &self.store {
+                    Some(store) => {
+                        let store = store.clone();
+                        let digest = node.digest.clone();
+                        let size = node.size;
+                        let budget = reader.content_scope.clone();
+                        let completion = workers
+                            .run(
+                                reader.clone(),
+                                admission,
+                                RequestMeters {
+                                    kind: "small_whole",
+                                    wanted: size,
+                                },
+                                move || {
+                                    WorkResult::local(
+                                        VerifiedCasContent::read(&store, &digest, size, &budget),
+                                        None,
+                                    )
+                                },
+                            )
+                            .await
+                            .map_err(io_err)?;
+                        (completion.result.map_err(io_err)?, completion.admission)
+                    }
+                    None => (None, admission),
+                };
+                file.validate(reader).await.map_err(io_err)?;
+                let content = match local {
+                    Some(owner) => StoreContent::Cas(owner),
+                    None => StoreContent::Wire(
+                        coordinator
+                            .fetch_owned(
+                                file.file().clone(),
+                                reader.capabilities().features.objects,
+                            )
+                            .await
+                            .map_err(io_err)?,
+                    ),
+                };
+                (content, admission)
+            }
+        };
+        if content.len() as u64 != node.size
+            || (node.fs_kind == "symlink" && content.as_bytes().contains(&0))
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        file.validate(reader).await.map_err(io_err)?;
+        let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
+        let end = usize::try_from(offset + wanted).map_err(|_| Errno::from(libc::EIO))?;
+        let data = admission
+            .store_content(content.clone(), start, end)
+            .map_err(io_err)?;
+        let mut state = self.state.lock().unwrap();
+        reader.local_lease_status().map_err(io_err)?;
+        state
+            .online
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .contents
+            .insert(OnlineContentEntry { inode, content });
+        Ok(ReplyData { data })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_online_range(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        file: Arc<OnlineSnapshotFile>,
+        offset: u64,
+        wanted: u64,
+        admission: ReplyAdmission,
+    ) -> Result<ReplyData> {
+        let (cached, workers) = {
+            let mut state = self.state.lock().unwrap();
+            let cache = state
+                .online
+                .as_mut()
+                .ok_or_else(|| Errno::from(libc::EIO))?;
+            (cache.ranges.get(inode), cache.workers.clone())
+        };
+        if cached
+            .as_ref()
+            .is_some_and(|entry| !Arc::ptr_eq(&entry.file, &file))
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        // Always try real stored CAS before the path-specific wire handle.
+        // The primitive returns None only for a verified true missing object.
+        let (local, admission) = match &self.store {
+            Some(store) => {
+                let store = store.clone();
+                let digest = node.digest.clone();
+                let size = node.size;
+                let budget = reader.content_scope.clone();
+                let completion = workers
+                    .run(
+                        reader.clone(),
+                        admission,
+                        RequestMeters {
+                            kind: "large_range",
+                            wanted,
+                        },
+                        move || {
+                            let mut meters = LocalCasRangeMeters::default();
+                            let result = VerifiedCasRange::read(
+                                &store,
+                                &digest,
+                                size,
+                                offset,
+                                wanted,
+                                &budget,
+                                &mut meters,
+                            );
+                            WorkResult::local(result, Some(meters))
+                        },
+                    )
+                    .await
+                    .map_err(io_err)?;
+                (completion.result.map_err(io_err)?, completion.admission)
+            }
+            None => (None, admission),
+        };
+        file.validate(reader).await.map_err(io_err)?;
+        if let Some(owner) = local {
+            if owner.len() as u64 != wanted {
+                return Err(Errno::from(libc::EIO));
+            }
+            reader.local_lease_status().map_err(io_err)?;
+            return Ok(ReplyData {
+                data: admission.cas_range(owner).map_err(io_err)?,
+            });
+        }
+        let range = match cached {
+            Some(entry) => entry.range,
+            None => Arc::new(
+                OwnedChunkedFile::open_online_path(reader, file.clone())
+                    .await
+                    .map_err(io_err)?,
+            ),
+        };
+        let owner = range
+            .read_range_owned(offset, wanted)
+            .await
+            .map_err(io_err)?;
+        if owner.len() as u64 != wanted {
+            return Err(Errno::from(libc::EIO));
+        }
+        file.validate(reader).await.map_err(io_err)?;
+        let data = admission.range(owner).map_err(io_err)?;
+        let mut state = self.state.lock().unwrap();
+        reader.local_lease_status().map_err(io_err)?;
+        state
+            .online
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .ranges
+            .insert(OnlineRangeEntry { inode, file, range });
+        Ok(ReplyData { data })
+    }
+
+    fn store_reader(&self) -> Option<&SnapshotReader> {
+        if self.state.lock().unwrap().store_small.is_some() {
+            self.reader.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn store_workers(&self) -> Result<Arc<CasReadScope>> {
+        self.state
+            .lock()
+            .unwrap()
+            .store_ranges
+            .as_ref()
+            .map(|cache| cache.workers.clone())
+            .ok_or_else(|| Errno::from(libc::EIO))
+    }
+
+    // This observes the current local grant and any latched terminal failure;
+    // it is not a fresh remote authorization decision or a metadata fetch.
+    fn check_metadata_lease(&self) -> std::result::Result<(), SnapshotError> {
+        match self.reader.as_ref() {
+            Some(reader) => reader.local_lease_status(),
+            None => Ok(()),
+        }
+    }
+
+    /// Each logical path proves its own fixed membership before sharing bytes.
+    /// A CAS miss alone may reach the existing sized, accounted transport.
+    async fn read_store_small(
+        &self,
+        reader: &SnapshotReader,
+        node: &FileNode,
+        offset: u64,
+        requested: u64,
+    ) -> Result<ReplyData> {
+        let proven = Self::proven_node(reader, node, None).await?;
+        if requested == 0 || offset >= node.size {
+            proven.validate(reader).await.map_err(io_err)?;
+            return Ok(ReplyData { data: Bytes::new() });
+        }
+        let key = ContentKey::new(&node.digest, node.size).map_err(io_err)?;
+        let end = offset.saturating_add(requested).min(node.size);
+        let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
+        let stop = usize::try_from(end).map_err(|_| Errno::from(libc::EIO))?;
+        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        let cached = self
+            .state
+            .lock()
+            .unwrap()
+            .store_small
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .get(key);
+        let (content, admission) = match cached {
+            Some(content) => (content, admission),
+            None => {
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| Errno::from(libc::EIO))?
+                    .clone();
+                let digest = node.digest.clone();
+                let size = node.size;
+                let budget = reader.content_scope.clone();
+                let completion = self
+                    .store_workers()?
+                    .run(
+                        reader.clone(),
+                        admission,
+                        RequestMeters {
+                            kind: "small_whole",
+                            wanted: size,
+                        },
+                        move || {
+                            WorkResult::local(
+                                VerifiedCasContent::read(&store, &digest, size, &budget),
+                                None,
+                            )
+                        },
+                    )
+                    .await
+                    .map_err(io_err)?;
+                let local = completion.result.map_err(io_err)?;
+                // The queue and local read may outlive the original lease.
+                proven.validate(reader).await.map_err(io_err)?;
+                let content = match local {
+                    Some(content) => StoreContent::Cas(content),
+                    None => StoreContent::Wire(
+                        reader
+                            .read_proven_content(&proven, reader.capabilities().features.objects)
+                            .await
+                            .map_err(io_err)?,
+                    ),
+                };
+                (content, completion.admission)
+            }
+        };
+        if content.len() as u64 != node.size
+            || (node.fs_kind == "symlink"
+                && (!(1..=4095).contains(&content.len()) || content.as_bytes().contains(&0)))
+        {
+            return Err(Errno::from(libc::EIO));
+        }
+        proven.validate(reader).await.map_err(io_err)?;
+        let data = admission
+            .store_content(content.clone(), start, stop)
+            .map_err(io_err)?;
+        let mut state = self.state.lock().unwrap();
+        reader.local_lease_status().map_err(io_err)?;
+        state
+            .store_small
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .insert(key, content)
+            .map_err(io_err)?;
+        Ok(ReplyData { data })
+    }
+
+    /// Every metadata-pages stored read uses actual fixed-root membership.
+    /// CAS errors are terminal; only a true missing object permits wire I/O.
+    async fn read_store_large(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        offset: u64,
+        requested: u64,
+    ) -> Result<ReplyData> {
+        let cached = self
+            .state
+            .lock()
+            .unwrap()
+            .store_ranges
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .ranges
+            .get(inode);
+        let proven = Self::proven_node(
+            reader,
+            node,
+            cached.as_ref().map(|entry| entry.proven.clone()),
+        )
+        .await?;
+        if requested == 0 || offset >= node.size {
+            proven.validate(reader).await.map_err(io_err)?;
+            return Ok(ReplyData { data: Bytes::new() });
+        }
+        let wanted = requested.min(node.size - offset);
+        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .clone();
+        let digest = node.digest.clone();
+        let size = node.size;
+        let budget = reader.content_scope.clone();
+        // Always prefer local CAS, including when a wire handle is cached.
+        // Only the primitive's safe-open NotFound permits wire fallback.
+        let completion = self
+            .store_workers()?
+            .run(
+                reader.clone(),
+                admission,
+                RequestMeters {
+                    kind: "large_range",
+                    wanted,
+                },
+                move || {
+                    let mut meters = LocalCasRangeMeters::default();
+                    let result = VerifiedCasRange::read(
+                        &store,
+                        &digest,
+                        size,
+                        offset,
+                        wanted,
+                        &budget,
+                        &mut meters,
+                    );
+                    WorkResult::local(result, Some(meters))
+                },
+            )
+            .await
+            .map_err(io_err)?;
+        let local = completion.result.map_err(io_err)?;
+        proven.validate(reader).await.map_err(io_err)?;
+        let admission = completion.admission;
+        if let Some(owner) = local {
+            if owner.len() as u64 != wanted {
+                return Err(Errno::from(libc::EIO));
+            }
+            reader.local_lease_status().map_err(io_err)?;
+            return Ok(ReplyData {
+                data: admission.cas_range(owner).map_err(io_err)?,
+            });
+        }
+        let range = match cached {
+            Some(entry) => entry.range,
+            None => Arc::new(
+                OwnedChunkedFile::open_proven(reader, proven.clone())
+                    .await
+                    .map_err(io_err)?,
+            ),
+        };
+        let owner = range
+            .read_range_owned(offset, wanted)
+            .await
+            .map_err(io_err)?;
+        if owner.len() as u64 != wanted {
+            return Err(Errno::from(libc::EIO));
+        }
+        proven.validate(reader).await.map_err(io_err)?;
+        let data = admission.range(owner).map_err(io_err)?;
+        let mut state = self.state.lock().unwrap();
+        reader.local_lease_status().map_err(io_err)?;
+        state
+            .store_ranges
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .ranges
+            .insert(RangeEntry {
+                inode,
+                proven,
+                range,
+            });
+        Ok(ReplyData { data })
     }
 
     async fn proven_node(
@@ -787,8 +1561,8 @@ impl Mst2Fuse {
         Ok(proven)
     }
 
-    /// The modern branch runs before legacy empty/EOF/cache paths. It cannot
-    /// fall back after a proof, authority, quota or body validation failure.
+    /// Fixed-root authority gates cached content, empty reads and EOF.
+    /// Proof, quota and body validation failures are terminal.
     async fn read_owned(
         &self,
         reader: &SnapshotReader,
@@ -811,6 +1585,9 @@ impl Mst2Fuse {
             .map(|entry| entry.proven.clone())
             .or_else(|| range.as_ref().map(|entry| entry.proven.clone()));
         let proven = Self::proven_node(reader, node, cached).await?;
+        if node.fs_kind == "symlink" && !(1..=4095).contains(&node.size) {
+            return Err(Errno::from(libc::EIO));
+        }
         if size == 0 || offset >= node.size {
             return Ok(ReplyData { data: Bytes::new() });
         }
@@ -824,25 +1601,22 @@ impl Mst2Fuse {
                     .await
                     .map_err(io_err)?,
             };
-            if owner.len() as u64 != node.size {
+            if owner.len() as u64 != node.size
+                || (node.fs_kind == "symlink" && owner.as_bytes().contains(&0))
+            {
                 return Err(Errno::from(libc::EIO));
             }
             proven.validate(reader).await.map_err(io_err)?;
             let data = admission
                 .content(owner.clone(), offset as usize, end as usize)
                 .map_err(io_err)?;
-            self.state
-                .lock()
-                .unwrap()
-                .owned
-                .as_mut()
-                .unwrap()
-                .contents
-                .insert(ContentEntry {
-                    inode,
-                    proven,
-                    content: owner,
-                });
+            let mut state = self.state.lock().unwrap();
+            reader.local_lease_status().map_err(io_err)?;
+            state.owned.as_mut().unwrap().contents.insert(ContentEntry {
+                inode,
+                proven,
+                content: owner,
+            });
             Ok(ReplyData { data })
         } else {
             let chunked = match range {
@@ -862,18 +1636,13 @@ impl Mst2Fuse {
             }
             proven.validate(reader).await.map_err(io_err)?;
             let data = admission.range(owner).map_err(io_err)?;
-            self.state
-                .lock()
-                .unwrap()
-                .owned
-                .as_mut()
-                .unwrap()
-                .ranges
-                .insert(RangeEntry {
-                    inode,
-                    proven,
-                    range: chunked,
-                });
+            let mut state = self.state.lock().unwrap();
+            reader.local_lease_status().map_err(io_err)?;
+            state.owned.as_mut().unwrap().ranges.insert(RangeEntry {
+                inode,
+                proven,
+                range: chunked,
+            });
             Ok(ReplyData { data })
         }
     }
@@ -888,6 +1657,13 @@ impl Mst2Fuse {
             .ok_or_else(|| Errno::from(libc::ENOENT))
     }
 
+    pub(crate) fn metadata_node(&self, inode: u64) -> Result<Node> {
+        self.check_metadata_lease().map_err(io_err)?;
+        let node = self.node(inode)?;
+        self.check_metadata_lease().map_err(io_err)?;
+        Ok(node)
+    }
+
     /// Query fixed metadata without reading content or following a symlink.
     /// A missing child is proven only after its parent's entire canonical
     /// radix is verified. Legacy file-only manifests cannot prove namespace.
@@ -895,7 +1671,36 @@ impl Mst2Fuse {
         &self,
         rel_path: &str,
     ) -> std::result::Result<SnapshotPathState, SnapshotError> {
-        match self.path_inode(rel_path).await? {
+        self.check_metadata_lease()?;
+        let result = self.recorded_path_state(rel_path).await;
+        self.check_metadata_lease()?;
+        result
+    }
+
+    // Only paused upper-diff inspection may reuse already recorded facts after
+    // revocation. Unloaded directory pages still go through load_directory.
+    pub(crate) async fn path_state_for_diff(
+        &self,
+        rel_path: &str,
+        pause: &MutationPause,
+    ) -> std::result::Result<SnapshotPathState, SnapshotError> {
+        Self::check_diff_pause(pause)?;
+        let result = self.recorded_path_state(rel_path).await;
+        Self::check_diff_pause(pause)?;
+        result
+    }
+
+    fn check_diff_pause(pause: &MutationPause) -> std::result::Result<(), SnapshotError> {
+        pause.ensure_certain().map_err(|error| {
+            SnapshotError::new(SnapshotErrorCode::IntegrityError, error.to_string())
+        })
+    }
+
+    async fn recorded_path_state(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<SnapshotPathState, SnapshotError> {
+        match self.recorded_path_inode(rel_path).await? {
             Some(inode) => {
                 let state = self.state.lock().unwrap();
                 let node = state.nodes.get(&inode).ok_or_else(|| {
@@ -916,10 +1721,31 @@ impl Mst2Fuse {
         &self,
         rel_path: &str,
     ) -> std::result::Result<Vec<SnapshotDirectoryEntry>, SnapshotError> {
-        let inode = self.path_inode(rel_path).await?.ok_or_else(|| {
+        self.check_metadata_lease()?;
+        let result = self.recorded_directory_entries(rel_path).await;
+        self.check_metadata_lease()?;
+        result
+    }
+
+    pub(crate) async fn directory_entries_for_diff(
+        &self,
+        rel_path: &str,
+        pause: &MutationPause,
+    ) -> std::result::Result<Vec<SnapshotDirectoryEntry>, SnapshotError> {
+        Self::check_diff_pause(pause)?;
+        let result = self.recorded_directory_entries(rel_path).await;
+        Self::check_diff_pause(pause)?;
+        result
+    }
+
+    async fn recorded_directory_entries(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<Vec<SnapshotDirectoryEntry>, SnapshotError> {
+        let inode = self.recorded_path_inode(rel_path).await?.ok_or_else(|| {
             SnapshotError::new(SnapshotErrorCode::PathNotFound, "fixed directory is absent")
         })?;
-        self.ensure_dir_loaded(inode).await?;
+        self.load_directory(inode).await?;
         let state = self.state.lock().unwrap();
         let directory = match state.nodes.get(&inode) {
             Some(Node::Dir(directory)) => directory,
@@ -933,7 +1759,7 @@ impl Mst2Fuse {
                 return Err(SnapshotError::new(
                     SnapshotErrorCode::NotDirectory,
                     "fixed path is not a directory",
-                ))
+                ));
             }
         };
         let mut entries = Vec::with_capacity(directory.children.len());
@@ -997,14 +1823,17 @@ impl Mst2Fuse {
         Ok(relative)
     }
 
-    async fn path_inode(&self, rel_path: &str) -> std::result::Result<Option<u64>, SnapshotError> {
+    async fn recorded_path_inode(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<Option<u64>, SnapshotError> {
         let relative = self.metadata_path(rel_path)?;
         let mut inode = ROOT_INODE;
         if relative == "/" {
             return Ok(Some(inode));
         }
         for name in relative.trim_start_matches('/').split('/') {
-            self.ensure_dir_loaded(inode).await?;
+            self.load_directory(inode).await?;
             let state = self.state.lock().unwrap();
             match state.nodes.get(&inode) {
                 Some(Node::Dir(directory)) => match directory.children.get(name) {
@@ -1021,7 +1850,7 @@ impl Mst2Fuse {
                     return Err(SnapshotError::new(
                         SnapshotErrorCode::NotDirectory,
                         "fixed ancestor is not a directory",
-                    ))
+                    ));
                 }
             }
         }
@@ -1074,7 +1903,7 @@ fn ensure_child(
             return Err(crate::snapshot::SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
                 format!("manifest parent inode {parent_inode} missing"),
-            ))
+            ));
         }
         // A manifest where one path is a file and another uses that file as a
         // directory (`a` and `a/b`) is contradictory; that is a server/manifest
@@ -1084,7 +1913,7 @@ fn ensure_child(
             return Err(crate::snapshot::SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
                 format!("manifest uses file {parent_inode} as a directory (entry {name:?})"),
-            ))
+            ));
         }
         Some(Node::Dir(_)) => {}
     }
@@ -1101,7 +1930,7 @@ fn ensure_child(
             return Err(crate::snapshot::SnapshotError::new(
                 crate::snapshot::SnapshotErrorCode::Internal,
                 format!("manifest parent inode {parent_inode} vanished"),
-            ))
+            ));
         }
     };
     let full = if parent_path.is_empty() {
@@ -1116,6 +1945,7 @@ fn ensure_child(
             fs_kind: f.fs_kind.clone(),
             size: f.size,
             digest: f.content_digest.clone(),
+            online_file: None,
         })
     } else {
         Node::Dir(DirNode {
@@ -1201,11 +2031,13 @@ impl Filesystem for Mst2Fuse {
         _fh: Option<u64>,
         _flags: u32,
     ) -> Result<ReplyAttr> {
+        self.check_metadata_lease().map_err(io_err)?;
         let node = self.node(inode)?;
         let attr = match &node {
             Node::Dir(_) => dir_attr(inode),
             Node::File(f) => file_attr(inode, f),
         };
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyAttr { attr, ttl: TTL })
     }
 
@@ -1219,12 +2051,14 @@ impl Filesystem for Mst2Fuse {
                 _ => None,
             }
         };
+        self.check_metadata_lease().map_err(io_err)?;
         let inode = child.ok_or_else(|| Errno::from(libc::ENOENT))?;
         let node = self.node(inode)?;
         let attr = match &node {
             Node::Dir(_) => dir_attr(inode),
             Node::File(f) => file_attr(inode, f),
         };
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyEntry {
             attr,
             ttl: TTL,
@@ -1253,6 +2087,7 @@ impl Filesystem for Mst2Fuse {
                 })
             })
             .collect();
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyDirectory {
             entries: iter(entries),
         })
@@ -1293,6 +2128,7 @@ impl Filesystem for Mst2Fuse {
                 attr_ttl: TTL,
             }));
         }
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyDirectoryPlus {
             entries: iter(entries),
         })
@@ -1302,6 +2138,7 @@ impl Filesystem for Mst2Fuse {
         // Handle needed only so the kernel's directory-open round trip
         // succeeds; the read-only tree needs no per-handle state.
         self.ensure_loaded(inode).await?;
+        self.check_metadata_lease().map_err(io_err)?;
         match self.node(inode)? {
             Node::Dir(_) => Ok(ReplyOpen {
                 fh: inode,
@@ -1317,12 +2154,16 @@ impl Filesystem for Mst2Fuse {
 
     async fn statfs(&self, _req: Request, _inode: Inode) -> Result<ReplyStatFs> {
         // Read-only view: report the snapshot's shape, not a device's usage.
-        let state = self.state.lock().unwrap();
-        let files = state
-            .nodes
-            .values()
-            .filter(|n| matches!(n, Node::File(_)))
-            .count() as u64;
+        self.check_metadata_lease().map_err(io_err)?;
+        let files = {
+            let state = self.state.lock().unwrap();
+            state
+                .nodes
+                .values()
+                .filter(|n| matches!(n, Node::File(_)))
+                .count() as u64
+        };
+        self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyStatFs {
             blocks: 0,
             bfree: 0,
@@ -1337,6 +2178,9 @@ impl Filesystem for Mst2Fuse {
 
     async fn open(&self, _req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
         let node = self.node(inode)?;
+        if let Some(reader) = self.store_reader() {
+            reader.ensure_lease().await.map_err(io_err)?;
+        }
         if is_symlink(&node) {
             // The kernel resolves symlinks itself; opening the link inode
             // directly (e.g. O_NOFOLLOW) is ELOOP, never "serve target text
@@ -1398,97 +2242,31 @@ impl Filesystem for Mst2Fuse {
             Node::File(f) => f,
             Node::Dir(_) => return Err(Errno::from(libc::EISDIR)),
         };
+        if let Some(scope) = &self.local_cas {
+            return self.read_local(scope, &f, offset, size as u64).await;
+        }
         if let Some(reader) = self.owned_reader() {
             return self
                 .read_owned(reader, inode, &f, offset, size as u64)
                 .await;
         }
-        if size == 0 || offset >= f.size {
-            return Ok(ReplyData { data: Bytes::new() });
-        }
-        let end = offset.saturating_add(size as u64).min(f.size);
-
-        // 1. Whole content already in memory (verified when it was read).
-        if let Some(bytes) = self.state.lock().unwrap().contents.get(&inode).cloned() {
-            return Ok(ReplyData {
-                data: verified_slice(&bytes, f.size, offset, end)?,
-            });
-        }
-
-        // 2. Small file: whole content (CAS when hydrated, OBJECT frames
-        //    otherwise), cached in memory — a small file's whole bytes are
-        //    cheap and repeats are common.
-        if f.size <= crate::snapshot::range::OBJECT_CAP {
-            if let Some(store) = &self.store {
-                if let Ok(bytes) = store.read_blob(&f.digest, f.size) {
-                    let arc = Arc::new(bytes);
-                    let out = verified_slice(&arc, f.size, offset, end)?;
-                    self.state.lock().unwrap().contents.insert(inode, arc);
-                    return Ok(ReplyData { data: out });
-                }
+        let store_reader = self.store_reader();
+        if let Some(reader) = store_reader {
+            reader.ensure_lease().await.map_err(io_err)?;
+            if f.size <= crate::snapshot::OBJECT_CAP {
+                return self.read_store_small(reader, &f, offset, size as u64).await;
             }
-            let bytes = Arc::new(self.fetch_content(&f).await?);
-            let out = verified_slice(&bytes, f.size, offset, end)?;
-            self.state.lock().unwrap().contents.insert(inode, bytes);
-            return Ok(ReplyData { data: out });
+            return self
+                .read_store_large(reader, inode, &f, offset, size as u64)
+                .await;
         }
-
-        // 3. Large file: serve the requested range only (spec 07 §6, BODY-12).
-        //    Local CAS builds private chunk facts with a cold whole scan,
-        //    then verifies complete covering chunks from the returned buffers.
-        //    Uncovered mutations are detected when read or by a strict audit.
-        //    The verified chunk reader is the live-transport path when the
-        //    CAS does not hold the file.
-        if let Some(store) = &self.store {
-            if let Some(bytes) = store
-                .read_indexed_blob_range(&f.digest, f.size, offset, (end - offset) as usize)
-                .map_err(io_err)?
-            {
-                if bytes.len() as u64 != end - offset {
-                    return Err(Errno::from(libc::EIO));
-                }
-                return Ok(ReplyData {
-                    data: Bytes::from(bytes),
-                });
-            }
+        if let Some(reader) = self.reader.as_ref() {
+            return self
+                .read_online(reader, inode, &f, offset, size as u64)
+                .await;
         }
-
-        // 4. Large file online: verified chunk reader, transferred range only.
-        let reader = self
-            .reader
-            .as_ref()
-            .ok_or_else(|| Errno::from(libc::EIO))?
-            .clone();
-        let chunked = {
-            let cached = self.state.lock().unwrap().chunked.get(&inode).cloned();
-            match cached {
-                Some(c) => c,
-                None => {
-                    let path = format!("/{}", f.path);
-                    let c = Arc::new(
-                        crate::snapshot::range::ChunkedFile::open(
-                            &reader, &path, &f.digest, f.size,
-                        )
-                        .await
-                        .map_err(io_err)?,
-                    );
-                    self.state.lock().unwrap().chunked.insert(inode, c.clone());
-                    c
-                }
-            }
-        };
-        let data = chunked
-            .read_range(offset, end - offset)
-            .await
-            .map_err(io_err)?;
-        if data.len() as u64 != end - offset {
-            return Err(Errno::from(libc::EIO));
-        }
-        Ok(ReplyData {
-            data: Bytes::from(data),
-        })
+        Err(Errno::from(libc::EIO))
     }
-
     /// Return the symlink target recorded in the fixed view. The content is
     /// the target bytes (git symlink blobs have no NUL terminator), verified
     /// against the digest the view advertised.
@@ -1499,27 +2277,21 @@ impl Filesystem for Mst2Fuse {
             Node::File(_) => return Err(Errno::from(libc::EINVAL)),
             Node::Dir(_) => return Err(Errno::from(libc::EINVAL)),
         };
+        if let Some(scope) = &self.local_cas {
+            return self.read_local(scope, &f, 0, f.size).await;
+        }
         if let Some(reader) = self.owned_reader() {
             return self.read_owned(reader, inode, &f, 0, f.size).await;
         }
-        let cached = self.state.lock().unwrap().contents.get(&inode).cloned();
-        let target = match cached {
-            Some(b) => b,
-            None => {
-                let arc = Arc::new(self.fetch_content(&f).await?);
-                self.state
-                    .lock()
-                    .unwrap()
-                    .contents
-                    .insert(inode, arc.clone());
-                arc
-            }
-        };
-        Ok(ReplyData {
-            data: Bytes::copy_from_slice(target.as_slice()),
-        })
+        if let Some(reader) = self.store_reader() {
+            reader.ensure_lease().await.map_err(io_err)?;
+            return self.read_store_small(reader, &f, 0, f.size).await;
+        }
+        if let Some(reader) = self.reader.as_ref() {
+            return self.read_online(reader, inode, &f, 0, f.size).await;
+        }
+        Err(Errno::from(libc::EIO))
     }
-
     async fn getlk(
         &self,
         _req: Request,
@@ -1712,24 +2484,14 @@ impl Filesystem for Mst2Fuse {
     }
 }
 
-fn verified_slice(bytes: &[u8], file_size: u64, offset: u64, end: u64) -> Result<Bytes> {
-    if bytes.len() as u64 != file_size {
-        return Err(Errno::from(libc::EIO));
-    }
-    let start = usize::try_from(offset).map_err(|_| Errno::from(libc::EIO))?;
-    let stop = usize::try_from(end).map_err(|_| Errno::from(libc::EIO))?;
-    bytes
-        .get(start..stop)
-        .map(Bytes::copy_from_slice)
-        .ok_or_else(|| Errno::from(libc::EIO))
-}
-
 fn io_err(e: crate::snapshot::SnapshotError) -> Errno {
     use crate::snapshot::SnapshotErrorCode::*;
     let code = match e.code {
         PathNotFound => libc::ENOENT,
-        Unauthenticated | ScopeForbidden | LeaseExpired | LeaseUnknown => libc::EACCES,
+        Unauthenticated | ScopeForbidden | LeaseUnknown => libc::EACCES,
+        LeaseExpired | SnapshotGone => libc::ESTALE,
         NotDirectory => libc::ENOTDIR,
+        MetadataNotReady => libc::EAGAIN,
         DigestMismatch => libc::EIO,
         _ => libc::EIO,
     };
@@ -1812,6 +2574,468 @@ mod tests {
             ],
         );
         closure_for_pages(root, pages)
+    }
+
+    async fn local_content_view(
+        body: &[u8],
+        kind: &str,
+        full: bool,
+    ) -> (tempfile::TempDir, Arc<DurableStore>, Mst2Fuse) {
+        use crate::snapshot::durable::{digest_of, ViewMeta};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(DurableStore::open(temp.path()).unwrap());
+        let digest = digest_of(body);
+        let fs = if full {
+            let mut pages = BTreeMap::new();
+            let empty = insert_page(&mut pages, &[]);
+            let kind = match kind {
+                "symlink" => EntryKind::Symlink,
+                "executable" => EntryKind::Executable,
+                _ => EntryKind::Regular,
+            };
+            let entry = |name: &[u8]| {
+                Entry::file(
+                    kind,
+                    name,
+                    body.len() as u64,
+                    crate::snapshot::frames::parse_digest(&digest).unwrap(),
+                )
+            };
+            let root = insert_page(
+                &mut pages,
+                &[entry(b"alias"), Entry::dir(b"empty", empty), entry(b"file")],
+            );
+            let closure = closure_for_pages(root, pages);
+            let view = ViewMeta {
+                snapshot_id: closure.snapshot_id().into(),
+                namespace_view_id: closure.descriptor().namespace_view_id.clone(),
+                scope: closure.descriptor().scope.clone(),
+                lease_id: "local-integrity-test".into(),
+            };
+            store
+                .hydrate_snapshot_with(&view, &closure, |_| std::future::ready(Ok(body.to_vec())))
+                .await
+                .unwrap();
+            Mst2Fuse::from_snapshot_store(store.clone()).unwrap()
+        } else {
+            let manifest = ["alias", "file"].map(|path| SnapshotFile {
+                rel_path: path.into(),
+                fs_kind: kind.into(),
+                size: body.len() as u64,
+                content_digest: digest.clone(),
+            });
+            store
+                .hydrate_with(
+                    &ViewMeta {
+                        snapshot_id: "sha256:local-snapshot".into(),
+                        namespace_view_id: "sha256:local-view".into(),
+                        scope: "/project".into(),
+                        lease_id: "local-integrity-test".into(),
+                    },
+                    &manifest,
+                    |_| std::future::ready(Ok(body.to_vec())),
+                )
+                .await
+                .unwrap();
+            Mst2Fuse::from_store(store.clone()).unwrap()
+        };
+        (temp, store, fs)
+    }
+
+    async fn local_inode(fs: &Mst2Fuse, name: &str) -> u64 {
+        fs.lookup(Request::default(), ROOT_INODE, OsStr::new(name))
+            .await
+            .unwrap()
+            .attr
+            .ino
+    }
+
+    fn local_object(store: &DurableStore, body: &[u8]) -> std::path::PathBuf {
+        store.content_dir().join(
+            crate::snapshot::durable::digest_of(body)
+                .strip_prefix("sha256:")
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn local_constructors_share_actual_small_owners_and_preserve_namespace_contracts() {
+        let body = vec![0x51; 8192];
+        for full in [false, true] {
+            let (_temp, store, fs) = local_content_view(&body, "regular", full).await;
+            assert!(fs.reader.is_none());
+            let scope = fs.local_cas.as_ref().unwrap();
+            assert_eq!(scope.access, LocalCasAccess::CallerEstablished);
+            let budget = scope.budget.clone();
+            assert!(Arc::ptr_eq(&scope.workers, &budget.cas_workers()));
+            let baseline = budget.usage();
+            let twin = if full {
+                Mst2Fuse::from_snapshot_store(store).unwrap()
+            } else {
+                Mst2Fuse::from_store(store).unwrap()
+            };
+            let twin_scope = twin.local_cas.as_ref().unwrap();
+            let twin_budget = twin_scope.budget.clone();
+            assert!(!Arc::ptr_eq(&budget, &twin_budget));
+            assert!(!Arc::ptr_eq(&scope.workers, &twin_scope.workers));
+            let twin_baseline = twin_budget.usage();
+            let inode = local_inode(&fs, "file").await;
+            let alias = local_inode(&fs, "alias").await;
+            assert_ne!(inode, alias);
+            if full {
+                assert_eq!(
+                    fs.path_state("empty/missing").await.unwrap(),
+                    SnapshotPathState::AbsentProven
+                );
+            } else {
+                assert_eq!(
+                    fs.path_state("missing").await.unwrap_err().code,
+                    SnapshotErrorCode::SnapshotNotReady
+                );
+            }
+            let reply = fs
+                .read(Request::default(), inode, inode, 0, body.len() as u32)
+                .await
+                .unwrap();
+            let alias_reply = fs
+                .read(Request::default(), alias, alias, 0, body.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(reply.data.as_ptr(), alias_reply.data.as_ptr());
+            assert_eq!(twin_budget.usage(), twin_baseline);
+            let twin_inode = local_inode(&twin, "file").await;
+            let twin_reply = twin
+                .read(
+                    Request::default(),
+                    twin_inode,
+                    twin_inode,
+                    0,
+                    body.len() as u32,
+                )
+                .await
+                .unwrap();
+            assert_ne!(reply.data.as_ptr(), twin_reply.data.as_ptr());
+            assert_eq!(twin_reply.data.as_ref(), body.as_slice());
+            drop(twin_reply);
+            drop(twin);
+            assert_eq!(twin_budget.usage().output_bytes, 0);
+            let key = ContentKey::new(&crate::snapshot::durable::digest_of(&body), 8192).unwrap();
+            let owner = fs
+                .state
+                .lock()
+                .unwrap()
+                .store_small
+                .as_mut()
+                .unwrap()
+                .get(key)
+                .unwrap();
+            assert_eq!(reply.data.as_ptr(), owner.as_bytes().as_ptr());
+            drop(owner);
+            let state = fs.state.lock().unwrap();
+            assert!(state.owned.is_none() && state.online.is_none());
+            assert!(state.store_ranges.is_none());
+            drop(state);
+            let last = reply.data.clone().slice(17..31);
+            drop(reply);
+            drop(alias_reply);
+            let paid = budget.usage();
+            assert!(paid.output_bytes > baseline.output_bytes + body.len());
+            assert_eq!(paid.construction_bytes, 0);
+            drop(fs);
+            assert_eq!(
+                budget.usage().output_bytes,
+                paid.output_bytes - baseline.output_bytes
+            );
+            assert_eq!(last.as_ref(), &[0x51; 14]);
+            drop(last);
+            assert_eq!(budget.usage().output_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_large_replies_retain_real_output_credit_through_clone_and_mount_drop() {
+        let body = vec![0x76; crate::snapshot::OBJECT_CAP as usize + 7];
+        for full in [false, true] {
+            let (_temp, _store, fs) = local_content_view(&body, "regular", full).await;
+            let inode = local_inode(&fs, "file").await;
+            let budget = fs.local_cas.as_ref().unwrap().budget.clone();
+            let baseline = budget.usage();
+            let reply = fs
+                .read(Request::default(), inode, inode, 4, 4096)
+                .await
+                .unwrap();
+            let pointer = reply.data.as_ptr();
+            let paid = budget.usage();
+            assert!(paid.output_bytes > baseline.output_bytes + 4096);
+            assert_eq!(paid.construction_bytes, 0);
+            let clone = reply.data.clone();
+            assert_eq!(clone.as_ptr(), pointer);
+            assert_eq!(budget.usage(), paid);
+            let last = clone.slice(17..31);
+            drop(clone);
+            drop(reply);
+            drop(fs);
+            assert_eq!(last.as_ptr(), pointer.wrapping_add(17));
+            assert_eq!(last.as_ref(), &[0x76; 14]);
+            assert_eq!(
+                budget.usage().output_bytes,
+                paid.output_bytes - baseline.output_bytes
+            );
+            assert_eq!(budget.usage().construction_bytes, 0);
+            drop(last);
+            assert_eq!(budget.usage().output_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_cold_damage_and_type_errors_are_terminal_and_refund_admission() {
+        for full in [false, true] {
+            for size in [17, crate::snapshot::OBJECT_CAP as usize + 7] {
+                for fault in ["hash", "short", "long", "directory"] {
+                    let body = vec![0x57; size];
+                    let (_temp, store, fs) = local_content_view(&body, "regular", full).await;
+                    let inode = local_inode(&fs, "file").await;
+                    let path = local_object(&store, &body);
+                    match fault {
+                        "hash" => {
+                            let mut damaged = body.clone();
+                            *damaged.last_mut().unwrap() ^= 1;
+                            std::fs::write(&path, damaged).unwrap();
+                        }
+                        "short" => std::fs::write(&path, &body[..size - 1]).unwrap(),
+                        "long" => {
+                            let mut damaged = body.clone();
+                            damaged.push(1);
+                            std::fs::write(&path, damaged).unwrap();
+                        }
+                        "directory" => {
+                            std::fs::remove_file(&path).unwrap();
+                            std::fs::create_dir(&path).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    let budget = fs.local_cas.as_ref().unwrap().budget.clone();
+                    let baseline = budget.usage();
+                    for _ in 0..2 {
+                        let error = fs
+                            .read(Request::default(), inode, inode, 0, 13)
+                            .await
+                            .unwrap_err();
+                        assert_eq!(i32::from(error), -libc::EIO, "{full} {size} {fault}");
+                        assert_eq!(budget.usage(), baseline);
+                    }
+                    assert!(fs.reader.is_none());
+                    assert!(fs.state.lock().unwrap().online.is_none());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_cas_symlink_open_errors_are_terminal_even_with_matching_targets() {
+        use std::os::unix::fs::symlink;
+
+        for full in [false, true] {
+            for size in [17, crate::snapshot::OBJECT_CAP as usize + 7] {
+                let body = vec![0x63; size];
+                let (temp, store, fs) = local_content_view(&body, "regular", full).await;
+                let inode = local_inode(&fs, "file").await;
+                let path = local_object(&store, &body);
+                let target = temp.path().join("matching-target");
+                std::fs::write(&target, &body).unwrap();
+                std::fs::remove_file(&path).unwrap();
+                symlink(&target, &path).unwrap();
+                let baseline = fs.local_cas.as_ref().unwrap().budget.usage();
+                for _ in 0..2 {
+                    assert_eq!(
+                        i32::from(
+                            fs.read(Request::default(), inode, inode, 0, 13)
+                                .await
+                                .unwrap_err()
+                        ),
+                        -libc::EIO
+                    );
+                    assert_eq!(fs.local_cas.as_ref().unwrap().budget.usage(), baseline);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_misses_keep_small_and_readlink_enoent_large_eio_and_empty_eof() {
+        for full in [false, true] {
+            for size in [17, crate::snapshot::OBJECT_CAP as usize + 7] {
+                let body = vec![0x61; size];
+                let (_temp, store, fs) = local_content_view(&body, "regular", full).await;
+                let inode = local_inode(&fs, "file").await;
+                std::fs::remove_file(local_object(&store, &body)).unwrap();
+                let budget = fs.local_cas.as_ref().unwrap().budget.clone();
+                let baseline = budget.usage();
+                for (offset, wanted) in [(size as u64, 13), (u64::MAX, u32::MAX), (0, 0)] {
+                    assert!(fs
+                        .read(Request::default(), inode, inode, offset, wanted)
+                        .await
+                        .unwrap()
+                        .data
+                        .is_empty());
+                }
+                for _ in 0..2 {
+                    let error = fs
+                        .read(Request::default(), inode, inode, 0, 13)
+                        .await
+                        .unwrap_err();
+                    let errno = if size <= crate::snapshot::OBJECT_CAP as usize {
+                        libc::ENOENT
+                    } else {
+                        libc::EIO
+                    };
+                    assert_eq!(i32::from(error), -errno);
+                    assert_eq!(budget.usage(), baseline);
+                }
+                assert!(fs.reader.is_none());
+            }
+            let (_temp, store, fs) = local_content_view(b"target", "symlink", full).await;
+            let link = local_inode(&fs, "file").await;
+            std::fs::remove_file(local_object(&store, b"target")).unwrap();
+            let baseline = fs.local_cas.as_ref().unwrap().budget.usage();
+            for _ in 0..2 {
+                assert_eq!(
+                    i32::from(fs.readlink(Request::default(), link).await.unwrap_err()),
+                    -libc::ENOENT
+                );
+                assert_eq!(fs.local_cas.as_ref().unwrap().budget.usage(), baseline);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn file_only_local_symlinks_use_the_modern_target_profile() {
+        for body in [Vec::new(), b"bad\0target".to_vec(), vec![b'x'; 4096]] {
+            let (_temp, _store, fs) = local_content_view(&body, "symlink", false).await;
+            let inode = local_inode(&fs, "file").await;
+            assert_eq!(
+                i32::from(
+                    fs.open(Request::default(), inode, libc::O_RDONLY as u32)
+                        .await
+                        .unwrap_err()
+                ),
+                -libc::ELOOP
+            );
+            let baseline = fs.local_cas.as_ref().unwrap().budget.usage();
+            assert_eq!(
+                i32::from(fs.readlink(Request::default(), inode).await.unwrap_err()),
+                -libc::EIO
+            );
+            assert_eq!(fs.local_cas.as_ref().unwrap().budget.usage(), baseline);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_persistent_budget_rejects_before_missing_body_open_then_refunds() {
+        let (_temp, store, fs) = local_content_view(b"data", "regular", false).await;
+        let inode = local_inode(&fs, "file").await;
+        let budget = fs.local_cas.as_ref().unwrap().budget.clone();
+        let baseline = budget.usage();
+        std::fs::remove_file(local_object(&store, b"data")).unwrap();
+        let held = budget
+            .reserve(
+                crate::snapshot::content::BudgetClass::Output,
+                128 * 1024 * 1024 - baseline.output_bytes,
+            )
+            .unwrap();
+        let occupied = budget.usage();
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), inode, inode, 0, 4)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EIO
+        );
+        assert_eq!(budget.usage(), occupied);
+        drop(held);
+        assert_eq!(budget.usage(), baseline);
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), inode, inode, 0, 4)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::ENOENT
+        );
+        assert_eq!(budget.usage(), baseline);
+    }
+
+    #[tokio::test]
+    async fn local_held_small_reply_survives_real_cache_eviction_and_mount_drop() {
+        use crate::snapshot::durable::{digest_of, ViewMeta};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(DurableStore::open(temp.path()).unwrap());
+        let bodies: Vec<_> = (0..66u8)
+            .map(|byte| vec![byte; crate::snapshot::OBJECT_CAP as usize])
+            .collect();
+        let manifest: Vec<_> = bodies
+            .iter()
+            .enumerate()
+            .map(|(index, body)| SnapshotFile {
+                rel_path: format!("file{index:03}"),
+                fs_kind: "regular".into(),
+                size: body.len() as u64,
+                content_digest: digest_of(body),
+            })
+            .collect();
+        store
+            .hydrate_with(
+                &ViewMeta {
+                    snapshot_id: "sha256:local-snapshot".into(),
+                    namespace_view_id: "sha256:local-view".into(),
+                    scope: "/project".into(),
+                    lease_id: "local-integrity-test".into(),
+                },
+                &manifest,
+                |file| {
+                    let index = file.rel_path[4..].parse::<usize>().unwrap();
+                    std::future::ready(Ok(bodies[index].clone()))
+                },
+            )
+            .await
+            .unwrap();
+        let fs = Mst2Fuse::from_store(store).unwrap();
+        let budget = fs.local_cas.as_ref().unwrap().budget.clone();
+        let inode = local_inode(&fs, "file000").await;
+        let reply = fs
+            .read(Request::default(), inode, inode, 0, 32)
+            .await
+            .unwrap();
+        let last = reply.data.clone().slice(17..31);
+        drop(reply);
+        for index in 1..66 {
+            let inode = local_inode(&fs, &format!("file{index:03}")).await;
+            drop(
+                fs.read(Request::default(), inode, inode, 0, 32)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let key = ContentKey::new(&manifest[0].content_digest, manifest[0].size).unwrap();
+        assert!(fs
+            .state
+            .lock()
+            .unwrap()
+            .store_small
+            .as_mut()
+            .unwrap()
+            .get(key)
+            .is_none());
+        assert_eq!(last.as_ref(), &[0; 14]);
+        drop(fs);
+        assert!(budget.usage().output_bytes > crate::snapshot::OBJECT_CAP as usize);
+        assert_eq!(budget.usage().construction_bytes, 0);
+        drop(last);
+        assert_eq!(budget.usage().output_bytes, 0);
     }
 
     #[tokio::test]
@@ -1987,7 +3211,26 @@ mod tests {
     #[tokio::test]
     async fn complete_snapshot_preserves_executable_and_symlink_semantics() {
         let closure = directory_closure();
-        let fs = Mst2Fuse::build_snapshot_closure(None, None, &closure).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(DurableStore::open(temp.path()).unwrap());
+        let view = crate::snapshot::ViewMeta {
+            snapshot_id: closure.snapshot_id().into(),
+            namespace_view_id: closure.descriptor().namespace_view_id.clone(),
+            scope: closure.descriptor().scope.clone(),
+            lease_id: "local-integrity-test".into(),
+        };
+        store
+            .hydrate_snapshot_with(&view, &closure, |file| {
+                let body = match file.fs_kind.as_str() {
+                    "executable" => b"#!/bin/sh\n".as_slice(),
+                    "symlink" => b"plain".as_slice(),
+                    _ => b"data".as_slice(),
+                };
+                std::future::ready(Ok(body.to_vec()))
+            })
+            .await
+            .unwrap();
+        let fs = Mst2Fuse::from_snapshot_store(store).unwrap();
         let req = Request::default();
         let left = fs
             .lookup(req, ROOT_INODE, OsStr::new("left"))
@@ -2019,11 +3262,6 @@ mod tests {
         );
         let error = fs.open(req, link, libc::O_RDONLY as u32).await.unwrap_err();
         assert_eq!(i32::from(error), -libc::ELOOP);
-        fs.state
-            .lock()
-            .unwrap()
-            .contents
-            .insert(link, Arc::new(b"plain".to_vec()));
         assert_eq!(
             fs.readlink(req, link).await.unwrap().data.as_ref(),
             b"plain"
@@ -2060,7 +3298,11 @@ mod tests {
 
     #[tokio::test]
     async fn lower_open_rejects_write_flags_without_fetching_content() {
-        let fs = file_view(4);
+        let (_temp, store, fs) = local_content_view(b"data", "regular", false).await;
+        let budget = fs.local_cas.as_ref().unwrap().budget.clone();
+        let baseline = budget.usage();
+        // Any accidental body open after construction would now fail.
+        std::fs::remove_file(local_object(&store, b"data")).unwrap();
         let req = Request::default();
         let inode = fs
             .lookup(req, ROOT_INODE, OsStr::new("file"))
@@ -2079,7 +3321,16 @@ mod tests {
             let error = fs.open(req, inode, flags as u32).await.unwrap_err();
             assert_eq!(i32::from(error), -libc::EROFS, "flags {flags}");
         }
-        assert!(fs.state.lock().unwrap().contents.is_empty());
+        assert_eq!(budget.usage(), baseline);
+        assert!(fs
+            .state
+            .lock()
+            .unwrap()
+            .store_small
+            .as_mut()
+            .unwrap()
+            .get(ContentKey::new(&crate::snapshot::durable::digest_of(b"data"), 4).unwrap())
+            .is_none());
         fs.fsync(req, inode, inode, false).await.unwrap();
     }
 
@@ -2100,8 +3351,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_short_content_is_eio_and_true_eof_is_empty() {
-        let fs = file_view(4);
+    async fn local_short_content_is_eio_and_true_eof_is_empty() {
+        let (_temp, store, fs) = local_content_view(b"data", "regular", false).await;
         let req = Request::default();
         let inode = fs
             .lookup(req, ROOT_INODE, OsStr::new("file"))
@@ -2109,11 +3360,8 @@ mod tests {
             .unwrap()
             .attr
             .ino;
-        fs.state
-            .lock()
-            .unwrap()
-            .contents
-            .insert(inode, Arc::new(b"dat".to_vec()));
+        let path = local_object(&store, b"data");
+        std::fs::write(&path, b"dat").unwrap();
         let error = fs.read(req, inode, inode, 0, 4).await.unwrap_err();
         assert_eq!(i32::from(error), -libc::EIO);
         for (offset, size) in [(4, 10), (u64::MAX, u32::MAX), (0, 0)] {
@@ -2124,11 +3372,7 @@ mod tests {
                 .data
                 .is_empty());
         }
-        fs.state
-            .lock()
-            .unwrap()
-            .contents
-            .insert(inode, Arc::new(b"data".to_vec()));
+        std::fs::write(&path, b"data").unwrap();
         assert_eq!(
             fs.read(req, inode, inode, 3, u32::MAX)
                 .await
@@ -2143,28 +3387,12 @@ mod tests {
     async fn local_large_ranges_verify_cold_file_and_warm_covering_chunks() {
         // Invoke filesystem operations directly, without a mount or an
         // offline authorization claim.
-        let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(DurableStore::open(temp.path()).unwrap());
         let body = vec![0x51; 2 * 1024 * 1024 + 7];
-        let digest = crate::snapshot::durable::digest_of(&body);
-        let path = store
-            .content_dir()
-            .join(digest.strip_prefix("sha256:").unwrap());
-        std::fs::write(&path, &body).unwrap();
-        let fs = Mst2Fuse::build(
-            None,
-            Some(store),
-            vec![SnapshotFile {
-                rel_path: "large".into(),
-                fs_kind: "regular".into(),
-                size: body.len() as u64,
-                content_digest: digest,
-            }],
-        )
-        .unwrap();
+        let (_temp, store, fs) = local_content_view(&body, "regular", false).await;
+        let path = local_object(&store, &body);
         let req = Request::default();
         let inode = fs
-            .lookup(req, ROOT_INODE, OsStr::new("large"))
+            .lookup(req, ROOT_INODE, OsStr::new("file"))
             .await
             .unwrap()
             .attr
@@ -2225,13 +3453,17 @@ mod tests {
     #[test]
     fn unavailable_view_does_not_become_a_negative_path_entry() {
         use crate::snapshot::{SnapshotError, SnapshotErrorCode};
-        for code in [
-            SnapshotErrorCode::ViewNotFound,
-            SnapshotErrorCode::SnapshotGone,
+        for (code, errno) in [
+            (SnapshotErrorCode::ViewNotFound, libc::EIO),
+            (SnapshotErrorCode::SnapshotGone, libc::ESTALE),
+            (SnapshotErrorCode::LeaseExpired, libc::ESTALE),
+            (SnapshotErrorCode::ScopeForbidden, libc::EACCES),
+            (SnapshotErrorCode::Unauthenticated, libc::EACCES),
+            (SnapshotErrorCode::LeaseUnknown, libc::EACCES),
         ] {
             assert_eq!(
                 i32::from(io_err(SnapshotError::new(code, "unavailable"))),
-                -libc::EIO
+                -errno
             );
         }
         assert_eq!(

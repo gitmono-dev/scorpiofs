@@ -12,7 +12,7 @@ use axum::{
     body::Body,
     extract::{Query, State as HttpState},
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -111,13 +111,19 @@ struct Fixture {
     metadata: Mutex<Vec<String>>,
     requests: AtomicUsize,
     map_requests: AtomicUsize,
+    map_not_ready: AtomicUsize,
     leaf_requests: AtomicUsize,
     chunk_requests: AtomicUsize,
     emitted: Arc<AtomicUsize>,
     renewals: AtomicUsize,
+    renewal_status: u16,
     mode: AtomicUsize,
     release: tokio::sync::Semaphore,
     objects: bool,
+    metadata_pages: bool,
+    directory_requests: AtomicUsize,
+    content_paths: Mutex<Vec<String>>,
+    range_paths: Mutex<Vec<String>>,
     expiry: String,
     large: Option<Large>,
     nested_page: Option<Vec<u8>>,
@@ -163,13 +169,19 @@ impl Fixture {
             metadata: Mutex::new(Vec::new()),
             requests: AtomicUsize::new(0),
             map_requests: AtomicUsize::new(0),
+            map_not_ready: AtomicUsize::new(0),
             leaf_requests: AtomicUsize::new(0),
             chunk_requests: AtomicUsize::new(0),
             emitted: Arc::new(AtomicUsize::new(0)),
             renewals: AtomicUsize::new(0),
+            renewal_status: 403,
             mode: AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(0),
             objects,
+            metadata_pages: true,
+            directory_requests: AtomicUsize::new(0),
+            content_paths: Mutex::new(Vec::new()),
+            range_paths: Mutex::new(Vec::new()),
             expiry: "2099-01-01T00:00:00Z".into(),
             large: None,
             nested_page: None,
@@ -272,7 +284,36 @@ impl Fixture {
 }
 async fn capabilities(HttpState(f): HttpState<Arc<Fixture>>) -> Json<Value> {
     Json(
-        json!({"protocol_versions":[2],"metadata_codecs":[1],"frame_encodings":["identity"],"features":{"resolve":true,"directory":true,"leases":true,"metadata_pages":true,"objects":f.objects,"raw_blob":true,"chunk_reads":true}}),
+        json!({"protocol_versions":[2],"metadata_codecs":[1],"frame_encodings":["identity"],"features":{"resolve":true,"directory":true,"leases":true,"metadata_pages":f.metadata_pages,"objects":f.objects,"raw_blob":true,"chunk_reads":true}}),
+    )
+}
+async fn directory(
+    HttpState(f): HttpState<Arc<Fixture>>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    assert!(!f.metadata_pages);
+    assert_eq!(query["path"], "/");
+    assert_eq!(query["limit"], "256");
+    assert!(!query.contains_key("cursor"));
+    f.directory_requests.fetch_add(1, Ordering::SeqCst);
+    let mut entries: Vec<Value> = f.bodies.iter().map(|(name, body)| json!({
+        "name": name,
+        "fs_kind": match name.as_str() { "exec" => "executable", "link" => "symlink", _ => "regular" },
+        "size": body.len().to_string(), "content_digest": id(&hash(body)),
+    })).collect();
+    if let Some(large) = &f.large {
+        entries.extend((0..17).map(|index| json!({
+            "name":format!("range{index:03}"), "fs_kind":"regular",
+            "size":large.map.file_size.to_string(), "content_digest":id(&large.map.file_content_id),
+        })));
+    }
+    entries.sort_by(|a, b| a["name"].as_str().unwrap().cmp(b["name"].as_str().unwrap()));
+    Json(
+        json!({"snapshot_id": id(&f.descriptor.snapshot_id().unwrap()), "path":"/",
+            "metadata_root": id(&f.descriptor.metadata_root), "directory_root":id(&f.descriptor.metadata_root),
+            "node_class":"native_tree", "lifecycle":"immutable_release", "range_start_exclusive":null,
+            "entry_count":entries.len().to_string(), "entries":entries, "next_cursor":null, "proof_pages":[],
+        }),
     )
 }
 async fn resolve(HttpState(f): HttpState<Arc<Fixture>>) -> Json<Value> {
@@ -284,8 +325,10 @@ async fn resolve(HttpState(f): HttpState<Arc<Fixture>>) -> Json<Value> {
 async fn renew(HttpState(f): HttpState<Arc<Fixture>>) -> (StatusCode, Json<Value>) {
     f.renewals.fetch_add(1, Ordering::SeqCst);
     (
-        StatusCode::FORBIDDEN,
-        Json(json!({"error":{"code":"SCOPE_FORBIDDEN","message":"revoked FUSE lease"}})),
+        StatusCode::from_u16(f.renewal_status).unwrap(),
+        Json(
+            json!({"error":{"code":if f.renewal_status == 410 { "SNAPSHOT_GONE" } else { "SCOPE_FORBIDDEN" },"message":"revoked FUSE lease"}}),
+        ),
     )
 }
 async fn metadata(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Response {
@@ -326,6 +369,7 @@ async fn objects(HttpState(f): HttpState<Arc<Fixture>>, request: Bytes) -> Respo
     let items = value["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     let name = items[0]["path"].as_str().unwrap().trim_start_matches('/');
+    f.content_paths.lock().unwrap().push(name.into());
     let body = &f.bodies[name];
     assert_eq!(items[0]["expected_digest"], id(&hash(body)));
     let mut wire = ObjectPayload {
@@ -359,22 +403,42 @@ async fn raw(
 ) -> Response {
     f.requests.fetch_add(1, Ordering::SeqCst);
     let bytes = &f.bodies[query["path"].trim_start_matches('/')];
+    f.content_paths
+        .lock()
+        .unwrap()
+        .push(query["path"].trim_start_matches('/').into());
     assert_eq!(query["expected_digest"], id(&hash(bytes)));
     Response::builder().body(Body::from(bytes.clone())).unwrap()
 }
 async fn map_response(
     HttpState(f): HttpState<Arc<Fixture>>,
     Query(query): Query<BTreeMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
     f.map_requests.fetch_add(1, Ordering::SeqCst);
+    f.range_paths
+        .lock()
+        .unwrap()
+        .push(query["path"].trim_start_matches('/').into());
     let map = &f.large.as_ref().unwrap().map;
     assert!(query["path"].trim_start_matches('/').starts_with("range"));
     assert_eq!(query["expected_digest"], id(&map.file_content_id));
+    if f.map_not_ready
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":{"code":"METADATA_NOT_READY","message":"fixed map is being prepared","request_id":"fuse-map","retryable":false}})),
+        )
+            .into_response();
+    }
     let mut value = json!({"snapshot_id":id(&f.descriptor.snapshot_id().unwrap()),"path":query["path"],"schema_version":2,"file_content_id":id(&map.file_content_id),"file_size":map.file_size.to_string(),"chunk_size":CHUNK_SIZE,"chunk_count":map.chunk_count.to_string(),"page_count":map.page_count.to_string(),"pages_root":id(&map.pages_root),"map_id":id(&map.map_id())});
     if f.mode.load(Ordering::SeqCst) == 5 {
         value["file_size"] = json!((map.file_size + 1).to_string());
     }
-    Json(value)
+    Json(value).into_response()
 }
 async fn leaf_response(
     HttpState(f): HttpState<Arc<Fixture>>,
@@ -458,6 +522,7 @@ impl Server {
             .route("/api/v2/snapshots/resolve", post(resolve))
             .route("/api/v2/snapshots/leases/{lease}/renew", post(renew))
             .route("/api/v2/snapshots/{sid}/metadata/pages", post(metadata))
+            .route("/api/v2/snapshots/{sid}/directory", get(directory))
             .route("/api/v2/snapshots/{sid}/objects", post(objects))
             .route("/api/v2/snapshots/{sid}/blob", get(raw))
             .route("/api/v2/snapshots/{sid}/chunk-map", get(map_response))
@@ -492,7 +557,838 @@ impl Server {
             Mst2Fuse::from_reader(self.reader.clone()).await.unwrap()
         }
     }
+
+    async fn stored_view(&self) -> (tempfile::TempDir, Arc<DurableStore>, Mst2Fuse) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            DurableStore::open_for_reader(
+                temp.path().join("view"),
+                temp.path().join("cas"),
+                &self.reader,
+            )
+            .unwrap(),
+        );
+        let view = Mst2Fuse::from_reader_with_store(self.reader.clone(), store.clone())
+            .await
+            .unwrap();
+        (temp, store, view)
+    }
 }
+
+#[tokio::test]
+async fn no_pages_public_constructors_keep_path_requests_independent_and_actual_replies_paid() {
+    let _serial = TEST_LOCK.lock().await;
+    for (stored, objects) in [(false, true), (true, true), (false, false), (true, false)] {
+        let mut fixture = Fixture::new(false, objects);
+        fixture.metadata_pages = false;
+        fixture
+            .bodies
+            .insert("file001".into(), fixture.bodies["file000"].clone());
+        let server = Server::start(fixture.with_large(), 32 * 1024 * 1024).await;
+        let (_temp, _store, fs) = if stored {
+            let (temp, store, fs) = server.stored_view().await;
+            (Some(temp), Some(store), fs)
+        } else {
+            (None, None, server.view(false).await)
+        };
+        assert_eq!(server.fixture.directory_requests.load(Ordering::SeqCst), 1);
+        assert!(server.fixture.metadata.lock().unwrap().is_empty());
+        assert!(server.reader.content_membership.get().is_none());
+        assert_eq!(
+            fs.path_state("missing").await.unwrap_err().code,
+            SnapshotErrorCode::SnapshotNotReady
+        );
+        let slots = server.reader.content_usage().output_bytes;
+        let first = read(&fs, "file000", 17, 31).await;
+        let alias = read(&fs, "file001", 17, 31).await;
+        assert_eq!(first.data.as_ref(), alias.data.as_ref());
+        assert_ne!(first.data.as_ptr(), alias.data.as_ptr());
+        assert_eq!(
+            server.fixture.content_paths.lock().unwrap().as_slice(),
+            ["file000", "file001"]
+        );
+        let warmed = read(&fs, "file000", 17, 31).await;
+        assert_eq!(warmed.data.as_ptr(), first.data.as_ptr());
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 2);
+        let large = read(&fs, "range000", CHUNK_SIZE as u64 - 2, 5).await;
+        let large_alias = read(&fs, "range001", CHUNK_SIZE as u64 - 2, 5).await;
+        assert_eq!(large.data.as_ref(), [0, 0, 1, 1, 1]);
+        assert_eq!(large.data.as_ref(), large_alias.data.as_ref());
+        assert_eq!(
+            server.fixture.range_paths.lock().unwrap().as_slice(),
+            ["range000", "range001"]
+        );
+        assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 4);
+        let link = inode(&fs, "link").await;
+        assert_eq!(
+            fs.readlink(Request::default(), link)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            b"file000"
+        );
+        assert!(server.reader.content_usage().output_bytes > slots);
+        assert_eq!(server.reader.content_usage().construction_bytes, 0);
+        drop(alias);
+        drop(warmed);
+        drop(large_alias);
+        let last = first.data.slice(1..8);
+        let tail = large.data.slice(1..4);
+        drop(first);
+        drop(large);
+        drop(fs);
+        assert!(server.reader.content_usage().output_bytes > 0);
+        assert_eq!(last.as_ref(), [0; 7]);
+        assert_eq!(tail.as_ref(), [0, 1, 1]);
+        drop(last);
+        drop(tail);
+        assert_eq!(server.reader.content_usage().output_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn legacy_pages_stored_constructor_uses_actual_full_proof_and_preserves_empty_directories() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, true);
+    let empty = Page::build(&[]).unwrap();
+    let mut entries: Vec<_> = fixture
+        .bodies
+        .iter()
+        .map(|(name, body)| {
+            Entry::file(
+                match name.as_str() {
+                    "exec" => EntryKind::Executable,
+                    "link" => EntryKind::Symlink,
+                    _ => EntryKind::Regular,
+                },
+                name.as_bytes(),
+                body.len() as u64,
+                hash(body),
+            )
+        })
+        .collect();
+    entries.push(Entry::dir(b"nested", page_id(&empty)));
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    fixture.page = Page::build(&entries).unwrap();
+    fixture.descriptor.metadata_root = page_id(&fixture.page);
+    fixture.nested_page = Some(empty);
+    let server = Server::start(fixture, 8 * 1024 * 1024).await;
+    assert!(matches!(
+        server.reader.capability_advertisement(),
+        crate::snapshot::capabilities::CapabilityAdvertisement::Legacy(_)
+    ));
+    let (_temp, store, fs) = server.stored_view().await;
+    assert_eq!(
+        server.fixture.metadata.lock().unwrap().as_slice(),
+        ["/", "/nested"]
+    );
+    assert!(server.reader.content_membership.get().is_some());
+    assert_eq!(server.fixture.directory_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs.path_state("nested/missing").await.unwrap(),
+        SnapshotPathState::AbsentProven
+    );
+    let baseline = server.fixture.metadata.lock().unwrap().len();
+    std::fs::write(
+        store
+            .content_dir()
+            .join(hex::encode(hash(&server.fixture.bodies["file000"]))),
+        &server.fixture.bodies["file000"],
+    )
+    .unwrap();
+    let reply = read(&fs, "file000", 0, 4).await;
+    assert_eq!(reply.data.as_ref(), [0; 4]);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.fixture.metadata.lock().unwrap().len(), baseline);
+    assert!(fs.state.lock().unwrap().online.is_none());
+    assert!(fs.state.lock().unwrap().store_small.is_some());
+    drop(reply);
+    drop(fs);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn no_pages_raw_builder_tuple_changes_and_foreign_tokens_never_authorize_cached_or_empty_replies(
+) {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, true);
+    fixture.metadata_pages = false;
+    let server = Server::start(fixture, 8 * 1024 * 1024).await;
+    let raw = Mst2Fuse::build(
+        Some(server.reader.clone()),
+        None,
+        server.reader.file_manifest().await.unwrap(),
+    )
+    .unwrap();
+    let file = inode(&raw, "file000").await;
+    for (offset, size) in [(0, 1), (u64::MAX, 0)] {
+        assert_eq!(
+            i32::from(
+                raw.read(Request::default(), file, file, offset, size)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EIO
+        );
+    }
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+    drop(raw);
+    let mut foreign_fixture = Fixture::new(false, true);
+    foreign_fixture.metadata_pages = false;
+    let foreign = Server::start(foreign_fixture, 8 * 1024 * 1024).await;
+    let foreign_fs = foreign.view(false).await;
+    let foreign_file = foreign_fs
+        .online_file_for_test(inode(&foreign_fs, "file000").await)
+        .unwrap();
+    for mutation in 0..5 {
+        let fs = server.view(false).await;
+        let file = inode(&fs, "file000").await;
+        drop(fs.read(Request::default(), file, file, 0, 1).await.unwrap());
+        let before = server.fixture.requests.load(Ordering::SeqCst);
+        let Node::File(mut node) = fs.node(file).unwrap() else {
+            panic!("file")
+        };
+        match mutation {
+            0 => node.path = "file001".into(),
+            1 => node.fs_kind = "symlink".into(),
+            2 => node.size = 0,
+            3 => node.digest = id(&[0x99; 32]),
+            _ => node.online_file = Some(foreign_file.clone()),
+        }
+        fs.state
+            .lock()
+            .unwrap()
+            .nodes
+            .insert(file, Node::File(node));
+        for (offset, size) in [(0, 1), (u64::MAX, 0)] {
+            assert_eq!(
+                i32::from(
+                    fs.read(Request::default(), file, file, offset, size)
+                        .await
+                        .unwrap_err()
+                ),
+                -libc::EIO
+            );
+        }
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), before);
+        drop(fs);
+    }
+    drop(foreign_fs);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+    assert_eq!(foreign.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn no_pages_held_replies_survive_actual_small_and_range_cache_eviction() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, true).with_large();
+    fixture.metadata_pages = false;
+    let server = Server::start(fixture, 32 * 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let first = read(&fs, "file000", 17, 31).await;
+    let large = read(&fs, "range000", CHUNK_SIZE as u64 - 2, 5).await;
+    let small_pointer = first.data.as_ptr();
+    let large_pointer = large.data.as_ptr();
+    let last = first.data.clone().slice(1..8);
+    let tail = large.data.clone().slice(1..4);
+    for index in 1..17 {
+        drop(read(&fs, &format!("file{index:03}"), 0, 1).await);
+        drop(
+            read(
+                &fs,
+                &format!("range{index:03}"),
+                2 * CHUNK_SIZE as u64 + 3,
+                u32::MAX,
+            )
+            .await,
+        );
+    }
+    {
+        let state = fs.state.lock().unwrap();
+        let cache = state.online.as_ref().unwrap();
+        assert_eq!(cache.contents.len(), 16);
+        assert_eq!(cache.ranges.len(), 16);
+    }
+    drop(read(&fs, "file000", 0, 1).await);
+    drop(read(&fs, "range000", CHUNK_SIZE as u64 - 2, 5).await);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 18);
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 18);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 20);
+    drop(first);
+    drop(large);
+    drop(fs);
+    assert_eq!(last.as_ptr(), small_pointer.wrapping_add(1));
+    assert_eq!(tail.as_ptr(), large_pointer.wrapping_add(1));
+    assert_eq!(last.as_ref(), [0; 7]);
+    assert_eq!(tail.as_ref(), [0, 1, 1]);
+    assert!(server.reader.content_usage().output_bytes > 8192);
+    assert_eq!(server.reader.content_usage().construction_bytes, 0);
+    drop(last);
+    drop(tail);
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn online_stored_profiles_use_real_cas_owners_and_only_missing_objects_reach_wire() {
+    let _serial = TEST_LOCK.lock().await;
+    for metadata_pages in [false, true] {
+        let mut fixture = Fixture::new(false, true).with_large();
+        fixture.metadata_pages = metadata_pages;
+        let server = Server::start(fixture, 32 * 1024 * 1024).await;
+        let (_temp, store, fs) = server.stored_view().await;
+        let small = &server.fixture.bodies["file000"];
+        std::fs::write(store.content_dir().join(hex::encode(hash(small))), small).unwrap();
+        let large = server.fixture.large.as_ref().unwrap();
+        let body: Vec<_> = (0..large.map.chunk_count)
+            .flat_map(|index| large.bytes(index))
+            .collect();
+        assert_eq!(hash(&body), large.map.file_content_id);
+        let path = store
+            .content_dir()
+            .join(hex::encode(large.map.file_content_id));
+        std::fs::write(&path, body).unwrap();
+        let reply = read(&fs, "file000", 17, 31).await;
+        let range = read(&fs, "range000", CHUNK_SIZE as u64 - 2, 5).await;
+        assert_eq!(reply.data.as_ref(), [0; 31]);
+        assert_eq!(range.data.as_ref(), [0, 0, 1, 1, 1]);
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(read(&fs, "file001", 0, 1).await.data.as_ref(), [1]);
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 1);
+        // Large reads prefer local CAS even with an existing wire handle.
+        // Removing this actual object is the only reason the next range
+        // can create its independent wire handle.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read(&fs, "range001", 2 * CHUNK_SIZE as u64, 7)
+                .await
+                .data
+                .as_ref(),
+            [2; 7]
+        );
+        assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 1);
+        let small_last = reply.data.slice(1..8);
+        let range_last = range.data.slice(1..4);
+        drop(reply);
+        drop(range);
+        drop(fs);
+        idle(&server.reader).await;
+        assert_eq!(small_last.as_ref(), [0; 7]);
+        assert_eq!(range_last.as_ref(), [0, 1, 1]);
+        assert!(server.reader.content_usage().output_bytes > 8192);
+        drop(small_last);
+        drop(range_last);
+        assert_eq!(server.reader.content_usage().output_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn online_stored_corrupt_size_and_type_errors_never_fallback_or_publish_a_cache() {
+    let _serial = TEST_LOCK.lock().await;
+    for metadata_pages in [false, true] {
+        for large in [false, true] {
+            for damage in 0..4 {
+                let mut fixture = Fixture::new(false, true).with_large();
+                fixture.metadata_pages = metadata_pages;
+                let server = Server::start(fixture, 8 * 1024 * 1024).await;
+                let (_temp, store, fs) = server.stored_view().await;
+                let (name, body) = if large {
+                    let large = server.fixture.large.as_ref().unwrap();
+                    (
+                        "range000",
+                        (0..large.map.chunk_count)
+                            .flat_map(|index| large.bytes(index))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    ("file000", server.fixture.bodies["file000"].clone())
+                };
+                let path = store.content_dir().join(hex::encode(hash(&body)));
+                match damage {
+                    0 => {
+                        let mut bytes = body.clone();
+                        *bytes.last_mut().unwrap() ^= 1;
+                        std::fs::write(&path, bytes).unwrap();
+                    }
+                    1 => std::fs::write(&path, &body[..body.len() - 1]).unwrap(),
+                    2 => {
+                        let mut bytes = body.clone();
+                        bytes.push(1);
+                        std::fs::write(&path, bytes).unwrap();
+                    }
+                    _ => std::fs::create_dir(&path).unwrap(),
+                }
+                let file = inode(&fs, name).await;
+                let baseline = server.reader.content_usage();
+                for _ in 0..2 {
+                    assert_eq!(
+                        i32::from(
+                            fs.read(Request::default(), file, file, 0, 13)
+                                .await
+                                .unwrap_err()
+                        ),
+                        -libc::EIO
+                    );
+                    idle(&server.reader).await;
+                    assert_eq!(server.reader.content_usage(), baseline);
+                    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+                    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 0);
+                    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 0);
+                    let state = fs.state.lock().unwrap();
+                    if let Some(cache) = &state.online {
+                        assert_eq!(cache.contents.len(), 0);
+                        assert_eq!(cache.ranges.len(), 0);
+                    }
+                }
+                if damage == 3 {
+                    std::fs::remove_dir(&path).unwrap();
+                }
+                std::fs::write(&path, &body).unwrap();
+                assert_eq!(
+                    fs.read(Request::default(), file, file, 0, 13)
+                        .await
+                        .unwrap()
+                        .data
+                        .as_ref(),
+                    &body[..13]
+                );
+                drop(fs);
+                idle(&server.reader).await;
+                assert_eq!(server.reader.content_usage().output_bytes, 0);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn online_stored_cas_symlinks_are_terminal_even_with_valid_target_bytes() {
+    let _serial = TEST_LOCK.lock().await;
+    for metadata_pages in [false, true] {
+        for large in [false, true] {
+            let mut fixture = Fixture::new(false, true).with_large();
+            fixture.metadata_pages = metadata_pages;
+            let server = Server::start(fixture, 8 * 1024 * 1024).await;
+            let (_temp, store, fs) = server.stored_view().await;
+            let (name, body) = if large {
+                let large = server.fixture.large.as_ref().unwrap();
+                (
+                    "range000",
+                    (0..large.map.chunk_count)
+                        .flat_map(|index| large.bytes(index))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                ("file000", server.fixture.bodies["file000"].clone())
+            };
+            let target = store.content_dir().join("real-target");
+            std::fs::write(&target, &body).unwrap();
+            std::os::unix::fs::symlink(&target, store.content_dir().join(hex::encode(hash(&body))))
+                .unwrap();
+            let file = inode(&fs, name).await;
+            let baseline = server.reader.content_usage();
+            for _ in 0..2 {
+                assert_eq!(
+                    i32::from(
+                        fs.read(Request::default(), file, file, 0, 13)
+                            .await
+                            .unwrap_err()
+                    ),
+                    -libc::EIO
+                );
+                idle(&server.reader).await;
+                assert_eq!(server.reader.content_usage(), baseline);
+                assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+                assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 0);
+                assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_pages_exhausted_reply_quota_rejects_before_wire_and_cas_but_valid_eof_is_empty() {
+    let _serial = TEST_LOCK.lock().await;
+    for stored in [false, true] {
+        let mut fixture = Fixture::new(false, true).with_large();
+        fixture.metadata_pages = false;
+        let limit = 8 * 1024 * 1024;
+        let server = Server::start(fixture, limit).await;
+        let (_temp, store, fs) = if stored {
+            let (temp, store, fs) = server.stored_view().await;
+            (Some(temp), Some(store), fs)
+        } else {
+            (None, None, server.view(false).await)
+        };
+        let small = inode(&fs, "file000").await;
+        let range = inode(&fs, "range000").await;
+        if let Some(store) = &store {
+            std::fs::write(
+                store
+                    .content_dir()
+                    .join(hex::encode(hash(&server.fixture.bodies["file000"]))),
+                &server.fixture.bodies["file000"],
+            )
+            .unwrap();
+        }
+        let baseline = server.reader.content_usage().output_bytes;
+        let pressure = server
+            .reader
+            .content_scope
+            .reserve(
+                crate::snapshot::content::BudgetClass::Output,
+                limit - baseline,
+            )
+            .unwrap();
+        for file in [small, range] {
+            assert!(fs.read(Request::default(), file, file, 0, 1).await.is_err());
+            assert!(fs
+                .read(Request::default(), file, file, 0, 0)
+                .await
+                .unwrap()
+                .data
+                .is_empty());
+            assert!(fs
+                .read(Request::default(), file, file, u64::MAX, u32::MAX)
+                .await
+                .unwrap()
+                .data
+                .is_empty());
+        }
+        assert_eq!(server.reader.content_usage().output_bytes, limit);
+        assert_eq!(server.reader.content_usage().construction_bytes, 0);
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 0);
+        drop(pressure);
+        assert_eq!(read(&fs, "file000", 0, 1).await.data.as_ref(), [0]);
+        assert_eq!(
+            read(&fs, "range000", 2 * CHUNK_SIZE as u64, 7)
+                .await
+                .data
+                .as_ref(),
+            [2; 7]
+        );
+        assert_eq!(
+            server.fixture.requests.load(Ordering::SeqCst),
+            usize::from(!stored)
+        );
+        drop(fs);
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage().output_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn no_pages_malformed_object_map_chunk_end_and_nul_symlink_never_publish() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(false, true);
+    fixture.metadata_pages = false;
+    fixture
+        .bodies
+        .insert("link".into(), b"bad\0target".to_vec());
+    let server = Server::start(fixture.with_large(), 8 * 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let small = inode(&fs, "file000").await;
+    let range = inode(&fs, "range000").await;
+    let link = inode(&fs, "link").await;
+    let baseline = server.reader.content_usage();
+    for mode in [1, 2] {
+        server.fixture.mode.store(mode, Ordering::SeqCst);
+        let before = server.fixture.requests.load(Ordering::SeqCst);
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), small, small, 0, 1)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EIO
+        );
+        assert_eq!(server.fixture.requests.load(Ordering::SeqCst), before + 1);
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage(), baseline);
+        assert_eq!(
+            fs.state
+                .lock()
+                .unwrap()
+                .online
+                .as_ref()
+                .unwrap()
+                .contents
+                .len(),
+            0
+        );
+    }
+    for (mode, expected_chunks) in [(5, 0), (1, 1), (2, 1), (6, 1), (7, 2)] {
+        server.fixture.mode.store(mode, Ordering::SeqCst);
+        let maps = server.fixture.map_requests.load(Ordering::SeqCst);
+        let chunks = server.fixture.chunk_requests.load(Ordering::SeqCst);
+        assert_eq!(
+            i32::from(
+                fs.read(Request::default(), range, range, CHUNK_SIZE as u64 - 2, 5)
+                    .await
+                    .unwrap_err()
+            ),
+            -libc::EIO
+        );
+        assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), maps + 1);
+        assert_eq!(
+            server.fixture.chunk_requests.load(Ordering::SeqCst),
+            chunks + expected_chunks
+        );
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage(), baseline);
+        assert_eq!(
+            fs.state
+                .lock()
+                .unwrap()
+                .online
+                .as_ref()
+                .unwrap()
+                .ranges
+                .len(),
+            0
+        );
+    }
+    server.fixture.mode.store(0, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(
+            i32::from(fs.readlink(Request::default(), link).await.unwrap_err()),
+            -libc::EIO
+        );
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage(), baseline);
+        assert_eq!(
+            fs.state
+                .lock()
+                .unwrap()
+                .online
+                .as_ref()
+                .unwrap()
+                .contents
+                .len(),
+            0
+        );
+    }
+    assert_eq!(read(&fs, "file000", 0, 1).await.data.as_ref(), [0]);
+    assert_eq!(
+        read(&fs, "range000", CHUNK_SIZE as u64 - 2, 5)
+            .await
+            .data
+            .as_ref(),
+        [0, 0, 1, 1, 1]
+    );
+}
+
+#[tokio::test]
+async fn no_pages_actual_fuse_cancellation_keeps_other_small_and_range_replies_paid() {
+    let _serial = TEST_LOCK.lock().await;
+    for large in [false, true] {
+        let mut fixture = Fixture::new(false, true).with_large();
+        fixture.metadata_pages = false;
+        let server = Server::start(fixture, 8 * 1024 * 1024).await;
+        let fs = Arc::new(server.view(false).await);
+        let retained = read(
+            &fs,
+            if large { "range000" } else { "file000" },
+            if large { 2 * CHUNK_SIZE as u64 } else { 0 },
+            7,
+        )
+        .await;
+        let baseline = server.reader.content_usage().output_bytes;
+        for (mode, name) in if large {
+            [(4, "range001"), (3, "range002")]
+        } else {
+            [(4, "file001"), (3, "file002")]
+        } {
+            server.fixture.mode.store(mode, Ordering::SeqCst);
+            let file = inode(&fs, name).await;
+            let count = if large {
+                &server.fixture.chunk_requests
+            } else {
+                &server.fixture.requests
+            };
+            let before = count.load(Ordering::SeqCst);
+            let emitted = server.fixture.emitted.load(Ordering::SeqCst);
+            let task = tokio::spawn({
+                let fs = fs.clone();
+                async move { fs.read(Request::default(), file, file, 0, 4).await }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while count.load(Ordering::SeqCst) == before
+                    || mode == 3 && server.fixture.emitted.load(Ordering::SeqCst) == emitted
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!task.is_finished());
+            assert!(server.reader.content_usage().output_bytes > baseline);
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            if mode == 4 {
+                server.fixture.release.add_permits(1);
+            }
+            idle(&server.reader).await;
+            assert_eq!(server.reader.content_usage().output_bytes, baseline);
+            assert_eq!(
+                retained.data.as_ref(),
+                if large { &[2; 7] } else { &[0; 7] }
+            );
+            let state = fs.state.lock().unwrap();
+            let cache = state.online.as_ref().unwrap();
+            assert_eq!(
+                if large {
+                    cache.ranges.len()
+                } else {
+                    cache.contents.len()
+                },
+                1
+            );
+        }
+        drop(retained);
+        drop(fs);
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage().output_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn no_pages_cached_content_range_readlink_and_empty_replies_observe_real_403_and_410() {
+    let _serial = TEST_LOCK.lock().await;
+    for status in [403, 410] {
+        let mut fixture = Fixture::new(false, true).with_large();
+        fixture.metadata_pages = false;
+        fixture.renewal_status = status;
+        let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(4);
+        fixture.expiry = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            expiry.year(),
+            u8::from(expiry.month()),
+            expiry.day(),
+            expiry.hour(),
+            expiry.minute(),
+            expiry.second()
+        );
+        let server = Server::start(fixture, 8 * 1024 * 1024).await;
+        let fs = server.view(false).await;
+        let small = inode(&fs, "file000").await;
+        let range = inode(&fs, "range000").await;
+        let link = inode(&fs, "link").await;
+        let prior = read(&fs, "file000", 0, 4).await;
+        let prior_range = read(&fs, "range000", 2 * CHUNK_SIZE as u64, 7).await;
+        drop(fs.readlink(Request::default(), link).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while server.fixture.renewals.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let expected_code = if status == 403 {
+            SnapshotErrorCode::ScopeForbidden
+        } else {
+            SnapshotErrorCode::SnapshotGone
+        };
+        assert_eq!(
+            server.reader.ensure_lease().await.unwrap_err().code,
+            expected_code
+        );
+        let before = (
+            server.fixture.requests.load(Ordering::SeqCst),
+            server.fixture.map_requests.load(Ordering::SeqCst),
+            server.fixture.chunk_requests.load(Ordering::SeqCst),
+        );
+        let errno = if status == 403 {
+            libc::EACCES
+        } else {
+            libc::ESTALE
+        };
+        for file in [small, range] {
+            for (offset, size) in [(0, 1), (0, 0), (u64::MAX, u32::MAX)] {
+                assert_eq!(
+                    i32::from(
+                        fs.read(Request::default(), file, file, offset, size)
+                            .await
+                            .unwrap_err()
+                    ),
+                    -errno
+                );
+            }
+            assert_eq!(
+                i32::from(
+                    fs.getattr(Request::default(), file, None, 0)
+                        .await
+                        .unwrap_err()
+                ),
+                -errno
+            );
+        }
+        assert_eq!(
+            i32::from(fs.readlink(Request::default(), link).await.unwrap_err()),
+            -errno
+        );
+        assert_eq!(
+            (
+                server.fixture.requests.load(Ordering::SeqCst),
+                server.fixture.map_requests.load(Ordering::SeqCst),
+                server.fixture.chunk_requests.load(Ordering::SeqCst)
+            ),
+            before
+        );
+        assert_eq!(prior.data.as_ref(), [0; 4]);
+        assert_eq!(prior_range.data.as_ref(), [2; 7]);
+        drop(prior);
+        drop(prior_range);
+        drop(fs);
+        idle(&server.reader).await;
+        assert_eq!(server.reader.content_usage().output_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn actual_symlink_nul_is_terminal_in_every_online_owner_profile() {
+    let _serial = TEST_LOCK.lock().await;
+    for metadata_pages in [false, true] {
+        for stored in [false, true] {
+            let mut fixture = Fixture::new(false, true);
+            fixture.metadata_pages = metadata_pages;
+            fixture
+                .bodies
+                .insert("link".into(), b"bad\0target".to_vec());
+            let server = Server::start(fixture.with_large(), 8 * 1024 * 1024).await;
+            let (_temp, _store, fs) = if stored {
+                let (temp, store, fs) = server.stored_view().await;
+                let body = &server.fixture.bodies["link"];
+                std::fs::write(store.content_dir().join(hex::encode(hash(body))), body).unwrap();
+                (Some(temp), Some(store), fs)
+            } else {
+                (None, None, server.view(false).await)
+            };
+            let link = inode(&fs, "link").await;
+            let baseline = server.reader.content_usage();
+            for _ in 0..2 {
+                assert_eq!(
+                    i32::from(fs.readlink(Request::default(), link).await.unwrap_err()),
+                    -libc::EIO
+                );
+                idle(&server.reader).await;
+                assert_eq!(server.reader.content_usage(), baseline);
+            }
+            assert_eq!(
+                server.fixture.requests.load(Ordering::SeqCst),
+                if stored { 0 } else { 2 }
+            );
+            drop(fs);
+            assert_eq!(server.reader.content_usage().output_bytes, 0);
+        }
+    }
+}
+
 async fn inode(fs: &Mst2Fuse, name: &str) -> u64 {
     fs.lookup(Request::default(), ROOT_INODE, OsStr::new(name))
         .await
@@ -542,7 +1438,7 @@ async fn actual_reply_clones_survive_small_cache_eviction_mount_drop_and_keep_qu
             .len(),
         16
     );
-    assert!(fs.state.lock().unwrap().contents.is_empty());
+    assert!(fs.state.lock().unwrap().online.is_none());
     drop(reply);
     drop(cloned_reply);
     drop(fs);
@@ -665,7 +1561,7 @@ async fn failed_body_and_end_do_not_cache_or_retry_through_a_legacy_api() {
                 .len(),
             0
         );
-        assert!(fs.state.lock().unwrap().contents.is_empty());
+        assert!(fs.state.lock().unwrap().online.is_none());
     }
     server.fixture.mode.store(0, Ordering::SeqCst);
     assert_eq!(read(&fs, "file000", 0, 1).await.data.as_ref(), [0]);
@@ -863,8 +1759,8 @@ async fn actual_cross_chunk_reply_survives_range_reader_eviction_and_mount_drop(
     {
         let state = fs.state.lock().unwrap();
         assert_eq!(state.owned.as_ref().unwrap().ranges.len(), 16);
-        assert!(state.chunked.is_empty());
-        assert!(state.contents.is_empty());
+        assert!(state.online.is_none());
+        assert!(state.store_small.is_none());
     }
     // The real first reader was evicted: opening this inode again requests its
     // map and both covering chunks. Its old reply continues owning its range.
@@ -916,6 +1812,60 @@ async fn actual_range_reply_retention_blocks_admission_until_the_last_bytes_drop
 }
 
 #[tokio::test]
+async fn actual_metadata_not_ready_returns_eagain_without_publishing_or_latching_a_range() {
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::new(false, true).with_large();
+    fixture.map_not_ready.store(1, Ordering::SeqCst);
+    let server = Server::start(fixture, 8 * 1024 * 1024).await;
+    let fs = server.view(false).await;
+    let file = inode(&fs, "range000").await;
+    let baseline = server.reader.content_usage();
+    assert_eq!(
+        i32::from(
+            fs.read(Request::default(), file, file, CHUNK_SIZE as u64 - 2, 5)
+                .await
+                .unwrap_err()
+        ),
+        -libc::EAGAIN
+    );
+    idle(&server.reader).await;
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.fixture.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.reader.content_usage(), baseline);
+    assert_eq!(
+        fs.state
+            .lock()
+            .unwrap()
+            .owned
+            .as_ref()
+            .unwrap()
+            .ranges
+            .len(),
+        0
+    );
+
+    server.fixture.map_not_ready.store(0, Ordering::SeqCst);
+    let reply = fs
+        .read(Request::default(), file, file, CHUNK_SIZE as u64 - 2, 5)
+        .await
+        .unwrap();
+    assert_eq!(reply.data.as_ref(), [0, 0, 1, 1, 1]);
+    assert_eq!(server.fixture.map_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(server.fixture.leaf_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.fixture.chunk_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        server.reader.snapshot_id(),
+        id(&server.fixture.descriptor.snapshot_id().unwrap())
+    );
+    drop(reply);
+    drop(fs);
+    idle(&server.reader).await;
+    assert_eq!(server.reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
 async fn malformed_actual_range_map_chunk_and_end_publish_no_reply_or_reader_cache() {
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::new(false, true).with_large(), 8 * 1024 * 1024).await;
@@ -947,7 +1897,7 @@ async fn malformed_actual_range_map_chunk_and_end_publish_no_reply_or_reader_cac
         assert_eq!(server.reader.content_usage().output_bytes, slots);
         let state = fs.state.lock().unwrap();
         assert_eq!(state.owned.as_ref().unwrap().ranges.len(), 0);
-        assert!(state.chunked.is_empty());
+        assert!(state.online.is_none());
     }
     server.fixture.mode.store(0, Ordering::SeqCst);
     assert_eq!(

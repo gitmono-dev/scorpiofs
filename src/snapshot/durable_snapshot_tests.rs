@@ -54,6 +54,168 @@ async fn offline_grant_is_bound_to_complete_pin_and_actor_domain() {
     assert!(!store.is_complete().unwrap());
 }
 
+#[tokio::test]
+async fn local_grant_mount_checks_exact_reopen_binding_without_new_per_read_expiry() {
+    use std::{ffi::OsStr, sync::Arc};
+
+    use asyncfuse::raw::prelude::*;
+
+    let (closure, raw, view) = fixture(2);
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(DurableStore::open(temp.path()).unwrap());
+    store
+        .hydrate_snapshot_with(&view, &closure, |file| {
+            std::future::ready(Ok(raw[&file.content_digest].clone()))
+        })
+        .await
+        .unwrap();
+    let mut grant = OfflineGrant {
+        grant_id: "export-local-owners".into(),
+        snapshot_id: view.snapshot_id.clone(),
+        actor_domain_id: "mount-domain".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        policy: "trusted_local_export_v1".into(),
+    };
+    let reopen = |grant: &OfflineGrant, actor: &str| {
+        crate::snapshot::fuse::Mst2Fuse::from_snapshot_store_with_grant(store.clone(), grant, actor)
+    };
+    assert_eq!(
+        reopen(&grant, "mount-domain").err().unwrap().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    {
+        let _transaction = store.transaction().unwrap();
+        store
+            .finish_hydration_commit(
+                &view,
+                closure.files(),
+                Some(&closure),
+                Some(&grant),
+                (0, 2, 0),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        reopen(&grant, "different-domain").err().unwrap().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    let mut wrong = grant.clone();
+    wrong.snapshot_id = "sha256:different-snapshot".into();
+    assert_eq!(
+        reopen(&wrong, "mount-domain").err().unwrap().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    wrong = grant.clone();
+    wrong.grant_id.push_str("-different");
+    assert_eq!(
+        reopen(&wrong, "mount-domain").err().unwrap().code,
+        SnapshotErrorCode::ScopeForbidden
+    );
+    let mounted = reopen(&grant, "mount-domain").unwrap();
+    let req = Request::default();
+    let directory = mounted
+        .lookup(req, 1, OsStr::new("alias-a"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let inode = mounted
+        .lookup(req, directory, OsStr::new("f0000"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let file = closure
+        .files()
+        .iter()
+        .find(|file| file.rel_path == "alias-a/f0000")
+        .unwrap();
+    let reply = mounted.read(req, inode, inode, 0, 1024).await.unwrap();
+    assert_eq!(reply.data.as_ref(), raw[&file.content_digest].as_slice());
+    let alias_directory = mounted
+        .lookup(req, 1, OsStr::new("alias-b"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let alias = mounted
+        .lookup(req, alias_directory, OsStr::new("f0000"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    assert_ne!(inode, alias);
+    let alias_reply = mounted.read(req, alias, alias, 0, 1024).await.unwrap();
+    assert_eq!(alias_reply.data.as_ptr(), reply.data.as_ptr());
+
+    // Commit an expired grant into the fixture after a legitimate open. The
+    // existing mount intentionally retains reopen-established access; this
+    // byte-owner migration must not introduce a per-read expiry policy.
+    grant.expires_at = "2000-01-01T00:00:00Z".into();
+    {
+        let _transaction = store.transaction().unwrap();
+        store
+            .finish_hydration_commit(
+                &view,
+                closure.files(),
+                Some(&closure),
+                Some(&grant),
+                (0, 2, 0),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        reopen(&grant, "mount-domain").err().unwrap().code,
+        SnapshotErrorCode::LeaseExpired
+    );
+    assert_eq!(
+        mounted
+            .getattr(req, inode, None, 0)
+            .await
+            .unwrap()
+            .attr
+            .size,
+        file.size
+    );
+    assert_eq!(
+        mounted
+            .read(req, inode, inode, 0, 1024)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        reply.data.as_ref()
+    );
+    let second = mounted
+        .lookup(req, directory, OsStr::new("f0001"))
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let second_file = closure
+        .files()
+        .iter()
+        .find(|file| file.rel_path == "alias-a/f0001")
+        .unwrap();
+    assert_eq!(
+        mounted
+            .read(req, second, second, 0, 1024)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        raw[&second_file.content_digest].as_slice()
+    );
+    for (offset, wanted) in [(file.size, 1024), (u64::MAX, u32::MAX), (0, 0)] {
+        assert!(mounted
+            .read(req, inode, inode, offset, wanted)
+            .await
+            .unwrap()
+            .data
+            .is_empty());
+    }
+}
+
 fn add_directory_pages(entries: &[Entry], pages: &mut BTreeMap<String, Vec<u8>>) -> [u8; 32] {
     let root = Page::build(entries).unwrap();
     let id = page_id(&root);
@@ -217,7 +379,8 @@ async fn full_batch_merges_small_and_large_aliases_and_resumes_all_logical_paths
         large,
     ]);
     let temp = tempfile::tempdir().unwrap();
-    let store = DurableStore::open(temp.path()).unwrap();
+    let mut store = DurableStore::open(temp.path()).unwrap();
+    let meters = store.enable_verification_meters();
     let report = hydrate_full_core(&store, "batch", &view, &closure, &raw)
         .await
         .unwrap();
@@ -228,6 +391,10 @@ async fn full_batch_merges_small_and_large_aliases_and_resumes_all_logical_paths
     assert_eq!(report.total_files, 8);
     assert_eq!(report.bytes_total, 4 * (5 + 256 * 1024 + 1));
     assert_eq!(report.completion_kind, CompletionKind::FullSnapshot);
+    let cold = meters.snapshot_for(CasVerificationReason::Resume);
+    assert_eq!(cold.calls, 2);
+    assert_eq!(cold.missing, 2);
+    assert_eq!(cold.read_bytes, 0);
     let marker: SnapshotCompleteMarker =
         serde_json::from_slice(&fs::read(temp.path().join(COMPLETE_MARKER)).unwrap()).unwrap();
     assert_eq!(marker.verification_revision, SNAPSHOT_VERIFICATION_REVISION);
@@ -255,7 +422,130 @@ async fn full_batch_merges_small_and_large_aliases_and_resumes_all_logical_paths
         .unwrap();
     assert_eq!(warm.fetched, 0);
     assert_eq!(warm.resumed, 8);
+    assert_eq!(warm.bytes_total, report.bytes_total);
+    assert_eq!(store.read_journal().unwrap().len(), 8);
+    let resumed = meters.snapshot_for(CasVerificationReason::Resume);
+    assert_eq!(resumed.calls - cold.calls, 2);
+    assert_eq!(resumed.verified - cold.verified, 2);
+    assert_eq!(resumed.read_bytes - cold.read_bytes, 5 + 256 * 1024 + 1);
     assert!(store.is_snapshot_complete().unwrap());
+
+    // Both duplicated sizes still repair through one fetch per content unit.
+    fs::write(store.blob_path(&digest_of(b"small")).unwrap(), b"bad!!").unwrap();
+    let large_digest = raw
+        .keys()
+        .find(|digest| raw[*digest].len() > 256 * 1024)
+        .unwrap();
+    fs::remove_file(store.blob_path(large_digest).unwrap()).unwrap();
+    let repaired = hydrate_full_core(&store, "batch", &view, &closure, &raw)
+        .await
+        .unwrap();
+    assert_eq!(repaired.fetched, 2);
+    assert_eq!(repaired.resumed, 0);
+    assert_eq!(
+        repaired.repaired, 4,
+        "four paths name the damaged small blob"
+    );
+    assert_eq!(repaired.total_files, 8);
+    assert_eq!(repaired.bytes_total, report.bytes_total);
+    let audited = meters.snapshot_for(CasVerificationReason::Resume);
+    assert_eq!(audited.calls - resumed.calls, 2);
+    assert_eq!(audited.digest_mismatches - resumed.digest_mismatches, 1);
+    assert_eq!(audited.missing - resumed.missing, 1);
+    assert_eq!(store.read_journal().unwrap().len(), 8);
+    assert_eq!(store.snapshot_manifest().unwrap().files(), closure.files());
+}
+
+#[tokio::test]
+async fn full_batch_resume_audits_one_blob_for_128_paths_and_keeps_every_journal_entry() {
+    let bytes = vec![0x67; 8 * 1024];
+    let (closure, raw, view) = fixture_contents(vec![bytes.clone(); 64]);
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = DurableStore::open(temp.path()).unwrap();
+    hydrate_full_core(&store, "batch", &view, &closure, &raw)
+        .await
+        .unwrap();
+    let meters = store.enable_verification_meters();
+    let report = store
+        .hydrate_batches_closure::<_, _, HashMap<String, std::sync::Arc<Vec<u8>>>, Vec<u8>>(
+            &view,
+            closure.files(),
+            Some(SnapshotHydration {
+                closure: &closure,
+                reader: None,
+            }),
+            (2, 2),
+            |_| Box::pin(async { panic!("the shared blob is already verified") }),
+            |_| Box::pin(async { panic!("all fixture files are small") }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.total_files, 128);
+    assert_eq!(report.resumed, 128);
+    assert_eq!(report.fetched, 0);
+    assert_eq!(report.bytes_total, 128 * bytes.len() as u64);
+    assert_eq!(store.read_journal().unwrap().len(), 128);
+    for reason in [
+        CasVerificationReason::Resume,
+        CasVerificationReason::HydrationCommit,
+    ] {
+        let audited = meters.snapshot_for(reason);
+        assert_eq!(audited.calls, 1);
+        assert_eq!(audited.verified, 1);
+        assert_eq!(audited.read_bytes, bytes.len() as u64);
+    }
+    assert_eq!(store.snapshot_manifest().unwrap().files(), closure.files());
+}
+
+#[tokio::test]
+async fn batch_alias_reuse_does_not_cache_proof_across_the_final_dependency_audit() {
+    let (closure, raw, view) = fixture_contents(vec![b"warm".to_vec(), b"fetch".to_vec()]);
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = DurableStore::open(temp.path()).unwrap();
+    hydrate_full_core(&store, "batch", &view, &closure, &raw)
+        .await
+        .unwrap();
+    let warm_path = store.blob_path(&digest_of(b"warm")).unwrap();
+    fs::remove_file(store.blob_path(&digest_of(b"fetch")).unwrap()).unwrap();
+    let meters = store.enable_verification_meters();
+    let error = store
+        .hydrate_batches_closure::<_, _, HashMap<String, std::sync::Arc<Vec<u8>>>, Vec<u8>>(
+            &view,
+            closure.files(),
+            Some(SnapshotHydration {
+                closure: &closure,
+                reader: None,
+            }),
+            (2, 2),
+            move |batch| {
+                let warm_path = warm_path.clone();
+                Box::pin(async move {
+                    assert_eq!(batch.len(), 1);
+                    assert_eq!(batch[0].content_digest, digest_of(b"fetch"));
+                    // A different workspace or local writer can change the
+                    // shared CAS after the resume hint was checked.
+                    fs::write(warm_path, b"bad!").unwrap();
+                    Ok(HashMap::from([(
+                        digest_of(b"fetch"),
+                        std::sync::Arc::new(b"fetch".to_vec()),
+                    )]))
+                })
+            },
+            |_| Box::pin(async { panic!("all fixture files are small") }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::IntegrityError);
+    assert_eq!(hydration_error_label(&error), Some("dependency_audit"));
+    assert_eq!(meters.snapshot_for(CasVerificationReason::Resume).calls, 2);
+    assert_eq!(
+        meters
+            .snapshot_for(CasVerificationReason::HydrationCommit)
+            .digest_mismatches,
+        1
+    );
+    assert!(!temp.path().join(COMPLETE_MARKER).exists());
+    assert!(!store.is_snapshot_complete().unwrap());
 }
 
 #[tokio::test]

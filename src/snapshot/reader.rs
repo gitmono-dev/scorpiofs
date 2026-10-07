@@ -332,6 +332,7 @@ fn lease_window(expiry: &str) -> Result<LeaseWindow, SnapshotError> {
 
 fn recoverable_renewal_error(error: &SnapshotError) -> bool {
     match error.code {
+        SnapshotErrorCode::MetadataNotReady => error.http_status == 503,
         SnapshotErrorCode::TemporaryUnavailable if error.http_status == 0 => true,
         SnapshotErrorCode::TemporaryUnavailable
         | SnapshotErrorCode::Internal
@@ -669,19 +670,6 @@ impl SnapshotReader {
         Ok(self.client.lookup(self.snapshot_id(), paths).await?.results)
     }
 
-    /// Fetch one file's verified bytes (digest checked on both server and
-    /// client sides).
-    /// This compatibility Vec is caller-owned; use `read_content` for retained
-    /// capacity credits and fixed-root membership checks.
-    pub async fn read_file(&self, rel_path: &str, digest: &str) -> Result<Vec<u8>, SnapshotError> {
-        self.context.validate_relative_path(rel_path)?;
-        let request_path = ScopeRequestPath(rel_path).to_string();
-        self.ensure_lease().await?;
-        self.client
-            .blob_verified(self.snapshot_id(), &request_path, digest)
-            .await
-    }
-
     /// One directory, following the cursor to the end, so callers see every
     /// entry with the directory's own `directory_root` (spec 04 §6: the
     /// cursor chain is the complete enumeration, never a silent first page).
@@ -982,168 +970,6 @@ impl SnapshotReader {
                 Some(c) => cursor = Some(c),
             }
         }
-    }
-
-    /// Fetch one file through the frame surface (spec 04 §9 / spec 07):
-    /// OBJECT batch for files ≤256 KiB, Chunk Map + CHUNK frames above that.
-    ///
-    /// Every chunk is hash-checked against the map's leaf and the assembled
-    /// file is re-hashed before it is returned — verified chunks alone never
-    /// make a verified file (spec 07 §7).
-    /// This compatibility Vec is caller-owned; `read_content` uses the owned
-    /// fixed-size transport without whole-stream staging.
-    pub async fn read_file_frames(
-        &self,
-        rel_path: &str,
-        digest: &str,
-        size: u64,
-    ) -> Result<Vec<u8>, SnapshotError> {
-        self.client.validate_file_size(size)?;
-        if size > crate::snapshot::client::MAX_BUFFERED_FILE_BYTES || usize::try_from(size).is_err()
-        {
-            return Err(SnapshotError::new(
-                SnapshotErrorCode::LimitExceeded,
-                "whole-file buffered read exceeds the local 64 MiB budget; use range reads",
-            ));
-        }
-        self.context.validate_relative_path(rel_path)?;
-        self.ensure_lease().await?;
-        let sid = self.snapshot_id();
-        let request_path = ScopeRequestPath(rel_path).to_string();
-        if size <= 256 * 1024 {
-            let map = self
-                .client
-                .objects(
-                    sid,
-                    &[(request_path, digest.to_string())],
-                    self.content_encoding(),
-                )
-                .await?;
-            let want = crate::snapshot::frames::parse_digest(digest)?;
-            let bytes = map.get(&want).cloned().ok_or_else(|| {
-                SnapshotError::new(
-                    SnapshotErrorCode::DigestMismatch,
-                    "objects response missing the requested unit",
-                )
-            })?;
-            if bytes.len() as u64 != size {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::DigestMismatch,
-                    format!("{rel_path}: size {} != advertised {size}", bytes.len()),
-                ));
-            }
-            if crate::snapshot::durable::digest_of(&bytes) != digest {
-                return Err(SnapshotError::new(
-                    SnapshotErrorCode::DigestMismatch,
-                    format!("{rel_path}: whole-object rehash mismatch"),
-                ));
-            }
-            return Ok(bytes);
-        }
-
-        // Large file: verify the map binding, every leaf proof, every chunk
-        // hash, then the whole-file hash.
-        self.ensure_lease().await?;
-        let map = self.client.chunk_map(sid, &request_path, digest).await?;
-        if map.file_size != size {
-            return Err(SnapshotError::new(
-                SnapshotErrorCode::DigestMismatch,
-                "chunk map file size differs from the fixed view's advertised size",
-            ));
-        }
-        let mut chunk_hashes: Vec<[u8; 32]> = Vec::with_capacity(map.chunk_count as usize);
-        for page_index in 0..map.page_count {
-            self.ensure_lease().await?;
-            let leaf = self
-                .client
-                .chunk_map_page(sid, &request_path, digest, &map, page_index)
-                .await?;
-            chunk_hashes.extend(leaf.chunk_sha256);
-        }
-        if chunk_hashes.len() as u64 != map.chunk_count {
-            return Err(SnapshotError::new(
-                SnapshotErrorCode::DigestMismatch,
-                "chunk map pages did not cover chunk_count",
-            ));
-        }
-        let file_id = crate::snapshot::frames::parse_digest(digest)?;
-        let length_map = mst2_codec::chunkmap::ChunkMap::new(file_id, size, map.pages_root)
-            .map_err(|e| SnapshotError::new(SnapshotErrorCode::Internal, e.to_string()))?;
-
-        let map_id = map.map_id.clone();
-        let mut out: Vec<Option<Vec<u8>>> = (0..map.chunk_count).map(|_| None).collect();
-        for start in (0..map.chunk_count).step_by(128) {
-            self.ensure_lease().await?;
-            let items: Vec<crate::snapshot::frames::ChunkRequest> = (start
-                ..(start + 128).min(map.chunk_count))
-                .map(|i| crate::snapshot::frames::ChunkRequest {
-                    path: request_path.clone(),
-                    expected_digest: digest.to_string(),
-                    map_id: map_id.clone(),
-                    chunk_index: i,
-                })
-                .collect();
-            for unit in self
-                .client
-                .chunks(sid, &items, self.content_encoding())
-                .await?
-            {
-                if unit.chunk_index >= map.chunk_count {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::DigestMismatch,
-                        "chunk index outside the map",
-                    ));
-                }
-                let idx = unit.chunk_index as usize;
-                let want_len = length_map.chunk_len(unit.chunk_index).map_err(|e| {
-                    SnapshotError::new(SnapshotErrorCode::DigestMismatch, e.to_string())
-                })?;
-                if unit.bytes.len() as u64 != want_len {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::DigestMismatch,
-                        format!("chunk {idx} length {}", unit.bytes.len()),
-                    ));
-                }
-                if crate::snapshot::durable::digest_of(&unit.bytes).as_str()
-                    != format!(
-                        "sha256:{}",
-                        crate::snapshot::frames::hex32(&chunk_hashes[idx])
-                    )
-                {
-                    return Err(SnapshotError::new(
-                        SnapshotErrorCode::DigestMismatch,
-                        format!("chunk {idx} hash mismatch"),
-                    ));
-                }
-                out[idx] = Some(unit.bytes);
-            }
-        }
-        let total: usize = out
-            .iter()
-            .map(|c| c.as_ref().map(|v| v.len()).unwrap_or(0))
-            .sum();
-        if total as u64 != size {
-            return Err(SnapshotError::new(
-                SnapshotErrorCode::DigestMismatch,
-                "assembled size disagrees with the map",
-            ));
-        }
-        let mut assembled = Vec::with_capacity(total);
-        for c in out {
-            assembled.extend_from_slice(&c.ok_or_else(|| {
-                SnapshotError::new(
-                    SnapshotErrorCode::DigestMismatch,
-                    "missing chunk after the response completed",
-                )
-            })?);
-        }
-        if crate::snapshot::durable::digest_of(&assembled) != digest {
-            return Err(SnapshotError::new(
-                SnapshotErrorCode::DigestMismatch,
-                format!("{rel_path}: assembled file rehash mismatch"),
-            ));
-        }
-        Ok(assembled)
     }
 
     /// Private sized coordinator path. Its final allocation is admitted before
@@ -1753,6 +1579,9 @@ mod tests {
             (SnapshotErrorCode::Internal, 503, true),
             (SnapshotErrorCode::Internal, 429, true),
             (SnapshotErrorCode::SnapshotNotReady, 503, true),
+            (SnapshotErrorCode::MetadataNotReady, 503, true),
+            (SnapshotErrorCode::MetadataNotReady, 0, false),
+            (SnapshotErrorCode::MetadataNotReady, 403, false),
             (SnapshotErrorCode::Internal, 0, false),
             (SnapshotErrorCode::TemporaryUnavailable, 403, false),
             (SnapshotErrorCode::IntegrityError, 503, false),

@@ -5,8 +5,7 @@ use serde_json::Value;
 
 use super::{SnapshotError, SnapshotErrorCode};
 
-/// SPEC error types for explicit canonical-envelope consumers. The original
-/// `SnapshotErrorCode` remains source-compatible for exhaustive matches.
+/// SPEC error types for explicit canonical-envelope consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CanonicalSnapshotErrorCode {
