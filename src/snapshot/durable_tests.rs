@@ -29,15 +29,20 @@ fn duplicated_descriptor_cannot_extend_transaction_lifetime() {
 }
 
 struct Fault {
-    path: PathBuf,
+    operation_id: uuid::Uuid,
     phase: &'static str,
     after_complete_rename: bool,
     armed: bool,
 }
 
 thread_local! {
-    static FAULT: RefCell<Option<Fault>> = const { RefCell::new(None) };
     static SYNC_COUNTS: RefCell<Option<SyncCounts>> = const { RefCell::new(None) };
+}
+
+fn faults() -> &'static Mutex<BTreeMap<PathBuf, Fault>> {
+    static FAULTS: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, Fault>>> =
+        std::sync::OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 #[derive(Clone)]
@@ -163,7 +168,10 @@ pub(super) fn record_cas_batch_sync(path: &Path) {
     });
 }
 
-pub(in crate::snapshot) struct FaultGuard;
+pub(in crate::snapshot) struct FaultGuard {
+    path: PathBuf,
+    operation_id: uuid::Uuid,
+}
 
 impl FaultGuard {
     pub(in crate::snapshot) fn install(
@@ -171,44 +179,57 @@ impl FaultGuard {
         phase: &'static str,
         after_complete_rename: bool,
     ) -> Self {
-        FAULT.with(|slot| {
-            assert!(slot.borrow().is_none());
-            *slot.borrow_mut() = Some(Fault {
-                path: path.into(),
+        let operation_id = uuid::Uuid::new_v4();
+        let mut faults = faults().lock().unwrap();
+        assert!(!faults.contains_key(path));
+        faults.insert(
+            path.into(),
+            Fault {
+                operation_id,
                 phase,
                 after_complete_rename,
                 armed: !after_complete_rename,
-            });
-        });
-        Self
+            },
+        );
+        Self {
+            path: path.into(),
+            operation_id,
+        }
     }
 }
 
 impl Drop for FaultGuard {
     fn drop(&mut self) {
-        FAULT.with(|slot| *slot.borrow_mut() = None);
+        let mut faults = faults().lock().unwrap();
+        if faults
+            .get(&self.path)
+            .is_some_and(|fault| fault.operation_id == self.operation_id)
+        {
+            faults.remove(&self.path);
+        }
     }
 }
 
 pub(super) fn checkpoint(path: &Path, phase: &str) -> Result<(), SnapshotError> {
-    let fail = FAULT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(fault) = slot.as_mut() else {
-            return false;
-        };
-        if fault.path != path {
-            return false;
-        }
-        if fault.after_complete_rename && phase == "complete-renamed" {
-            fault.armed = true;
-        }
-        if fault.armed && fault.phase == phase {
-            *slot = None; // The revocation path must still be able to persist.
-            true
+    let fail = {
+        // Actual streaming fsync now runs on a blocking IO thread. An exact
+        // per-path registration reaches that job while isolating parallel
+        // fixtures; a consumed fault must still allow revocation to persist.
+        let mut faults = faults().lock().unwrap();
+        if let Some(fault) = faults.get_mut(path) {
+            if fault.after_complete_rename && phase == "complete-renamed" {
+                fault.armed = true;
+            }
+            if fault.armed && fault.phase == phase {
+                faults.remove(path);
+                true
+            } else {
+                false
+            }
         } else {
             false
         }
-    });
+    };
     if fail {
         return Err(io_err(io::Error::other("injected durability I/O failure")));
     }
@@ -244,6 +265,49 @@ pub(super) fn checkpoint(path: &Path, phase: &str) -> Result<(), SnapshotError> 
         }
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn fault_guard_reaches_actual_blocking_sync_and_old_drop_cannot_erase_a_new_fault() {
+    let temp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let first = FaultGuard::install(temp.path(), "object-file-sync", false);
+    let other_path = other.path().to_path_buf();
+    tokio::task::spawn_blocking(move || write_atomic(&other_path, "unrelated", b"other"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(other.path().join("unrelated")).unwrap(), b"other");
+    let path = temp.path().to_path_buf();
+    let error = tokio::task::spawn_blocking(move || write_atomic(&path, "body", b"body"))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert!(error.message.contains("injected durability I/O failure"));
+    assert!(!temp.path().join("body").exists());
+    assert!(!fs::read_dir(temp.path()).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(".tmp.")));
+
+    let second = FaultGuard::install(temp.path(), "object-file-sync", false);
+    drop(first); // It owns only the consumed operation, not this new one.
+    let path = temp.path().to_path_buf();
+    let error = tokio::task::spawn_blocking(move || write_atomic(&path, "body", b"body"))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, SnapshotErrorCode::Internal);
+    assert!(error.message.contains("injected durability I/O failure"));
+    drop(second);
+    let path = temp.path().to_path_buf();
+    tokio::task::spawn_blocking(move || write_atomic(&path, "body", b"body"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(temp.path().join("body")).unwrap(), b"body");
 }
 
 fn view() -> ViewMeta {
