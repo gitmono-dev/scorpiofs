@@ -1812,11 +1812,20 @@ impl Mst2Fuse {
         Ok(node)
     }
 
-    pub(crate) fn metadata_node(&self, inode: u64) -> Result<Node> {
+    fn node_attr(&self, inode: u64) -> Result<FileAttr> {
+        let state = self.state.lock().unwrap();
+        match state.nodes.get(&inode) {
+            Some(Node::Dir(_)) => Ok(dir_attr(inode)),
+            Some(Node::File(file)) => Ok(file_attr(inode, file)),
+            None => Err(Errno::from(libc::ENOENT)),
+        }
+    }
+
+    pub(crate) fn metadata_attr(&self, inode: u64) -> Result<FileAttr> {
         self.check_metadata_lease().map_err(io_err)?;
-        let node = self.node(inode)?;
+        let attr = self.node_attr(inode)?;
         self.check_metadata_lease().map_err(io_err)?;
-        Ok(node)
+        Ok(attr)
     }
 
     /// Query fixed metadata without reading content or following a symlink.
@@ -2187,11 +2196,7 @@ impl Filesystem for Mst2Fuse {
         _flags: u32,
     ) -> Result<ReplyAttr> {
         self.check_metadata_lease().map_err(io_err)?;
-        let node = self.node(inode)?;
-        let attr = match &node {
-            Node::Dir(_) => dir_attr(inode),
-            Node::File(f) => file_attr(inode, f),
-        };
+        let attr = self.node_attr(inode)?;
         self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyAttr { attr, ttl: TTL })
     }
@@ -2208,11 +2213,7 @@ impl Filesystem for Mst2Fuse {
         };
         self.check_metadata_lease().map_err(io_err)?;
         let inode = child.ok_or_else(|| Errno::from(libc::ENOENT))?;
-        let node = self.node(inode)?;
-        let attr = match &node {
-            Node::Dir(_) => dir_attr(inode),
-            Node::File(f) => file_attr(inode, f),
-        };
+        let attr = self.node_attr(inode)?;
         self.check_metadata_lease().map_err(io_err)?;
         Ok(ReplyEntry {
             attr,
@@ -2267,11 +2268,7 @@ impl Filesystem for Mst2Fuse {
         for e in listing {
             // "." and ".." are the directory itself; children resolve through
             // the same inode table, so attributes come from one place.
-            let node = self.node(e.inode)?;
-            let attr = match &node {
-                Node::Dir(_) => dir_attr(e.inode),
-                Node::File(f) => file_attr(e.inode, f),
-            };
+            let attr = self.node_attr(e.inode)?;
             entries.push(Ok(DirectoryEntryPlus {
                 inode: e.inode,
                 generation: 0,
@@ -2294,12 +2291,12 @@ impl Filesystem for Mst2Fuse {
         // succeeds; the read-only tree needs no per-handle state.
         self.ensure_loaded(inode).await?;
         self.check_metadata_lease().map_err(io_err)?;
-        match self.node(inode)? {
-            Node::Dir(_) => Ok(ReplyOpen {
+        match self.node_attr(inode)?.kind {
+            FileType::Directory => Ok(ReplyOpen {
                 fh: inode,
                 flags: 0,
             }),
-            Node::File(_) => Err(Errno::from(libc::ENOTDIR)),
+            _ => Err(Errno::from(libc::ENOTDIR)),
         }
     }
 
@@ -2668,6 +2665,10 @@ fn membership_io_err(error: FileMembershipError) -> Errno {
 #[cfg(test)]
 #[path = "fuse_owned_tests.rs"]
 mod owned_tests;
+
+#[cfg(test)]
+#[path = "fuse_attribute_tests.rs"]
+mod attribute_tests;
 
 #[cfg(test)]
 mod tests {

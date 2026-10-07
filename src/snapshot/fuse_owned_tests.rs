@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use libfuse_fs::unionfs::layer::Layer;
 use mst2_codec::{
     chunkmap::{ChunkLeaf, ChunkMap, CHUNK_SIZE},
     descriptor::ServingDescriptor,
@@ -905,6 +906,48 @@ async fn profiled_canonical_store_cache_still_proves_aliases_and_rejects_revoked
             -libc::EACCES
         );
     }
+    let req = Request::default();
+    assert_eq!(
+        i32::from(fs.metadata_attr(alias).unwrap_err()),
+        -libc::EACCES
+    );
+    assert_eq!(
+        i32::from(fs.getattr(req, alias, None, 0).await.unwrap_err()),
+        -libc::EACCES
+    );
+    assert_eq!(
+        i32::from(
+            fs.lookup(req, ROOT_INODE, OsStr::new("file001"))
+                .await
+                .unwrap_err()
+        ),
+        -libc::EACCES
+    );
+    assert_eq!(
+        i32::from(fs.opendir(req, ROOT_INODE, 0).await.unwrap_err()),
+        -libc::EACCES
+    );
+    assert_eq!(
+        i32::from(
+            fs.readdirplus(req, ROOT_INODE, ROOT_INODE, 0, 0)
+                .await
+                .err()
+                .unwrap()
+        ),
+        -libc::EACCES
+    );
+    assert_eq!(
+        fs.getattr_with_mapping(alias, None, false)
+            .await
+            .err()
+            .unwrap()
+            .raw_os_error(),
+        Some(libc::EACCES)
+    );
+    assert_eq!(
+        i32::from(fs.is_opaque(req, ROOT_INODE).await.unwrap_err()),
+        -libc::EACCES
+    );
     let denied = profile.snapshot();
     assert_eq!(denied.metric(Metric::OwnerCacheHit), 1);
     assert_eq!(denied.metric(Metric::SmallCasCalls), 1);

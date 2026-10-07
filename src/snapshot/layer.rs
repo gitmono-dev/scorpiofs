@@ -22,7 +22,7 @@ use libfuse_fs::{
     util::whiteout::WhiteoutFormat,
 };
 
-use super::fuse::{self, Mst2Fuse, Node};
+use super::fuse::{self, Mst2Fuse};
 
 #[cfg(target_os = "linux")]
 type Stat64 = libc::stat64;
@@ -43,9 +43,9 @@ impl Layer for Mst2Fuse {
     }
 
     async fn is_opaque(&self, _ctx: asyncfuse::raw::Request, inode: Inode) -> Result<bool> {
-        match self.metadata_node(inode)? {
-            Node::Dir(_) => Ok(false),
-            Node::File(_) => Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into()),
+        match self.metadata_attr(inode)?.kind {
+            FileType::Directory => Ok(false),
+            _ => Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into()),
         }
     }
 
@@ -65,7 +65,7 @@ impl Layer for Mst2Fuse {
             self.read_profile(),
             crate::util::read_profile::Phase::LowerGetattrMapping,
         );
-        let node = self.metadata_node(inode).map_err(|e| {
+        let attr = self.metadata_attr(inode).map_err(|e| {
             let raw = i32::from(e);
             tracing::warn!(
                 inode,
@@ -74,10 +74,6 @@ impl Layer for Mst2Fuse {
             );
             std::io::Error::from_raw_os_error(raw.saturating_abs())
         })?;
-        let attr = match &node {
-            Node::Dir(_) => fuse::dir_attr(inode),
-            Node::File(f) => fuse::file_attr(inode, f),
-        };
         let type_bits: libc::mode_t = match attr.kind {
             FileType::Directory => libc::S_IFDIR,
             FileType::Symlink => libc::S_IFLNK,
