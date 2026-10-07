@@ -98,16 +98,16 @@ mod tests {
         chunkmap::{ChunkLeaf, ChunkMap, CHUNK_SIZE},
         descriptor::ServingDescriptor,
         metapage::{page_id, Entry, EntryKind, Page},
-        treeframe::{ChunkPayload, EndPayload, MetaPayload, ObjectPayload},
+        treeframe::{ChunkPayload, EndPayload, MetaPayload, ObjectPayload, OBJECT_MAX_RAW},
     };
     use serde_json::{json, Value};
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::{Barrier, Mutex, Notify};
 
     use super::*;
     use crate::snapshot::{
         durable::{digest_of, CasVerificationReason},
         frames::parse_digest,
-        CompletionKind, LocalPinState, Mst2Client,
+        CompletionKind, ContentBudgetLimits, FetchCoordinator, LocalPinState, Mst2Client,
     };
 
     fn hash(bytes: &[u8]) -> [u8; 32] {
@@ -162,14 +162,21 @@ mod tests {
         hold_objects: AtomicBool,
         objects_started: Notify,
         objects_release: Notify,
+        fail_objects: AtomicBool,
         object_calls: AtomicUsize,
         object_active: AtomicUsize,
         object_peak: AtomicUsize,
+        object_max_bytes: AtomicUsize,
         chunk_calls: AtomicUsize,
         map_calls: AtomicUsize,
         leaf_calls: AtomicUsize,
         chunk_active: AtomicUsize,
         chunk_peak: AtomicUsize,
+        hold_chunks: AtomicBool,
+        chunks_release: Notify,
+        fail_chunks: AtomicBool,
+        request_active: AtomicUsize,
+        request_peak: AtomicUsize,
         raw_calls: AtomicUsize,
         metadata_calls: AtomicUsize,
         metadata_pages: AtomicUsize,
@@ -247,14 +254,21 @@ mod tests {
                 hold_objects: AtomicBool::new(false),
                 objects_started: Notify::new(),
                 objects_release: Notify::new(),
+                fail_objects: AtomicBool::new(false),
                 object_calls: AtomicUsize::new(0),
                 object_active: AtomicUsize::new(0),
                 object_peak: AtomicUsize::new(0),
+                object_max_bytes: AtomicUsize::new(0),
                 chunk_calls: AtomicUsize::new(0),
                 map_calls: AtomicUsize::new(0),
                 leaf_calls: AtomicUsize::new(0),
                 chunk_active: AtomicUsize::new(0),
                 chunk_peak: AtomicUsize::new(0),
+                hold_chunks: AtomicBool::new(false),
+                chunks_release: Notify::new(),
+                fail_chunks: AtomicBool::new(false),
+                request_active: AtomicUsize::new(0),
+                request_peak: AtomicUsize::new(0),
                 raw_calls: AtomicUsize::new(0),
                 metadata_calls: AtomicUsize::new(0),
                 metadata_pages: AtomicUsize::new(0),
@@ -263,6 +277,49 @@ mod tests {
                 metadata_started: Notify::new(),
                 metadata_release: Notify::new(),
             }
+        }
+        fn near_budget_mix() -> Self {
+            let mut fixture = Self::new(true, false, true);
+            fixture.bodies.retain(|path, _| path.starts_with("/large"));
+            let mut root = Vec::new();
+            // 14 MiB of unique small objects fills two 7-MiB requests.
+            // Each request must use legal bounded OBJECT frames.
+            for (directory, files) in [24, 24, 8].into_iter().enumerate() {
+                let mut entries = Vec::new();
+                for file in 0..files {
+                    let name = format!("f{file:03}");
+                    let mut bytes = vec![directory as u8; 256 * 1024];
+                    bytes[0] = file as u8;
+                    entries.push(Entry::file(
+                        EntryKind::Regular,
+                        name.as_bytes(),
+                        bytes.len() as u64,
+                        hash(&bytes),
+                    ));
+                    fixture
+                        .bodies
+                        .insert(format!("/d{directory}/{name}"), bytes);
+                }
+                let bytes = Page::build(&entries).unwrap();
+                root.push(Entry::dir(
+                    format!("d{directory}").as_bytes(),
+                    page_id(&bytes),
+                ));
+                fixture.pages.insert(format!("/d{directory}"), bytes);
+            }
+            for name in ["large0", "large1"] {
+                let bytes = &fixture.bodies[&format!("/{name}")];
+                root.push(Entry::file(
+                    EntryKind::Regular,
+                    name.as_bytes(),
+                    bytes.len() as u64,
+                    hash(bytes),
+                ));
+            }
+            let bytes = Page::build(&root).unwrap();
+            fixture.descriptor.metadata_root = page_id(&bytes);
+            fixture.pages.insert("/".into(), bytes);
+            fixture
         }
         fn update_version(objects: bool, version: u8) -> Self {
             let mut fixture = Self::new(objects, false, false);
@@ -449,6 +506,7 @@ mod tests {
     ) -> Response {
         assert_eq!(sid, f.sid());
         assert!(f.objects);
+        let _request = active(&f.request_active, &f.request_peak);
         f.object_calls.fetch_add(1, Ordering::SeqCst);
         let _active = active(&f.object_active, &f.object_peak);
         f.objects_started.notify_one();
@@ -461,8 +519,12 @@ mod tests {
         if f.hold_objects.load(Ordering::SeqCst) {
             release.await;
         }
+        if f.fail_objects.load(Ordering::SeqCst) {
+            return rejected_content();
+        }
         let value: Value = serde_json::from_slice(&body).unwrap();
         let items = value["items"].as_array().unwrap();
+        assert!(items.len() <= 128);
         let mut units = Vec::new();
         for item in items {
             let path = match checked_wire_path(item["path"].as_str().unwrap()) {
@@ -474,18 +536,54 @@ mod tests {
             units.push((hash(bytes), bytes.clone()));
         }
         let logical = units.iter().map(|(_, bytes)| bytes.len()).sum();
-        f.frame(
-            &body,
-            ObjectPayload { objects: units }.encode(7, 0).unwrap(),
-            items.len(),
-            items.len(),
-            logical,
-        )
+        assert!(logical <= 7 * 1024 * 1024);
+        f.object_max_bytes.fetch_max(logical, Ordering::SeqCst);
+        let mut bytes = Vec::new();
+        let mut frame_objects = Vec::new();
+        let mut raw_size = 4;
+        let mut sequence = 0;
+        for unit in units {
+            let unit_size = 40 + unit.1.len();
+            if raw_size + unit_size > OBJECT_MAX_RAW {
+                bytes.extend(
+                    ObjectPayload {
+                        objects: std::mem::take(&mut frame_objects),
+                    }
+                    .encode(7, sequence)
+                    .unwrap(),
+                );
+                sequence += 1;
+                raw_size = 4;
+            }
+            raw_size += unit_size;
+            frame_objects.push(unit);
+        }
+        if !frame_objects.is_empty() {
+            bytes.extend(
+                ObjectPayload {
+                    objects: frame_objects,
+                }
+                .encode(7, sequence)
+                .unwrap(),
+            );
+            sequence += 1;
+        }
+        bytes.extend(
+            EndPayload {
+                request_item_count: items.len() as u32,
+                unique_unit_count: items.len() as u32,
+                logical_bytes: logical as u64,
+                request_body_sha256: hash(&body),
+            }
+            .encode(7, sequence),
+        );
+        f.frame_response(&body, bytes)
     }
     async fn map(
         State(f): State<Arc<Fixture>>,
         Query(query): Query<BTreeMap<String, String>>,
     ) -> Response {
+        let _request = active(&f.request_active, &f.request_peak);
         let path = match checked_wire_path(&query["path"]) {
             Ok(path) => path,
             Err(response) => return response.into_response(),
@@ -501,6 +599,7 @@ mod tests {
         State(f): State<Arc<Fixture>>,
         Query(query): Query<BTreeMap<String, String>>,
     ) -> Response {
+        let _request = active(&f.request_active, &f.request_peak);
         let path = match checked_wire_path(&query["path"]) {
             Ok(path) => path,
             Err(response) => return response.into_response(),
@@ -514,6 +613,7 @@ mod tests {
         ).into_response()
     }
     async fn chunks(State(f): State<Arc<Fixture>>, body: Bytes) -> Response {
+        let _request = active(&f.request_active, &f.request_peak);
         let value: Value = serde_json::from_slice(&body).unwrap();
         let items = value["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
@@ -532,10 +632,19 @@ mod tests {
         assert_eq!(item["map_id"], id(&map.map_id()));
         f.chunk_calls.fetch_add(1, Ordering::SeqCst);
         let _active = active(&f.chunk_active, &f.chunk_peak);
+        let release = f.chunks_release.notified();
+        tokio::pin!(release);
+        release.as_mut().enable();
         if index == 0 {
             if let Some(gate) = &f.large_gate {
                 gate.wait().await;
             }
+        }
+        if f.hold_chunks.load(Ordering::SeqCst) {
+            release.await;
+        }
+        if f.fail_chunks.load(Ordering::SeqCst) {
+            return rejected_content();
         }
         f.frame(
             &body,
@@ -551,6 +660,13 @@ mod tests {
             1,
             bytes.len(),
         )
+    }
+    fn rejected_content() -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"code":"INVALID_REQUEST","message":"rejected test content","request_id":"mixed-lane-failure","retryable":false}})),
+        )
+            .into_response()
     }
     async fn blob(
         State(f): State<Arc<Fixture>>,
@@ -577,6 +693,8 @@ mod tests {
             self.task.abort();
             self.fixture.hold_objects.store(false, Ordering::SeqCst);
             self.fixture.objects_release.notify_waiters();
+            self.fixture.hold_chunks.store(false, Ordering::SeqCst);
+            self.fixture.chunks_release.notify_waiters();
             self.fixture.hold_metadata.store(false, Ordering::SeqCst);
             self.fixture.metadata_release.notify_waiters();
         }
@@ -748,6 +866,462 @@ mod tests {
             let file = &actual[path];
             assert_eq!(store.read_blob(&file.1, file.0).unwrap(), *bytes);
         }
+    }
+
+    const MIXED_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
+    const MIXED_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
+    static MIXED_TESTS: Mutex<()> = Mutex::const_new(());
+
+    async fn mixed_reader(server: &Server) -> SnapshotReader {
+        server.reader().await.with_content_limits(
+            ContentBudgetLimits::new(MIXED_OUTPUT_BYTES, MIXED_CONSTRUCTION_BYTES).unwrap(),
+        )
+    }
+
+    async fn wait_for_content(condition: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("bounded real HTTP content condition did not become true");
+    }
+
+    async fn assert_mixed_lanes_pending(fixture: &Fixture, reader: &SnapshotReader) {
+        assert_mixed_lanes_pending_with_limits(
+            fixture,
+            reader,
+            MIXED_OUTPUT_BYTES,
+            MIXED_CONSTRUCTION_BYTES,
+        )
+        .await;
+    }
+
+    async fn assert_mixed_lanes_pending_with_limits(
+        fixture: &Fixture,
+        reader: &SnapshotReader,
+        output_bytes: usize,
+        construction_bytes: usize,
+    ) {
+        wait_for_content(|| {
+            fixture.object_active.load(Ordering::SeqCst) == 2
+                && fixture.chunk_active.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert_eq!(fixture.request_active.load(Ordering::SeqCst), 4);
+        assert_eq!(fixture.object_peak.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.chunk_peak.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.request_peak.load(Ordering::SeqCst), 4);
+        let local = reader.content_usage();
+        assert!(local.output_bytes > 0 && local.output_bytes <= output_bytes);
+        assert!(local.construction_bytes > 0 && local.construction_bytes <= construction_bytes);
+        // These are the actual shared semaphore charges, not fixture byte
+        // estimates or RSS. Other parallel tests may own additional credits.
+        let process = FetchCoordinator::process_content_usage();
+        assert!(process.output_bytes >= local.output_bytes);
+        assert!(process.construction_bytes >= local.construction_bytes);
+        assert!(process.output_bytes <= 512 * 1024 * 1024);
+        assert!(process.construction_bytes <= 64 * 1024 * 1024);
+    }
+
+    fn assert_uncommitted_and_refunded(store: &DurableStore, reader: &SnapshotReader) {
+        assert!(!store.is_snapshot_complete().unwrap());
+        assert!(!store.root().join("DURABLE_COMPLETE").exists());
+        assert!(!matches!(
+            store.local_pin_state().unwrap(),
+            LocalPinState::Complete(_)
+        ));
+        assert_eq!(reader.content_usage().output_bytes, 0);
+        assert_eq!(reader.content_usage().construction_bytes, 0);
+        for entry in std::fs::read_dir(store.content_dir()).unwrap() {
+            assert!(!entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp."));
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_object_batches_overlap_chunks_with_default_charged_limits() {
+        let _serial = MIXED_TESTS.lock().await;
+        let fixture = Fixture::near_budget_mix();
+        fixture.hold_objects.store(true, Ordering::SeqCst);
+        fixture.hold_chunks.store(true, Ordering::SeqCst);
+        let server = Server::new(fixture).await;
+        let reader = mixed_reader(&server).await;
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            DurableStore::open_for_workspace(
+                temp.path(),
+                "11111111-2222-4333-8444-555555555523",
+                &reader,
+            )
+            .unwrap(),
+        );
+        let source = reader.clone();
+        let target = store.clone();
+        let task = tokio::spawn(async move { hydrate_workspace(&target, &source).await });
+        assert_mixed_lanes_pending(&server.fixture, &reader).await;
+        assert!(reader.content_usage().output_bytes >= 14 * 1024 * 1024);
+        assert!(!store.root().join("DURABLE_COMPLETE").exists());
+        server.fixture.hold_objects.store(false, Ordering::SeqCst);
+        server.fixture.hold_chunks.store(false, Ordering::SeqCst);
+        server.fixture.objects_release.notify_waiters();
+        server.fixture.chunks_release.notify_waiters();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(report.complete);
+        assert_eq!(report.fetched, 58);
+        assert_eq!(server.fixture.object_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            server.fixture.object_max_bytes.load(Ordering::SeqCst),
+            7 * 1024 * 1024
+        );
+        assert_eq!(server.fixture.chunk_calls.load(Ordering::SeqCst), 6);
+        assert_full_snapshot(&store, &reader, &server.fixture);
+        assert_eq!(reader.content_usage().output_bytes, 0);
+        assert_eq!(reader.content_usage().construction_bytes, 0);
+    }
+
+    async fn assert_serial_maximum_batches(server: &Server, reader: &SnapshotReader) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            DurableStore::open_for_workspace(
+                temp.path(),
+                "11111111-2222-4333-8444-555555555524",
+                reader,
+            )
+            .unwrap(),
+        );
+        let source = reader.clone();
+        let target = store.clone();
+        let task = tokio::spawn(async move { hydrate_workspace(&target, &source).await });
+        wait_for_content(|| server.fixture.object_active.load(Ordering::SeqCst) == 2).await;
+        // Give a concurrently scheduled large lane time to issue its map and
+        // CHUNK requests. With the serial fallback it cannot start yet.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(server.fixture.map_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.fixture.chunk_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.fixture.request_active.load(Ordering::SeqCst), 2);
+        assert!(!store.root().join("DURABLE_COMPLETE").exists());
+        server.fixture.hold_objects.store(false, Ordering::SeqCst);
+        server.fixture.objects_release.notify_waiters();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(report.complete);
+        assert_eq!(report.fetched, 58);
+        assert_eq!(server.fixture.object_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            server.fixture.object_max_bytes.load(Ordering::SeqCst),
+            7 * 1024 * 1024
+        );
+        assert_eq!(server.fixture.chunk_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(server.fixture.object_peak.load(Ordering::SeqCst), 2);
+        assert!(server.fixture.chunk_peak.load(Ordering::SeqCst) <= 2);
+        assert!(server.fixture.request_peak.load(Ordering::SeqCst) <= 2);
+        assert_full_snapshot(&store, reader, &server.fixture);
+    }
+
+    #[tokio::test]
+    async fn lowered_output_or_construction_policy_keeps_maximum_batches_serial() {
+        let _serial = MIXED_TESTS.lock().await;
+        for (output, construction) in [
+            (16 * 1024 * 1024, MIXED_CONSTRUCTION_BYTES),
+            (MIXED_OUTPUT_BYTES, 8 * 1024 * 1024),
+        ] {
+            let fixture = Fixture::near_budget_mix();
+            fixture.hold_objects.store(true, Ordering::SeqCst);
+            let server = Server::new(fixture).await;
+            let reader = server
+                .reader()
+                .await
+                .with_content_limits(ContentBudgetLimits::new(output, construction).unwrap());
+            assert_serial_maximum_batches(&server, &reader).await;
+            assert_eq!(reader.content_usage().output_bytes, 0);
+            assert_eq!(reader.content_usage().construction_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_reader_credit_owners_keep_default_policy_hydration_serial() {
+        let _serial = MIXED_TESTS.lock().await;
+        for (output, construction) in [(112 * 1024 * 1024, 0), (0, 26 * 1024 * 1024)] {
+            let fixture = Fixture::near_budget_mix();
+            fixture.hold_objects.store(true, Ordering::SeqCst);
+            let server = Server::new(fixture).await;
+            let reader = mixed_reader(&server).await;
+            let owners = reader
+                .content_scope
+                .reserve_test_capacity(output, construction)
+                .unwrap();
+            assert_serial_maximum_batches(&server, &reader).await;
+            assert_eq!(reader.content_usage().output_bytes, output);
+            assert_eq!(reader.content_usage().construction_bytes, construction);
+            let process = FetchCoordinator::process_content_usage();
+            assert!(process.output_bytes >= output);
+            assert!(process.construction_bytes >= construction);
+            drop(owners);
+            assert_eq!(reader.content_usage().output_bytes, 0);
+            assert_eq!(reader.content_usage().construction_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn process_credit_pressure_falls_back_and_release_allows_real_http_overlap() {
+        // Global quotas belong to one OS process. Execute the pressure case
+        // in its own test process so the ordinary parallel suite still runs
+        // this regression without borrowing the other tests' headroom.
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("workspace::hydrate::tests::process_credit_pressure_worker")
+                .arg("--test-threads=1")
+                .arg("--nocapture")
+                .env("SCORPIOFS_HYDRATION_PROCESS_PRESSURE_WORKER", "1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated process pressure test exceeded its deadline")
+        .expect("failed to launch the process pressure worker");
+        assert!(
+            output.status.success(),
+            "pressure worker failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("HYDRATION_PROCESS_PRESSURE_VERIFIED"),
+            "the isolated worker must execute all pressure and refund assertions"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_credit_pressure_worker() {
+        if std::env::var("SCORPIOFS_HYDRATION_PROCESS_PRESSURE_WORKER").as_deref() != Ok("1") {
+            return;
+        }
+        let _serial = MIXED_TESTS.lock().await;
+        let fixture = Fixture::near_budget_mix();
+        fixture.hold_objects.store(true, Ordering::SeqCst);
+        let server = Server::new(fixture).await;
+        let reader = mixed_reader(&server).await;
+        let other_a = mixed_reader(&server).await;
+        let other_b = mixed_reader(&server).await;
+        let before = FetchCoordinator::process_content_usage();
+        let owner_a = other_a
+            .content_scope
+            .reserve_test_capacity(0, 29 * 1024 * 1024)
+            .unwrap();
+        let owner_b = other_b
+            .content_scope
+            .reserve_test_capacity(0, 29 * 1024 * 1024)
+            .unwrap();
+        assert_serial_maximum_batches(&server, &reader).await;
+        assert_eq!(reader.content_usage().output_bytes, 0);
+        assert_eq!(reader.content_usage().construction_bytes, 0);
+        drop(owner_a);
+        assert_eq!(other_a.content_usage().construction_bytes, 0);
+        assert_eq!(other_b.content_usage().construction_bytes, 29 * 1024 * 1024);
+        drop(owner_b);
+        assert_eq!(other_b.content_usage().construction_bytes, 0);
+        assert_eq!(FetchCoordinator::process_content_usage(), before);
+
+        // A fresh owner has no CAS resume shortcuts, so after the unrelated
+        // owners drop it must issue both real HTTP lanes concurrently.
+        server.fixture.hold_objects.store(true, Ordering::SeqCst);
+        server.fixture.hold_chunks.store(true, Ordering::SeqCst);
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            DurableStore::open_for_workspace(
+                temp.path(),
+                "11111111-2222-4333-8444-555555555525",
+                &reader,
+            )
+            .unwrap(),
+        );
+        let source = reader.clone();
+        let target = store.clone();
+        let task = tokio::spawn(async move { hydrate_workspace(&target, &source).await });
+        assert_mixed_lanes_pending(&server.fixture, &reader).await;
+        server.fixture.hold_objects.store(false, Ordering::SeqCst);
+        server.fixture.hold_chunks.store(false, Ordering::SeqCst);
+        server.fixture.objects_release.notify_waiters();
+        server.fixture.chunks_release.notify_waiters();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(report.complete);
+        assert_eq!(report.fetched, 58);
+        assert_full_snapshot(&store, &reader, &server.fixture);
+        assert_eq!(reader.content_usage().output_bytes, 0);
+        assert_eq!(reader.content_usage().construction_bytes, 0);
+        assert_eq!(FetchCoordinator::process_content_usage(), before);
+        println!("HYDRATION_PROCESS_PRESSURE_VERIFIED");
+    }
+
+    #[tokio::test]
+    async fn held_objects_do_not_delay_large_chunks_or_allow_early_completion() {
+        let _serial = MIXED_TESTS.lock().await;
+        let fixture = Fixture::new(true, false, true);
+        fixture.hold_objects.store(true, Ordering::SeqCst);
+        fixture.hold_chunks.store(true, Ordering::SeqCst);
+        let server = Server::new(fixture).await;
+        let reader = mixed_reader(&server).await;
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            DurableStore::open_for_workspace(
+                temp.path(),
+                "11111111-2222-4333-8444-555555555520",
+                &reader,
+            )
+            .unwrap(),
+        );
+        let source = reader.clone();
+        let target = store.clone();
+        let task = tokio::spawn(async move { hydrate_workspace(&target, &source).await });
+        assert_mixed_lanes_pending(&server.fixture, &reader).await;
+        assert!(!store.root().join("DURABLE_COMPLETE").exists());
+        server.fixture.hold_chunks.store(false, Ordering::SeqCst);
+        server.fixture.chunks_release.notify_waiters();
+        let large_cas: Vec<_> = ["/large0", "/large1"]
+            .into_iter()
+            .map(|name| {
+                let digest = digest_of(&server.fixture.bodies[name]);
+                store
+                    .content_dir()
+                    .join(digest.strip_prefix("sha256:").unwrap())
+            })
+            .collect();
+        wait_for_content(|| {
+            server.fixture.chunk_calls.load(Ordering::SeqCst) == 6
+                && server.fixture.chunk_active.load(Ordering::SeqCst) == 0
+                && reader.content_usage().output_bytes < 1024 * 1024
+                && large_cas.iter().all(|path| path.is_file())
+        })
+        .await;
+        for name in ["/large0", "/large1"] {
+            let bytes = &server.fixture.bodies[name];
+            assert_eq!(
+                store
+                    .read_blob(&digest_of(bytes), bytes.len() as u64)
+                    .unwrap(),
+                *bytes
+            );
+        }
+        assert!(!store.root().join("DURABLE_COMPLETE").exists());
+        assert_eq!(server.fixture.object_active.load(Ordering::SeqCst), 2);
+        server.fixture.hold_objects.store(false, Ordering::SeqCst);
+        server.fixture.objects_release.notify_waiters();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.fetched, 194);
+        assert_full_snapshot(&store, &reader, &server.fixture);
+        assert_eq!(reader.content_usage().output_bytes, 0);
+        assert_eq!(reader.content_usage().construction_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn either_mixed_http_lane_failure_drops_its_pending_sibling_and_can_retry() {
+        let _serial = MIXED_TESTS.lock().await;
+        for fail_objects in [true, false] {
+            let fixture = Fixture::new(true, false, true);
+            fixture.hold_objects.store(true, Ordering::SeqCst);
+            fixture.hold_chunks.store(true, Ordering::SeqCst);
+            let server = Server::new(fixture).await;
+            let reader = mixed_reader(&server).await;
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                DurableStore::open_for_workspace(
+                    temp.path(),
+                    "11111111-2222-4333-8444-555555555521",
+                    &reader,
+                )
+                .unwrap(),
+            );
+            let source = reader.clone();
+            let target = store.clone();
+            let task = tokio::spawn(async move { hydrate_workspace(&target, &source).await });
+            assert_mixed_lanes_pending(&server.fixture, &reader).await;
+            if fail_objects {
+                server.fixture.fail_objects.store(true, Ordering::SeqCst);
+                server.fixture.hold_objects.store(false, Ordering::SeqCst);
+                server.fixture.objects_release.notify_waiters();
+            } else {
+                server.fixture.fail_chunks.store(true, Ordering::SeqCst);
+                server.fixture.hold_chunks.store(false, Ordering::SeqCst);
+                server.fixture.chunks_release.notify_waiters();
+            }
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, SnapshotErrorCode::InvalidRequest);
+            assert_uncommitted_and_refunded(&store, &reader);
+            server.fixture.fail_objects.store(false, Ordering::SeqCst);
+            server.fixture.fail_chunks.store(false, Ordering::SeqCst);
+            server.fixture.hold_objects.store(false, Ordering::SeqCst);
+            server.fixture.hold_chunks.store(false, Ordering::SeqCst);
+            server.fixture.objects_release.notify_waiters();
+            server.fixture.chunks_release.notify_waiters();
+            wait_for_content(|| server.fixture.request_active.load(Ordering::SeqCst) == 0).await;
+            assert!(bounded_hydrate(&store, &reader).await.complete);
+            assert_full_snapshot(&store, &reader, &server.fixture);
+            assert!(server.fixture.object_peak.load(Ordering::SeqCst) <= 2);
+            assert!(server.fixture.chunk_peak.load(Ordering::SeqCst) <= 2);
+            assert!(server.fixture.request_peak.load(Ordering::SeqCst) <= 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_both_real_http_lanes_refunds_bytes_and_keeps_retry_possible() {
+        let _serial = MIXED_TESTS.lock().await;
+        let fixture = Fixture::new(true, false, true);
+        fixture.hold_objects.store(true, Ordering::SeqCst);
+        fixture.hold_chunks.store(true, Ordering::SeqCst);
+        let server = Server::new(fixture).await;
+        let reader = mixed_reader(&server).await;
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            DurableStore::open_for_workspace(
+                temp.path(),
+                "11111111-2222-4333-8444-555555555522",
+                &reader,
+            )
+            .unwrap(),
+        );
+        let source = reader.clone();
+        let target = store.clone();
+        let task = tokio::spawn(async move { hydrate_workspace(&target, &source).await });
+        assert_mixed_lanes_pending(&server.fixture, &reader).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_uncommitted_and_refunded(&store, &reader);
+        server.fixture.hold_objects.store(false, Ordering::SeqCst);
+        server.fixture.hold_chunks.store(false, Ordering::SeqCst);
+        server.fixture.objects_release.notify_waiters();
+        server.fixture.chunks_release.notify_waiters();
+        wait_for_content(|| server.fixture.request_active.load(Ordering::SeqCst) == 0).await;
+        assert!(bounded_hydrate(&store, &reader).await.complete);
+        assert_full_snapshot(&store, &reader, &server.fixture);
+        assert!(server.fixture.object_peak.load(Ordering::SeqCst) <= 2);
+        assert!(server.fixture.chunk_peak.load(Ordering::SeqCst) <= 2);
+        assert!(server.fixture.request_peak.load(Ordering::SeqCst) <= 4);
     }
 
     #[tokio::test]

@@ -122,6 +122,36 @@ impl ContentBudget {
         }
     }
 
+    pub(crate) fn can_overlap_hydration(&self) -> bool {
+        if self.limits.output_bytes != COORDINATOR_OUTPUT_BYTES
+            || self.limits.construction_bytes != COORDINATOR_CONSTRUCTION_BYTES
+        {
+            return false;
+        }
+        let local = self.usage();
+        let process = Self::process_usage();
+        // Existing owners and lowered policies retain their serial peaks.
+        // This is a conservative scheduling hint, never an admission grant:
+        // every actual allocation still acquires local and process credits.
+        local.output_bytes == 0
+            && local.construction_bytes == 0
+            && process.output_bytes <= PROCESS_OUTPUT_BYTES - COORDINATOR_OUTPUT_BYTES
+            && process.construction_bytes
+                <= PROCESS_CONSTRUCTION_BYTES - COORDINATOR_CONSTRUCTION_BYTES
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_test_capacity(
+        &self,
+        output_bytes: usize,
+        construction_bytes: usize,
+    ) -> Result<(Reservation, Reservation), SnapshotError> {
+        Ok((
+            self.reserve(BudgetClass::Output, output_bytes)?,
+            self.reserve(BudgetClass::Construction, construction_bytes)?,
+        ))
+    }
+
     pub(crate) fn reserve(
         &self,
         class: BudgetClass,
