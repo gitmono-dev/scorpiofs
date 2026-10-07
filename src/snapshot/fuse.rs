@@ -2928,7 +2928,10 @@ mod tests {
                         .returned_bytes,
                     2 * body.len() as u64
                 );
-                assert!(snapshot.phases[Phase::LowerGetattrMapping as usize].calls > 0);
+                let getattr = snapshot.operations[Operation::Getattr as usize].times;
+                assert_eq!(getattr.calls, 1);
+                assert_eq!(getattr.completed, 1);
+                assert_eq!(getattr.errors, 0);
                 assert!(snapshot.operations.iter().all(|op| op.times.active == 0));
                 assert!(
                     !snapshot.native_kernel_copy_measured && !snapshot.upper_reply_copy_measured

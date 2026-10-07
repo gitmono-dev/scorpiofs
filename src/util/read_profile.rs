@@ -478,14 +478,9 @@ pub(crate) async fn native<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::task::{Context, Wake, Waker};
+    use std::task::{Context, Waker};
 
     use super::*;
-
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
 
     #[tokio::test]
     async fn actual_future_errors_empty_replies_and_cancellation_are_distinct() {
@@ -522,10 +517,9 @@ mod tests {
             std::future::pending::<asyncfuse::Result<Vec<u8>>>(),
             |body| body.len() as u64,
         ));
-        let waker = Waker::from(Arc::new(NoopWake));
         assert!(pending
             .as_mut()
-            .poll(&mut Context::from_waker(&waker))
+            .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending());
         let running = profile.snapshot().operations[Operation::Read as usize].times;
         assert_eq!(running.calls, 4);

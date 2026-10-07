@@ -144,7 +144,7 @@ impl VerifiedCasContent {
         read?;
         let start = meters.as_ref().map(|_| Instant::now());
         let actual_digest = ring::digest::digest(&ring::digest::SHA256, buffer.as_bytes());
-        if let (Some(start), Some(meters)) = (start, meters.as_deref_mut()) {
+        if let (Some(start), Some(meters)) = (start, meters) {
             elapsed_meter(start, &mut meters.whole_hash_wall_ns, &mut meters.overflow);
             add_meter(
                 &mut meters.whole_sha256_bytes,
