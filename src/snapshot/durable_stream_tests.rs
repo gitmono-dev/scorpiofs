@@ -810,7 +810,7 @@ async fn parallel_streams_mix_small_objects_and_large_aliases_with_old_complete_
         assert!(reopened.is_snapshot_complete().unwrap(), "{core}");
         assert_eq!(
             reopened
-                .pread_blob(&id(&fixture.whole), size - 4, 20)
+                .read_verified_blob_range(&id(&fixture.whole), size, size - 4, 20)
                 .unwrap()
                 .unwrap(),
             vec![pattern(65); 4]
@@ -1016,7 +1016,7 @@ async fn large_online_stream_is_complete_reopens_and_resumes_without_fetching() 
     assert!(reopened.is_snapshot_complete().unwrap());
     let offset = CHUNK_SIZE as u64 - 3;
     let bytes = reopened
-        .pread_blob(&id(&fixture.whole), offset, 8)
+        .read_verified_blob_range(&id(&fixture.whole), size, offset, 8)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1034,7 +1034,7 @@ async fn large_online_stream_is_complete_reopens_and_resumes_without_fetching() 
     );
     assert_eq!(
         reopened
-            .pread_blob(&id(&fixture.whole), size - 4, 20)
+            .read_verified_blob_range(&id(&fixture.whole), size, size - 4, 20)
             .unwrap()
             .unwrap(),
         vec![pattern(65); 4]

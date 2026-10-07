@@ -2648,40 +2648,6 @@ impl DurableStore {
         }
     }
 
-    /// Bounded range read of one CAS object: `None` when the object is not in
-    /// the store, `Some(bytes)` (exactly `len`, clamped to EOF) when it is.
-    ///
-    /// The digest is validated before it becomes a path. This primitive
-    /// bounds output but does not prove content integrity; FUSE uses
-    /// read_indexed_blob_range for local CAS content.
-    pub fn pread_blob(
-        &self,
-        digest: &str,
-        offset: u64,
-        len: usize,
-    ) -> Result<Option<Vec<u8>>, SnapshotError> {
-        let path = self.blob_path(digest)?;
-        let mut f = match secure_fs::open_regular(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io_err(e)),
-        };
-        use std::io::{Read, Seek, SeekFrom};
-        let file_len = f.metadata().map_err(io_err)?.len();
-        if offset >= file_len {
-            return Ok(Some(Vec::new()));
-        }
-        let want = (file_len - offset).min(len as u64);
-        let want = buffered_size(want)?;
-        f.seek(SeekFrom::Start(offset)).map_err(io_err)?;
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(want)
-            .map_err(|_| buffered_allocation_error())?;
-        buf.resize(want, 0);
-        f.read_exact(&mut buf).map_err(io_err)?;
-        Ok(Some(buf))
-    }
-
     /// Read a CAS range only after verifying its fixed size and whole digest.
     /// The returned bytes are copied from the same buffers that are hashed,
     /// so a separate read cannot race that verification. A single open file
