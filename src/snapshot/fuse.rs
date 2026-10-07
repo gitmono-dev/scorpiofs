@@ -200,6 +200,19 @@ impl Mst2Fuse {
         Self::build_snapshot_closure(None, Some(store), &closure)
     }
 
+    /// Reopen a complete snapshot without contacting the service, but only
+    /// when the caller presents the exact server-issued grant and local actor
+    /// domain that were committed with the store.
+    pub fn from_snapshot_store_with_grant(
+        store: Arc<DurableStore>,
+        grant: &crate::snapshot::OfflineGrant,
+        actor_domain_id: &str,
+    ) -> std::result::Result<Self, crate::snapshot::SnapshotError> {
+        store.validate_offline_grant(grant, actor_domain_id)?;
+        let closure = store.snapshot_manifest()?;
+        Self::build_snapshot_closure(None, Some(store), &closure)
+    }
+
     /// Lazy mount: the tree starts at the scope root's verified page tree,
     /// and child directory pages are fetched on first
     /// readdir/lookup. File content materializes on open through the existing

@@ -58,7 +58,7 @@ pub use range::{ChunkedFile, OBJECT_CAP};
 pub use reader::{SnapshotFile, SnapshotReader};
 pub use resolve_receipt::ResolveTraceReceipt;
 pub use types::{
-    Capabilities, Descriptor, DirEntry, DirectoryResponse, LookupResult, ResolveDelivery,
-    ResolveRequest, ResolveTarget, SnapshotError, SnapshotErrorCode,
+    Capabilities, Descriptor, DirEntry, DirectoryResponse, LookupResult, OfflineGrant,
+    ResolveDelivery, ResolveRequest, ResolveTarget, SnapshotError, SnapshotErrorCode,
 };
 pub use workspace_pins::{LocalPinState, ReleaseLocalPinReceipt, WorkspaceBinding};
