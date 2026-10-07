@@ -47,6 +47,9 @@ struct SyncCounts {
     journal_chunks: Vec<(usize, usize)>,
     journal_compactions: usize,
     files: Vec<PathBuf>,
+    cas_objects: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+    cas_batch_events: Vec<&'static str>,
 }
 
 pub(super) struct SyncCounter;
@@ -60,6 +63,9 @@ impl SyncCounter {
                 journal_chunks: Vec::new(),
                 journal_compactions: 0,
                 files: Vec::new(),
+                cas_objects: Vec::new(),
+                directories: Vec::new(),
+                cas_batch_events: Vec::new(),
             });
         });
         Self
@@ -71,6 +77,18 @@ impl SyncCounter {
 
     pub(super) fn synced_files(&self) -> Vec<PathBuf> {
         self.counts().files
+    }
+
+    pub(super) fn synced_cas_objects(&self) -> Vec<PathBuf> {
+        self.counts().cas_objects
+    }
+
+    pub(super) fn synced_directories(&self) -> Vec<PathBuf> {
+        self.counts().directories
+    }
+
+    pub(super) fn cas_batch_events(&self) -> Vec<&'static str> {
+        self.counts().cas_batch_events
     }
 }
 
@@ -84,6 +102,7 @@ pub(super) fn record_journal_sync(root: &Path, bytes: &[u8]) {
     SYNC_COUNTS.with(|counts| {
         if let Some(counts) = counts.borrow_mut().as_mut() {
             if counts.root == root {
+                counts.cas_batch_events.push("journal-sync");
                 counts.journal_chunks.push((
                     bytes.len(),
                     bytes.iter().filter(|byte| **byte == b'\n').count(),
@@ -108,6 +127,37 @@ pub(super) fn record_file_sync(path: &Path) {
         if let Some(counts) = counts.borrow_mut().as_mut() {
             if path.starts_with(&counts.root) {
                 counts.files.push(path.into());
+            }
+        }
+    });
+}
+
+pub(super) fn record_cas_object_sync(path: &Path) {
+    SYNC_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            if path.starts_with(&counts.root) {
+                counts.cas_objects.push(path.into());
+                counts.cas_batch_events.push("object-sync");
+            }
+        }
+    });
+}
+
+pub(super) fn record_directory_sync(path: &Path) {
+    SYNC_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            if path.starts_with(&counts.root) {
+                counts.directories.push(path.into());
+            }
+        }
+    });
+}
+
+pub(super) fn record_cas_batch_sync(path: &Path) {
+    SYNC_COUNTS.with(|counts| {
+        if let Some(counts) = counts.borrow_mut().as_mut() {
+            if path.starts_with(&counts.root) {
+                counts.cas_batch_events.push("batch-directory-sync");
             }
         }
     });
