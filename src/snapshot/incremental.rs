@@ -84,6 +84,10 @@ pub struct SyncMeters {
     /// Page nodes actually visited (including the branch pages examined to
     /// make a reuse decision).
     pub traversal_nodes: u64,
+    /// File rows constructed from acquired pages for the file-only API.
+    /// Full snapshot acquisition leaves this at zero: its final independent
+    /// root proof constructs the manifest. Cached records are not counted.
+    pub acquisition_file_entries: u64,
     /// Directories whose subtrees were reused wholesale.
     pub reused_subtrees: u64,
     /// Index read attempts, including a missing or corrupt index. A sync
@@ -552,9 +556,9 @@ impl<'a> IncrementalSync<'a> {
             ValidatedSnapshotClosure::with_subtree_facts(reader.descriptor(), pages)?;
         meters.collector_route_visits = route_visits;
         meters.collector_page_decodes = collector_decodes;
-        // Replace every current reachable record, including ancestors that
-        // acquisition built using a stale subtree hint. Unrelated old roots
-        // remain cache hints and never enter this snapshot's dependency set.
+        // Publish current reachable records only from the final root proof.
+        // Acquisition uses records as page hints, never as file-list truth.
+        // Unrelated old roots never enter this snapshot's dependency set.
         for fact in facts {
             let record = ClosureRecord {
                 auth_domain: self.auth_domain.clone(),
@@ -858,7 +862,7 @@ impl<'a> IncrementalSync<'a> {
                                 format!("sha256:{}", crate::snapshot::frames::hex32(&e.child_root)),
                             ));
                         }
-                        kind => {
+                        kind if !full_snapshot => {
                             let fs_kind = match kind {
                                 mst2_codec::metapage::EntryKind::Regular => "regular",
                                 mst2_codec::metapage::EntryKind::Executable => "executable",
@@ -874,7 +878,9 @@ impl<'a> IncrementalSync<'a> {
                                     crate::snapshot::frames::hex32(&e.content_id)
                                 ),
                             });
+                            self.meters.acquisition_file_entries += 1;
                         }
+                        _ => {}
                     }
                     Ok(())
                 };
@@ -926,28 +932,31 @@ impl<'a> IncrementalSync<'a> {
 
                 let mut page_ids: Vec<String> = st.page_ids.into_iter().collect();
                 page_ids.sort();
-                // Closure record: paths relative to this directory.
-                // Replace rejected records as well, otherwise one stale
-                // record would force a full walk on every subsequent sync.
-                // Publish all records only after the whole sync succeeds.
-                transaction.put_record(ClosureRecord {
-                    auth_domain: self.auth_domain.clone(),
-                    metadata_codec: self.codec,
-                    policy_revision: POLICY_REVISION,
-                    root_page_id: st.root_page_id.clone(),
-                    page_ids: page_ids.clone(),
-                    total_entries: st.total_entries,
-                    files: st.files.clone(),
-                    pin_ref: self.reader.snapshot_id().to_string(),
-                });
+                // The file-only API builds records from this walk. Full
+                // snapshots derive every record from the independent proof
+                // below, so do not construct temporary subtree manifests.
+                if !full_snapshot {
+                    transaction.put_record(ClosureRecord {
+                        auth_domain: self.auth_domain.clone(),
+                        metadata_codec: self.codec,
+                        policy_revision: POLICY_REVISION,
+                        root_page_id: st.root_page_id.clone(),
+                        page_ids: page_ids.clone(),
+                        total_entries: st.total_entries,
+                        files: st.files.clone(),
+                        pin_ref: self.reader.snapshot_id().to_string(),
+                    });
+                }
 
                 match st.parent.clone() {
                     Some(parent_path) => {
                         if let Some(ps) = states.get_mut(&parent_path) {
-                            ps.files.extend(st.files.into_iter().map(|f| SnapshotFile {
-                                rel_path: with_prefix(&f.rel_path, &st.base),
-                                ..f
-                            }));
+                            if !full_snapshot {
+                                ps.files.extend(st.files.into_iter().map(|f| SnapshotFile {
+                                    rel_path: with_prefix(&f.rel_path, &st.base),
+                                    ..f
+                                }));
+                            }
                             ps.page_ids.extend(page_ids);
                             ps.total_entries = ps
                                 .total_entries

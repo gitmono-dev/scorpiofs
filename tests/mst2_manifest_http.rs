@@ -799,6 +799,7 @@ async fn full_snapshot_cache_preserves_empty_alias_radix_and_reports_full_proof(
     assert_eq!(sync.meters().closure_index_reads, 1);
     assert_eq!(sync.meters().closure_index_writes, 1);
     assert_eq!(sync.meters().pin_set_reads, 1);
+    assert_eq!(sync.meters().acquisition_file_entries, 0);
     assert_eq!(
         sync.closure_meters().proof_page_hashes,
         closure.pages().len() as u64
@@ -808,6 +809,25 @@ async fn full_snapshot_cache_preserves_empty_alias_radix_and_reports_full_proof(
         sync.closure_meters().proof_logical_files,
         http.fixture.expected.len() as u64
     );
+    // The file-only API still constructs its manifest during acquisition.
+    // The full API's proof must produce identical files and subtree records
+    // without first building that temporary manifest.
+    let file_tmp = tempfile::tempdir().unwrap();
+    let file_cache = ScopeCache::open(file_tmp.path()).unwrap();
+    let mut file_sync = IncrementalSync::new(&reader, &file_cache);
+    let files = file_sync.sync().await.unwrap();
+    assert_manifest(&files, &http.fixture.expected);
+    assert_eq!(
+        file_sync.meters().acquisition_file_entries,
+        files.len() as u64
+    );
+    for root in closure.directories().iter().map(|d| &d.directory_root) {
+        let mut proven = cache.record_for(root).unwrap();
+        let mut acquired = file_cache.record_for(root).unwrap();
+        proven.files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        acquired.files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        assert_eq!(proven, acquired);
+    }
     let before = http.fixture.requested_ids();
     hydrate_full(&cache, &reader, &closure).await;
     assert_eq!(
@@ -823,6 +843,7 @@ async fn full_snapshot_cache_preserves_empty_alias_radix_and_reports_full_proof(
     assert_eq!(next.files(), closure.files());
     assert!(http.fixture.requested_ids().is_empty());
     assert_eq!(warm.meters().fetched_pages, 0);
+    assert_eq!(warm.meters().acquisition_file_entries, 0);
     assert_eq!(
         warm.meters().traversal_nodes,
         0,
@@ -889,6 +910,7 @@ async fn full_snapshot_ignores_forged_files_and_repairs_truncated_or_extra_page_
         "dependencies omitted by the hint still exist in the cache"
     );
     assert!(repair.closure_meters().repaired_records > 0);
+    assert_eq!(repair.meters().acquisition_file_entries, 0);
     let root = cache.record_for(&root_id).unwrap();
     assert_manifest(&root.files, &http.fixture.expected);
     assert_eq!(
