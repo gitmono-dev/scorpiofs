@@ -18,9 +18,8 @@ use axum::{
 };
 use mst2_codec::descriptor::ServingDescriptor;
 use scorpiofs::snapshot::{
-    durable::digest_of,
-    range::{ChunkedFile, OBJECT_CAP},
-    FetchCoordinator, Mst2Client, SnapshotErrorCode, SnapshotFile, SnapshotReader,
+    durable::digest_of, FetchCoordinator, Mst2Client, OwnedChunkedFile, SnapshotErrorCode,
+    SnapshotFile, SnapshotReader, OBJECT_CAP,
 };
 use serde_json::{json, Value};
 use tokio::{sync::Notify, task::JoinHandle};
@@ -217,7 +216,8 @@ async fn large_file_open_rejects_invalid_composed_paths_before_chunk_map_rpc() {
         .unwrap();
     for (path, expected) in invalid_paths() {
         let error =
-            match ChunkedFile::open(&reader, &path, &digest_of(CONTENT), OBJECT_CAP + 1).await {
+            match OwnedChunkedFile::open(&reader, &path, &digest_of(CONTENT), OBJECT_CAP + 1).await
+            {
                 Ok(_) => panic!("invalid range-read path was accepted: {path:?}"),
                 Err(error) => error,
             };

@@ -1184,7 +1184,10 @@ async fn selected_membership_rejects_wrong_kinds_missing_paths_and_serving_profi
     assert!(server.reader.prove_file("../file000").await.is_err());
     assert_eq!(server.fixture.requests.lock().unwrap().len(), before);
     for (kind, size) in [
-        (EntryKind::Regular, super::super::range::MAX_FILE_SIZE + 1),
+        (
+            EntryKind::Regular,
+            super::super::content_profile::MAX_FILE_SIZE + 1,
+        ),
         (EntryKind::Symlink, 0),
         (EntryKind::Symlink, 4096),
     ] {

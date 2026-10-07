@@ -26,8 +26,8 @@ use scorpiofs::snapshot::{
     capabilities::CapabilityAdvertisement,
     durable::digest_of,
     frames::{parse_digest, MetadataPageItem},
-    ChunkedFile, CompletionKind, DurableStore, LocalPinState, Mst2Client, OwnedChunkedFile,
-    ResolveDelivery, ResolveRequest, ResolveTarget, ScopeCache, SnapshotErrorCode, SnapshotReader,
+    CompletionKind, DurableStore, LocalPinState, Mst2Client, OwnedChunkedFile, ResolveDelivery,
+    ResolveRequest, ResolveTarget, ScopeCache, SnapshotErrorCode, SnapshotReader,
 };
 use serde_json::{json, Value};
 
@@ -537,12 +537,16 @@ async fn canonical_ranges_use_page_index_and_split_actual_chunks_by_advertised_b
         .unwrap();
     let bytes = reader.read_content(file, true).await.unwrap();
     assert_eq!(bytes.as_bytes(), s.f.bodies["/large"]);
-    let range = ChunkedFile::open(&reader, "/large", &file.content_digest, file.size)
+    let range = OwnedChunkedFile::open(&reader, "/large", &file.content_digest, file.size)
         .await
         .unwrap();
     assert_eq!(
-        range.read_range(CHUNK_SIZE as u64 - 2, 6).await.unwrap(),
-        vec![0x51; 6]
+        range
+            .read_range_owned(CHUNK_SIZE as u64 - 2, 6)
+            .await
+            .unwrap()
+            .as_bytes(),
+        &[0x51; 6]
     );
     assert_eq!(
         s.calls("chunks")

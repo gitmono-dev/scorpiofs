@@ -1,12 +1,70 @@
 //! Private fixed-SID path authority for a completed online directory manifest.
 //!
-//! This token is not an MTP2 membership proof. Only the public file-manifest
-//! mount constructors mint it after their actual fixed-SID directory walk.
+//! This token is not an MTP2 membership proof. The mount and hydration
+//! constructors mint it only after their actual fixed-SID directory walk.
 //! Each path retains an independent online request and current lease check.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use super::{CacheDomain, SnapshotError, SnapshotErrorCode, SnapshotFile, SnapshotReader};
+
+/// Hydration may stream only entries from this completed online walk. No
+/// caller-supplied manifest constructor or fixed-root conversion is provided.
+pub(super) struct CompletedOnlineManifest {
+    files: Vec<SnapshotFile>,
+    ranges: HashMap<String, Arc<OnlineSnapshotFile>>,
+}
+
+impl CompletedOnlineManifest {
+    pub(super) async fn walk(reader: &SnapshotReader) -> Result<Self, SnapshotError> {
+        if reader.capabilities().features.metadata_pages {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::InvalidRequest,
+                "online manifest cannot replace fixed-root membership",
+            ));
+        }
+        // Do not mint any authority before every directory/cursor succeeds.
+        let files = reader.file_manifest_directory().await?;
+        reader.ensure_lease().await?;
+        let mut ranges = HashMap::new();
+        for file in &files {
+            if file.size > super::OBJECT_CAP {
+                let authority = OnlineSnapshotFile::from_manifest_file(reader, file.clone())?;
+                if ranges.insert(file.rel_path.clone(), authority).is_some() {
+                    return Err(SnapshotError::new(
+                        SnapshotErrorCode::IntegrityError,
+                        "completed online manifest repeats a file path",
+                    ));
+                }
+            }
+        }
+        reader.local_lease_status()?;
+        Ok(Self { files, ranges })
+    }
+
+    pub(super) fn files(&self) -> &[SnapshotFile] {
+        &self.files
+    }
+
+    pub(super) fn range_file(
+        &self,
+        file: &SnapshotFile,
+    ) -> Result<Arc<OnlineSnapshotFile>, SnapshotError> {
+        let authority = self.ranges.get(&file.rel_path).ok_or_else(|| {
+            SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "file is not a large entry in the completed online manifest",
+            )
+        })?;
+        if authority.file() != file {
+            return Err(SnapshotError::new(
+                SnapshotErrorCode::IntegrityError,
+                "stream tuple differs from the completed online manifest",
+            ));
+        }
+        Ok(authority.clone())
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct OnlineSnapshotFile {

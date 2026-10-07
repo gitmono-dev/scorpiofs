@@ -713,7 +713,7 @@ async fn eight_tib_map_shape_opens_without_allocating_or_fetching_file_payload()
     let mut fixture = Fixture::new(1);
     fixture.map = ChunkMap::new(
         fixture.map.file_content_id,
-        super::super::range::MAX_FILE_SIZE,
+        super::super::content_profile::MAX_FILE_SIZE,
         fixture.map.pages_root,
     )
     .unwrap();
@@ -732,7 +732,7 @@ async fn eight_tib_map_shape_opens_without_allocating_or_fetching_file_payload()
             &server.reader,
             "file",
             &digest,
-            super::super::range::MAX_FILE_SIZE + 1
+            super::super::content_profile::MAX_FILE_SIZE + 1
         )
         .await
         .err()

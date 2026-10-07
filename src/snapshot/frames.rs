@@ -239,6 +239,23 @@ pub struct VerifiedChunkMap {
     pub pages_root: [u8; 32],
 }
 
+impl VerifiedChunkMap {
+    /// Length of chunk `index` derived from the fixed profile map.
+    pub fn chunk_len(&self, index: u64) -> Result<u64, SnapshotError> {
+        let map = mst2_codec::chunkmap::ChunkMap::new(
+            parse_digest(&self.file_content_id)?,
+            self.file_size,
+            self.pages_root,
+        )
+        .map_err(|error| {
+            SnapshotError::new(SnapshotErrorCode::Internal, format!("chunk codec: {error}"))
+        })?;
+        map.chunk_len(index).map_err(|error| {
+            SnapshotError::new(SnapshotErrorCode::Internal, format!("chunk codec: {error}"))
+        })
+    }
+}
+
 /// One verified chunk, in request order.
 #[derive(Debug, Clone)]
 pub struct ChunkUnit {
@@ -1256,6 +1273,27 @@ pub fn check_merkle_root(leaves: &[[u8; 32]], root: [u8; 32]) -> Result<(), Snap
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chunk_len_matches_the_map_rules() {
+        use mst2_codec::chunkmap::CHUNK_SIZE;
+
+        use super::{parse_digest, VerifiedChunkMap};
+
+        let size = 2 * CHUNK_SIZE as u64 + 7;
+        let id = "sha256:".to_string() + &"0".repeat(64);
+        let map = VerifiedChunkMap {
+            file_content_id: id.clone(),
+            map_id: id,
+            file_size: size,
+            chunk_count: 3,
+            page_count: 1,
+            pages_root: [0u8; 32],
+        };
+        assert_eq!(map.chunk_len(0).unwrap(), CHUNK_SIZE as u64);
+        assert_eq!(map.chunk_len(2).unwrap(), 7);
+        assert!(map.chunk_len(3).is_err());
+        assert!(parse_digest(&map.file_content_id).is_ok());
+    }
     use super::*;
 
     #[test]

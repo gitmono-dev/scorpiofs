@@ -29,6 +29,9 @@ use tokio::sync::Notify;
 
 use super::{durability_tests::FaultGuard, *};
 
+#[path = "durable_online_tests.rs"]
+mod online_retirement;
+
 // This batch fixture exercises the coordinator's fixed final allocation while
 // the existing single-chunk fixture below keeps testing streaming CAS writes.
 async fn owned_chunks(
@@ -974,15 +977,15 @@ async fn range_profile_rejects_above_eight_tib_before_request_and_accepts_bounda
     fixture.descriptor.metadata_root = page_id(&fixture.page);
     let (_server, fixture, reader, _store) = open_fixture(fixture, temp.path()).await;
     let digest = id(&fixture.advertised);
-    match crate::snapshot::ChunkedFile::open(&reader, "large.bin", &digest, size + 1).await {
+    match crate::snapshot::OwnedChunkedFile::open(&reader, "large.bin", &digest, size + 1).await {
         Ok(_) => panic!("over-profile range handle was accepted"),
         Err(error) => assert_eq!(error.code, SnapshotErrorCode::LimitExceeded),
     }
     assert_eq!(fixture.maps.load(Ordering::SeqCst), 0);
-    let handle = crate::snapshot::ChunkedFile::open(&reader, "large.bin", &digest, size)
+    let handle = crate::snapshot::OwnedChunkedFile::open(&reader, "large.bin", &digest, size)
         .await
         .unwrap();
-    assert_eq!(handle.size, size);
+    assert_eq!(handle.size(), size);
     assert_eq!(handle.map_id(), id(&fixture.map.map_id()));
     assert_eq!(fixture.maps.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.chunks.load(Ordering::SeqCst), 0);

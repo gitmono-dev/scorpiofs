@@ -12,9 +12,9 @@ use std::{
 
 use super::{
     content::{AccountedBuffer, BudgetClass, ContentBudget},
+    content_profile::OBJECT_CAP,
     durable::DurableStore,
     frames::parse_digest,
-    range::OBJECT_CAP,
     secure_fs, SnapshotError, SnapshotErrorCode,
 };
 
