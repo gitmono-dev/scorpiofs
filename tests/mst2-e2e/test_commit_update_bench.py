@@ -217,7 +217,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
             self.assertIsNone(BENCH.query(BENCH.NATIVE_SQL, time.monotonic() + 30))
 
     def test_workflow_recovery_preserves_deadline_and_rejects_extension_before_setup(self):
-        workflow = SOURCE.parents[2] / ".github/workflows/mst2-workspace-update.yml"
+        workflow = SOURCE.parents[2] / ".github/workflows/mst2-real-update.yml"
         script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
         started = datetime.now(timezone.utc) - timedelta(minutes=1)
         deadline = (started + timedelta(minutes=235)).isoformat()
@@ -247,7 +247,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
     def test_explicit_recovery_keeps_the_original_window_after_queue_freshness_expires(self):
         started = datetime.now(timezone.utc) - timedelta(minutes=20)
         deadline = (started + timedelta(minutes=235)).isoformat()
-        for name in ("mst2-real-update.yml", "mst2-workspace-update.yml"):
+        for name in ("mst2-real-update.yml",):
             workflow = SOURCE.parents[2] / ".github/workflows" / name
             script = textwrap.dedent(workflow.read_text(encoding="utf-8").split("python3 -B - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
             with tempfile.TemporaryDirectory() as temp:

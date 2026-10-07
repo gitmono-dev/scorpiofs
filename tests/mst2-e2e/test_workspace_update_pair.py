@@ -84,7 +84,7 @@ class PairedContractsTests(unittest.TestCase):
                 budget.require_external_time(original, reserve)
 
     def test_actual_workflow_run_metadata_preserves_original_window_and_escapes_public_inputs(self):
-        workflow = Path(__file__).resolve().parents[2] / ".github/workflows/mst2-workspace-update.yml"
+        workflow = Path(__file__).resolve().parents[2] / ".github/workflows/mst2-real-update.yml"
         script = workflow.read_text().split('python3 -B - "$safe/run.json" <<\'PY\'\n', 1)[1].split("          PY", 1)[0]
         env = {"GITHUB_RUN_ID": 'public"run\\name', "GITHUB_RUN_ATTEMPT": "2",
                "SCORPIO_SHA": "a" * 40, "MEGA_SHA": "b" * 40,
