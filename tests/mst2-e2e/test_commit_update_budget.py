@@ -245,6 +245,117 @@ class SessionBudgetTests(unittest.TestCase):
                 deps.assert_not_called()
             self.assertFalse(root.exists())
 
+    def test_recovery_only_caps_current_build_and_reserves_every_future_complete_stage(self):
+        with patch.object(budget.time, "time", return_value=0), \
+                patch.object(budget.time, "monotonic", return_value=0):
+            strict = budget.SessionBudget("1970-01-01T03:55:00Z", 3)
+            recovered = budget.SessionBudget("1970-01-01T03:55:00Z", 3,
+                                              recover_original_window=True)
+        with patch.object(budget.time, "monotonic", return_value=47 * 60):
+            with self.assertRaises(TimeoutError):
+                strict.stage_deadline("server-build")
+            with patch("sys.stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(recovered.stage_deadline("server-build"), 75 * 60)
+            self.assertEqual(json.loads(output.getvalue()), {
+                "record": "session_stage_budget", "stage": "server-build",
+                "recover_original_window": True, "stage_cap_minutes": 28.0,
+                "future_reserved_minutes": 145.0})
+        # Even if the recovered build consumes its entire cap, all remaining
+        # stage maxima and three full 25-minute rounds remain available.
+        for now, stage, end in [(75, "client-build", 95), (95, "fences", 105), (105, "setup", 115)]:
+            with patch.object(budget.time, "monotonic", return_value=now * 60):
+                self.assertEqual(recovered.stage_deadline(stage), end * 60)
+        for number, now in [(1, 115), (2, 140), (3, 165)]:
+            with patch.object(budget.time, "monotonic", return_value=now * 60):
+                self.assertEqual(recovered.round_deadline(number), (now + 25) * 60)
+        with patch.object(budget.time, "monotonic", return_value=190 * 60):
+            self.assertEqual(recovered.report_deadline(), 200 * 60)
+        self.assertEqual(recovered.deadline_utc, strict.deadline_utc)
+        self.assertEqual(recovered.cleanup_deadline, strict.cleanup_deadline)
+        self.assertEqual(recovered.measurement_deadline, strict.measurement_deadline)
+
+    def test_fresh_recovery_keeps_full_current_stage_cap_and_default_remains_strict(self):
+        with patch.object(budget.time, "time", return_value=0), \
+                patch.object(budget.time, "monotonic", return_value=0):
+            modes = [budget.SessionBudget("1970-01-01T03:55:00Z", 3),
+                     budget.SessionBudget("1970-01-01T03:55:00Z", 3, recover_original_window=True)]
+        for mode in modes:
+            with patch.object(budget.time, "monotonic", return_value=10 * 60):
+                self.assertEqual(mode.stage_deadline("server-build"), 45 * 60)
+        self.assertFalse(modes[0].recover_original_window)
+
+    def test_recovery_refuses_insufficient_future_or_current_minimum_without_starting_work(self):
+        with patch.object(budget.time, "time", return_value=0), \
+                patch.object(budget.time, "monotonic", return_value=0):
+            recovered = budget.SessionBudget("1970-01-01T03:55:00Z", 3,
+                                              recover_original_window=True)
+        for stage in budget.STAGES:
+            names = tuple(budget.STAGES)
+            future = sum(budget.STAGES[name] for name in names[names.index(stage) + 1:])
+            reserve = future + 3 * 25 * 60 + 3 * 10 * 60
+            for current_seconds in (budget.STAGE_MINIMUM[stage] - 1, 0, -1):
+                now = recovered.cleanup_deadline - reserve - current_seconds
+                with patch.object(budget.time, "monotonic", return_value=now), \
+                        patch.object(budget.subprocess, "Popen") as start:
+                    with self.assertRaises(TimeoutError):
+                        budget.run_process(["unused"], recovered.stage_deadline(stage))
+                    start.assert_not_called()
+
+    def test_recovery_flags_are_explicit_and_cannot_extend_or_revive_original_anchor(self):
+        for value in (None, "TRUE", "yes", "1", 0, 1, [], {}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                budget.recovery_flag(value)
+        with patch.object(budget.time, "time", return_value=0), \
+                patch.object(budget.time, "monotonic", return_value=0):
+            for value in ("true", 1, None):
+                with self.assertRaises(ValueError):
+                    budget.SessionBudget("1970-01-01T03:55:00Z", 3, recover_original_window=value)
+            for anchor in (-1, 0, 220 * 60 + 2):
+                with self.assertRaises(ValueError):
+                    budget.SessionBudget("1970-01-01T03:55:00Z", 3, anchor, True)
+            with self.assertRaises(ValueError):
+                budget.SessionBudget("1969-12-31T23:55:00Z", 3, 1000, True)
+            # A forged monotonic anchor cannot consume the external reserve.
+            with self.assertRaises(ValueError):
+                budget.SessionBudget("1970-01-01T02:00:00Z", 3, 110 * 60, True)
+            options = SimpleNamespace(session_deadline_utc="1970-01-01T03:55:00Z", rounds=3)
+            with patch.dict(os.environ, {"RECOVERY_INPUT": "true"}):
+                self.assertTrue(budget.from_options(options).recover_original_window)
+                options.recover_original_window = False
+                self.assertFalse(budget.from_options(options).recover_original_window)
+                options.recover_original_window = "invalid"
+                with self.assertRaises(ValueError):
+                    budget.from_options(options)
+
+    def test_stage_cli_uses_validated_workflow_recovery_and_emits_actual_cap(self):
+        environment = {"MST2_SESSION_DEADLINE": "1970-01-01T03:55:00Z",
+                       "MST2_WORK_CLEANUP_DEADLINE_MONOTONIC": str(220 * 60),
+                       "RECOVERY_INPUT": "true"}
+        arguments = ["budget", "--rounds", "3", "--stage", "server-build", "--", "owned-build"]
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(budget.time, "time", return_value=0), \
+                patch.object(budget.time, "monotonic", return_value=47 * 60), \
+                patch.object(budget, "run_process", return_value=(0, None, None)) as run, \
+                patch("sys.argv", arguments), patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(budget.main(), 0)
+            run.assert_called_once_with(["owned-build"], 75 * 60, capture=False)
+            self.assertEqual(json.loads(output.getvalue())["stage_cap_minutes"], 28.0)
+        # A CLI false explicitly restores the default strict build admission.
+        strict = arguments[:1] + ["--recover-original-window", "false"] + arguments[1:]
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(budget.time, "time", return_value=0), \
+                patch.object(budget.time, "monotonic", return_value=47 * 60), \
+                patch.object(budget, "run_process") as run, patch("sys.argv", strict):
+            with self.assertRaises(TimeoutError):
+                budget.main()
+            run.assert_not_called()
+        with patch.dict(os.environ, dict(environment, RECOVERY_INPUT="TRUE"), clear=True), \
+                patch.object(budget, "run_process") as run, patch("sys.argv", arguments), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                budget.main()
+            run.assert_not_called()
+
     def test_verified_end_point_rejects_tampering_and_contains_immediate_full_byte_oracle(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
