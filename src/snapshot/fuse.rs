@@ -31,9 +31,10 @@ use crate::{
     snapshot::{
         capabilities::CapabilityAdvertisement,
         cas_content::VerifiedCasContent,
+        cas_range::VerifiedCasRange,
         closure::{verify_directory_pages, ValidatedSnapshotClosure},
-        durable::DurableStore,
-        fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission},
+        durable::{DurableStore, LocalCasRangeMeters},
+        fuse_owned::{ContentEntry, OwnedFuseCache, RangeEntry, ReplyAdmission, StoreRangeCache},
         fuse_store::{ContentKey, StoreContent, StoreSmallCache},
         FileMembershipError, MetadataProofLimits, OwnedChunkedFile, ProvenSnapshotFile, ScopeCache,
         SnapshotDirectoryEntry, SnapshotError, SnapshotErrorCode, SnapshotFile,
@@ -87,6 +88,7 @@ struct State {
     owned: Option<OwnedFuseCache>,
     /// Only a canonical, authorized online v3 workspace owns this cache.
     store_small: Option<StoreSmallCache>,
+    store_ranges: Option<StoreRangeCache>,
     /// Lazy mounts: directory pages are fetched on first readdir/lookup.
     lazy: bool,
     /// None for legacy file-only manifests, which cannot prove namespace absence.
@@ -273,6 +275,10 @@ impl Mst2Fuse {
         } else {
             None
         };
+        let store_ranges = store_small
+            .as_ref()
+            .map(|_| StoreRangeCache::new(&reader))
+            .transpose()?;
         let mut state = State {
             next_inode: ROOT_INODE,
             nodes: HashMap::new(),
@@ -280,6 +286,7 @@ impl Mst2Fuse {
             chunked: HashMap::new(),
             owned: owned_cache(Some(&reader), store.as_ref())?,
             store_small,
+            store_ranges,
             lazy: true,
             namespace_scope: Some(reader.descriptor().scope.clone()),
         };
@@ -598,6 +605,7 @@ impl Mst2Fuse {
             chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
             store_small: None,
+            store_ranges: None,
             lazy: false,
             namespace_scope: None,
         };
@@ -650,6 +658,7 @@ impl Mst2Fuse {
             chunked: HashMap::new(),
             owned: owned_cache(reader.as_ref(), store.as_ref())?,
             store_small: None,
+            store_ranges: None,
             lazy: false,
             namespace_scope: Some(closure.descriptor().scope.clone()),
         };
@@ -891,6 +900,92 @@ impl Mst2Fuse {
             .ok_or_else(|| Errno::from(libc::EIO))?
             .insert(key, content)
             .map_err(io_err)?;
+        Ok(ReplyData { data })
+    }
+
+    /// Every large read in the authorized canonical v3 store path returns
+    /// here. Errors cannot re-enter the legacy Vec/chunk-reader branch.
+    async fn read_store_large(
+        &self,
+        reader: &SnapshotReader,
+        inode: Inode,
+        node: &FileNode,
+        offset: u64,
+        requested: u64,
+    ) -> Result<ReplyData> {
+        let cached = self
+            .state
+            .lock()
+            .unwrap()
+            .store_ranges
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .ranges
+            .get(inode);
+        let proven = Self::proven_node(
+            reader,
+            node,
+            cached.as_ref().map(|entry| entry.proven.clone()),
+        )
+        .await?;
+        if requested == 0 || offset >= node.size {
+            proven.validate(reader).await.map_err(io_err)?;
+            return Ok(ReplyData { data: Bytes::new() });
+        }
+        let wanted = requested.min(node.size - offset);
+        let admission = ReplyAdmission::new(reader).map_err(io_err)?;
+        let store = self.store.as_ref().ok_or_else(|| Errno::from(libc::EIO))?;
+        let mut meters = LocalCasRangeMeters::default();
+        // Always prefer local CAS, including when a wire handle is cached.
+        // Only the primitive's safe-open NotFound permits wire fallback.
+        if let Some(owner) = VerifiedCasRange::read(
+            store,
+            &node.digest,
+            node.size,
+            offset,
+            wanted,
+            &reader.content_scope,
+            &mut meters,
+        )
+        .map_err(io_err)?
+        {
+            if owner.len() as u64 != wanted {
+                return Err(Errno::from(libc::EIO));
+            }
+            proven.validate(reader).await.map_err(io_err)?;
+            return Ok(ReplyData {
+                data: admission.cas_range(owner).map_err(io_err)?,
+            });
+        }
+        let range = match cached {
+            Some(entry) => entry.range,
+            None => Arc::new(
+                OwnedChunkedFile::open_proven(reader, proven.clone())
+                    .await
+                    .map_err(io_err)?,
+            ),
+        };
+        let owner = range
+            .read_range_owned(offset, wanted)
+            .await
+            .map_err(io_err)?;
+        if owner.len() as u64 != wanted {
+            return Err(Errno::from(libc::EIO));
+        }
+        proven.validate(reader).await.map_err(io_err)?;
+        let data = admission.range(owner).map_err(io_err)?;
+        self.state
+            .lock()
+            .unwrap()
+            .store_ranges
+            .as_mut()
+            .ok_or_else(|| Errno::from(libc::EIO))?
+            .ranges
+            .insert(RangeEntry {
+                inode,
+                proven,
+                range,
+            });
         Ok(ReplyData { data })
     }
 
@@ -1543,6 +1638,9 @@ impl Filesystem for Mst2Fuse {
             if f.size <= crate::snapshot::OBJECT_CAP {
                 return self.read_store_small(reader, &f, offset, size as u64).await;
             }
+            return self
+                .read_store_large(reader, inode, &f, offset, size as u64)
+                .await;
         }
         let reply = async {
             if size == 0 || offset >= f.size {

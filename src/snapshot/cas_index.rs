@@ -14,9 +14,9 @@ use std::{
 
 use ring::digest::{Context, SHA256};
 
-use super::{secure_fs, SnapshotError, SnapshotErrorCode};
+use super::{content::AccountedBuffer, secure_fs, SnapshotError, SnapshotErrorCode};
 
-const CHUNK_SIZE: u64 = 1024 * 1024;
+pub(super) const CHUNK_SIZE: u64 = 1024 * 1024;
 const INDEX_FORMAT: u32 = 1;
 const MAX_DIGEST_BYTES: usize = 8 * 1024 * 1024;
 const PROCESS_INDEX_BYTES: usize = 64 * 1024 * 1024;
@@ -252,35 +252,97 @@ fn allocation_error() -> SnapshotError {
     )
 }
 
-fn copy_intersection(output: &mut Vec<u8>, buffer: &[u8], start: u64, offset: u64, end: u64) {
+/// Both legacy Vec results and admitted owners use the same integrity core.
+/// The core can only append within the one allocation supplied by its caller.
+trait RangeSink {
+    fn len(&self) -> usize;
+    fn append(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>;
+}
+
+impl RangeSink for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn append(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        if bytes.len() > self.capacity() - self.len() {
+            return Err(mismatch(
+                "local CAS range exceeds its fixed output capacity",
+            ));
+        }
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl RangeSink for AccountedBuffer {
+    fn len(&self) -> usize {
+        AccountedBuffer::len(self)
+    }
+    fn append(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        AccountedBuffer::append(self, bytes)
+    }
+}
+
+fn copy_intersection(
+    output: &mut impl RangeSink,
+    buffer: &[u8],
+    start: u64,
+    offset: u64,
+    end: u64,
+) -> Result<(), SnapshotError> {
     let from = start.max(offset);
     let to = (start + buffer.len() as u64).min(end);
     if from < to {
-        output.extend_from_slice(&buffer[(from - start) as usize..(to - start) as usize]);
+        output.append(&buffer[(from - start) as usize..(to - start) as usize])?;
     }
+    Ok(())
 }
 
 // The only constructor of trusted facts is this full successful scan. Whole
 // and chunk digests consume the exact buffers that supply returned bytes.
+#[allow(clippy::too_many_arguments)]
 fn scan(
     mut input: File,
     digest: &str,
     size: u64,
     offset: u64,
-    len: usize,
+    end: u64,
+    output: &mut impl RangeSink,
+    scratch: &mut [u8],
+    chunks: Option<&mut Vec<[u8; 32]>>,
+    meters: &mut LocalCasRangeMeters,
+) -> Result<(), SnapshotError> {
+    scan_body(
+        &mut input, digest, size, offset, end, output, scratch, chunks, meters,
+    )?;
+    check_metadata(&input, size)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_body(
+    input: &mut impl Read,
+    digest: &str,
+    size: u64,
+    offset: u64,
+    end: u64,
+    output: &mut impl RangeSink,
+    scratch: &mut [u8],
     mut chunks: Option<&mut Vec<[u8; 32]>>,
     meters: &mut LocalCasRangeMeters,
-) -> Result<Vec<u8>, SnapshotError> {
-    let (mut output, end) = output(size, offset, len)?;
+) -> Result<(), SnapshotError> {
     let mut whole = Context::new(&SHA256);
     let mut chunk = Context::new(&SHA256);
     let mut chunk_bytes = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
+    let scan_capacity = scratch.len().min(64 * 1024);
+    if scan_capacity == 0 {
+        return Err(allocation_error());
+    }
+    let buffer = &mut scratch[..scan_capacity];
     let mut read = 0u64;
     {
-        let mut bounded = (&mut input).take(size.saturating_add(1));
+        let mut bounded = input.take(size.saturating_add(1));
         loop {
-            let count = bounded.read(&mut buffer).map_err(io_error)?;
+            let count = read_retry(&mut bounded, buffer)?;
             meters.bytes_read += count as u64;
             if count == 0 {
                 break;
@@ -308,7 +370,7 @@ fn scan(
                     }
                 }
             }
-            copy_intersection(&mut output, &buffer[..count], read, offset, end);
+            copy_intersection(output, &buffer[..count], read, offset, end)?;
             read = next;
         }
     }
@@ -325,8 +387,17 @@ fn scan(
             "local CAS object does not match the fixed whole-file identity",
         ));
     }
-    check_metadata(&input, size)?;
-    Ok(output)
+    Ok(())
+}
+
+fn read_retry(input: &mut impl Read, buffer: &mut [u8]) -> Result<usize, SnapshotError> {
+    loop {
+        match input.read(buffer) {
+            Ok(count) => return Ok(count),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(io_error(error)),
+        }
+    }
 }
 
 pub(super) fn read_strict(
@@ -340,7 +411,9 @@ pub(super) fn read_strict(
     let Some(input) = open(path, size)? else {
         return Ok(None);
     };
-    scan(input, digest, size, offset, len, None, meters).map(Some)
+    let (mut output, end) = output(size, offset, len)?;
+    scan_legacy(input, digest, size, offset, end, &mut output, None, meters)?;
+    Ok(Some(output))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,6 +452,71 @@ fn read_with_cache(
     let Some(input) = open(path, size)? else {
         return Ok(None);
     };
+    let (mut output, end) = output(size, offset, len)?;
+    read_input_with_cache(
+        cache,
+        input,
+        domain,
+        digest,
+        size,
+        offset,
+        end,
+        &mut output,
+        None,
+        meters,
+    )?;
+    Ok(Some(output))
+}
+
+/// Fill the caller's already admitted output and construction allocations.
+/// Only a safe CAS open returning NotFound is a miss; all other errors are
+/// terminal. No local payload or scratch allocation is made in this entry.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_indexed_into(
+    path: &Path,
+    domain: &Path,
+    digest: &str,
+    size: u64,
+    offset: u64,
+    wanted: usize,
+    output: &mut AccountedBuffer,
+    scratch: &mut [u8],
+    meters: &mut LocalCasRangeMeters,
+) -> Result<bool, SnapshotError> {
+    let input = match secure_fs::open_regular_nonblocking(path) {
+        Ok(input) => input,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(error)),
+    };
+    check_metadata(&input, size)?;
+    read_input_with_cache(
+        process_cache(),
+        input,
+        domain,
+        digest,
+        size,
+        offset,
+        offset.saturating_add(wanted as u64),
+        output,
+        Some(scratch),
+        meters,
+    )?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_input_with_cache(
+    cache: &Cache,
+    input: File,
+    domain: &Path,
+    digest: &str,
+    size: u64,
+    offset: u64,
+    end: u64,
+    output: &mut impl RangeSink,
+    scratch: Option<&mut [u8]>,
+    meters: &mut LocalCasRangeMeters,
+) -> Result<(), SnapshotError> {
     let count = size.div_ceil(CHUNK_SIZE);
     let fixed_digest: Option<[u8; 32]> = digest
         .strip_prefix("sha256:")
@@ -392,16 +530,20 @@ fn read_with_cache(
     // retains the independent whole-file contract. No index is fabricated.
     let (Ok(domain), Some(fixed_digest)) = (domain, fixed_digest) else {
         meters.strict_fallback = true;
-        return scan(input, digest, size, offset, len, None, meters).map(Some);
+        return scan_with_scratch(
+            input, digest, size, offset, end, output, scratch, None, meters,
+        );
     };
     if count > (MAX_DIGEST_BYTES / 32) as u64 {
         meters.strict_fallback = true;
-        return scan(input, digest, size, offset, len, None, meters).map(Some);
+        return scan_with_scratch(
+            input, digest, size, offset, end, output, scratch, None, meters,
+        );
     }
     if let Some(fact) = cache.get(&domain, &fixed_digest, size) {
         meters.index_hit = true;
         meters.index_fact_charge_bytes = fact._reservation.bytes;
-        return read_chunks(input, &fact, offset, len, meters).map(Some);
+        return read_chunks_with_scratch(input, &fact, offset, end, output, scratch, meters);
     }
     let count = count as usize;
     // Reserve a conservative payload allowance before allocating. Global
@@ -419,16 +561,30 @@ fn read_with_cache(
         .saturating_add(INDEX_OVERHEAD);
     let Some(reservation) = cache.reserve(charge) else {
         meters.strict_fallback = true;
-        return scan(input, digest, size, offset, len, None, meters).map(Some);
+        return scan_with_scratch(
+            input, digest, size, offset, end, output, scratch, None, meters,
+        );
     };
     let mut chunks = Vec::new();
     if chunks.try_reserve_exact(count).is_err() || chunks.capacity().saturating_mul(32) > payload {
         drop(chunks);
         drop(reservation);
         meters.strict_fallback = true;
-        return scan(input, digest, size, offset, len, None, meters).map(Some);
+        return scan_with_scratch(
+            input, digest, size, offset, end, output, scratch, None, meters,
+        );
     }
-    let bytes = scan(input, digest, size, offset, len, Some(&mut chunks), meters)?;
+    scan_with_scratch(
+        input,
+        digest,
+        size,
+        offset,
+        end,
+        output,
+        scratch,
+        Some(&mut chunks),
+        meters,
+    )?;
     if chunks.len() != count {
         return Err(mismatch(
             "local CAS chunk geometry differs from the fixed file",
@@ -444,48 +600,125 @@ fn read_with_cache(
         _reservation: reservation,
     }));
     meters.index_built = true;
-    Ok(Some(bytes))
+    Ok(())
 }
 
+// Legacy public Vec calls keep their existing cold stack scratch and warm
+// heap scratch. Owned calls always provide their already admitted allocation.
+#[allow(clippy::too_many_arguments)]
+fn scan_with_scratch(
+    input: File,
+    digest: &str,
+    size: u64,
+    offset: u64,
+    end: u64,
+    output: &mut impl RangeSink,
+    scratch: Option<&mut [u8]>,
+    chunks: Option<&mut Vec<[u8; 32]>>,
+    meters: &mut LocalCasRangeMeters,
+) -> Result<(), SnapshotError> {
+    match scratch {
+        Some(scratch) => scan(
+            input, digest, size, offset, end, output, scratch, chunks, meters,
+        ),
+        None => scan_legacy(input, digest, size, offset, end, output, chunks, meters),
+    }
+}
+
+// Keep the legacy stack scratch out of the admitted caller's stack frame.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn scan_legacy(
+    input: File,
+    digest: &str,
+    size: u64,
+    offset: u64,
+    end: u64,
+    output: &mut impl RangeSink,
+    chunks: Option<&mut Vec<[u8; 32]>>,
+    meters: &mut LocalCasRangeMeters,
+) -> Result<(), SnapshotError> {
+    let mut scratch = [0u8; 64 * 1024];
+    scan(
+        input,
+        digest,
+        size,
+        offset,
+        end,
+        output,
+        &mut scratch,
+        chunks,
+        meters,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_chunks_with_scratch(
+    input: File,
+    fact: &Index,
+    offset: u64,
+    end: u64,
+    output: &mut impl RangeSink,
+    scratch: Option<&mut [u8]>,
+    meters: &mut LocalCasRangeMeters,
+) -> Result<(), SnapshotError> {
+    match scratch {
+        Some(scratch) => read_chunks(input, fact, offset, end, output, scratch, meters),
+        None => {
+            let mut scratch = Vec::new();
+            if end > offset {
+                scratch
+                    .try_reserve_exact(CHUNK_SIZE as usize)
+                    .map_err(|_| allocation_error())?;
+                scratch.resize(CHUNK_SIZE as usize, 0);
+            }
+            read_chunks(input, fact, offset, end, output, &mut scratch, meters)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn read_chunks(
     mut input: File,
     fact: &Index,
     offset: u64,
-    len: usize,
+    end: u64,
+    output: &mut impl RangeSink,
+    scratch: &mut [u8],
     meters: &mut LocalCasRangeMeters,
-) -> Result<Vec<u8>, SnapshotError> {
-    let (mut output, end) = output(fact.size, offset, len)?;
+) -> Result<(), SnapshotError> {
     if end > offset {
-        let mut buffer = Vec::new();
-        buffer
-            .try_reserve_exact(CHUNK_SIZE as usize)
-            .map_err(|_| allocation_error())?;
         for index in offset / CHUNK_SIZE..=(end - 1) / CHUNK_SIZE {
             let start = index * CHUNK_SIZE;
             let chunk_len = (fact.size - start).min(CHUNK_SIZE) as usize;
-            buffer.resize(chunk_len, 0);
+            let buffer = scratch.get_mut(..chunk_len).ok_or_else(allocation_error)?;
             input.seek(SeekFrom::Start(start)).map_err(io_error)?;
             let mut filled = 0;
             while filled < chunk_len {
-                let count = input.read(&mut buffer[filled..]).map_err(io_error)?;
+                let count = read_retry(&mut input, &mut buffer[filled..])?;
                 meters.bytes_read += count as u64;
                 if count == 0 {
                     return Err(mismatch("local CAS covering chunk is truncated"));
                 }
                 filled += count;
             }
-            let hash = ring::digest::digest(&SHA256, &buffer);
+            let hash = ring::digest::digest(&SHA256, buffer);
             meters.chunk_sha256_bytes += chunk_len as u64;
             if hash.as_ref() != fact.chunks[index as usize] {
                 return Err(mismatch(
                     "local CAS covering chunk does not match its verified digest",
                 ));
             }
-            copy_intersection(&mut output, &buffer, start, offset, end);
+            copy_intersection(output, buffer, start, offset, end)?;
         }
     }
+    if output.len() as u64 != end.saturating_sub(offset) {
+        return Err(mismatch(
+            "local CAS range differs from its fixed output length",
+        ));
+    }
     check_metadata(&input, fact.size)?;
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -734,5 +967,198 @@ mod tests {
             .entries
             .iter()
             .all(Option::is_none));
+    }
+
+    #[test]
+    fn strict_fallback_fills_the_same_admitted_output_without_a_payload_vec_or_fact() {
+        use super::super::content::{BudgetClass, ContentBudget, ContentBudgetLimits};
+
+        let (temp, path, digest, body) = fixture();
+        for missing_domain in [false, true] {
+            let cache = Cache::new(if missing_domain {
+                PROCESS_INDEX_BYTES
+            } else {
+                0
+            });
+            let domain = if missing_domain {
+                temp.path().join("not-a-domain")
+            } else {
+                temp.path().to_path_buf()
+            };
+            let budget = ContentBudget::new(ContentBudgetLimits::default());
+            let baseline = budget.usage();
+            let mut meters = LocalCasRangeMeters::default();
+            let mut output = AccountedBuffer::new(&budget, BudgetClass::Output, 13, 0).unwrap();
+            let pointer = output.as_bytes().as_ptr();
+            // The core sees caller-owned, fixed construction storage.
+            let scratch_credit = budget
+                .reserve(BudgetClass::Construction, CHUNK_SIZE as usize + 1024)
+                .unwrap();
+            let mut scratch = vec![0u8; CHUNK_SIZE as usize];
+            read_input_with_cache(
+                &cache,
+                open(&path, body.len() as u64).unwrap().unwrap(),
+                &domain,
+                &digest,
+                body.len() as u64,
+                0,
+                13,
+                &mut output,
+                Some(&mut scratch),
+                &mut meters,
+            )
+            .unwrap();
+            assert_eq!(output.as_bytes().as_ptr(), pointer);
+            assert_eq!(output.as_bytes(), &body[..13]);
+            assert!(meters.strict_fallback && !meters.index_built && !meters.index_hit);
+            assert_eq!(meters.bytes_read, body.len() as u64);
+            assert_eq!(meters.whole_sha256_bytes, body.len() as u64);
+            assert_eq!(meters.chunk_sha256_bytes, 0);
+            assert!(cache
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(Option::is_none));
+            drop(output);
+            let mut corrupt = body.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            std::fs::write(&path, &corrupt).unwrap();
+            let mut output = AccountedBuffer::new(&budget, BudgetClass::Output, 13, 0).unwrap();
+            assert_eq!(
+                read_input_with_cache(
+                    &cache,
+                    open(&path, body.len() as u64).unwrap().unwrap(),
+                    &domain,
+                    &digest,
+                    body.len() as u64,
+                    0,
+                    13,
+                    &mut output,
+                    Some(&mut scratch),
+                    &mut meters,
+                )
+                .unwrap_err()
+                .code,
+                SnapshotErrorCode::DigestMismatch
+            );
+            drop(output);
+            drop(scratch);
+            drop(scratch_credit);
+            assert_eq!(budget.usage(), baseline);
+            assert!(cache
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(Option::is_none));
+            std::fs::write(&path, &body).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_scan_retries_interrupted_short_reads_across_chunk_boundaries() {
+        struct ShortReads {
+            interrupted: bool,
+            input: io::Cursor<Vec<u8>>,
+        }
+        impl Read for ShortReads {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let capacity = output.len().min(63 * 1024);
+                self.input.read(&mut output[..capacity])
+            }
+        }
+        let body = vec![0x35; CHUNK_SIZE as usize + 7];
+        let digest = super::super::durable::digest_of(&body);
+        let mut input = ShortReads {
+            interrupted: false,
+            input: io::Cursor::new(body.clone()),
+        };
+        let mut scratch = [0u8; 64 * 1024];
+        let (mut output, end) = output(body.len() as u64, CHUNK_SIZE - 2, 9).unwrap();
+        let mut chunks = Vec::with_capacity(2);
+        let mut meters = LocalCasRangeMeters::default();
+        scan_body(
+            &mut input,
+            &digest,
+            body.len() as u64,
+            CHUNK_SIZE - 2,
+            end,
+            &mut output,
+            &mut scratch,
+            Some(&mut chunks),
+            &mut meters,
+        )
+        .unwrap();
+        assert!(input.interrupted);
+        assert_eq!(output, vec![0x35; 9]);
+        assert_eq!(meters.bytes_read, body.len() as u64);
+        assert_eq!(meters.whole_sha256_bytes, body.len() as u64);
+        assert_eq!(meters.chunk_sha256_bytes, body.len() as u64);
+        assert_eq!(chunks.len(), 2);
+        for (chunk, bytes) in chunks.iter().zip(body.chunks(CHUNK_SIZE as usize)) {
+            assert_eq!(
+                chunk.as_slice(),
+                ring::digest::digest(&SHA256, bytes).as_ref()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_scan_detects_growth_with_one_sentinel_and_truncation_before_publication() {
+        use super::super::content::{BudgetClass, ContentBudget, ContentBudgetLimits};
+
+        let budget = ContentBudget::new(ContentBudgetLimits::default());
+        let baseline = budget.usage();
+        let mut scratch = [0u8; 64 * 1024];
+        let mut meters = LocalCasRangeMeters::default();
+        let mut input = io::Cursor::new(b"grew well beyond the fixed view".as_slice());
+        let mut output = AccountedBuffer::new(&budget, BudgetClass::Output, 1, 0).unwrap();
+        assert_eq!(
+            scan_body(
+                &mut input,
+                &super::super::durable::digest_of(b"gre"),
+                3,
+                0,
+                1,
+                &mut output,
+                &mut scratch,
+                None,
+                &mut meters,
+            )
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::DigestMismatch
+        );
+        assert_eq!(input.position(), 4);
+        assert_eq!(meters.bytes_read, 4);
+        assert_eq!(output.len(), 0);
+        drop(output);
+        let mut input = io::Cursor::new(b"short".as_slice());
+        let mut output = AccountedBuffer::new(&budget, BudgetClass::Output, 1, 0).unwrap();
+        assert_eq!(
+            scan_body(
+                &mut input,
+                &super::super::durable::digest_of(b"trusted"),
+                7,
+                0,
+                1,
+                &mut output,
+                &mut scratch,
+                None,
+                &mut meters,
+            )
+            .unwrap_err()
+            .code,
+            SnapshotErrorCode::DigestMismatch
+        );
+        drop(output);
+        assert_eq!(budget.usage(), baseline);
     }
 }
