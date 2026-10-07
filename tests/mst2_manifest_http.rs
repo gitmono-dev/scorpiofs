@@ -16,7 +16,7 @@ use asyncfuse::raw::prelude::{Filesystem, Request};
 use axum::{
     body::{Body, Bytes},
     extract::{Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -24,9 +24,10 @@ use axum::{
 use futures::StreamExt;
 use libfuse_fs::unionfs::layer::Layer;
 use mst2_codec::{
+    chunkmap::{ChunkLeaf, ChunkMap, CHUNK_SIZE},
     descriptor::ServingDescriptor,
     metapage::{page_id, BranchChild, Entry, EntryKind, Page},
-    treeframe::{EndPayload, MetaPayload, ObjectPayload},
+    treeframe::{ChunkPayload, EndPayload, MetaPayload, ObjectPayload},
 };
 use scorpiofs::snapshot::{
     capabilities::CapabilityAdvertisement, durable::digest_of, frames::parse_digest,
@@ -70,6 +71,13 @@ struct Fixture {
     fail_blob_once: AtomicBool,
     blob_started: Notify,
     blob_release: Notify,
+    map_requests: Mutex<Vec<String>>,
+    leaf_requests: Mutex<Vec<String>>,
+    chunk_requests: Mutex<Vec<(String, u64)>>,
+    range_fault: AtomicUsize,
+    pause_chunks: AtomicBool,
+    chunk_started: Notify,
+    chunk_release: Notify,
 }
 
 fn id_string(id: &[u8; 32]) -> String {
@@ -477,6 +485,159 @@ async fn objects(
         .unwrap()
 }
 
+fn fixture_chunk_map(bytes: &[u8]) -> (ChunkMap, ChunkLeaf) {
+    let leaf = ChunkLeaf {
+        page_index: 0,
+        chunk_sha256: bytes
+            .chunks(CHUNK_SIZE as usize)
+            .map(|chunk| parse_digest(&digest_of(chunk)).unwrap())
+            .collect(),
+    };
+    assert!(leaf.chunk_sha256.len() <= 256);
+    let map = ChunkMap::new(
+        parse_digest(&digest_of(bytes)).unwrap(),
+        bytes.len() as u64,
+        leaf.leaf_hash().unwrap(),
+    )
+    .unwrap();
+    (map, leaf)
+}
+
+fn fixture_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    for part in bytes.chunks(3) {
+        let bits = u32::from(part[0]) << 16
+            | u32::from(part.get(1).copied().unwrap_or(0)) << 8
+            | u32::from(part.get(2).copied().unwrap_or(0));
+        result.push(ALPHABET[(bits >> 18) as usize] as char);
+        result.push(ALPHABET[((bits >> 12) & 63) as usize] as char);
+        result.push(if part.len() > 1 {
+            ALPHABET[((bits >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        result.push(if part.len() > 2 {
+            ALPHABET[(bits & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    result
+}
+
+async fn range_map(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(sid): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_eq!(sid, f.snapshot_id());
+    assert_eq!(headers["x-mega-snapshot-lease"], "fixture-lease");
+    assert_eq!(query.len(), 2);
+    let bytes = &f.blobs[&query["path"]];
+    assert_eq!(query["expected_digest"], digest_of(bytes));
+    f.map_requests.lock().unwrap().push(query["path"].clone());
+    let (map, _) = fixture_chunk_map(bytes);
+    let mut value = json!({"snapshot_id":sid,"path":query["path"],"map":{
+        "schema_version":2,"file_content_id":id_string(&map.file_content_id),
+        "file_size":map.file_size.to_string(),"chunk_size":CHUNK_SIZE,
+        "chunk_count":map.chunk_count.to_string(),"page_count":map.page_count.to_string(),
+        "pages_root":id_string(&map.pages_root),"map_id":id_string(&map.map_id())}});
+    if f.range_fault.load(Ordering::SeqCst) == 4 {
+        value["map"]["map_id"] = json!(id_string(&[0x91; 32]));
+    }
+    Json(value)
+}
+
+async fn range_leaf(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(sid): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_eq!(sid, f.snapshot_id());
+    assert_eq!(headers["x-mega-snapshot-lease"], "fixture-lease");
+    assert_eq!(query.len(), 3);
+    assert_eq!(query["page_index"], "0");
+    let (map, leaf) = fixture_chunk_map(&f.blobs[&query["path"]]);
+    assert_eq!(query["map_id"], id_string(&map.map_id()));
+    f.leaf_requests.lock().unwrap().push(query["path"].clone());
+    let mut encoded = leaf.encode().unwrap();
+    if f.range_fault.load(Ordering::SeqCst) == 5 {
+        *encoded.last_mut().unwrap() ^= 1;
+    }
+    Json(json!({"map_id":id_string(&map.map_id()),"page_index":"0",
+        "leaf_base64":fixture_base64(&encoded),"proof":[]}))
+}
+
+async fn range_chunks(
+    State(f): State<Arc<Fixture>>,
+    AxumPath(sid): AxumPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    assert_eq!(sid, f.snapshot_id());
+    assert_eq!(headers["x-mega-snapshot-lease"], "fixture-lease");
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    let items = request["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let path = item["path"].as_str().unwrap();
+    let bytes = &f.blobs[path];
+    let (map, _) = fixture_chunk_map(bytes);
+    assert_eq!(item["expected_digest"], digest_of(bytes));
+    assert_eq!(item["map_id"], id_string(&map.map_id()));
+    let index = item["chunk_index"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let start = index as usize * CHUNK_SIZE as usize;
+    let chunk = &bytes[start..(start + CHUNK_SIZE as usize).min(bytes.len())];
+    f.chunk_requests.lock().unwrap().push((path.into(), index));
+    if f.pause_chunks.load(Ordering::SeqCst) {
+        f.chunk_started.notify_one();
+        f.chunk_release.notified().await;
+    }
+    let mode = f.range_fault.load(Ordering::SeqCst);
+    let mut payload = ChunkPayload {
+        map_id: map.map_id(),
+        file_content_id: map.file_content_id,
+        chunk_index: index,
+        chunk_bytes: chunk.to_vec(),
+    };
+    if mode == 1 {
+        payload.chunk_bytes[0] ^= 1;
+    }
+    if mode == 3 {
+        payload.map_id[0] ^= 1;
+    }
+    let mut wire = payload.encode(19, 0).unwrap();
+    let mut end_digest = parse_digest(&digest_of(&body)).unwrap();
+    if mode == 2 || mode == 7 && index > 0 {
+        end_digest[0] ^= 1;
+    }
+    wire.extend(
+        EndPayload {
+            request_item_count: 1,
+            unique_unit_count: 1,
+            logical_bytes: chunk.len() as u64,
+            request_body_sha256: end_digest,
+        }
+        .encode(19, 1),
+    );
+    if mode == 6 {
+        wire.push(0);
+    }
+    Response::builder()
+        .header("content-type", "application/vnd.mega.treeframe;version=2")
+        .header("x-mega-snapshot-id", sid)
+        .header("x-mega-request-digest", digest_of(&body))
+        .body(Body::from(wire))
+        .unwrap()
+}
+
 struct HttpFixture {
     fixture: Arc<Fixture>,
     base: String,
@@ -516,6 +677,9 @@ impl HttpFixture {
             .route("/api/v2/snapshots/{sid}/metadata/pages", post(metadata))
             .route("/api/v2/snapshots/{sid}/blob", get(blob))
             .route("/api/v2/snapshots/{sid}/objects", post(objects))
+            .route("/api/v2/snapshots/{sid}/chunk-map", get(range_map))
+            .route("/api/v2/snapshots/{sid}/chunk-map/pages", get(range_leaf))
+            .route("/api/v2/snapshots/{sid}/chunks", post(range_chunks))
             .with_state(fixture.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
     }
@@ -1211,6 +1375,553 @@ async fn owned_cas_capacity_failure_does_not_try_a_compatibility_body_or_false_e
         .is_empty());
     assert!(http.fixture.object_requests.lock().unwrap().is_empty());
     assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+fn owned_large_cas_fixture(aliases: usize, changed: bool) -> Fixture {
+    let mut fixture = Fixture::default();
+    let mut body = vec![0x31; 2 * CHUNK_SIZE as usize + 7];
+    body[CHUNK_SIZE as usize..2 * CHUNK_SIZE as usize].fill(0x72);
+    body[2 * CHUNK_SIZE as usize..].fill(0xe4);
+    let stable = body.clone();
+    if changed {
+        body[17] ^= 1;
+    }
+    let mut entries = vec![file_entry("stable", EntryKind::Regular, &stable)];
+    fixture.expect_file("stable", "regular", &stable);
+    for index in 0..aliases {
+        let name = format!("range{index:03}");
+        entries.push(file_entry(&name, EntryKind::Regular, &body));
+        fixture.expect_file(&name, "regular", &body);
+    }
+    fixture.root = fixture.leaf("/", entries);
+    fixture
+}
+
+fn assert_no_range_wire(http: &HttpFixture) {
+    assert!(http.fixture.map_requests.lock().unwrap().is_empty());
+    assert!(http.fixture.leaf_requests.lock().unwrap().is_empty());
+    assert!(http.fixture.chunk_requests.lock().unwrap().is_empty());
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn owned_cas_range_local_cold_warm_cross_chunk_tail_and_held_reply() {
+    let http = HttpFixture::start_canonical(owned_large_cas_fixture(1, false)).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    let inode = root_file_inode(&fs, "range000").await;
+    let baseline = reader.content_usage();
+    let first = fs
+        .read(Request::default(), inode, inode, 0, 4096)
+        .await
+        .unwrap();
+    assert_eq!(first.data.as_ref(), &[0x31; 4096]);
+    assert!(reader.content_usage().output_bytes > baseline.output_bytes + 4096);
+    assert_eq!(
+        reader.content_usage().construction_bytes,
+        baseline.construction_bytes
+    );
+    let body = &http.fixture.blobs["/range000"];
+    let mut meters = scorpiofs::snapshot::LocalCasRangeMeters::default();
+    assert_eq!(
+        store
+            .read_indexed_blob_range_with_meters(
+                &digest_of(body),
+                body.len() as u64,
+                0,
+                13,
+                &mut meters
+            )
+            .unwrap()
+            .unwrap(),
+        &[0x31; 13]
+    );
+    assert!(meters.index_hit && !meters.index_built);
+    assert_eq!(meters.bytes_read, CHUNK_SIZE as u64);
+    assert_eq!(meters.whole_sha256_bytes, 0);
+    assert_eq!(meters.chunk_sha256_bytes, CHUNK_SIZE as u64);
+    let cross = fs
+        .read(Request::default(), inode, inode, CHUNK_SIZE as u64 - 3, 6)
+        .await
+        .unwrap();
+    assert_eq!(cross.data.as_ref(), &[0x31, 0x31, 0x31, 0x72, 0x72, 0x72]);
+    let tail = fs
+        .read(
+            Request::default(),
+            inode,
+            inode,
+            2 * CHUNK_SIZE as u64,
+            u32::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(tail.data.as_ref(), &[0xe4; 7]);
+    drop(cross);
+    drop(tail);
+    let cloned = first.data.clone();
+    let held = cloned.slice(17..31);
+    assert_eq!(held.as_ptr(), first.data.as_ptr().wrapping_add(17));
+    assert_no_range_wire(&http);
+    drop(fs);
+    drop(first);
+    drop(cloned);
+    assert!(reader.content_usage().output_bytes > 0);
+    assert_eq!(held.as_ref(), &[0x31; 14]);
+    drop(held);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn owned_cas_range_cold_tail_and_warm_covering_damage_never_fall_back() {
+    let http = HttpFixture::start_canonical(owned_large_cas_fixture(1, false)).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    let body = &http.fixture.blobs["/range000"];
+    let path = cas_path(&store, body);
+    let inode = root_file_inode(&fs, "range000").await;
+    let baseline = reader.content_usage();
+    let mut damaged = body.clone();
+    *damaged.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, &damaged).unwrap();
+    for _ in 0..2 {
+        assert!(fs
+            .read(Request::default(), inode, inode, 0, 1)
+            .await
+            .is_err());
+        assert_eq!(reader.content_usage(), baseline);
+    }
+    std::fs::write(&path, body).unwrap();
+    drop(
+        fs.read(Request::default(), inode, inode, 0, 1)
+            .await
+            .unwrap(),
+    );
+    std::fs::write(&path, &damaged).unwrap();
+    assert_eq!(
+        fs.read(Request::default(), inode, inode, 0, 1)
+            .await
+            .unwrap()
+            .data
+            .as_ref(),
+        &[0x31]
+    );
+    assert!(store
+        .read_verified_blob_range(&digest_of(body), body.len() as u64, 0, 1)
+        .is_err());
+    damaged = body.clone();
+    damaged[8192] ^= 1;
+    std::fs::write(&path, &damaged).unwrap();
+    assert!(fs
+        .read(Request::default(), inode, inode, 0, 1)
+        .await
+        .is_err());
+    assert_eq!(reader.content_usage(), baseline);
+    assert_no_range_wire(&http);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_cas_range_wrong_size_directory_and_symlink_are_terminal() {
+    use std::os::unix::fs::symlink;
+    let http = HttpFixture::start_canonical(owned_large_cas_fixture(1, false)).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    let body = &http.fixture.blobs["/range000"];
+    let path = cas_path(&store, body);
+    let inode = root_file_inode(&fs, "range000").await;
+    let baseline = reader.content_usage();
+    std::fs::write(&path, &body[..body.len() - 1]).unwrap();
+    assert!(fs
+        .read(Request::default(), inode, inode, 0, 1)
+        .await
+        .is_err());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(fs
+        .read(Request::default(), inode, inode, 0, 1)
+        .await
+        .is_err());
+    std::fs::remove_dir(&path).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::write(&outside, body).unwrap();
+    for target in [&outside, &root.path().join("missing")] {
+        symlink(target, &path).unwrap();
+        assert!(fs
+            .read(Request::default(), inode, inode, 0, 1)
+            .await
+            .is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(reader.content_usage(), baseline);
+    }
+    assert_no_range_wire(&http);
+}
+
+#[tokio::test]
+async fn owned_cas_range_missing_uses_canonical_chunks_bounded_cache_and_local_precedence() {
+    let http = HttpFixture::start_canonical(owned_large_cas_fixture(17, false)).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    let inode = root_file_inode(&fs, "range000").await;
+    let first = fs
+        .read(Request::default(), inode, inode, 0, 13)
+        .await
+        .unwrap();
+    assert_eq!(first.data.as_ref(), &[0x31; 13]);
+    drop(
+        fs.read(Request::default(), inode, inode, 0, 13)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        http.fixture.map_requests.lock().unwrap().as_slice(),
+        ["/range000"]
+    );
+    assert_eq!(
+        http.fixture.leaf_requests.lock().unwrap().as_slice(),
+        ["/range000"]
+    );
+    assert_eq!(
+        http.fixture.chunk_requests.lock().unwrap().as_slice(),
+        [("/range000".to_string(), 0u64)]
+    );
+    drop(
+        fs.read(Request::default(), inode, inode, CHUNK_SIZE as u64 - 3, 6)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(http.fixture.chunk_requests.lock().unwrap().len(), 2);
+    for index in 1..17 {
+        let next = root_file_inode(&fs, &format!("range{index:03}")).await;
+        assert_ne!(inode, next);
+        drop(fs.read(Request::default(), next, next, 0, 1).await.unwrap());
+    }
+    assert_eq!(http.fixture.map_requests.lock().unwrap().len(), 17);
+    assert_eq!(http.fixture.leaf_requests.lock().unwrap().len(), 17);
+    drop(
+        fs.read(Request::default(), inode, inode, 0, 1)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        http.fixture.map_requests.lock().unwrap().len(),
+        18,
+        "oldest of 16 range entries was evicted"
+    );
+    let chunk_calls = http.fixture.chunk_requests.lock().unwrap().len();
+    let body = &http.fixture.blobs["/range000"];
+    std::fs::write(cas_path(&store, body), body).unwrap();
+    drop(
+        fs.read(Request::default(), inode, inode, 2 * CHUNK_SIZE as u64, 7)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        http.fixture.chunk_requests.lock().unwrap().len(),
+        chunk_calls,
+        "CAS precedes a cached network handle"
+    );
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+    assert!(http.fixture.object_requests.lock().unwrap().is_empty());
+    let held = first.data.slice(3..7);
+    drop(first);
+    drop(fs);
+    assert_eq!(held.as_ref(), &[0x31; 4]);
+    assert!(reader.content_usage().output_bytes > 0);
+    drop(held);
+    assert_eq!(reader.content_usage().output_bytes, 0);
+}
+
+#[tokio::test]
+async fn owned_cas_range_bad_map_leaf_chunk_identity_end_and_eof_publish_nothing() {
+    for mode in 1..=7 {
+        let http = HttpFixture::start_canonical(owned_large_cas_fixture(1, false)).await;
+        let reader = http.canonical_reader().await;
+        let root = tempfile::tempdir().unwrap();
+        let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+        let inode = root_file_inode(&fs, "range000").await;
+        let baseline = reader.content_usage();
+        http.fixture.range_fault.store(mode, Ordering::SeqCst);
+        for _ in 0..2 {
+            assert!(
+                fs.read(Request::default(), inode, inode, 0, CHUNK_SIZE + 1)
+                    .await
+                    .is_err(),
+                "fault {mode}"
+            );
+            assert_eq!(
+                reader.content_usage(),
+                baseline,
+                "failed range/table owner retained for fault {mode}"
+            );
+        }
+        assert_eq!(
+            http.fixture.map_requests.lock().unwrap().len(),
+            2,
+            "failure cannot publish a range entry"
+        );
+        assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+        http.fixture.range_fault.store(0, Ordering::SeqCst);
+        assert_eq!(
+            fs.read(Request::default(), inode, inode, 0, 13)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            &[0x31; 13]
+        );
+    }
+}
+
+#[tokio::test]
+async fn owned_cas_range_output_and_construction_admission_reject_before_fallback() {
+    for fill_cas in [false, true] {
+        for (output, construction, requested) in [
+            (192 * 1024, 2 * 1024 * 1024, 256 * 1024),
+            (2 * 1024 * 1024, 64 * 1024, 13),
+        ] {
+            let http = HttpFixture::start_canonical(owned_large_cas_fixture(1, false)).await;
+            let reader = http
+                .canonical_reader()
+                .await
+                .with_content_limits(ContentBudgetLimits::new(output, construction).unwrap());
+            let root = tempfile::tempdir().unwrap();
+            let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), fill_cas).await;
+            let inode = root_file_inode(&fs, "range000").await;
+            let baseline = reader.content_usage();
+            assert!(fs
+                .read(Request::default(), inode, inode, 0, requested)
+                .await
+                .is_err());
+            assert_eq!(reader.content_usage(), baseline);
+            assert!(fs
+                .read(Request::default(), inode, inode, u64::MAX, u32::MAX)
+                .await
+                .unwrap()
+                .data
+                .is_empty());
+            assert!(fs
+                .read(Request::default(), inode, inode, 0, 0)
+                .await
+                .unwrap()
+                .data
+                .is_empty());
+            assert_no_range_wire(&http);
+        }
+    }
+}
+
+#[tokio::test]
+async fn owned_cas_range_current_lease_gates_local_warm_cached_wire_zero_and_eof() {
+    for fill_cas in [true, false] {
+        let mut fixture = owned_large_cas_fixture(1, false);
+        fixture.lease_expiry = expiring_cas_fixture().lease_expiry;
+        let http = HttpFixture::start_canonical(fixture).await;
+        let reader = http.canonical_reader().await;
+        let root = tempfile::tempdir().unwrap();
+        let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), fill_cas).await;
+        let inode = root_file_inode(&fs, "range000").await;
+        let first = fs
+            .read(Request::default(), inode, inode, 0, 13)
+            .await
+            .unwrap();
+        let map_calls = http.fixture.map_requests.lock().unwrap().len();
+        let chunk_calls = http.fixture.chunk_requests.lock().unwrap().len();
+        let baseline = reader.content_usage();
+        wait_for_cas_revocation(&http, &reader).await;
+        for (offset, size) in [(0, 1), (0, 0), (u64::MAX, u32::MAX)] {
+            assert_eq!(
+                i32::from(
+                    fs.read(Request::default(), inode, inode, offset, size)
+                        .await
+                        .unwrap_err()
+                ),
+                -libc::EACCES
+            );
+        }
+        assert_eq!(reader.content_usage(), baseline);
+        assert_eq!(http.fixture.map_requests.lock().unwrap().len(), map_calls);
+        assert_eq!(
+            http.fixture.chunk_requests.lock().unwrap().len(),
+            chunk_calls
+        );
+        assert_eq!(first.data.as_ref(), &[0x31; 13]);
+    }
+}
+
+#[tokio::test]
+async fn owned_cas_range_lease_failure_during_chunk_rejects_entry_and_reply() {
+    let mut fixture = owned_large_cas_fixture(1, false);
+    fixture.lease_expiry = expiring_cas_fixture().lease_expiry;
+    fixture.pause_chunks.store(true, Ordering::SeqCst);
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    let inode = root_file_inode(&fs, "range000").await;
+    let baseline = reader.content_usage();
+    let reading = fs.clone();
+    let task =
+        tokio::spawn(async move { reading.read(Request::default(), inode, inode, 0, 13).await });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        http.fixture.chunk_started.notified(),
+    )
+    .await
+    .unwrap();
+    wait_for_cas_revocation(&http, &reader).await;
+    http.fixture.chunk_release.notify_one();
+    assert_eq!(i32::from(task.await.unwrap().unwrap_err()), -libc::EACCES);
+    assert_eq!(reader.content_usage(), baseline);
+    assert_eq!(http.fixture.map_requests.lock().unwrap().len(), 1);
+    assert_eq!(http.fixture.blob_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn owned_cas_range_cancelled_wire_read_releases_actual_owners() {
+    let fixture = owned_large_cas_fixture(1, false);
+    fixture.pause_chunks.store(true, Ordering::SeqCst);
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (_store, fs) = owned_small_cas_view(&http, &reader, root.path(), false).await;
+    let inode = root_file_inode(&fs, "range000").await;
+    let baseline = reader.content_usage();
+    let reading = fs.clone();
+    let task =
+        tokio::spawn(async move { reading.read(Request::default(), inode, inode, 0, 13).await });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        http.fixture.chunk_started.notified(),
+    )
+    .await
+    .unwrap();
+    assert!(reader.content_usage().output_bytes > baseline.output_bytes);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(reader.content_usage(), baseline);
+    http.fixture.pause_chunks.store(false, Ordering::SeqCst);
+    http.fixture.chunk_release.notify_one();
+    drop(
+        fs.read(Request::default(), inode, inode, 0, 13)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(http.fixture.map_requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn owned_cas_range_commit_switch_keeps_old_bytes_and_reuses_shared_cas_facts() {
+    let http = HttpFixture::start_canonical(owned_large_cas_fixture(1, false)).await;
+    let old_reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (old_store, old_fs) = owned_small_cas_view(&http, &old_reader, root.path(), true).await;
+    let old_inode = root_file_inode(&old_fs, "range000").await;
+    let old_reply = old_fs
+        .read(Request::default(), old_inode, old_inode, 0, 32)
+        .await
+        .unwrap();
+    let http = http
+        .restart({
+            let mut f = owned_large_cas_fixture(1, true);
+            f.canonical = true;
+            f
+        })
+        .await;
+    let reader = http.canonical_reader().await;
+    assert_ne!(old_reader.snapshot_id(), reader.snapshot_id());
+    let (store, fs) = owned_small_cas_view(&http, &reader, root.path(), true).await;
+    assert_eq!(old_store.content_dir(), store.content_dir());
+    let stable = root_file_inode(&fs, "stable").await;
+    drop(
+        fs.read(Request::default(), stable, stable, 0, 32)
+            .await
+            .unwrap(),
+    );
+    let inode = root_file_inode(&fs, "range000").await;
+    let reply = fs
+        .read(Request::default(), inode, inode, 0, 32)
+        .await
+        .unwrap();
+    assert_eq!(reply.data[17], 0x30);
+    assert_eq!(old_reply.data[17], 0x31);
+    assert_eq!(
+        old_fs
+            .read(Request::default(), old_inode, old_inode, 0, 32)
+            .await
+            .unwrap()
+            .data,
+        old_reply.data
+    );
+    let body = &http.fixture.blobs["/stable"];
+    let mut meters = scorpiofs::snapshot::LocalCasRangeMeters::default();
+    store
+        .read_indexed_blob_range_with_meters(
+            &digest_of(body),
+            body.len() as u64,
+            0,
+            13,
+            &mut meters,
+        )
+        .unwrap();
+    assert!(meters.index_hit && !meters.index_built);
+    assert_no_range_wire(&http);
+}
+
+#[tokio::test]
+async fn owned_cas_range_unseeded_aliases_prove_selected_paths_without_unrelated_fetch() {
+    let body = vec![0x6d; 2 * CHUNK_SIZE as usize + 7];
+    let mut fixture = Fixture::default();
+    let selected = fixture.leaf("/a", vec![file_entry("large", EntryKind::Regular, &body)]);
+    fixture.routes.insert(("/alias".into(), vec![]), selected);
+    fixture.root = fixture.leaf(
+        "/",
+        vec![
+            Entry::dir(b"a", selected),
+            Entry::dir(b"alias", selected),
+            Entry::dir(b"unavailable", [0x93; 32]),
+        ],
+    );
+    fixture.expect_file("a/large", "regular", &body);
+    fixture.expect_file("alias/large", "regular", &body);
+    let http = HttpFixture::start_canonical(fixture).await;
+    let reader = http.canonical_reader().await;
+    let root = tempfile::tempdir().unwrap();
+    let (store, _cache) = owned_fuse_page_cache(root.path(), &reader);
+    std::fs::write(cas_path(&store, &body), &body).unwrap();
+    let fs = Mst2Fuse::from_reader_lazy(reader, Some(store))
+        .await
+        .unwrap();
+    let mut files = Vec::new();
+    for name in ["a", "alias"] {
+        let parent = root_file_inode(&fs, name).await;
+        let inode = fs
+            .lookup(Request::default(), parent, OsStr::new("large"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        files.push(inode);
+        http.fixture.requests.lock().unwrap().clear();
+        assert_eq!(
+            fs.read(Request::default(), inode, inode, 0, 17)
+                .await
+                .unwrap()
+                .data
+                .as_ref(),
+            &[0x6d; 17]
+        );
+        assert_eq!(
+            http.fixture.requested_ids(),
+            [id_string(&http.fixture.root), id_string(&selected)]
+        );
+    }
+    assert_ne!(files[0], files[1]);
+    assert_no_range_wire(&http);
 }
 
 fn expiring_cas_fixture() -> Fixture {
