@@ -1937,10 +1937,9 @@ async fn owned_cas_range_unseeded_aliases_prove_selected_paths_without_unrelated
                 .as_ref(),
             &[0x6d; 17]
         );
-        assert_eq!(
-            http.fixture.requested_ids(),
-            [id_string(&http.fixture.root), id_string(&selected)]
-        );
+        // Lookup has already proved this alias's complete directory chain.
+        // A root-bound file token reuses it when reading the shared CAS range.
+        assert!(http.fixture.requested_ids().is_empty());
     }
     assert_ne!(files[0], files[1]);
     assert_no_range_wire(&http);
