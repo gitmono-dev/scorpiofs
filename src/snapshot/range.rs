@@ -79,17 +79,6 @@ pub struct ChunkedFile {
 }
 
 impl ChunkedFile {
-    /// Open a range reader with retained chunk/output credits and fixed-root
-    /// membership checks. The legacy `open` path is outside owned byte quotas.
-    pub async fn open_owned(
-        reader: &SnapshotReader,
-        path: &str,
-        digest: &str,
-        size: u64,
-    ) -> Result<super::OwnedChunkedFile, SnapshotError> {
-        super::OwnedChunkedFile::open(reader, path, digest, size).await
-    }
-
     /// Fetch and verify the chunk map for one path in the fixed view.
     pub async fn open(
         reader: &SnapshotReader,

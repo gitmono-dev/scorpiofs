@@ -1186,28 +1186,7 @@ impl DurableStore {
     /// identical content itself (single-flight); here we merge the durable
     /// side as well so the same content id is written and journaled once
     /// while every logical path is still recorded.
-    pub async fn hydrate_concurrent<F>(
-        &self,
-        view: &ViewMeta,
-        manifest: &[SnapshotFile],
-        concurrency: usize,
-        fetch: F,
-    ) -> Result<HydrateReport, SnapshotError>
-    where
-        F: Fn(
-                SnapshotFile,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-    {
-        self.hydrate_concurrent_with_body(view, manifest, concurrency, fetch)
-            .await
-    }
-
+    ///
     /// Hydrate from borrowed callback body bytes without a compatibility copy.
     /// This method adds no capacity accounting: reservations, if any, follow
     /// the body's origin and remain owned by that body. Caller-created bodies
@@ -1239,28 +1218,7 @@ impl DurableStore {
     /// With chunk reads available, files above OBJECT_CAP stream through the
     /// reader into verified durable CAS; their aliases share one fetch unit.
     /// Other files retain the supplied buffered fetch callback.
-    pub async fn hydrate_snapshot_concurrent<F>(
-        &self,
-        reader: &SnapshotReader,
-        closure: &ValidatedSnapshotClosure,
-        concurrency: usize,
-        fetch: F,
-    ) -> Result<HydrateReport, SnapshotError>
-    where
-        F: Fn(
-                SnapshotFile,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-    {
-        self.hydrate_snapshot_concurrent_with_body(reader, closure, concurrency, fetch)
-            .await
-    }
-
+    ///
     /// Hydrate from borrowed callback body bytes without a compatibility copy.
     /// This method adds no capacity accounting: reservations, if any, follow
     /// the body's origin and remain owned by that body. Caller-created bodies
@@ -1446,7 +1404,7 @@ impl DurableStore {
     }
 
     /// Batched hydration: same verification, write-ahead, resume and journal
-    /// rules as [`hydrate_concurrent`], but small files (≤ [`OBJECT_CAP`]) are
+    /// rules as [`hydrate_concurrent_with_body`], but small files (≤ [`OBJECT_CAP`]) are
     /// fetched in OBJECT batches (≤128 unique digests, ≤7 MiB raw per request
     /// — spec 14 §4 batch limits with headroom) instead of one request per
     /// file. Large files still go through `fetch_large` (chunk-map + CHUNK).
@@ -1454,46 +1412,7 @@ impl DurableStore {
     /// `fetch_batch` receives the batch's files (deduplicated by digest) and
     /// must return every requested digest; missing digests are an error, and
     /// every returned byte is re-verified here regardless of transport claims.
-    pub async fn hydrate_batches<FBatch, FLarge>(
-        &self,
-        view: &ViewMeta,
-        manifest: &[SnapshotFile],
-        batch_concurrency: usize,
-        large_concurrency: usize,
-        fetch_batch: FBatch,
-        fetch_large: FLarge,
-    ) -> Result<HydrateReport, SnapshotError>
-    where
-        FBatch: Fn(
-                Vec<SnapshotFile>,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-        FLarge: Fn(
-                SnapshotFile,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-    {
-        self.hydrate_batches_with_body(
-            view,
-            manifest,
-            batch_concurrency,
-            large_concurrency,
-            fetch_batch,
-            fetch_large,
-        )
-        .await
-    }
-
+    ///
     /// Hydrate from borrowed callback body bytes without a compatibility copy.
     /// This method adds no capacity accounting: reservations, if any, follow
     /// the body's origin and remain owned by that body. Caller-created bodies
@@ -1544,46 +1463,7 @@ impl DurableStore {
     /// descriptor/page/content dependencies before one FullSnapshot marker.
     /// With chunk reads available, large files use the fixed reader's bounded
     /// verified stream; fetch_large remains the bounded compatibility fallback.
-    pub async fn hydrate_snapshot_batches<FBatch, FLarge>(
-        &self,
-        reader: &SnapshotReader,
-        closure: &ValidatedSnapshotClosure,
-        batch_concurrency: usize,
-        large_concurrency: usize,
-        fetch_batch: FBatch,
-        fetch_large: FLarge,
-    ) -> Result<HydrateReport, SnapshotError>
-    where
-        FBatch: Fn(
-                Vec<SnapshotFile>,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-        FLarge: Fn(
-                SnapshotFile,
-            ) -> futures::future::BoxFuture<
-                'static,
-                Result<std::sync::Arc<Vec<u8>>, SnapshotError>,
-            > + Send
-            + Sync
-            + Clone
-            + 'static,
-    {
-        self.hydrate_snapshot_batches_with_body(
-            reader,
-            closure,
-            batch_concurrency,
-            large_concurrency,
-            fetch_batch,
-            fetch_large,
-        )
-        .await
-    }
-
+    ///
     /// Hydrate from borrowed callback body bytes without a compatibility copy.
     /// This method adds no capacity accounting: reservations, if any, follow
     /// the body's origin and remain owned by that body. Caller-created bodies
