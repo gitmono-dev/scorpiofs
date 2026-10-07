@@ -174,7 +174,8 @@ async fn invalid_waiter_paths_cannot_join_a_valid_in_flight_content_request() {
     };
     let leader_coordinator = coordinator.clone();
     let leader_file = file.clone();
-    let leader = tokio::spawn(async move { leader_coordinator.fetch(leader_file, false).await });
+    let leader =
+        tokio::spawn(async move { leader_coordinator.fetch_owned(leader_file, false).await });
     tokio::time::timeout(Duration::from_secs(5), fixture.blob_started.notified())
         .await
         .unwrap();
@@ -183,10 +184,13 @@ async fn invalid_waiter_paths_cannot_join_a_valid_in_flight_content_request() {
             rel_path: path.clone(),
             ..file.clone()
         };
-        let error = tokio::time::timeout(Duration::from_secs(1), coordinator.fetch(invalid, false))
-            .await
-            .expect("invalid waiter joined the blocked valid download")
-            .unwrap_err();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.fetch_owned(invalid, false),
+        )
+        .await
+        .expect("invalid waiter joined the blocked valid download")
+        .unwrap_err();
         assert_eq!(error.code, expected, "{path:?}");
     }
     assert_eq!(fixture.blob_requests.load(Ordering::SeqCst), 1);
