@@ -61,7 +61,7 @@ pub(crate) struct DirNode {
     #[allow(dead_code)]
     path: String,
     /// child basename -> inode
-    children: HashMap<String, u64>,
+    children: BTreeMap<String, u64>,
     /// inode of the parent directory (`..`); the root is its own parent.
     parent: u64,
     /// Lazy mounts: has this directory's page been fetched and its children
@@ -445,7 +445,7 @@ impl Mst2Fuse {
             ROOT_INODE,
             Node::Dir(DirNode {
                 path: String::new(),
-                children: HashMap::new(),
+                children: BTreeMap::new(),
                 parent: ROOT_INODE,
                 loaded: false,
                 page_id: Some(root_page_id.clone()),
@@ -722,7 +722,7 @@ impl Mst2Fuse {
             let node = match e.kind {
                 mst2_codec::metapage::EntryKind::Directory => Node::Dir(DirNode {
                     path: full,
-                    children: HashMap::new(),
+                    children: BTreeMap::new(),
                     parent: parent_inode,
                     loaded: false,
                     page_id: Some(format!(
@@ -803,7 +803,7 @@ impl Mst2Fuse {
             ROOT_INODE,
             Node::Dir(DirNode {
                 path: String::new(),
-                children: HashMap::new(),
+                children: BTreeMap::new(),
                 parent: ROOT_INODE,
                 loaded: true,
                 page_id: None,
@@ -876,7 +876,7 @@ impl Mst2Fuse {
                 inode,
                 Node::Dir(DirNode {
                     path: path.to_string(),
-                    children: HashMap::new(),
+                    children: BTreeMap::new(),
                     parent,
                     loaded: true,
                     page_id: Some(directory.directory_root.clone()),
@@ -950,8 +950,6 @@ impl Mst2Fuse {
             Some(Node::Dir(d)) => d,
             _ => return Err(Errno::from(libc::ENOTDIR)),
         };
-        let mut children: Vec<_> = d.children.iter().collect();
-        children.sort_by(|a, b| a.0.cmp(b.0));
         let parent = d.parent;
 
         let mut out = Vec::new();
@@ -971,7 +969,7 @@ impl Mst2Fuse {
                 offset: 2,
             });
         }
-        for (i, (name, ino)) in children.into_iter().enumerate() {
+        for (i, (name, ino)) in d.children.iter().enumerate() {
             let off = (i + 3) as i64;
             if off > offset {
                 out.push(ListEntry {
@@ -1932,7 +1930,6 @@ impl Mst2Fuse {
                 identity: node_identity(node)?,
             });
         }
-        entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         Ok(entries)
     }
 
@@ -2107,7 +2104,7 @@ fn ensure_child(
     } else {
         Node::Dir(DirNode {
             path: full,
-            children: HashMap::new(),
+            children: BTreeMap::new(),
             parent: parent_inode,
             loaded: true,
             page_id: None,
