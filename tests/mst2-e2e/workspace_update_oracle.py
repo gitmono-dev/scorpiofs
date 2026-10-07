@@ -67,6 +67,9 @@ def verify_workspace(root, expected, deadline, *, git_checkout=False):
     def walk_error(error):
         raise error
 
+    # This covers namespace traversal, descriptor/path checks, reads and SHA256.
+    # It excludes child startup and manifest loading; it is not pure FUSE I/O.
+    walk_started = time.monotonic()
     for base, directories, names, parent in os.fwalk(root, follow_symlinks=False, onerror=walk_error):
         _check_deadline(deadline)
         relative = Path(base).relative_to(root).as_posix()
@@ -143,8 +146,10 @@ def verify_workspace(root, expected, deadline, *, git_checkout=False):
     if found_files != set(files) or found_directories != wanted_directories:
         raise AssertionError("workspace omitted fixed snapshot entries")
     _check_deadline(deadline)
+    walk_and_hash_ms = (time.monotonic() - walk_started) * 1000
     return {
         "verified_files": len(found_files), "verified_directories": len(found_directories),
         "verified_bytes": read_bytes, "regular_read_calls": read_calls,
+        "oracle_walk_and_hash_ms": walk_and_hash_ms,
         "raw_empty_tree_directories_omitted_by_git": sorted(omitted) if git_checkout else [],
     }

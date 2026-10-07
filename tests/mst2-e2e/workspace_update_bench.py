@@ -87,6 +87,7 @@ def execute(options):
           "fixture_content": "distinct deterministic 32-byte blocks repeated to source-like synthetic file lengths",
           "git_baseline": "depth=1 cold fetch; incremental fetch into shared bare ODB; each commit gets a new detached worktree; previous detached worktrees retained; no Git dirty sentinel/files are created",
           "git_durability_synchronization": "NOT_MEASURED; no additional fsync imposed on the default checkout baseline",
+          "oracle_timing_scope": "oracle_walk_and_hash_ms covers namespace walk, metadata checks, file reads, SHA256 and path revalidation; isolated_oracle_process_ms additionally includes child startup/imports, manifest read/hash/parse and result IPC; both remain inside full-side verified times",
           "unexposed_measurements": ["transport_request_counts", "transport_body_bytes", "RSS", "weighted_byte_budget", "disk_growth"],
           "started_utc": datetime.now(timezone.utc).isoformat()})
 

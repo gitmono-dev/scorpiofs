@@ -1,3 +1,4 @@
+import hashlib
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -339,6 +340,39 @@ class WorkerReceiptTests(unittest.TestCase):
         self.assertLess(len(raw), ORACLE_MANIFEST_LIMIT)
         path.write_bytes(raw)
         self.assertEqual(len(worker._load_expected(path)["files"]), len(files))
+
+    @unittest.skipUnless(hasattr(os, "fwalk") and hasattr(os, "O_NOFOLLOW"),
+                         "requires POSIX directory descriptors")
+    def test_isolated_oracle_reports_walk_time_inside_process_time_for_both_sides(self):
+        worker = self.worker()
+        view = self.root / "oracle-view"
+        view.mkdir()
+        (view / "empty").mkdir()
+        raw = b"same streamed bytes on each side" * 8192
+        (view / "file").write_bytes(raw)
+        expected = {"directories": ["", "empty"], "files": [{
+            "rel_path": "file", "fs_kind": "regular", "size": len(raw),
+            "content_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        }]}
+        scorpio = worker._oracle(view, expected, time.monotonic() + 10)
+        (view / "empty").rmdir()
+        (view / ".git").write_text("gitdir: isolated fixture")
+        git = worker._oracle(view, expected, time.monotonic() + 10, git_checkout=True)
+        for report in (scorpio, git):
+            self.assertEqual(report["verified_files"], 1)
+            self.assertEqual(report["verified_bytes"], len(raw))
+            self.assertGreater(report["regular_read_calls"], 1)
+            self.assertGreaterEqual(report["oracle_walk_and_hash_ms"], 0)
+            self.assertGreaterEqual(report["isolated_oracle_process_ms"],
+                                    report["oracle_walk_and_hash_ms"])
+        self.assertEqual(scorpio["verified_directories"], 2)
+        self.assertEqual(git["verified_directories"], 1)
+        self.assertEqual(git["raw_empty_tree_directories_omitted_by_git"], ["empty"])
+        # The same isolated path still rejects a damaged body instead of
+        # returning timing data that could look like a successful sample.
+        (view / "file").write_bytes(b"X" + raw[1:])
+        with self.assertRaises(WorkerError):
+            worker._oracle(view, expected, time.monotonic() + 10, git_checkout=True)
 
     def test_pending_receipt_is_written_before_any_child(self):
         worker = self.worker()
