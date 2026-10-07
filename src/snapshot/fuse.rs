@@ -950,19 +950,8 @@ impl Mst2Fuse {
             Some(Node::Dir(d)) => d,
             _ => return Err(Errno::from(libc::ENOTDIR)),
         };
-        let mut children: Vec<(u64, FileType, String)> = d
-            .children
-            .iter()
-            .map(|(name, ino)| {
-                let kind = state
-                    .nodes
-                    .get(ino)
-                    .map(entry_kind)
-                    .unwrap_or(FileType::RegularFile);
-                (*ino, kind, name.clone())
-            })
-            .collect();
-        children.sort_by(|a, b| a.2.cmp(&b.2));
+        let mut children: Vec<_> = d.children.iter().collect();
+        children.sort_by(|a, b| a.0.cmp(b.0));
         let parent = d.parent;
 
         let mut out = Vec::new();
@@ -982,13 +971,17 @@ impl Mst2Fuse {
                 offset: 2,
             });
         }
-        for (i, (ino, kind, name)) in children.into_iter().enumerate() {
+        for (i, (name, ino)) in children.into_iter().enumerate() {
             let off = (i + 3) as i64;
             if off > offset {
                 out.push(ListEntry {
-                    inode: ino,
-                    kind,
-                    name,
+                    inode: *ino,
+                    kind: state
+                        .nodes
+                        .get(ino)
+                        .map(entry_kind)
+                        .unwrap_or(FileType::RegularFile),
+                    name: name.clone(),
                     offset: off,
                 });
             }
