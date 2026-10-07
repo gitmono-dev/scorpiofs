@@ -145,7 +145,14 @@ pub(super) fn managed_scope(path: &Path) -> Result<Option<PathBuf>, SnapshotErro
                 return Ok(Some(directory.to_path_buf()));
             }
             Ok(_) => return Err(integrity("managed cache policy is not a regular file")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            // Callers may pass an actual CAS file, a missing object or a
+            // broken descendant. Such a candidate cannot contain a policy;
+            // continue to its ancestors and let the actual IO validate it.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
             Err(error) => return Err(io_error(error)),
         }
     }

@@ -149,6 +149,45 @@ fn scope(store: &DurableStore) -> PathBuf {
     store.content_dir().parent().unwrap().to_path_buf()
 }
 
+#[test]
+fn regular_cas_leaf_keeps_managed_ancestor_fence_and_unmanaged_io_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let (context, closure) = root(&[("live", b"live")]);
+    let store = managed(&temp, &context, 131);
+    store.retain_snapshot_root(&closure).unwrap();
+    let live = blob(&store, b"live");
+    let directory = scope(&store);
+    assert_eq!(managed_scope(&live).unwrap(), Some(directory.clone()));
+    let held = io_guard(&live).unwrap().unwrap();
+    assert_eq!(
+        collect_scope(&directory).unwrap_err().code,
+        SnapshotErrorCode::SnapshotNotReady
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"live");
+    drop(held);
+    assert!(collect_scope(&directory).is_ok());
+
+    // Even a non-directory descendant must not hide a managed ancestor.
+    assert_eq!(
+        managed_scope(&live.join("child")).unwrap(),
+        Some(directory.clone())
+    );
+    let policy_before = fs::read(directory.join(POLICY)).unwrap();
+    fs::write(directory.join(POLICY), b"{}").unwrap();
+    assert_eq!(
+        managed_scope(&live).unwrap_err().code,
+        SnapshotErrorCode::IntegrityError
+    );
+    fs::write(directory.join(POLICY), policy_before).unwrap();
+
+    let unmanaged = tempfile::tempdir().unwrap();
+    let file = unmanaged.path().join("actual-file");
+    fs::write(&file, b"ordinary").unwrap();
+    assert!(managed_scope(&file).unwrap().is_none());
+    assert!(io_guard(&file).unwrap().is_none());
+    assert_eq!(fs::read(&file).unwrap(), b"ordinary");
+}
+
 fn torn_control_temp(directory: &Path, final_name: &str, bytes: &[u8]) -> PathBuf {
     let path = directory.join(format!(".{final_name}.tmp.{}", uuid::Uuid::new_v4()));
     let mut file = secure_fs::open_create_new(&path).unwrap();
