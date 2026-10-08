@@ -229,7 +229,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
             env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
                        GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
                        STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
-                       PYTHONPATH=str(SOURCE.parent), COMPARISON="single", RECOVERY_INPUT="false")
+                       PYTHONPATH=str(SOURCE.parent), COMPARISON="single", PROFILE="smoke", RECOVERY_INPUT="false")
             for _ in range(2):
                 subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
                 self.assertIn("MST2_SESSION_STARTED=" + started.isoformat(), output.read_text())
@@ -242,7 +242,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
                         dict(env, DEADLINE_INPUT="2099-01-01T00:00:00Z"),
                         dict(env, DEADLINE_INPUT=deadline[:-6]),
                         dict(env, DEADLINE_INPUT=deadline[:-6] + "+08:00"),
-                        dict(env, STARTED_INPUT="")]:
+                        dict(env, STARTED_INPUT=""), dict(env, RUNNER_LABEL="../unowned")]:
                 result = subprocess.run([os.sys.executable, "-c", script], env=bad, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(output.exists())
@@ -266,7 +266,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
                            GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
                            STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
-                           PYTHONPATH=str(SOURCE.parent), COMPARISON="single", RECOVERY_INPUT="true")
+                           PYTHONPATH=str(SOURCE.parent), COMPARISON="single", PROFILE="smoke", RECOVERY_INPUT="true")
                 for _ in range(2):
                     subprocess.run([os.sys.executable, "-c", script], check=True, env=env, capture_output=True)
                     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
@@ -297,7 +297,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
             env = dict(os.environ, GITHUB_ENV=str(output), RUNNER_TEMP=temp,
                        GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
                        STARTED_INPUT=started.isoformat(), DEADLINE_INPUT=deadline,
-                       PYTHONPATH=str(SOURCE.parent), COMPARISON="isolated", ROUNDS="3",
+                       PYTHONPATH=str(SOURCE.parent), COMPARISON="isolated", PROFILE="smoke", ROUNDS="3",
                        BASELINE_SHA=BASELINE, CANDIDATE_SHA=CANDIDATE,
                        READ_PROFILE_INPUT="false", BOOTSTRAP_COMMIT_TIME="1700000000")
             subprocess.run([os.sys.executable, "-c", script], check=True,
@@ -309,7 +309,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
             result = subprocess.run([os.sys.executable, "-c", script],
                                     env=dict(env, RECOVERY_INPUT="true"), capture_output=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn(b"isolated campaign requires the fixed fair sources, no recovery", result.stderr)
+            self.assertIn(b"isolated campaign requires immutable sources, no recovery", result.stderr)
             self.assertFalse(output.exists())
 
     def test_ci_setup_plan_cannot_create_local_resources(self):
@@ -438,7 +438,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
             BENCH.git(repo, deadline, "commit", "--allow-empty", "-qm", "seed", env=env)
             manifests = []
             for version in ("v1", "v2", "v3"):
-                commit, _ = BENCH.create_version(repo, 1, version, True, deadline)
+                commit, _ = BENCH.create_version(repo, 1, version, "smoke", deadline)
                 manifests.append(BENCH.expected_manifest(repo, commit, deadline))
             sets = [{f["content_digest"] for f in manifest["files"]} for manifest in manifests]
             self.assertEqual(len(sets[1] - sets[0]), 1)
@@ -449,7 +449,7 @@ class CommitUpdateBenchTests(unittest.TestCase):
             self.assertIn("empty-b", manifests[2]["directories"])
             self.assertIn("alias-r01-m007", manifests[2]["directories"])
             # A second repetition needs a distinct cold content set and tree.
-            commit, _ = BENCH.create_version(repo, 2, "v1", True, deadline)
+            commit, _ = BENCH.create_version(repo, 2, "v1", "smoke", deadline)
             new = BENCH.expected_manifest(repo, commit, deadline)
             self.assertTrue(all(f["rel_path"].startswith(("r02/", "alias-r02-m007/")) for f in new["files"]))
             self.assertFalse(sets[0] & {f["content_digest"] for f in new["files"]})
@@ -485,9 +485,9 @@ class CommitUpdateBenchTests(unittest.TestCase):
                                        "GIT_COMMITTER_EMAIL": "test@example.invalid"})
                 BENCH.git(repo, deadline, "commit", "--allow-empty", "-qm", "seed", env=env)
                 for version in ("v1", "v2", "v3"):
-                    old_commit, _ = BENCH.create_version(repo, 1, version, smoke, deadline)
+                    old_commit, _ = BENCH.create_version(repo, 1, version, "smoke" if smoke else "medium", deadline)
                 before = BENCH.expected_manifest(repo, old_commit, deadline)
-                commit, _ = BENCH.create_version(repo, 1, "v4", smoke, deadline)
+                commit, _ = BENCH.create_version(repo, 1, "v4", "smoke" if smoke else "medium", deadline)
                 after = BENCH.expected_manifest(repo, commit, deadline)
                 old = {file["rel_path"]: file for file in before["files"]}
                 new = {file["rel_path"]: file for file in after["files"]}

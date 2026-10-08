@@ -89,6 +89,7 @@ def lane_disk(lane, deadline):
 
 
 def execute(options):
+    fixture_admission = common.fixture_size.admit_backend(options.profile, False)
     if (not options.isolated_deployment or options.publication_mode != "native"
             or not getattr(options, "projection_traces", False)
             or not callable(getattr(options, "finalize_projection", None))
@@ -172,6 +173,7 @@ def execute(options):
                 raise
 
     environment = {"record": "environment", "profile": options.profile, "rounds": options.rounds,
+          "fixture_admission": fixture_admission,
           "runner_os": platform.system(), "runner_kernel_release": platform.release(),
           "runner_machine": platform.machine(), "runner_logical_cpus": os.cpu_count(),
           "scenarios": common.SCENARIOS,
@@ -241,10 +243,11 @@ def execute(options):
                     raise AssertionError("service or current commit changed before publication")
                 with common.phase("fixture_and_git_oracle"):
                     commit, tree = common.create_version(fixture, round_number, version,
-                                                         options.profile == "smoke", deadline)
+                                                         options.profile, deadline)
                     expected = common.expected_manifest(fixture, commit, deadline)
+                    manifest_raw, _ = common.fixture_size.validate_manifest(expected)
                 expected_path = group / f"{version}-expected.json"
-                expected_path.write_text(json.dumps(expected))
+                expected_path.write_bytes(manifest_raw)
                 expected_digest = file_digest(expected_path)
                 publish_start = time.monotonic()
                 with common.phase("git_publication_push"):

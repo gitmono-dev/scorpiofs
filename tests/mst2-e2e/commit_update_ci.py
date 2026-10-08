@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in isolated setup for the real benchmark on disposable hosted GitHub runners.
+"""Opt-in job-owned setup for the real benchmark on Linux Actions runners.
 
 Plan-only by default. Resources are owned by this job's unique Compose project.
 No existing server, cloud resource or persistent deployment is accepted.
@@ -27,8 +27,8 @@ import commit_update_projection as projection_module
 
 def hosted_root(root):
     if (sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true"
-            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"):
-        raise ValueError("execution is limited to a disposable GitHub-hosted Linux runner")
+            or os.environ.get("RUNNER_ENVIRONMENT") not in ("github-hosted", "self-hosted")):
+        raise ValueError("execution is limited to an explicitly selected Linux Actions runner")
     run, attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
     if not run.isdecimal() or not attempt.isdecimal():
         raise ValueError("job ownership identifiers are missing")
@@ -402,7 +402,21 @@ def persist_failure_record(run_root, error):
         return
 
 
+def configure_owned_local_storage(config, root):
+    root = Path(root)
+    if not root.is_absolute() or config.get("base_dir") != str(root / "service-data"):
+        raise AssertionError("local object storage must belong to the metered owned service-data tree")
+    config["object_storage"] = {
+        "storage_type": "local",
+        "local": {"root_dir": str(root / "service-data" / "objects")},
+    }
+
+
 def execute(options):
+    bench.fixture_size.admit_backend(options.profile, getattr(options, "isolated_backends", False))
+    from workspace_update_build import comparison_pair
+    if options.paired:
+        comparison_pair(options.baseline_sha, options.candidate_sha)
     if getattr(options, "isolated_backends", False):
         from workspace_update_campaign import execute as execute_campaign
         return execute_campaign(options)
@@ -473,7 +487,7 @@ def execute(options):
         config["redis"]["url"] = f"redis://127.0.0.1:{ports['redis']}"
         config["monorepo"].update(root_dirs=["third-party", "project"], object_format="sha1", push_policy="trunk")
         config["pack"].update(pack_decode_mem_size="512M", pack_decode_cache_path=str(root / "pack-cache"))
-        config["object_storage"]["s3"].update(endpoint_url=f"http://127.0.0.1:{ports['rustfs']}", bucket="mega2")
+        configure_owned_local_storage(config, root)
         config["git"].update(push_auth="token", ssh_receive_pack=False,
                              push_tokens=[{"name": "owned-benchmark", "token": "${file:" + str(root / "git-token") + "}",
                                            "paths": ["/project"]}])
@@ -565,6 +579,7 @@ def execute(options):
             "--service-pid", str(process.pid), "--driver", str(options.driver.resolve()),
             "--driver-sha256", options.driver_sha256, "--run-root", str(root / "measurements"),
             "--profile", options.profile, "--rounds", str(options.rounds),
+            "--baseline-sha", options.baseline_sha, "--candidate-sha", options.candidate_sha,
             "--session-deadline-utc", options.session_deadline_utc])
         args.budget = budget
         args.paired = getattr(options, "paired", False)
@@ -611,14 +626,14 @@ if __name__ == "__main__":
     parser.add_argument("--server-build-receipt", type=Path)
     parser.add_argument("--driver", type=Path)
     parser.add_argument("--driver-sha256")
-    from workspace_update_build import add_arguments
+    from workspace_update_build import add_arguments, comparison_pair
     add_arguments(parser)
     parser.add_argument("--session-deadline-utc")
     parser.add_argument("--session-started-utc")
     budget_module.add_recovery_argument(parser)
     parser.add_argument("--work-cleanup-deadline-monotonic", type=float,
                         default=os.environ.get("MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"))
-    parser.add_argument("--profile", choices=("smoke", "medium"), default="medium")
+    parser.add_argument("--profile", choices=tuple(bench.fixture_size.PROFILES), default="medium")
     parser.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     opts = parser.parse_args()
     try:
@@ -633,8 +648,14 @@ if __name__ == "__main__":
             if (owned / "owned.json").exists():
                 stop_owned(owned, compose_project, budget_module.from_options(opts).cleanup_deadline)
         elif not opts.execute:
+            admission = bench.fixture_size.admit_backend(opts.profile, opts.isolated_backends)
+            if opts.isolated_backends:
+                admission["campaign_disk"] = bench.fixture_size.campaign_disk_plan(opts.profile)
             print(json.dumps({"execute": False, "profile": opts.profile, "rounds": opts.rounds,
-                              "resources": "one unique disposable hosted-runner Compose project; no cloud resources",
+                              "paired_sources": comparison_pair(
+                                  opts.baseline_sha, opts.candidate_sha) if opts.paired else None,
+                              "fixture_admission": admission,
+                              "resources": "fresh independently owned backend per client and round; no cloud resources" if opts.isolated_backends else "one unique job-owned Actions-runner Compose project; no cloud resources",
                               "max_session_seconds": 14400, "persistent_service_changes": False}))
         else:
             required = (opts.mega_source, opts.mega_sha, opts.mega_binary, opts.session_deadline_utc)

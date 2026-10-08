@@ -40,10 +40,10 @@ SID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 POLL_SECONDS = 0.025
 HTTP_BODY_LIMIT = 2 * 1024 * 1024
-# HTTP responses stay bounded at HTTP_BODY_LIMIT.  The medium fixture's
+# HTTP responses stay bounded at HTTP_BODY_LIMIT. The bounded large fixture's
 # canonical expected namespace is a local evidence file and is intentionally
 # allowed to be larger so the complete oracle remains one fixed manifest.
-ORACLE_MANIFEST_LIMIT = 16 * 1024 * 1024
+from workspace_update_size import ORACLE_MANIFEST_LIMIT
 COMMAND_OUTPUT_LIMIT = 8 * 1024 * 1024
 DIRTY_SENTINEL = ".scorpiofs-worker-dirty-upper-sentinel"
 DIRTY_BYTES = b"workspace-v3-worker-dirty-upper\n"

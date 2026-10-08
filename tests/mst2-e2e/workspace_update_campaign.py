@@ -34,8 +34,8 @@ import workspace_update_profile as profiles
 from workspace_update_daemon import WorkspaceDaemon, mounts_under
 from workspace_update_worker import WorkerSession, DIRTY_BYTES, DIRTY_SENTINEL
 
-BASELINE = "d265e31169fb2f8b137ce9922784ebd0238c6397"
-CANDIDATE = "bb0b485abc919aa53507c614020c0a184eda3e3c"
+BASELINE = builds.DEFAULT_BASELINE
+CANDIDATE = builds.DEFAULT_CANDIDATE
 ORACLE_FIELDS = frozenset({"verified_files", "verified_directories", "verified_bytes",
     "regular_read_calls", "oracle_walk_and_hash_ms", "isolated_oracle_process_ms",
     "raw_empty_tree_directories_omitted_by_git"})
@@ -142,14 +142,32 @@ def canonical_seed(group, owner, deadline):
     return group.seed
 
 
+class ManifestFacts:
+    """Internal compact oracle facts, bound to the entire canonical manifest.
+
+    This object is never accepted from evidence JSON. Export derives it from a
+    parsed embedded manifest, then checks its fingerprint against the separately
+    pinned manifest file before validating the full retained-view workload.
+    """
+    __slots__ = ("fingerprint", "files", "directories", "git_directories", "bytes", "omitted")
+
+    def __init__(self, expected, *, fingerprint=True):
+        full, materialized, omitted = oracle.directory_sets(expected)
+        self.fingerprint = proofs.digest(expected) if fingerprint else None
+        self.files = len(expected["files"])
+        self.directories, self.git_directories = len(full), len(materialized)
+        self.bytes = sum(file["size"] for file in expected["files"])
+        self.omitted = sorted(omitted)
+
+
 def validate_oracle(value, expected, *, git=False, dirty=False):
     proofs.shape(value, ORACLE_FIELDS)
-    full, materialized, omitted = oracle.directory_sets(expected)
-    proofs.exact(value["verified_files"], len(expected["files"]) + int(dirty))
-    proofs.exact(value["verified_directories"], len(materialized if git else full))
-    proofs.exact(value["verified_bytes"], sum(file["size"] for file in expected["files"])
+    facts = expected if isinstance(expected, ManifestFacts) else ManifestFacts(expected, fingerprint=False)
+    proofs.exact(value["verified_files"], facts.files + int(dirty))
+    proofs.exact(value["verified_directories"], facts.git_directories if git else facts.directories)
+    proofs.exact(value["verified_bytes"], facts.bytes
                  + (len(DIRTY_BYTES) if dirty else 0))
-    proofs.exact(value["raw_empty_tree_directories_omitted_by_git"], sorted(omitted) if git else [])
+    proofs.exact(value["raw_empty_tree_directories_omitted_by_git"], facts.omitted if git else [])
     proofs.integer(value["regular_read_calls"])
     for key in ("oracle_walk_and_hash_ms", "isolated_oracle_process_ms"):
         proofs.finite(value[key])
@@ -299,8 +317,9 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
             lane.resources = ProcessResources(lane.daemon.process.pid, lane.daemon.started, lane.daemon.uid).start()
         for scenario_number, version in enumerate(common.SCENARIOS, 1):
             commit, tree = common.create_version(fixture, number if phase == "fair" else 4, version,
-                                                 group.options.profile == "smoke", deadline)
+                                                 group.options.profile, deadline)
             expected = common.expected_manifest(fixture, commit, deadline)
+            common.fixture_size.validate_manifest(expected)
             manifest_path = round_root / f"{version}-expected.json"
             write_json(manifest_path, expected, deadline)
             manifest_digest = backends._digest(manifest_path)
@@ -361,7 +380,11 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
             for entry in lane.entries:
                 proof = lane_record(entry, closed, sources[lane.client.label])
                 validated.append(proof)
-                record = {key: deepcopy(value) for key, value in entry.items() if key not in ("capture", "result")}
+                record = {key: deepcopy(value) for key, value in entry.items()
+                          if key not in ("capture", "result", "manifest")}
+                # Full manifests are shared across the two lanes until all
+                # original full-byte/retained-view assertions have passed.
+                record["manifest"] = entry["manifest"]
                 record.update(record="round", revision=2, correctness="PASS",
                     scorpio=entry["result"]["scorpio"], git=entry["result"]["git"], old_views=entry["result"]["old_views"],
                     actual_status=entry["result"]["actual_status"],
@@ -373,6 +396,7 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
                     wall_timing_scope="this lane's push start through its Scorpio/Git operations, retention and old audits; excludes final closure",
                     operation_kind="commit-to-new-mounted-view-with-retained-previous-views")
                 records.append(record)
+            lane.entries.clear()
             lane.backend.stop(group.cleanup_deadline, operation_deadline=deadline)
         if phase == "fair":
             for version_number in range(1, 5):
@@ -380,6 +404,9 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
                 proofs.compare_pair(*pair)
         for record in records:
             append(path / "measurements.jsonl", record, phase, deadline)
+            # Preserve the complete original wire record, then retain only
+            # compact oracle facts across rounds and for final matrix checks.
+            record["manifest"] = ManifestFacts(record["manifest"])
         backends._check(deadline)
         return records
     finally:
@@ -448,6 +475,11 @@ def summaries(records):
 
 
 def execute(options):
+    fixture_admission = common.fixture_size.admit_backend(options.profile, True)
+    if options.profile == "large":
+        root, _ = ci.hosted_root(options.run_root)
+        fixture_admission["campaign_disk"] = common.fixture_size.admit_campaign_disk(options.profile, root)
+    pair = builds.comparison_pair(options.baseline_sha, options.candidate_sha)
     if (not options.paired or options.rounds != 3 or not options.projection_traces
             or options.workspace_read_profile or options.recover_original_window):
         raise ValueError("isolated campaign requires fair paired three rounds and a separate mandatory B diagnostic")
@@ -462,8 +494,8 @@ def execute(options):
         raise ValueError("campaign cannot move its dispatch anchor")
     deadline = budget.stage_deadline("setup")
     clients = builds.clients(options, deadline)
-    if [client.build["source_sha"] for client in clients] != [BASELINE, CANDIDATE]:
-        raise AssertionError("campaign A and B differ from the fixed comparison")
+    if [client.build["source_sha"] for client in clients] != pair:
+        raise AssertionError("campaign A and B differ from the requested immutable comparison")
     server = builds.load(options.server_build_receipt, "server", deadline)
     if (server.build["source_sha"] != options.mega_sha or server.driver != Path(options.mega_binary).resolve(strict=True)
             or server.build["source"] != str(Path(options.mega_source).resolve(strict=True))
@@ -487,12 +519,13 @@ def execute(options):
             (measurements / phase).mkdir(mode=0o700)
             append(measurements / phase / "measurements.jsonl", {
                 "record": "environment", "revision": 2, "profile": options.profile,
+                "fixture_admission": fixture_admission,
                 "rounds": 3 if phase == "fair" else 1, "sources": sources,
                 "architecture": "workspace-v3", "publication_mode": "native",
                 "runner_os": platform.system(), "runner_kernel_release": platform.release(),
                 "runner_machine": platform.machine(), "runner_logical_cpus": os.cpu_count(),
                 "run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-                "backend_isolation": "fresh separately owned PG/Redis/S3/process/cache per lane and round",
+                "backend_isolation": "fresh separately owned PG/Redis/Local object storage/process/cache per lane and round",
                 "cache_conditions": "host page caches, CPU scheduling and dependency image layers uncontrolled; no host cache flush",
                 "session_started_utc": options.session_started_utc, "session_deadline_utc": options.session_deadline_utc,
                 "cleanup_deadline_monotonic": budget.cleanup_deadline,
@@ -541,7 +574,8 @@ def execute(options):
             "server_build_receipt_sha256": backends._digest(Path(options.server_build_receipt)),
             "fair_records": 24, "diagnostic_records": 4, "fair_full_oracle_walks": fair_walks,
             "diagnostic_full_oracle_walks": diagnostic_walks, "cleanup": cleanup,
-            "phase_measurements_sha256": {phase: backends._digest(measurements / phase / "measurements.jsonl")
+            "phase_measurements_sha256": {phase: common.fixture_size.file_sha256(
+                                              measurements / phase / "measurements.jsonl", cleanup_limit)
                                           for phase in ("fair", "diagnostic")},
             "elapsed_execution_seconds": time.monotonic() - started,
             "performance_claims": "NOT_EVALUATED; raw fair evidence and independent diagnostic only"}

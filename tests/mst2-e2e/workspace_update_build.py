@@ -129,6 +129,11 @@ def clients(options, deadline):
     if options.rounds != 3 or not getattr(options, "build_a", None) or not getattr(options, "build_b", None):
         raise ValueError("paired mode requires two build receipts and three complete rounds")
     lanes = [load(options.build_a, "a", deadline), load(options.build_b, "b", deadline)]
+    if hasattr(options, "baseline_sha") or hasattr(options, "candidate_sha"):
+        requested = comparison_pair(getattr(options, "baseline_sha", None),
+                                    getattr(options, "candidate_sha", None))
+        if [lane.build["source_sha"] for lane in lanes] != requested:
+            raise AssertionError("paired build receipts differ from requested immutable commits")
     if (lanes[0].driver == lanes[1].driver
             or lanes[0].build["source"] == lanes[1].build["source"]
             or lanes[0].build["source_sha"] == lanes[1].build["source_sha"]):
@@ -171,10 +176,23 @@ def read_profile_mode(lane, requested, deadline):
     return "enabled" if supported else "unsupported"
 
 
+DEFAULT_BASELINE = "d265e31169fb2f8b137ce9922784ebd0238c6397"
+DEFAULT_CANDIDATE = "f18b99645d7bbbc5b4ea3374165e57dc4ff9f922"
+
+
+def comparison_pair(baseline, candidate):
+    if (any(type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None
+            for value in (baseline, candidate)) or baseline == candidate):
+        raise ValueError("comparison requires two distinct immutable full commit SHAs")
+    return [baseline, candidate]
+
+
 def add_arguments(parser):
     parser.add_argument("--paired", action="store_true")
     parser.add_argument("--build-a", type=Path)
     parser.add_argument("--build-b", type=Path)
+    parser.add_argument("--baseline-sha", default=DEFAULT_BASELINE)
+    parser.add_argument("--candidate-sha", default=DEFAULT_CANDIDATE)
     parser.add_argument("--workspace-read-profile", action="store_true",
                         help="Opt into read diagnostics; instrumented timings are diagnostic only")
 

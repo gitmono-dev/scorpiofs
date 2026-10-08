@@ -24,6 +24,7 @@ import uuid
 
 import commit_update_budget as budget_module
 import commit_update_projection as projection_module
+import workspace_update_size as fixture_size
 
 try:
     import tomllib
@@ -451,19 +452,47 @@ def expected_manifest(repo, commit, deadline):
             raise AssertionError("unexpected Git entry kind")
         parsed.append((path.decode(), mode, oid))
         unique[oid] = None
-    # A single Git cat-file invocation avoids one process per file and is
-    # independent of MST/2 metadata/content digest implementations.
-    raw = git(repo, deadline, "cat-file", "--batch", data=b"\n".join(unique) + b"\n")
-    cursor = 0
-    for oid in unique:
-        end = raw.index(b"\n", cursor)
-        got, kind, count = raw[cursor:end].split()
-        size = int(count)
-        body = raw[end + 1:end + 1 + size]
-        if got != oid or kind != b"blob" or len(body) != size or raw[end + 1 + size:end + 2 + size] != b"\n":
-            raise AssertionError("truncated or wrong independent Git blob")
-        unique[oid] = (size, "sha256:" + hashlib.sha256(body).hexdigest())
-        cursor = end + 2 + size
+    # Query sizes first, then hash independent Git bodies in batches bounded
+    # by both object count and bytes. Never capture the whole large fixture.
+    oids = list(unique)
+    pending, pending_bytes = [], 0
+
+    def hash_batch():
+        raw = git(repo, deadline, "cat-file", "--batch", data=b"\n".join(pending) + b"\n")
+        cursor = 0
+        for oid in pending:
+            end = raw.index(b"\n", cursor)
+            got, kind, count = raw[cursor:end].split()
+            size = int(count)
+            if got != oid or kind != b"blob" or size != unique[oid]:
+                raise AssertionError("wrong independent Git blob header")
+            body = memoryview(raw)[end + 1:end + 1 + size]
+            if len(body) != size or raw[end + 1 + size:end + 2 + size] != b"\n":
+                raise AssertionError("truncated independent Git blob")
+            unique[oid] = (size, "sha256:" + hashlib.sha256(body).hexdigest())
+            cursor = end + 2 + size
+        if cursor != len(raw):
+            raise AssertionError("independent Git batch has trailing bytes")
+
+    for offset in range(0, len(oids), fixture_size.CAT_FILE_ITEMS):
+        batch = oids[offset:offset + fixture_size.CAT_FILE_ITEMS]
+        rows = git(repo, deadline, "cat-file", "--batch-check", data=b"\n".join(batch) + b"\n").splitlines()
+        if len(rows) != len(batch):
+            raise AssertionError("independent Git size batch is truncated")
+        for oid, row in zip(batch, rows):
+            got, kind, count = row.split()
+            size = int(count)
+            if got != oid or kind != b"blob" or not 0 <= size <= fixture_size.CAT_FILE_BODY_BYTES:
+                raise ValueError("fixture blob exceeds bounded independent Git batch")
+            unique[oid] = size
+            if pending and (len(pending) >= fixture_size.CAT_FILE_ITEMS
+                            or pending_bytes + size > fixture_size.CAT_FILE_BODY_BYTES):
+                hash_batch()
+                pending, pending_bytes = [], 0
+            pending.append(oid)
+            pending_bytes += size
+    if pending:
+        hash_batch()
     return {"files": [{"rel_path": path, "fs_kind": "symlink" if mode == b"120000" else
                        "executable" if mode == b"100755" else "regular", "size": unique[oid][0],
                        "content_digest": unique[oid][1]} for path, mode, oid in parsed],
@@ -508,23 +537,17 @@ def verify_worktree(worktree, expected, deadline=None):
         raise AssertionError("Git worktree omitted expected content")
 
 
-def create_version(repo, round_number, version, smoke, deadline):
+def create_version(repo, round_number, version, profile, deadline):
     if version not in SCENARIOS:
         raise ValueError("unknown fixed commit-update scenario")
+    fixture_size.plan(profile)
+    modules, buckets, files, size = fixture_size.shape(profile)
+    smoke = profile == "smoke"
     prefix = f"r{round_number:02}"
     user = clean_env({"GIT_AUTHOR_NAME": "MST2 benchmark", "GIT_COMMITTER_NAME": "MST2 benchmark",
                       "GIT_AUTHOR_EMAIL": "benchmark@example.invalid", "GIT_COMMITTER_EMAIL": "benchmark@example.invalid"})
     if version == "v1":
         git(repo, deadline, "read-tree", "--empty")
-        if smoke:
-            modules, buckets, files, size = 8, 1, 8, 1024
-        else:
-            # Keep medium large enough to exercise metadata fan-out, retained
-            # views, and the Git oracle while staying practical for the shared
-            # four-hour cloud budget.  This is 1,024 generated files (about
-            # 8 MiB) plus the wide-directory and large-file probes below;
-            # m001 and m007 remain present for the v3 rename and alias checks.
-            modules, buckets, files, size = 16, 4, 16, 8192
         for module in range(modules):
             for bucket in range(buckets):
                 directory = repo / prefix / f"m{module:03}" / f"d{bucket:02}"
@@ -633,7 +656,7 @@ def parser():
     p.add_argument("--projection-traces", action="store_true")
     from workspace_update_build import add_arguments
     add_arguments(p)
-    p.add_argument("--profile", choices=("medium", "smoke"), default="medium")
+    p.add_argument("--profile", choices=tuple(fixture_size.PROFILES), default="medium")
     p.add_argument("--rounds", type=int, choices=range(3, 11), default=3)
     p.add_argument("--deadline-seconds", type=int, choices=range(60, 14401), default=14400)
     p.add_argument("--session-deadline-utc")
@@ -645,9 +668,14 @@ def parser():
 
 if __name__ == "__main__":
     opts = parser().parse_args()
+    from workspace_update_build import comparison_pair
     if not opts.execute:
+        fixture_size.admit_backend(opts.profile, False)
         endpoint_pair(opts.base_url, opts.git_url)
         print(json.dumps({"execute": False, "profile": opts.profile, "rounds": opts.rounds,
+                          "paired_sources": comparison_pair(
+                              opts.baseline_sha, opts.candidate_sha) if opts.paired else None,
+                          "fixture_admission": fixture_size.plan(opts.profile),
                           "scenarios": [version + "-" + scenario for version, scenario in SCENARIOS.items()],
                           "max_wall_seconds": min(opts.deadline_seconds, 14400),
                           "service_or_resource_changes": False,
