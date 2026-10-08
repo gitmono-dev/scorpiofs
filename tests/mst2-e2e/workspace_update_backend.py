@@ -15,9 +15,9 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
 import time
 from types import SimpleNamespace
-from urllib.request import urlopen
 import uuid
 
 import commit_update_bench as common
@@ -28,6 +28,22 @@ import commit_update_projection as projection
 SHA = re.compile(r"[0-9a-f]{40}")
 CONTAINER = re.compile(r"[0-9a-f]{64}")
 SERVICES = frozenset({"postgres", "redis", "rustfs", "rustfs-init"})
+CAPABILITY_PROBE = """
+import http.client
+import sys
+
+connection = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=2)
+try:
+    connection.request("GET", "/api/v2/snapshots/capabilities")
+    response = connection.getresponse()
+    if response.status != 200:
+        sys.exit(3)
+    sys.stdout.buffer.write(response.read(65537))
+except (OSError, http.client.HTTPException):
+    sys.exit(3)
+finally:
+    connection.close()
+"""
 
 
 def _canonical(value):
@@ -454,7 +470,10 @@ class OwnedBackend:
         config["redis"]["url"] = f"redis://127.0.0.1:{self.ports['redis']}"
         config["monorepo"].update(root_dirs=["third-party", "project"], object_format="sha1", push_policy="trunk")
         config["pack"].update(pack_decode_mem_size="512M", pack_decode_cache_path=str(self.root / "pack-cache"))
-        config["object_storage"]["s3"].update(endpoint_url=f"http://127.0.0.1:{self.ports['rustfs']}", bucket="mega2")
+        config["object_storage"] = {
+            "storage_type": "local",
+            "local": {"root_dir": str(self.root / "service-data" / "objects")},
+        }
         config["git"].update(push_auth="token", ssh_receive_pack=False,
                              push_tokens=[{"name": "owned-benchmark", "token": "${file:" + str(self.root / "git-token") + "}",
                                            "paths": ["/project"]}])
@@ -520,13 +539,32 @@ class OwnedBackend:
             _check(ready_until)
             if ci.owned_service_exit(self.process) is not None:
                 raise RuntimeError("owned backend failed readiness")
-            try:
-                with urlopen(self.base_url + "/api/v2/snapshots/capabilities",
-                             timeout=min(2, max(.001, ready_until - time.monotonic()))) as response:
-                    if response.status == 200:
-                        break
-            except OSError:
-                pass
+            # A socket timeout alone cannot bound a peer that keeps dripping
+            # bytes. The owned child runner also fences header/body reads and
+            # reserves termination/reaping time within this original deadline.
+            status, raw, _ = budget_module.run_process(
+                [sys.executable, "-I", "-c", CAPABILITY_PROBE, str(self.ports["http"])],
+                min(ready_until, time.monotonic() + 5), env=common.clean_env())
+            _check(ready_until)
+            if status == 0:
+                if not isinstance(raw, bytes) or len(raw) > 65536:
+                    raise AssertionError("owned backend capabilities are oversized or malformed")
+                try:
+                    capabilities = json.loads(raw)
+                except (ValueError, UnicodeError) as error:
+                    raise AssertionError("owned backend capabilities are malformed") from error
+                features = capabilities.get("features") if type(capabilities) is dict else None
+                required = ("strict_publication", "directory", "lookup", "metadata_pages",
+                            "raw_blob", "small_objects", "chunk_reads", "full_hydration")
+                if (type(features) is not dict
+                        or any(features.get(name) is not True for name in required)
+                        or type(capabilities.get("protocol_versions")) is not list
+                        or not any(type(version) is int and version == 2
+                                   for version in capabilities["protocol_versions"])):
+                    raise AssertionError("owned backend lacks required v3 benchmark delivery capabilities")
+                break
+            if status != 3:
+                raise AssertionError("owned backend capabilities probe failed")
             time.sleep(min(.2, max(0, ready_until - time.monotonic())))
         # Only materialize the seed path; never resolve a measured target here.
         self.initial_commit = self.tip(deadline)
