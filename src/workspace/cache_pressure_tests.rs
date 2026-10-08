@@ -10,6 +10,13 @@ use crate::{
     workspace::cache,
 };
 
+fn canonical_pressure_tempdir() -> tempfile::TempDir {
+    // Keep the fixture's system temporary parent outside the cache no-follow
+    // contract, including macOS /var's alias of /private/var.
+    let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+    tempfile::tempdir_in(parent).unwrap()
+}
+
 fn limits() -> CacheLimits {
     CacheLimits {
         max_bytes: 64 * 1024 * 1024,
@@ -68,7 +75,7 @@ fn managed_store(temp: &tempfile::TempDir, id: &str, reader: &SnapshotReader) ->
 #[tokio::test]
 async fn metadata_only_promotion_preserves_live_lazy_reads_and_collects_retired_version() {
     let server = VersionServer::new(vec![tiny_version(0), tiny_version(1)]).await;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_pressure_tempdir();
     let old_reader = server.reader(0).await;
     let old = managed_store(&temp, "11111111-2222-4333-8444-555555555701", &old_reader);
     assert!(bounded_hydrate(&old, &old_reader).await.complete);
@@ -181,7 +188,7 @@ async fn cancelled_real_http_promotion_leaves_unknown_use_and_retry_keeps_body_u
     fixture.hold_metadata.store(true, Ordering::SeqCst);
     let server = Server::new(fixture).await;
     let reader = server.reader().await;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_pressure_tempdir();
     let store = managed_store(&temp, "11111111-2222-4333-8444-555555555703", &reader);
     let use_record = fs::read(store.root().join("CACHE_USE.json")).unwrap();
     let source = reader.clone();
