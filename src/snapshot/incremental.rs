@@ -1195,6 +1195,8 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
         f.sync_all().map_err(io_err)?;
         #[cfg(test)]
         tests::before_index_rename(dir, name)?;
+        #[cfg(test)]
+        page_write_hooks::before_rename(&dir.join(name))?;
         fs::rename(&tmp, dir.join(name)).map_err(io_err)
     })();
     if result.is_err() {
@@ -1204,6 +1206,10 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), SnapshotError
     }
     result
 }
+
+#[cfg(test)]
+#[path = "incremental_page_hooks.rs"]
+pub(crate) mod page_write_hooks;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,8 @@
 //! Ownership of explicit owned-fetch output and managed construction buffers.
-//! Native codec/HTTP/TLS buffers, metadata/error DTO heaps and caller copies
-//! are separate. These are managed buffer capacity quotas, not RSS limits.
+//! Lazy learned-page payloads also reserve construction capacity while their
+//! actual blocking writer owns them. Other metadata/error DTO heaps, native
+//! codec/HTTP/TLS buffers and caller copies are separate. These are managed
+//! buffer capacity quotas, not RSS limits.
 
 use std::{
     fmt,

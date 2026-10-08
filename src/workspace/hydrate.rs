@@ -108,6 +108,9 @@ mod tests {
     #[path = "cache_pressure_tests.rs"]
     mod cache_pressure;
 
+    #[path = "lazy_metadata_learning_tests.rs"]
+    mod lazy_metadata_learning;
+
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::{

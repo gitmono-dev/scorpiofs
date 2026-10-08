@@ -13,7 +13,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
 };
 
@@ -33,7 +33,7 @@ use crate::{
         cas_range::VerifiedCasRange,
         cas_worker::{CasReadScope, LocalCasAccess, RequestMeters, WorkResult},
         closure::ValidatedSnapshotClosure,
-        content::ContentBudget,
+        content::{BudgetClass, ContentBudget, Reservation},
         durable::{DurableStore, LocalCasRangeMeters},
         fixed_directory_index::{DirectoryEntries, FixedDirectoryIndex},
         fuse_owned::{
@@ -56,6 +56,49 @@ use crate::{
 
 pub(crate) const ROOT_INODE: u64 = 1;
 pub(crate) const TTL: Duration = Duration::from_secs(60);
+
+const PAGE_LEARNING_JOBS: usize = 4;
+
+struct PageLearningAdmission {
+    _job: tokio::sync::OwnedSemaphorePermit,
+    _payload: Reservation,
+}
+
+struct AdmittedPages {
+    // Field order frees every retained payload before refunding its credits,
+    // including failures before the first page write and unwinding.
+    pages: BTreeMap<String, Vec<u8>>,
+    _admission: PageLearningAdmission,
+}
+
+fn admit_page_learning(
+    reader: &SnapshotReader,
+    pages: BTreeMap<String, Vec<u8>>,
+) -> std::result::Result<AdmittedPages, SnapshotError> {
+    static JOBS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let jobs = JOBS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(PAGE_LEARNING_JOBS)));
+    let limit = || {
+        SnapshotError::new(
+            SnapshotErrorCode::LimitExceeded,
+            "lazy metadata page learning admission is full",
+        )
+    };
+    let payload_bytes = pages
+        .values()
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes.capacity()))
+        .ok_or_else(limit)?;
+    let job = jobs.clone().try_acquire_owned().map_err(|_| limit())?;
+    let payload = reader
+        .content_scope
+        .reserve(BudgetClass::Construction, payload_bytes)?;
+    Ok(AdmittedPages {
+        pages,
+        _admission: PageLearningAdmission {
+            _job: job,
+            _payload: payload,
+        },
+    })
+}
 
 #[derive(Clone)]
 pub(crate) struct DirNode {
@@ -582,6 +625,7 @@ impl Mst2Fuse {
         // not certify namespace absence: the complete canonical partition
         // and every child's actual count are proved before publishing nodes.
         let mut proof_pages = BTreeMap::new();
+        let mut wire_page_ids = HashSet::new();
         let mut routes: VecDeque<(Vec<u8>, String)> =
             VecDeque::from([(Vec::new(), page_id.clone())]);
         let mut route_ids = HashMap::new();
@@ -623,6 +667,11 @@ impl Mst2Fuse {
                 missing.push(item);
             }
             if !missing.is_empty() {
+                wire_page_ids.extend(
+                    missing
+                        .iter()
+                        .filter_map(|item| item.expected_digest.clone()),
+                );
                 let wire = reader
                     .client
                     .metadata_pages(&sid, &missing, reader.encoding_hint())
@@ -696,6 +745,51 @@ impl Mst2Fuse {
                 self.metadata_limits.max_directory_entries,
             )
             .await?;
+
+        // Only the complete canonical directory proof authenticates these
+        // hints. Move wire payloads into their actual blocking IO owner;
+        // cancellation cannot release its store, fence or write admission.
+        if let (Some(cache), Some(store)) = (&self.scope_pages, &self.store) {
+            let learned = proof_pages
+                .into_iter()
+                .filter(|(id, _)| wire_page_ids.contains(id))
+                .collect::<BTreeMap<_, _>>();
+            if !learned.is_empty() {
+                reader.ensure_lease().await?;
+                match admit_page_learning(reader, learned) {
+                    Ok(learned) => {
+                        let scope = cache.dir().to_path_buf();
+                        let store = store.clone();
+                        let result = super::stage::trace_blocking(
+                            "lazy_metadata_page_learning",
+                            move || {
+                                // Move the whole owner, not just its pages via
+                                // a Rust 2021 disjoint closure-field capture.
+                                let owned_pages = learned;
+                                let _cache_io =
+                                    super::cache_retention::io_guard(store.content_dir())?;
+                                let cache = ScopeCache::open(scope)?;
+                                for (id, bytes) in &owned_pages.pages {
+                                    cache.put_page(id, bytes)?;
+                                }
+                                Ok::<_, SnapshotError>(())
+                            },
+                        )
+                        .await;
+                        // Hints grant no authority or completeness. A capacity
+                        // or publication failure cannot invalidate the view.
+                        if !matches!(&result, Ok(Ok(()))) {
+                            tracing::debug!(?result, "lazy metadata page learning deferred");
+                        }
+                    }
+                    Err(error) => {
+                        // Never queue an uncharged large payload behind busy
+                        // workers. A later cold lookup may learn these hints.
+                        tracing::debug!(?error, "lazy metadata page learning skipped");
+                    }
+                }
+            }
+        }
 
         // Local hints retain the same live fixed-view authority as wire pages.
         reader.ensure_lease().await?;
