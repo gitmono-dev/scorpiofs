@@ -1,6 +1,7 @@
 """Acceptance checks for the real runner's fences, Git oracle and durability."""
 
 import hashlib
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
@@ -11,6 +12,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+import zlib
 from unittest.mock import patch
 
 SOURCE = Path(__file__).with_name("commit_update_bench.py")
@@ -24,6 +26,112 @@ from workspace_update_worker import WorkerError
 
 
 class CommitUpdateBenchTests(unittest.TestCase):
+    def test_history_scenarios_are_profile_specific_and_leave_original_cases_intact(self):
+        original = {"v1": "cold", "v2": "single-file", "v3": "subtree-rename", "v4": "batch-file-update"}
+        for profile in ("smoke", "medium", "large"):
+            self.assertEqual(BENCH.scenarios(profile), original)
+        self.assertEqual(list(BENCH.scenarios("history-large")), [f"v{n}" for n in range(1, 11)])
+        changed = BENCH.scenarios("history-large")
+        changed.clear()
+        self.assertEqual(len(BENCH.HISTORY_SCENARIOS), 10)
+        with self.assertRaises(ValueError):
+            BENCH.scenarios("unknown")
+
+    def test_ten_real_history_commits_rotate_exact_cohorts_and_reproduce_exact_parents(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(BENCH.fixture_size.PROFILES, {"history-large": (40, 1, 2, 1024)}):
+            deadline = time.monotonic() + 120
+            runs = []
+            for repetition in range(2):
+                repo = Path(temp) / f"fixture-{repetition}"
+                subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+                env = BENCH.clean_env({"GIT_AUTHOR_NAME": "test", "GIT_COMMITTER_NAME": "test",
+                    "GIT_AUTHOR_EMAIL": "test@example.invalid", "GIT_COMMITTER_EMAIL": "test@example.invalid",
+                    "GIT_AUTHOR_DATE": "@1700000000 +0000", "GIT_COMMITTER_DATE": "@1700000000 +0000"})
+                BENCH.git(repo, deadline, "commit", "--allow-empty", "-qm", "seed", env=env)
+                seed = BENCH.git(repo, deadline, "rev-parse", "HEAD").decode().strip()
+                previous, prior, receipts, retained = None, seed, [], []
+                for version in BENCH.scenarios("history-large"):
+                    commit, tree = BENCH.create_version(repo, 1, version, "history-large", deadline)
+                    expected = BENCH.expected_manifest(repo, commit, deadline)
+                    receipt = BENCH.commit_receipt(repo, commit, version, expected, previous, deadline)
+                    self.assertEqual((receipt["commit"], receipt["tree"], receipt["parent"]), (commit, tree, prior))
+                    body = bytes.fromhex(receipt["commit_body_hex"])
+                    self.assertEqual(hashlib.sha1(b"commit " + str(len(body)).encode() + b"\0" + body).hexdigest(), commit)
+                    self.assertIn(b" +0000\n", body)
+                    selected = BENCH.fixture_size.history_modules(version)
+                    count = 2 * len(selected)
+                    self.assertEqual(receipt["source_changes"], {
+                        "changed_source_files": count, "changed_source_bytes": count * 1024,
+                        "distinct_changed_source_blobs": count,
+                        "added_source_files": count if version == "v1" else 0, "removed_source_files": 0})
+                    changes = receipt["change_counts"]
+                    if version == "v1":
+                        self.assertEqual(changes["files_added"], 80 + 2 + 130)
+                        sample = (repo / "r01/m000/d00/f000").read_bytes()
+                        self.assertGreaterEqual(len(zlib.compress(sample)), len(sample))
+                    else:
+                        alias_count = 2 if 7 in selected else 0
+                        self.assertEqual(changes, {"files_added": 0, "files_deleted": 0,
+                            "files_modified": count + alias_count,
+                            "added_or_modified_bytes": (count + alias_count) * 1024})
+                        old = {file["rel_path"]: file for file in previous["files"]}
+                        current = {file["rel_path"]: file for file in expected["files"]}
+                        changed_modules = {int(path.split("/")[1][1:]) for path in current
+                            if path.startswith("r01/m") and current[path] != old[path]}
+                        self.assertEqual(changed_modules, set(selected))
+                        bad = deepcopy(expected)
+                        source = next(file for file in bad["files"]
+                            if file["rel_path"] == f"r01/m{selected[0]:03}/d00/f000")
+                        source["content_digest"] = old[source["rel_path"]]["content_digest"]
+                        with self.assertRaises(AssertionError):
+                            BENCH.history_change(previous, bad, version)
+                        bad = deepcopy(expected)
+                        untouched = next(module for module in range(40) if module not in selected)
+                        source = next(file for file in bad["files"]
+                            if file["rel_path"] == f"r01/m{untouched:03}/d00/f000")
+                        source["content_digest"] = "sha256:" + "f" * 64
+                        with self.assertRaises(AssertionError):
+                            BENCH.history_change(previous, bad, version)
+                        bad = deepcopy(expected)
+                        alias = next(file for file in bad["files"] if file["rel_path"].startswith("alias-"))
+                        alias["content_digest"] = "sha256:" + "f" * 64
+                        with self.assertRaises(AssertionError):
+                            BENCH.history_change(previous, bad, version)
+                    retained.append((commit, expected))
+                    receipts.append(receipt)
+                    previous, prior = expected, commit
+                self.assertEqual(len({item["commit"] for item in receipts}), 10)
+                self.assertEqual(len({item["tree"] for item in receipts}), 10)
+                for commit, expected in retained:
+                    self.assertEqual(BENCH.expected_manifest(repo, commit, deadline), expected)
+                runs.append(receipts)
+            self.assertEqual(runs[0], runs[1])
+
+    def test_manifest_change_counts_include_aliases_and_reject_bad_shape(self):
+        old = {"directories": ["", "source", "alias"], "files": [
+            {"rel_path": directory + "/f", "fs_kind": "regular", "size": 8,
+             "content_digest": "sha256:" + "1" * 64} for directory in ("source", "alias")]}
+        new = deepcopy(old)
+        for file in new["files"]:
+            file["content_digest"] = "sha256:" + "2" * 64
+        self.assertEqual(BENCH.manifest_changes(new, old), {"files_added": 0, "files_deleted": 0,
+            "files_modified": 2, "added_or_modified_bytes": 16})
+        self.assertEqual(BENCH.manifest_changes(new), {"files_added": 2, "files_deleted": 0,
+            "files_modified": 0, "added_or_modified_bytes": 16})
+        with self.assertRaises(ValueError):
+            BENCH.manifest_changes({"files": []})
+
+    def test_history_receipt_rejects_mismatched_commit_identity_and_multiple_parents(self):
+        raw = b"tree " + b"a" * 40 + b"\nparent " + b"b" * 40 + b"\nparent " + b"c" * 40 + b"\n\nmessage\n"
+        commit = hashlib.sha1(b"commit " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+        for sha in (commit, "0" * 40):
+            with patch.object(BENCH, "git", side_effect=[str(len(raw)).encode(), raw]), \
+                    self.assertRaises(AssertionError):
+                BENCH.commit_receipt(Path("unused"), sha, "v1", {}, None, 1e20)
+        with patch.object(BENCH, "git", return_value=b"65537"), self.assertRaises(AssertionError):
+            BENCH.commit_receipt(Path("unused"), "a" * 40, "v1", {}, None, 1e20)
+
     def test_owned_native_bootstrap_rejects_other_database_host_and_noncanonical_instance(self):
         database = "mst2_bench_" + "a" * 32
         instance = "6ab219b0-4275-45ba-9d7b-7b0b633018cd"

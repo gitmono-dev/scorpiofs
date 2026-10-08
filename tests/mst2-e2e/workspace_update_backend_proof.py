@@ -21,11 +21,13 @@ import workspace_update_observation as observation
 
 SCRIPT_PATHS = frozenset({
     ".github/workflows/mst2-real-update.yml",
+    *{"tests/mst2-e2e/infra/aliyun/" + name + ".py"
+      for name in ("direct_campaign", "direct_remote", "direct_sources")},
     *{"tests/mst2-e2e/commit_update_" + name + ".py"
       for name in ("bench", "budget", "ci", "projection")},
     *{"tests/mst2-e2e/workspace_update_" + name + ".py"
       for name in ("backend", "backend_proof", "bench", "build", "campaign", "campaign_export", "daemon",
-                   "observation", "oracle", "profile", "resources", "size", "worker")},
+                   "execution", "observation", "oracle", "profile", "resources", "size", "worker")},
 })
 SOURCE_FIELDS = frozenset({
     "server_source_sha", "server_source_tree", "server_binary_sha256",
@@ -422,7 +424,7 @@ def validate_lane_values(record, capture):
         exact(capture["client_build"]["label"], runtime["client"])
         shape(record, LANE_FIELDS)
         integer(record["revision"], 1, True)
-        integer(record["version"], 4, True)
+        integer(record["version"], 10, True)
         for key in ("phase", "round", "client"):
             exact(record[key], runtime[key])
         sources(record["sources"])

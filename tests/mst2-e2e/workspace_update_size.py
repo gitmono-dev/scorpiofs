@@ -15,7 +15,17 @@ PROFILES = {
     "medium": (16, 4, 16, 8192),
     # About 100k logical entries in /project, including the directory alias.
     "large": (96, 8, 128, 8192),
+    # Five cohorts grow the repository while bounding each incremental rewrite.
+    "history-large": (165, 4, 128, 8192),
 }
+HISTORY_VERSIONS = 10
+HISTORY_COHORTS = 5
+HISTORY_LIMITS = {"source_entry_references_upper": 262144,
+                  "resident_metadata_pages_upper": 16384,
+                  "resident_metadata_bytes_upper": 256 * 1024 * 1024,
+                  "page_certificates_upper": 16384,
+                  "source_attestations_upper": 16384,
+                  "rooted_source_inventory_upper": 65536}
 ORACLE_MANIFEST_LIMIT = 32 * 1024 * 1024
 EVIDENCE_ROW_LIMIT = 64 * 1024 * 1024
 EVIDENCE_FILE_LIMIT = 1024 * 1024 * 1024
@@ -34,9 +44,23 @@ def shape(profile):
     return PROFILES[profile]
 
 
+def history_modules(version):
+    """Canonical cold tree and rotating, equally sized module cohorts."""
+    if type(version) is not str or re.fullmatch(r"v(?:[1-9]|10)", version) is None:
+        raise ValueError("unknown measured history version")
+    modules = shape("history-large")[0]
+    if modules < HISTORY_COHORTS or modules % HISTORY_COHORTS:
+        raise ValueError("history modules must divide into five equal cohorts")
+    if version == "v1":
+        return tuple(range(modules))
+    width = modules // HISTORY_COHORTS
+    start = ((int(version[1:]) - 2) % HISTORY_COHORTS) * width
+    return tuple(range(start, start + width))
+
+
 def admit_backend(profile, isolated_backends):
     report = plan(profile)
-    if profile == "large" and isolated_backends is not True:
+    if profile in ("large", "history-large") and isolated_backends is not True:
         raise ValueError("large fixtures require fresh isolated backends per round; shared namespaces exceed retained source history ceilings")
     return report
 
@@ -61,11 +85,13 @@ def campaign_disk_plan(profile):
     entries = report["logical_entries"]
     cold_unique = modules * buckets * files * body_size + 129 * 32 + (
         65536 if profile == "smoke" else 2097152)
-    updates = (17 if profile == "smoke" else 129) * body_size
+    versions = HISTORY_VERSIONS if profile == "history-large" else 4
+    updates = ((versions - 1) * len(history_modules("v2")) * buckets * files * body_size
+               if profile == "history-large" else (17 if profile == "smoke" else 129) * body_size)
     history = cold_unique + updates
     metadata = report["metadata_payload_bytes_upper"]
     manifests = report["oracle_manifest_bytes_upper"]
-    lanes, versions, fixture_repositories = 7, 4, 4
+    lanes, fixture_repositories = 7, 4
     components = {
         "retained_git_detached_checkouts": lanes * versions * (logical + entries * 4096),
         "retained_git_object_databases": lanes * (history + entries * 4096),
@@ -97,7 +123,7 @@ def admit_campaign_disk(profile, run_root):
     available = shutil.disk_usage(parent).free
     report.update(filesystem_path=str(parent), available_free_bytes=available)
     if available < report["minimum_free_bytes"]:
-        raise ValueError("large campaign requires at least " + str(report["minimum_free_bytes"])
+        raise ValueError("campaign requires at least " + str(report["minimum_free_bytes"])
                          + " free bytes on the run-root filesystem; available " + str(available))
     return report
 
@@ -180,7 +206,7 @@ def plan(profile):
     record = {"rel_path": "x" * 64, "fs_kind": "executable", "size": 2097152,
               "content_digest": "sha256:" + "f" * 64}
     manifest_upper = 64 + logical_files * (len(json.dumps(record)) + 1) + directories * 68
-    return _admit({"profile": profile, "scope": "/project", "logical_files": logical_files,
+    report = _admit({"profile": profile, "scope": "/project", "logical_files": logical_files,
         "logical_directories": directories, "selected_scope_entries": logical_files + directories - 1,
         "logical_entries": logical_files + directories,
         "metadata_pages_upper": pages, "metadata_edges_upper": edges,
@@ -190,6 +216,45 @@ def plan(profile):
                                   + (65536 if profile == "smoke" else 2097152),
         "admission": "conservative fixture envelope; actual manifest checked before publication",
         "completion_phase": "full-verified", "production_limits": dict(HARD_LIMITS)})
+    if profile == "history-large":
+        cohort_modules = len(history_modules("v2"))
+        # Frozen server 75a1d081 reuses COMMITTED/LIVE native attestations by
+        # exact Git tree OID, page lifetime and source revision/body, inside
+        # the same native profile and isolated backend namespace. Unchanged
+        # module subtrees therefore add no source-entry dictionary rows. Count
+        # every changed module's directory pointers and file entries, every
+        # ancestor's full direct entries, and an extra complete alias subtree
+        # on every increment. This gives no alias or changed-page dedup credit.
+        # rooted_metadata_projection.rs:646-656; qualified_metadata_rooted.rs:640;
+        # qualified_metadata_source_read.sql:46. Retained views keep roots live.
+        increment_source_entries = ((cohort_modules + 1) * buckets * (files + 1)
+                                    + modules + 7)
+        # Reserve the canonical seed separately. Metadata, certificates and
+        # attestations retain the larger ten-complete-trees envelope.
+        retained = {
+            "source_entry_references_upper": (report["logical_entries"]
+                + (HISTORY_VERSIONS - 1) * increment_source_entries + 1024),
+            "resident_metadata_pages_upper": HISTORY_VERSIONS * pages + 64,
+            "resident_metadata_bytes_upper": HISTORY_VERSIONS * payload + 64 * 1024,
+            "page_certificates_upper": HISTORY_VERSIONS * pages + 64,
+            "source_attestations_upper": HISTORY_VERSIONS * (directories + 1) + 64,
+            "rooted_source_inventory_upper": HISTORY_VERSIONS * (directories + 1) + 64,
+        }
+        for key, limit in HISTORY_LIMITS.items():
+            if retained[key] > limit:
+                raise ValueError("fixture exceeds production retained " + key + " ceiling")
+        report["history_admission"] = {"versions": HISTORY_VERSIONS,
+            "cohort_count": HISTORY_COHORTS,
+            "modules_rewritten_per_increment": cohort_modules,
+            "modules_preserved_per_increment": modules - cohort_modules,
+            "source_files_rewritten_per_increment": cohort_modules * buckets * files,
+            "source_bytes_rewritten_per_increment": cohort_modules * buckets * files * size,
+            "source_dictionary_entries_per_increment_upper": increment_source_entries,
+            "full_oracle_walks_per_lane": HISTORY_VERSIONS * (HISTORY_VERSIONS + 5) // 2,
+            **retained, "production_limits": dict(HISTORY_LIMITS),
+            "basis": "cold full tree plus nine exact changed cohorts and complete ancestor/alias entries; unchanged Git tree attestation reuse within the same native profile and isolated namespace with prior roots COMMITTED and LIVE; metadata reserves ten full trees plus seed; no GC or reconstruction credit",
+            "proof_json_quota": "actual canonical proof JSON remains subject to the server's independent 256 MiB per-relation limit"}
+    return report
 
 
 def validate_manifest(expected):

@@ -23,19 +23,11 @@ import uuid
 import commit_update_bench as bench
 import commit_update_budget as budget_module
 import commit_update_projection as projection_module
+import workspace_update_execution as execution
 
 
 def hosted_root(root):
-    if (sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true"
-            or os.environ.get("RUNNER_ENVIRONMENT") not in ("github-hosted", "self-hosted")):
-        raise ValueError("execution is limited to an explicitly selected Linux Actions runner")
-    run, attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
-    if not run.isdecimal() or not attempt.isdecimal():
-        raise ValueError("job ownership identifiers are missing")
-    expected = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True) / f"mst2-real-{run}-{attempt}"
-    if root.absolute() != expected or root.is_symlink():
-        raise ValueError("owned root must be the exact unique job directory under RUNNER_TEMP")
-    return expected, f"m2perf-{run}-{attempt}"
+    return execution.owned_root(root)
 
 
 def toml(data):
@@ -413,6 +405,7 @@ def configure_owned_local_storage(config, root):
 
 
 def execute(options):
+    execution.bind_options(options)
     bench.fixture_size.admit_backend(options.profile, getattr(options, "isolated_backends", False))
     from workspace_update_build import comparison_pair
     if options.paired:

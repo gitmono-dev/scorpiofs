@@ -18,7 +18,7 @@ import workspace_update_campaign as campaign
 import workspace_update_backend as backend_module
 
 
-def workload():
+def workload(profile="smoke"):
     manifest = {"files": [{"rel_path": "f", "fs_kind": "regular", "size": 7,
                            "content_digest": "sha256:" + "1" * 64}], "directories": ["", "empty"]}
     def oracle(git=False, dirty=False):
@@ -30,16 +30,16 @@ def workload():
         return {**record["workspace_binding"], "fd_verified": True,
                 "dirty_upper_verified": True, "oracle": oracle(dirty=True)}
     records = []
-    for index, version in enumerate(campaign.common.SCENARIOS, 1):
+    for index, version in enumerate(campaign.common.scenarios(profile), 1):
         binding = {"workspace_id": "workspace-" + str(index), "generation": "generation-" + str(index),
                    "snapshot_id": "snapshot-" + str(index)}
-        record = {"version": version, "round": 1, "fixed_commit": str(index) * 40,
+        record = {"version": version, "round": 1, "fixed_commit": f"{index:040x}",
                   "workspace_binding": binding, "manifest": manifest}
         record["result"] = {"version": version, "round": 1, "actual_status": binding,
             "git": {"commit": record["fixed_commit"], "oracle": oracle(git=True)},
             "scorpio": {"oracle": oracle()}, "old_views": [view(old) for old in records]}
         records.append(record)
-    final = {"retained": 4, "verified": True, "views": [view(record) for record in records],
+    final = {"retained": len(records), "verified": True, "views": [view(record) for record in records],
              "final_retained_view_audit_ms": 1.2}
     return records, final
 
@@ -337,6 +337,52 @@ class CampaignWorkloadTests(unittest.TestCase):
     def test_all_18_walks_and_retained_fd_upper_checks_are_required(self):
         records, final = workload()
         self.assertEqual(campaign.validate_workload(records, final), 18)
+
+    def test_ten_commit_history_requires_all_75_full_walks_in_numeric_order(self):
+        records, final = workload("history-large")
+        self.assertEqual([row["version"] for row in records], [f"v{index}" for index in range(1, 11)])
+        self.assertEqual(final["retained"], 10)
+        self.assertEqual(campaign.validate_workload(records, final, "history-large"), 75)
+
+    def test_ten_commit_history_rejects_missing_duplicate_and_lexical_order(self):
+        mutations = (lambda rows: rows.pop(),
+                     lambda rows: rows.__setitem__(-1, deepcopy(rows[-2])),
+                     lambda rows: rows.sort(key=lambda row: row["version"]))
+        for change in mutations:
+            records, final = workload("history-large")
+            change(records)
+            with self.assertRaises(AssertionError):
+                campaign.validate_workload(records, final, "history-large")
+
+    def test_tenth_commit_retains_all_old_fds_dirty_uppers_and_final_views(self):
+        for field in ("fd_verified", "dirty_upper_verified"):
+            records, final = workload("history-large")
+            records[-1]["result"]["old_views"][0][field] = False
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                campaign.validate_workload(records, final, "history-large")
+        for change in (lambda final: final["views"].pop(),
+                       lambda final: final.update(retained=9)):
+            records, final = workload("history-large")
+            change(final)
+            with self.assertRaises(AssertionError):
+                campaign.validate_workload(records, final, "history-large")
+
+    def test_ten_commit_history_matrix_cannot_omit_tenth_commit_or_duplicate_ninth(self):
+        import test_workspace_update_profile as profile_fixtures
+        evidence = {"semantic": {"fixed_commit": "1" * 40, "oracle_manifest_sha256": "2" * 64}}
+        for phase in ("fair", "diagnostic"):
+            records = [{"phase": phase, "round": number, "version": version, "client": label,
+                        "correctness": "PASS", "lane_full_oracle_walks": 75,
+                        "semantic_provenance": evidence, "lane_proof_sha256": campaign.proofs.digest(evidence),
+                        **evidence["semantic"],
+                        "scorpio": {} if phase == "fair" else {"read_profile": profile_fixtures.evidence()}}
+                       for number in (range(1, 4) if phase == "fair" else (1,))
+                       for version in campaign.common.scenarios("history-large")
+                       for label in (("a", "b") if phase == "fair" else ("b",))]
+            campaign.validate_matrix(records, phase, "history-large")
+            for altered in (records[:-1], [*records[:-1], {**records[-1], "version": "v9"}]):
+                with self.subTest(phase=phase), self.assertRaises(AssertionError):
+                    campaign.validate_matrix(altered, phase, "history-large")
 
     def test_omitted_or_reordered_previous_view_is_rejected(self):
         for change in (lambda records: records[3]["result"]["old_views"].pop(),

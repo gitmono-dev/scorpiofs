@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Runs only on a newly created disposable Ubuntu amd64 benchmark ECS.
-# Credentials, Actions registration, and measured workloads are deliberately absent.
+# Account credentials and measured workloads are deliberately absent.
 set -Eeuo pipefail
 umask 022
 
 readonly RUN_ID='${run_id}'
+readonly TEST_TIER='${test_tier}'
+readonly MINIMUM_CPUS='${minimum_cpus}'
+readonly MINIMUM_MEMORY_GIB='${minimum_memory_gib}'
+readonly MINIMUM_FREE_BYTES='${minimum_free_bytes}'
 readonly STARTED_UTC='${session_started_utc}'
 readonly DEADLINE_UTC='${session_deadline_utc}'
 readonly EXPIRES_AT='${expires_at}'
@@ -73,29 +77,35 @@ fi
 mountpoint -q "$DATA_ROOT" || mount "$DATA_ROOT"
 test "$(findmnt -n -o UUID --target "$DATA_ROOT")" = "$UUID" || fail mounted_wrong_filesystem
 test "$(findmnt -n -o TARGET --target "$DATA_ROOT")" = "$DATA_ROOT" || fail data_mount_missing
-test "$(df -B1 --output=avail "$DATA_ROOT" | tail -1 | tr -d ' ')" -ge 116412113924 || fail insufficient_campaign_disk
+test "$(df -B1 --output=avail "$DATA_ROOT" | tail -1 | tr -d ' ')" -ge "$MINIMUM_FREE_BYTES" || fail insufficient_campaign_disk
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y ca-certificates curl gnupg sudo git jq python3 pkg-config libssl-dev libfuse3-dev fuse3 protobuf-compiler postgresql-client build-essential
+apt-get install -y ca-certificates curl gnupg sudo git jq python3 python3-venv pkg-config libssl-dev libfuse3-dev fuse3 protobuf-compiler postgresql-client build-essential
 install -d -m 0755 /etc/apt/keyrings
 curl --retry 2 --max-time 90 --proto '=https' --tlsv1.2 -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 chmod 0644 /etc/apt/keyrings/docker.asc
 . /etc/os-release
 test "$ID" = ubuntu || fail unsupported_distribution
-case "$VERSION_ID" in 22.04|24.04) ;; *) fail unsupported_ubuntu_version ;; esac
+case "$VERSION_ID" in 24.04) ;; *) fail unsupported_ubuntu_version ;; esac
 printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://mirrors.aliyun.com/docker-ce/linux/ubuntu %s stable\n' "$VERSION_CODENAME" > /etc/apt/sources.list.d/docker.list
 apt-get update -y
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
 if ! id benchmark >/dev/null 2>&1; then
-  useradd --create-home --home-dir "$DATA_ROOT/runner-home" --shell /bin/bash benchmark
+  useradd --create-home --home-dir "$DATA_ROOT/test-home" --shell /bin/bash benchmark
 fi
-test "$(getent passwd benchmark | cut -d: -f6)" = "$DATA_ROOT/runner-home" || fail runner_home_mismatch
+test "$(getent passwd benchmark | cut -d: -f6)" = "$DATA_ROOT/test-home" || fail test_home_mismatch
 usermod -aG docker benchmark
-for directory in cargo rustup runner-home work tmp evidence; do
+for directory in cargo rustup test-home work tmp evidence; do
   install -d -m 0750 -o benchmark -g benchmark "$DATA_ROOT/$directory"
 done
+# The official OSS SDK signs transfers using ephemeral ECS role credentials.
+# Keep this environment root-owned: Cloud Assistant controls the transfer service.
+install -d -m 0755 -o root -g root "$DATA_ROOT/sdk"
+python3 -m venv "$DATA_ROOT/sdk"
+"$DATA_ROOT/sdk/bin/python" -m pip --isolated install --disable-pip-version-check --no-cache-dir --index-url https://pypi.org/simple 'oss2==2.19.1'
+"$DATA_ROOT/sdk/bin/python" -c 'import oss2; assert oss2.__version__ == "2.19.1"'
 install -d -m 0711 -o root -g root "$DATA_ROOT/docker"
 install -d -m 0755 -o root -g root /etc/docker
 printf '{"data-root":"%s/docker","registry-mirrors":["https://docker.m.daocloud.io"]}\n' "$DATA_ROOT" > /etc/docker/daemon.json
@@ -127,11 +137,11 @@ done
 printf 'export CARGO_HOME=%s/cargo\nexport RUSTUP_HOME=%s/rustup\nexport TMPDIR=%s/tmp\nexport PATH=%s/cargo/bin:$PATH\n' "$DATA_ROOT" "$DATA_ROOT" "$DATA_ROOT" "$DATA_ROOT" > /etc/profile.d/scorpiofs-benchmark.sh
 runuser -u benchmark -- env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" rustc --version
 
-# Registration checks this root-owned receipt, the original window, and the mount.
+# The direct controller checks this receipt, the original window, and the mount.
 # The public instance type is separately checked by the external controller.
-RUNNER_UID=$(id -u benchmark)
-RUNNER_GID=$(id -g benchmark)
-export RUN_ID STARTED_UTC DEADLINE_UTC EXPIRES_AT DATA_ROOT DEVICE UUID RUNNER_UID RUNNER_GID READY
+TEST_UID=$(id -u benchmark)
+TEST_GID=$(id -g benchmark)
+export RUN_ID TEST_TIER MINIMUM_CPUS MINIMUM_MEMORY_GIB MINIMUM_FREE_BYTES STARTED_UTC DEADLINE_UTC EXPIRES_AT DATA_ROOT DEVICE UUID TEST_UID TEST_GID READY
 python3 - <<'PY'
 import datetime
 import json
@@ -144,16 +154,16 @@ memory = int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().
                   if line.startswith('MemTotal:'))) * 1024
 cpus = os.cpu_count()
 free = shutil.disk_usage(env['DATA_ROOT']).free
-if cpus < 8 or memory < 30 * 1024 ** 3 or free < 116412113924:
+if cpus < int(env['MINIMUM_CPUS']) or memory < int(env['MINIMUM_MEMORY_GIB']) * 1024 ** 3 or free < int(env['MINIMUM_FREE_BYTES']):
     raise SystemExit('benchmark runtime shape or remaining disk is insufficient')
 if datetime.datetime.now(datetime.timezone.utc) >= datetime.datetime.fromisoformat(env['EXPIRES_AT'].replace('Z', '+00:00')):
     raise SystemExit('original hard release deadline is exhausted')
-receipt = dict(revision=1, status='ready', campaign_id=env['RUN_ID'],
-               runner_label='scorpiofs-' + env['RUN_ID'],
+receipt = dict(revision=2, status='ready', campaign_id=env['RUN_ID'],
+               test_tier=env['TEST_TIER'], execution_mode='cloud-assistant',
                session_started_utc=env['STARTED_UTC'], session_deadline_utc=env['DEADLINE_UTC'],
                hard_release_utc=env['EXPIRES_AT'], data_root=env['DATA_ROOT'],
-               runner_arch='linux-x64', runner_user='benchmark',
-               runner_uid=int(env['RUNNER_UID']), runner_gid=int(env['RUNNER_GID']),
+               test_arch='linux-x64', test_user='benchmark',
+               test_uid=int(env['TEST_UID']), test_gid=int(env['TEST_GID']),
                disk_device=env['DEVICE'], disk_uuid=env['UUID'], disk_free_bytes=free,
                logical_cpus=cpus, memory_bytes=memory)
 target = Path(env['READY'])

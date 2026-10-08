@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 import re
 import stat
 from datetime import timedelta
@@ -17,6 +17,7 @@ import workspace_update_campaign as campaign
 import workspace_update_observation as observation
 import workspace_update_profile as profiles
 import workspace_update_size as fixture_size
+import workspace_update_execution as execution
 from workspace_update_size import consume_regular
 
 ROOT_FILES = {"campaign.json", "canonical-seed.json", "backend-owners.json", "failure.json"}
@@ -26,10 +27,12 @@ OWNER_FIELDS = {"phase", "round", "client", "project", "database", "instance_id"
 RUN_FIELDS = {"revision", "run_id", "attempt", "harness_sha", "mega_sha", "baseline_sha", "candidate_sha",
               "profile", "rounds", "comparison", "bootstrap_commit_time", "session_started_utc",
               "session_deadline_utc", "cleanup_deadline_monotonic", "owned_root"}
+DIRECT_RUN_FIELDS = RUN_FIELDS | execution.DIRECT_FIELDS
 
 
 def run_metadata_from_env():
-    value = {"revision": 1, "run_id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+    context = execution.identity()
+    value = {"revision": 1, "run_id": context["run_id"], "attempt": context["attempt"],
         "harness_sha": os.environ["SCORPIO_SHA"], "mega_sha": os.environ["MEGA_SHA"],
         "baseline_sha": os.environ["BASELINE_SHA"], "candidate_sha": os.environ["CANDIDATE_SHA"],
         "profile": os.environ["PROFILE"], "rounds": int(os.environ["ROUNDS"]), "comparison": os.environ["COMPARISON"],
@@ -37,14 +40,22 @@ def run_metadata_from_env():
         "session_started_utc": os.environ["STARTED_INPUT"], "session_deadline_utc": os.environ["DEADLINE_INPUT"],
         "cleanup_deadline_monotonic": float(os.environ["MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"]),
         "owned_root": os.environ["MST2_OWNED_ROOT"]}
-    proofs.exact(value["harness_sha"], os.environ["GITHUB_SHA"])
-    proofs.exact(value["owned_root"], str(PurePosixPath(os.environ["RUNNER_TEMP"]) / f"mst2-real-{value['run_id']}-{value['attempt']}"))
+    if context["execution_provider"] == "github-actions":
+        proofs.exact(value["harness_sha"], os.environ["GITHUB_SHA"])
+        proofs.exact(value["owned_root"], str(PurePosixPath(os.environ["RUNNER_TEMP"]) / f"mst2-real-{value['run_id']}-{value['attempt']}"))
+    else:
+        value.update(execution.metadata_fields(context))
+        for key in ("owned_root", "session_started_utc", "session_deadline_utc"):
+            proofs.exact(value[key], context[key])
     validate_run_metadata(value)
     return value
 
 
 def validate_run_metadata(value, complete=None):
-    proofs.shape(value, RUN_FIELDS)
+    direct = type(value) is dict and "execution_provider" in value
+    proofs.shape(value, DIRECT_RUN_FIELDS if direct else RUN_FIELDS)
+    if direct:
+        execution.validate_metadata(value)
     proofs.exact(value["revision"], 1)
     for key in ("run_id", "attempt"):
         proofs.require(type(value[key]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", value[key]))
@@ -56,10 +67,15 @@ def validate_run_metadata(value, complete=None):
     fixture_size.plan(value["profile"])
     proofs.integer(value["bootstrap_commit_time"], (1 << 32) - 1)
     proofs.finite(value["cleanup_deadline_monotonic"])
-    proofs.require(type(value["owned_root"]) is str and PurePosixPath(value["owned_root"]).is_absolute()
-                   and PurePosixPath(value["owned_root"]).name == f"mst2-real-{value['run_id']}-{value['attempt']}")
+    if not direct:
+        proofs.require(type(value["owned_root"]) is str and PurePosixPath(value["owned_root"]).is_absolute()
+                       and PurePosixPath(value["owned_root"]).name == f"mst2-real-{value['run_id']}-{value['attempt']}")
     proofs.exact(budgets.utc(value["session_deadline_utc"]), budgets.utc(value["session_started_utc"]) + timedelta(minutes=235))
     if complete is not None:
+        proofs.exact("execution_provider" in complete, direct)
+        if direct:
+            for key in execution.DIRECT_FIELDS:
+                proofs.exact(value[key], complete[key])
         for key in ("session_started_utc", "session_deadline_utc", "cleanup_deadline_monotonic"):
             proofs.exact(value[key], complete[key])
         proofs.exact(value["bootstrap_commit_time"], complete["canonical_seed"]["bootstrap_commit_time"])
@@ -84,7 +100,7 @@ def allowed(relative):
     if parts[1] == "diagnostic" and parts[2] != "round-01":
         return False
     if len(parts) == 4:
-        return re.fullmatch(r"v[1-4]-expected\.json", parts[3]) is not None
+        return parts[3] == "git-history.json" or re.fullmatch(r"v(?:[1-9]|10)-expected\.json", parts[3]) is not None
     return (parts[3] in (("client-a", "client-b") if parts[1] == "fair" else ("client-b",))
             and parts[4] in CLIENT_FILES)
 
@@ -202,12 +218,13 @@ def copy_safe(source, output, relative, bindings, deadline_utc):
     return write_safe(output, relative, write, bindings)
 
 
-def workspace_sink(path, records):
+def workspace_sink(path, records, profile="smoke"):
     raw, values = rows(path)
-    proofs.require(len(values) == 5 and len(records) == 4)
+    count = len(campaign.common.scenarios(profile))
+    proofs.require(len(values) == count + 1 and len(records) == count)
     bindings, footer = values[:-1], values[-1]
     for key in ("workspace_id", "generation", "store"):
-        proofs.require(len({binding[key] for binding in bindings}) == 4)
+        proofs.require(len({binding[key] for binding in bindings}) == count)
     proofs.shape(footer, observation.FOOTER_FIELDS)
     proofs.exact(footer["record"], "workspace_observation_footer")
     proofs.exact(footer["revision"], 1)
@@ -216,7 +233,7 @@ def workspace_sink(path, records):
     proofs.exact(footer["daemon_exit_code"], 0)
     proofs.exact(footer["first_error"], None)
     for key in ("accepted_records", "received_records", "written_records"):
-        proofs.exact(footer[key], 4)
+        proofs.exact(footer[key], count)
     proofs.exact(footer["written_bytes"], sum(len(line) + 1 for line in raw.split(b"\n")[:-2]))
     for binding, record in zip(bindings, records):
         observation.validate_binding(binding, footer["run_id"])
@@ -225,7 +242,7 @@ def workspace_sink(path, records):
     return raw
 
 
-def validate_saved_lane(root, records, owner, expected_sources, client_build):
+def validate_saved_lane(root, records, owner, expected_sources, client_build, profile="smoke"):
     entries = []
     for record in records:
         evidence = record["semantic_provenance"]
@@ -262,7 +279,7 @@ def validate_saved_lane(root, records, owner, expected_sources, client_build):
         proofs.exact(evidence["semantic"], semantic)
         for key in ("phase", "round", "client", "fixed_commit", "path_tree", "oracle_manifest_sha256"):
             proofs.exact(lane[key], record[key])
-        proofs.exact(lane["version"], list(campaign.common.SCENARIOS).index(record["version"]) + 1)
+        proofs.exact(lane["version"], list(campaign.common.scenarios(profile)).index(record["version"]) + 1)
         relative = record["manifest_relative_path"]
         proofs.exact(relative, f"measurements/{record['phase']}/round-{record['round']:02}/{record['version']}-expected.json")
         raw = read_regular(root / relative, fixture_size.ORACLE_MANIFEST_LIMIT)
@@ -286,15 +303,59 @@ def validate_saved_lane(root, records, owner, expected_sources, client_build):
             "actual_status": record["actual_status"], "scorpio": record["scorpio"], "git": record["git"],
             "old_views": record["old_views"]}})
     proofs.require(all(record["round_final_retained_views"] == records[0]["round_final_retained_views"] for record in records))
-    campaign.validate_workload(entries, records[0]["round_final_retained_views"])
+    campaign.validate_workload(entries, records[0]["round_final_retained_views"], profile)
     leaf = root / "measurements" / records[0]["phase"] / f"round-{records[0]['round']:02}" / ("client-" + records[0]["client"])
-    workspace_sink(leaf / "workspace-observation.jsonl", records)
+    workspace_sink(leaf / "workspace-observation.jsonl", records, profile)
     for name in ("owned-workspace-daemon.json", "owned-workspace-worker.json"):
         raw = read_regular(leaf / name, 4096)
         receipt = records[0]["cleanup_receipts"][name]
         proofs.exact(receipt["sha256"], hashlib.sha256(raw).hexdigest())
         proofs.exact(receipt["record"], observation.parse(raw))
         proofs.exact(receipt["record"]["cleanup_complete"], True)
+
+
+def validate_history(root, phase, number, seed_commit, records, profile):
+    """Replay raw Git parent links and real changes against saved full oracles."""
+    folder = Path(root) / "measurements" / phase / f"round-{number:02}"
+    history = observation.parse(read_regular(folder / "git-history.json", 1024 * 1024))
+    proofs.shape(history, {"revision", "profile", "round", "seed_commit", "commits"})
+    proofs.exact(history["revision"], 1)
+    proofs.exact(history["profile"], profile)
+    proofs.exact(history["round"], number)
+    proofs.exact(history["seed_commit"], seed_commit)
+    versions = list(campaign.common.scenarios(profile))
+    proofs.require(type(history["commits"]) is list and len(history["commits"]) == len(versions))
+    parent, previous, seen = seed_commit, None, set()
+    for version, receipt in zip(versions, history["commits"]):
+        proofs.shape(receipt, {"version", "commit", "tree", "parent", "commit_body_hex", "change_counts", "source_changes"})
+        proofs.exact(receipt["version"], version)
+        proofs.exact(receipt["parent"], parent)
+        proofs.hex_digest(receipt["commit"], 40)
+        proofs.hex_digest(receipt["tree"], 40)
+        text = receipt["commit_body_hex"]
+        proofs.require(type(text) is str and len(text) <= 128 * 1024
+                       and re.fullmatch(r"(?:[0-9a-f]{2})+", text) is not None)
+        body = bytes.fromhex(text)
+        digest = hashlib.sha1(b"commit " + str(len(body)).encode() + b"\0" + body).hexdigest()
+        proofs.exact(receipt["commit"], digest)
+        headers = body.split(b"\n\n", 1)[0].split(b"\n")
+        proofs.exact([line for line in headers if line.startswith(b"tree ")], [("tree " + receipt["tree"]).encode()])
+        proofs.exact([line for line in headers if line.startswith(b"parent ")], [("parent " + parent).encode()])
+        proofs.require(digest not in seen)
+        seen.add(digest)
+        raw = read_regular(folder / f"{version}-expected.json", fixture_size.ORACLE_MANIFEST_LIMIT)
+        expected = observation.parse(raw)
+        fixture_size.validate_manifest(expected)
+        proofs.exact(receipt["change_counts"], campaign.common.manifest_changes(expected, previous))
+        proofs.exact(receipt["source_changes"], campaign.common.history_change(previous, expected, version))
+        lane_records = [record for record in records if record["round"] == number and record["version"] == version]
+        proofs.exact(len(lane_records), 2 if phase == "fair" else 1)
+        for record in lane_records:
+            proofs.exact(record["fixed_commit"], digest)
+            proofs.exact(record["path_tree"], receipt["tree"])
+            proofs.exact(record["oracle_manifest_sha256"], hashlib.sha256(raw).hexdigest())
+        parent, previous = digest, expected
+    return history
 
 
 def validate_seed(value):
@@ -325,22 +386,26 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_
     """Replay complete artifacts; this is not authority to start a backend."""
     root = Path(root)
     value = observation.parse(read_regular(root / "campaign.json", 2 * 1024 * 1024))
-    proofs.shape(value, {"revision", "record", "correctness", "session_started_utc", "session_deadline_utc",
+    complete_fields = {"revision", "record", "correctness", "session_started_utc", "session_deadline_utc",
         "cleanup_deadline_monotonic", "sources", "canonical_seed", "server_build", "server_build_receipt_sha256",
         "fair_records", "diagnostic_records", "fair_full_oracle_walks", "diagnostic_full_oracle_walks", "cleanup",
-        "phase_measurements_sha256", "elapsed_execution_seconds", "performance_claims"})
+        "phase_measurements_sha256", "elapsed_execution_seconds", "performance_claims"}
+    proofs.shape(value, complete_fields | (execution.DIRECT_FIELDS if "execution_provider" in value else set()))
     proofs.exact(value["revision"], 1)
     proofs.shape(value["sources"], {"a", "b"})
     proofs.shape(value["phase_measurements_sha256"], {"fair", "diagnostic"})
     proofs.require(value["record"] == "isolated_campaign_complete" and value["correctness"] == "PASS")
-    proofs.exact(value["fair_records"], 24)
-    proofs.exact(value["diagnostic_records"], 4)
-    proofs.exact(value["fair_full_oracle_walks"], 108)
-    proofs.exact(value["diagnostic_full_oracle_walks"], 18)
     proofs.exact(value["cleanup"]["owners"], 7)
     proofs.exact(value["cleanup"]["closed"], True)
     metadata = validate_run_metadata(run_metadata if run_metadata is not None else
         observation.parse(read_regular(root / "run.json", 16384)), value)
+    profile = metadata["profile"]
+    scenarios = campaign.common.scenarios(profile)
+    count, walks = len(scenarios), campaign.full_oracle_walks(profile)
+    proofs.exact(value["fair_records"], 6 * count)
+    proofs.exact(value["diagnostic_records"], count)
+    proofs.exact(value["fair_full_oracle_walks"], 6 * walks)
+    proofs.exact(value["diagnostic_full_oracle_walks"], walks)
     seed = validate_seed(observation.parse(read_regular(root / "canonical-seed.json", 65536)))
     proofs.exact(seed, value["canonical_seed"])
     build_receipts = build_receipts or {label: root / ("server-build.json" if label == "server" else "client-" + label + "-build.json")
@@ -355,7 +420,10 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_
         proofs.exact(build["revision"], 1)
         proofs.exact(build["label"], label)
         proofs.exact(build["build_env"], builds.BUILD_ENV)
-        proofs.exact(build["build_argv"], builds.build_argv(Path(build["source"]), "mega2" if label == "server" else "scorpio"))
+        # Replay the producer's path syntax, independently of this machine.
+        source_path = (PurePosixPath(build["source"]) if build["source"].startswith("/")
+                       else PureWindowsPath(build["source"]))
+        proofs.exact(build["build_argv"], builds.build_argv(source_path, "mega2" if label == "server" else "scorpio"))
         actual_builds[label] = build
         actual_build_hashes[label] = hashlib.sha256(raw).hexdigest()
         if label == "server":
@@ -436,25 +504,30 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_
             proofs.exact(environment[0][key], value[key])
         proofs.exact(environment[0]["run_id"], metadata["run_id"])
         proofs.exact(environment[0]["run_attempt"], metadata["attempt"])
+        if "execution_provider" in metadata:
+            for key in execution.DIRECT_FIELDS:
+                proofs.exact(environment[0][key], metadata[key])
         proofs.exact(environment[0]["profile"], metadata["profile"])
         proofs.exact(environment[0]["rounds"], 3 if phase == "fair" else 1)
-        campaign.validate_matrix(records, phase)
+        campaign.validate_matrix(records, phase, profile)
         proofs.require(len([row for row in all_rows if row.get("record") == "complete"]) == 1)
         complete = [row for row in all_rows if row.get("record") == "complete"][0]
-        proofs.exact(complete["round_scenarios"], 24 if phase == "fair" else 4)
-        proofs.exact(complete["full_oracle_walks"], 108 if phase == "fair" else 18)
+        proofs.exact(complete["round_scenarios"], count * (6 if phase == "fair" else 1))
+        proofs.exact(complete["full_oracle_walks"], walks * (6 if phase == "fair" else 1))
         proofs.exact(complete["correctness"], "PASS")
         proofs.exact(complete["campaign_cleanup_complete"], True)
         for number in (range(1, 4) if phase == "fair" else (1,)):
+            if profile == "history-large":
+                validate_history(root, phase, number, seed["commit"], records, profile)
             for label in (("a", "b") if phase == "fair" else ("b",)):
                 lane = sorted([record for record in records if record["round"] == number and record["client"] == label],
-                              key=lambda row: row["version"])
-                validate_saved_lane(root, lane, owner_map[(phase, number, label)], value["sources"][label], actual_builds[label])
+                              key=lambda row: list(scenarios).index(row["version"]))
+                validate_saved_lane(root, lane, owner_map[(phase, number, label)], value["sources"][label], actual_builds[label], profile)
                 for record in lane:
                     proofs.exact(inventory_map[(phase, number, label)]["client_cleanup"], record["cleanup_receipts"])
         phases[phase] = records
     for number in range(1, 4):
-        for version in campaign.common.SCENARIOS:
+        for version in scenarios:
             pair = [r for r in phases["fair"] if r["round"] == number and r["version"] == version]
             proofs.compare_pair_values(*(record["semantic_provenance"] for record in pair))
     return value

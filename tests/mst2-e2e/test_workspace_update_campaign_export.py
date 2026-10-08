@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -127,11 +127,14 @@ class CampaignExportTests(unittest.TestCase):
                      "measurements/diagnostic/round-02/v1-expected.json",
                      "measurements/diagnostic/round-01/client-a/workspace-observation.jsonl",
                      "measurements/fair/round-01/client-c/owned-workspace-worker.json",
-                     "measurements/fair/round-01/v5-expected.json"):
+                     "measurements/fair/round-01/v11-expected.json",
+                     "measurements/fair/round-01/v01-expected.json"):
             self.assertFalse(export_module.allowed(path), path)
         self.assertTrue(export_module.allowed("measurements/diagnostic/round-01/client-b/workspace-observation.jsonl"))
+        self.assertTrue(export_module.allowed("measurements/fair/round-01/v10-expected.json"))
+        self.assertTrue(export_module.allowed("measurements/fair/round-01/git-history.json"))
 
-    def replay_lane(self, fixture, phase="fair", number=1, label="a"):
+    def replay_lane(self, fixture, phase="fair", number=1, label="a", profile="smoke"):
         key = f"{phase}-r{number:02}-{label}"
         owner_root = getattr(self, "fixture_owned_root", "/owned") + "/backends/" + key
         runtime = fixture.runtime(label, phase=phase, round=number, base_dir=owner_root + "/service-data",
@@ -152,9 +155,10 @@ class CampaignExportTests(unittest.TestCase):
             projection_sink_inode=number * 100 + (1 if label == "a" else 2) + (1000 if phase == "diagnostic" else 0),
             native_json=export_module.proofs.canonical(native), identity_rows_json=export_module.proofs.canonical(rows))
         captured = fixture.capture(label, runtime=runtime)
-        workload, final = workload_fixtures.workload()
+        workload, final = workload_fixtures.workload(profile)
+        count = len(workload)
         lanes, payloads = [], []
-        for index in range(4):
+        for index in range(count):
             lane = fixture.lane(captured)
             lane["version"] = index + 1
             binding = lane["workspace_binding"]
@@ -178,12 +182,12 @@ class CampaignExportTests(unittest.TestCase):
         for lane in lanes:
             fixture.set_sink(lane, payloads, captured.evidence["runtime"])
             lane["projection_sink"].update(registered_receipts=[l["workspace_binding"]["resolve_trace_receipt"] for l in lanes],
-                                            expected_final_count=4)
+                                            expected_final_count=count)
         leaf = self.root / f"measurements/{phase}/round-{number:02}/client-{label}"
         leaf.mkdir(exist_ok=True)
         bindings_raw = b"".join((export_module.proofs.canonical(lane["workspace_binding"]) + "\n").encode() for lane in lanes)
         footer = {"record": "workspace_observation_footer", "revision": 1, "run_id": lanes[0]["workspace_binding"]["run_id"],
-            "accepted_records": 4, "received_records": 4, "written_records": 4, "written_bytes": len(bindings_raw),
+            "accepted_records": count, "received_records": count, "written_records": count, "written_bytes": len(bindings_raw),
             "producers_closed": True, "drained": True, "daemon_exit_code": 0, "complete": True, "first_error": None}
         sink_raw = bindings_raw + (export_module.proofs.canonical(footer) + "\n").encode()
         (leaf / "workspace-observation.jsonl").write_bytes(sink_raw)
@@ -208,7 +212,8 @@ class CampaignExportTests(unittest.TestCase):
                 old = deepcopy(final["views"][0])
                 old.update({key: previous["workspace_binding"][key] for key in ("workspace_id", "generation", "snapshot_id")})
                 result["old_views"].append(old)
-            record = {"record": "round", "revision": 2, "correctness": "PASS", "lane_full_oracle_walks": 18,
+            record = {"record": "round", "revision": 2, "correctness": "PASS",
+                "lane_full_oracle_walks": export_module.campaign.full_oracle_walks(profile),
                 "phase": phase, "round": number, "client": label, "version": "v" + str(index + 1),
                 "fixed_commit": lane["fixed_commit"], "path_tree": lane["path_tree"],
                 "oracle_manifest_sha256": lane["oracle_manifest_sha256"], "manifest": workload[index]["manifest"],
@@ -222,14 +227,15 @@ class CampaignExportTests(unittest.TestCase):
             records.append(record)
         final["views"] = []
         for record in records:
-            old = deepcopy(workload_fixtures.workload()[1]["views"][0])
+            old = deepcopy(workload_fixtures.workload(profile)[1]["views"][0])
             old.update({key: record["workspace_binding"][key] for key in ("workspace_id", "generation", "snapshot_id")})
             final["views"].append(old)
         for record in records:
             record["round_final_retained_views"] = final
         owner = {"root": owner_root, **{key: captured.evidence["runtime"][key]
             for key in ("phase", "round", "client", "project", "database", "instance_id", "service_pid", "service_starttime")}}
-        export_module.validate_saved_lane(self.root, records, owner, captured.evidence["sources"], captured.evidence["client_build"])
+        export_module.validate_saved_lane(self.root, records, owner, captured.evidence["sources"],
+                                          captured.evidence["client_build"], profile)
         return records, owner, captured, leaf, bindings_raw, sink_raw
 
     def proof_fixture(self):
@@ -268,12 +274,53 @@ class CampaignExportTests(unittest.TestCase):
                     with self.assertRaises(export_module.proofs.ProofRejected):
                         export_module.proofs.validate_lane_values(altered["lane"], altered["capture"])
 
+    def test_ten_commit_saved_lane_replays_all_manifests_bindings_and_retained_views(self):
+        # Typed fixtures verify the evidence contract, not native performance.
+        records, owner, captured, _leaf, _bindings, _sink = self.replay_lane(
+            self.proof_fixture(), profile="history-large")
+        self.assertEqual([record["version"] for record in records], [f"v{index}" for index in range(1, 11)])
+        self.assertTrue(all(record["lane_full_oracle_walks"] == 75 for record in records))
+        self.assertEqual(records[-1]["round_final_retained_views"]["retained"], 10)
+        export_module.validate_saved_lane(self.root, records, owner, captured.evidence["sources"],
+                                          captured.evidence["client_build"], "history-large")
+
+    def test_ten_commit_saved_lane_rejects_missing_duplicate_order_and_old_view_tampering(self):
+        records, owner, captured, _leaf, _bindings, _sink = self.replay_lane(
+            self.proof_fixture(), profile="history-large")
+        mutations = (lambda rows: rows.pop(),
+                     lambda rows: rows.__setitem__(-1, deepcopy(rows[-2])),
+                     lambda rows: rows.sort(key=lambda row: row["version"]),
+                     lambda rows: rows[-1]["old_views"][0].update(fd_verified=False),
+                     lambda rows: rows[-1]["old_views"][0].update(dirty_upper_verified=False))
+        for index, change in enumerate(mutations):
+            altered = deepcopy(records)
+            change(altered)
+            with self.subTest(mutation=index), self.assertRaises(AssertionError):
+                export_module.validate_saved_lane(self.root, altered, owner, captured.evidence["sources"],
+                                                  captured.evidence["client_build"], "history-large")
+
+    def test_ten_commit_saved_lane_rejects_incomplete_footer_or_missing_tenth_manifest(self):
+        records, owner, captured, leaf, bindings_raw, sink_raw = self.replay_lane(
+            self.proof_fixture(), profile="history-large")
+        footer = json.loads(sink_raw.splitlines()[-1])
+        footer["written_records"] = 9
+        (leaf / "workspace-observation.jsonl").write_bytes(
+            bindings_raw + (export_module.proofs.canonical(footer) + "\n").encode())
+        with self.assertRaises(AssertionError):
+            export_module.validate_saved_lane(self.root, records, owner, captured.evidence["sources"],
+                                              captured.evidence["client_build"], "history-large")
+        (leaf / "workspace-observation.jsonl").write_bytes(sink_raw)
+        (self.root / records[-1]["manifest_relative_path"]).unlink()
+        with self.assertRaises((AssertionError, FileNotFoundError)):
+            export_module.validate_saved_lane(self.root, records, owner, captured.evidence["sources"],
+                                              captured.evidence["client_build"], "history-large")
+
     def test_full_28_record_export_accepts_z_deadline_with_normalized_owners_and_rejects_tampering(self):
         fixture = self.proof_fixture()
         sources = deepcopy(fixture.sources)
         server = {"revision": 1, "label": "server", "source": "/immutable/server", "source_sha": "1" * 40,
             "cargo_lock_sha256": "4" * 64, "binary": "/immutable/server/target/release/mega2", "binary_sha256": "3" * 64,
-            "build_argv": export_module.builds.build_argv(Path("/immutable/server"), "mega2"),
+            "build_argv": export_module.builds.build_argv(PurePosixPath("/immutable/server"), "mega2"),
             "build_env": export_module.builds.BUILD_ENV, "rustc_version": sources["a"]["rustc_version"],
             "cargo_version": sources["a"]["cargo_version"]}
         server_path = Path(self.temp.name) / "server-build.json"
