@@ -10,5 +10,5 @@
   "ssh_identity_file": "REPLACE_WITH_ABSOLUTE_EXISTING_IDENTITY_PATH",
   "harness_ref": "REPLACE_WITH_REVIEWED_HARNESS_BRANCH_OR_TAG",
   "harness_sha": "REPLACE_WITH_IMMUTABLE_40_HEX_HARNESS_COMMIT",
-  "profile": "large"
+  "profile": "history-large"
 }

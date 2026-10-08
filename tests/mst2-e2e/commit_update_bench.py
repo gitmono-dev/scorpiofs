@@ -34,6 +34,13 @@ except ModuleNotFoundError:
 
 SCENARIOS = {"v1": "cold", "v2": "single-file", "v3": "subtree-rename",
              "v4": "batch-file-update"}
+HISTORY_SCENARIOS = {"v1": "cold", **{f"v{number}": "full-module-rewrite"
+                     for number in range(2, 11)}}
+
+
+def scenarios(profile):
+    fixture_size.shape(profile)
+    return dict(HISTORY_SCENARIOS if profile == "history-large" else SCENARIOS)
 
 
 # Duplicated deliberately at this boundary: the benchmark must remain able
@@ -538,7 +545,7 @@ def verify_worktree(worktree, expected, deadline=None):
 
 
 def create_version(repo, round_number, version, profile, deadline):
-    if version not in SCENARIOS:
+    if version not in scenarios(profile):
         raise ValueError("unknown fixed commit-update scenario")
     fixture_size.plan(profile)
     modules, buckets, files, size = fixture_size.shape(profile)
@@ -556,14 +563,35 @@ def create_version(repo, round_number, version, profile, deadline):
                     if time.monotonic() >= deadline:
                         raise TimeoutError("fixture generation exceeded the shared deadline")
                     name = f"{prefix}/m{module:03}/d{bucket:02}/f{number:03}"
-                    block = hashlib.sha256(name.encode()).digest()
-                    (repo / name).write_bytes(block * (size // len(block)))
+                    if profile == "history-large":
+                        body = hashlib.shake_256(("history:" + version + ":" + name).encode()).digest(size)
+                    else:
+                        block = hashlib.sha256(name.encode()).digest()
+                        body = block * (size // len(block))
+                    (repo / name).write_bytes(body)
         wide = repo / prefix / "wide"
         wide.mkdir()
         for number in range(129):
             (wide / f"f{number:03}").write_bytes(hashlib.sha256(f"{prefix}/wide/{number}".encode()).digest())
         (repo / prefix / "large.bin").write_bytes(hashlib.sha256(prefix.encode()).digest() *
                                                   ((65536 if smoke else 2097152) // 32))
+        git(repo, deadline, "add", "--", prefix)
+    elif profile == "history-large":
+        # Each measured incremental commit replaces all module bodies. The
+        # version salt prevents later commits from repeating identical bytes.
+        # Keep the namespace stable so old-view checks exercise byte retention.
+        for module in range(modules):
+            for bucket in range(buckets):
+                for number in range(files):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("history fixture generation exceeded the shared deadline")
+                    rel = f"{prefix}/m{module:03}/d{bucket:02}/f{number:03}"
+                    path = repo / rel
+                    if path.stat().st_size != size:
+                        raise AssertionError("history fixture source body size changed")
+                    path.write_bytes(hashlib.shake_256(("history:" + version + ":" + rel).encode()).digest(size))
+        # One directory argument keeps argv bounded and avoids a Git process
+        # for every leaf directory in this performance-sensitive fixture setup.
         git(repo, deadline, "add", "--", prefix)
     elif version == "v2":
         path = repo / prefix / "m000/d00/f000"
@@ -594,6 +622,12 @@ def create_version(repo, round_number, version, profile, deadline):
                     changed.append(rel)
         git(repo, deadline, "add", "--", *changed)
     parent = git(repo, deadline, "rev-parse", "HEAD").decode().strip()
+    if profile == "history-large":
+        # The canonical seed already fixes its timestamp. Derive every later
+        # timestamp from its parent, so the same seed/round/version reproduces
+        # the exact commit rather than incorporating the wall clock.
+        stamp = int(git(repo, deadline, "show", "-s", "--format=%ct", parent)) + 1
+        user.update(GIT_AUTHOR_DATE=f"@{stamp} +0000", GIT_COMMITTER_DATE=f"@{stamp} +0000")
     tree = git(repo, deadline, "write-tree").decode().strip()
     # Preserve raw empty directories and a logical directory alias in every
     # Git commit. Git checkout omits empty trees; MST/2 full closure must not.
@@ -607,6 +641,86 @@ def create_version(repo, round_number, version, profile, deadline):
                  data=f"MST2 benchmark round {round_number} {version}\n".encode()).decode().strip()
     git(repo, deadline, "update-ref", "refs/heads/main", commit, parent)
     return commit, tree
+
+
+def _manifest_files(expected):
+    if expected is None:
+        return {}
+    fixture_size.validate_manifest(expected)
+    return {file["rel_path"]: file for file in expected["files"]}
+
+
+def manifest_changes(expected, previous=None):
+    """Derive logical file changes from two independently hashed manifests."""
+    current, old = _manifest_files(expected), _manifest_files(previous)
+    added, deleted = current.keys() - old.keys(), old.keys() - current.keys()
+    modified = {path for path in current.keys() & old.keys() if current[path] != old[path]}
+    return {"files_added": len(added), "files_deleted": len(deleted),
+            "files_modified": len(modified),
+            "added_or_modified_bytes": sum(current[path]["size"] for path in added | modified)}
+
+
+def history_change(previous, current, version):
+    """Require the complete version-specific rewrite, without alias credit."""
+    if version not in HISTORY_SCENARIOS:
+        raise ValueError("unknown measured history version")
+    files, old = _manifest_files(current), _manifest_files(previous)
+    source = re.compile(r"r[0-9]{2}/m[0-9]{3}/d[0-9]{2}/f[0-9]{3}")
+    fresh = {path: file for path, file in files.items() if source.fullmatch(path)}
+    prior = {path: file for path, file in old.items() if source.fullmatch(path)}
+    modules, buckets, count, body_size = fixture_size.shape("history-large")
+    minimum = modules * buckets * count
+    prefixes = {path.split("/")[0] for path in fresh}
+    if len(prefixes) != 1:
+        raise AssertionError("history source round prefix differs")
+    prefix = next(iter(prefixes))
+    wanted = {f"{prefix}/m{module:03}/d{bucket:02}/f{number:03}"
+              for module in range(modules) for bucket in range(buckets) for number in range(count)}
+    if (fresh.keys() != wanted or any(file["size"] != body_size
+            or file["fs_kind"] != "regular" for file in fresh.values())):
+        raise AssertionError("history source namespace or body size differs")
+    added, deleted = fresh.keys() - prior.keys(), prior.keys() - fresh.keys()
+    changed = {path for path in fresh if path not in prior
+               or fresh[path]["content_digest"] != prior[path]["content_digest"]}
+    if version == "v1":
+        if previous is not None or len(added) != minimum:
+            raise AssertionError("history cold commit must populate an empty tracked namespace")
+    elif (previous is None or fresh.keys() != prior.keys() or files.keys() != old.keys()
+          or current["directories"] != previous["directories"] or len(changed) != minimum
+          or any(fresh[path]["fs_kind"] != prior[path]["fs_kind"]
+                 or fresh[path]["size"] != prior[path]["size"] for path in fresh)
+          or any(files[path] != old[path] for path in files.keys() - fresh.keys()
+                 if not path.startswith("alias-"))):
+        raise AssertionError("history commit did not rewrite every stable source file")
+    changed_bytes = sum(fresh[path]["size"] for path in changed)
+    distinct = len({fresh[path]["content_digest"] for path in changed})
+    if len(changed) != minimum or changed_bytes != minimum * body_size or distinct != minimum:
+        raise AssertionError("history commit lacks the required distinct changed bytes")
+    return {"changed_source_files": len(changed), "changed_source_bytes": changed_bytes,
+            "distinct_changed_source_blobs": distinct, "added_source_files": len(added),
+            "removed_source_files": len(deleted)}
+
+
+def commit_receipt(repo, commit, version, expected, previous, deadline):
+    """Bind raw Git history to manifests; no second full body read is needed."""
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise ValueError("history commit must be an immutable Git SHA1")
+    size = int(git(repo, deadline, "cat-file", "-s", commit))
+    if not 0 < size <= 64 * 1024:
+        raise AssertionError("history commit body exceeds its evidence ceiling")
+    raw = git(repo, deadline, "cat-file", "commit", commit)
+    if len(raw) != size or hashlib.sha1(b"commit " + str(len(raw)).encode() + b"\0" + raw).hexdigest() != commit:
+        raise AssertionError("history raw commit body differs from its Git identity")
+    headers, separator, _message = raw.partition(b"\n\n")
+    trees = [line[5:] for line in headers.splitlines() if line.startswith(b"tree ")]
+    parents = [line[7:] for line in headers.splitlines() if line.startswith(b"parent ")]
+    if (not separator or len(trees) != 1 or len(parents) != 1
+            or any(re.fullmatch(b"[0-9a-f]{40}", item) is None for item in trees + parents)):
+        raise AssertionError("history requires one fixed tree and one parent per commit")
+    return {"version": version, "commit": commit, "tree": trees[0].decode(),
+            "parent": parents[0].decode(), "commit_body_hex": raw.hex(),
+            "change_counts": manifest_changes(expected, previous),
+            "source_changes": history_change(previous, expected, version)}
 
 
 def percentile(values, percentage):
@@ -676,7 +790,7 @@ if __name__ == "__main__":
                           "paired_sources": comparison_pair(
                               opts.baseline_sha, opts.candidate_sha) if opts.paired else None,
                           "fixture_admission": fixture_size.plan(opts.profile),
-                          "scenarios": [version + "-" + scenario for version, scenario in SCENARIOS.items()],
+                          "scenarios": [version + "-" + scenario for version, scenario in scenarios(opts.profile).items()],
                           "max_wall_seconds": min(opts.deadline_seconds, 14400),
                           "service_or_resource_changes": False,
                           "git_baseline": "cold depth=1 fetch, incremental shared bare ODB fetch, new detached worktree per fixed commit, retained old worktrees, shared streamed oracle",

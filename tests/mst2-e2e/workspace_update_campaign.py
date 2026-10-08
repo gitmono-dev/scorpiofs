@@ -182,9 +182,16 @@ def validate_view(view, previous):
     validate_oracle(view["oracle"], previous["manifest"], dirty=True)
 
 
-def validate_workload(records, final):
-    """Bind all 18 full walks, old identities, dirty uppers and FDs per lane."""
-    proofs.require(len(records) == 4 and [r["version"] for r in records] == list(common.SCENARIOS))
+def full_oracle_walks(profile):
+    count = len(common.scenarios(profile))
+    return 3 * count + count * (count - 1) // 2
+
+
+def validate_workload(records, final, profile="smoke"):
+    """Bind every full walk, old identity, dirty upper and FD per lane."""
+    versions = list(common.scenarios(profile))
+    count = len(versions)
+    proofs.require(len(records) == count and [r["version"] for r in records] == versions)
     walks = 0
     for index, record in enumerate(records):
         result = record["result"]
@@ -201,14 +208,14 @@ def validate_workload(records, final):
             validate_view(old, previous)
             walks += 1
     proofs.shape(final, {"retained", "verified", "views", "final_retained_view_audit_ms"})
-    proofs.exact(final["retained"], 4)
+    proofs.exact(final["retained"], count)
     proofs.exact(final["verified"], True)
-    proofs.require(type(final["views"]) is list and len(final["views"]) == 4)
+    proofs.require(type(final["views"]) is list and len(final["views"]) == count)
     proofs.finite(final["final_retained_view_audit_ms"])
     for view, previous in zip(final["views"], records):
         validate_view(view, previous)
         walks += 1
-    proofs.require(walks == 18)
+    proofs.require(walks == full_oracle_walks(profile))
     return walks
 
 
@@ -254,7 +261,7 @@ def lane_record(entry, closed, expected_sources):
     capture, binding, result = entry["capture"], entry["workspace_binding"], entry["result"]
     runtime = capture.evidence["runtime"]
     record = {"revision": 1, "phase": entry["phase"], "round": entry["round"], "client": entry["client"],
-        "version": list(common.SCENARIOS).index(entry["version"]) + 1,
+        "version": int(entry["version"][1:]),
         "fixed_commit": entry["fixed_commit"], "path_tree": entry["path_tree"],
         "oracle_manifest_sha256": entry["oracle_manifest_sha256"], "sources": expected_sources,
         "identity_rows": runtime["identity_rows"], "identity": runtime["identity"],
@@ -267,6 +274,24 @@ def lane_record(entry, closed, expected_sources):
             "git_verified_ms": result["git"]["verified_ms"]}}
     record["native_proof_sha256"] = proofs.digest({key: record[key] for key in ("identity_rows", "identity", "native_publication")})
     return proofs.validate_lane_measurement(record, capture)
+
+
+def prepare_history(fixture, round_root, profile, number, seed, deadline, *, fixture_round):
+    """Build the real ten-commit chain before either lane starts measuring."""
+    prepared, receipts, previous = {}, [], None
+    for version in common.scenarios(profile):
+        commit, tree = common.create_version(fixture, fixture_round, version, profile, deadline)
+        expected = common.expected_manifest(fixture, commit, deadline)
+        common.fixture_size.validate_manifest(expected)
+        receipt = common.commit_receipt(fixture, commit, version, expected, previous, deadline)
+        proofs.exact(receipt["parent"], receipts[-1]["commit"] if receipts else seed)
+        receipts.append(receipt)
+        write_json(round_root / f"{version}-expected.json", expected, deadline)
+        prepared[version] = (commit, tree)
+        previous = expected
+    write_json(round_root / "git-history.json", {"revision": 1, "profile": profile,
+        "round": number, "seed_commit": seed, "commits": receipts}, deadline)
+    return prepared
 
 
 def run_phase(group, clients, sources, phase, number, deadline, harness):
@@ -295,6 +320,10 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
         fixture = round_root / "fixture"
         common.command(["git", "clone", "--no-hardlinks", "--no-checkout", "--single-branch", "--branch", "main",
                         str(group.root / "canonical-seed"), str(fixture)], deadline)
+        scenarios = common.scenarios(group.options.profile)
+        prepared = (prepare_history(fixture, round_root, group.options.profile, number, seed["commit"], deadline,
+                                    fixture_round=number if phase == "fair" else 4)
+                    if group.options.profile == "history-large" else None)
         for client, owner in zip(clients, owners):
             lane_root = round_root / ("client-" + client.label)
             lane_root.mkdir(mode=0o700)
@@ -315,13 +344,17 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
                 read_profile_mode=mode)
             from workspace_update_resources import ProcessResources
             lane.resources = ProcessResources(lane.daemon.process.pid, lane.daemon.started, lane.daemon.uid).start()
-        for scenario_number, version in enumerate(common.SCENARIOS, 1):
-            commit, tree = common.create_version(fixture, number if phase == "fair" else 4, version,
-                                                 group.options.profile, deadline)
-            expected = common.expected_manifest(fixture, commit, deadline)
-            common.fixture_size.validate_manifest(expected)
+        for scenario_number, version in enumerate(scenarios, 1):
             manifest_path = round_root / f"{version}-expected.json"
-            write_json(manifest_path, expected, deadline)
+            if prepared is not None:
+                commit, tree = prepared[version]
+                expected = observation.parse(manifest_path.read_bytes())
+            else:
+                commit, tree = common.create_version(fixture, number if phase == "fair" else 4, version,
+                                                     group.options.profile, deadline)
+                expected = common.expected_manifest(fixture, commit, deadline)
+                common.fixture_size.validate_manifest(expected)
+                write_json(manifest_path, expected, deadline)
             manifest_digest = backends._digest(manifest_path)
             ordered = active if (number + scenario_number) % 2 == 0 else list(reversed(active))
             for lane in ordered:
@@ -367,16 +400,16 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
         for lane in active:
             final = lane.worker.stop(deadline)
             lane.worker = None
-            walks = validate_workload(lane.entries, final)
+            walks = validate_workload(lane.entries, final, group.options.profile)
             resource_final = lane.resources.close(deadline)
             lane.resources = None
             daemon_status = lane.daemon.finish(deadline)
             lane.daemon = None
-            proofs.exact(daemon_status, {"actual_exit_code": 0, "bindings": 4,
+            proofs.exact(daemon_status, {"actual_exit_code": 0, "bindings": len(scenarios),
                                         "footer_complete": True, "native_mounts_remaining": 0})
             cleanup = cleanup_receipts(lane.root, deadline)
             lane.backend.finalize_projection(deadline)
-            closed = lane.backend.projection_collector.closed_evidence(4, deadline)
+            closed = lane.backend.projection_collector.closed_evidence(len(scenarios), deadline)
             for entry in lane.entries:
                 proof = lane_record(entry, closed, sources[lane.client.label])
                 validated.append(proof)
@@ -399,7 +432,7 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
             lane.entries.clear()
             lane.backend.stop(group.cleanup_deadline, operation_deadline=deadline)
         if phase == "fair":
-            for version_number in range(1, 5):
+            for version_number in range(1, len(scenarios) + 1):
                 pair = [p for p in validated if p.evidence["lane"]["version"] == version_number]
                 proofs.compare_pair(*pair)
         for record in records:
@@ -423,18 +456,18 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
             raise BaseExceptionGroup("isolated phase failed and cleanup was incomplete", [primary, *errors]) from None
 
 
-def validate_matrix(records, phase):
+def validate_matrix(records, phase, profile="smoke"):
     proofs.require(phase in ("fair", "diagnostic"))
     for record in records:
         proofs.require(type(record["round"]) is int and type(record["version"]) is str
                        and type(record["client"]) is str and type(record["phase"]) is str)
     expected = {(phase, r, v, c) for r in (range(1, 4) if phase == "fair" else (1,))
-                for v in common.SCENARIOS for c in (("a", "b") if phase == "fair" else ("b",))}
+                for v in common.scenarios(profile) for c in (("a", "b") if phase == "fair" else ("b",))}
     keys = [(r["phase"], r["round"], r["version"], r["client"]) for r in records]
     proofs.require(len(keys) == len(expected) and set(keys) == expected)
     for record in records:
         proofs.exact(record["correctness"], "PASS")
-        proofs.exact(record["lane_full_oracle_walks"], 18)
+        proofs.exact(record["lane_full_oracle_walks"], full_oracle_walks(profile))
         evidence = record["semantic_provenance"]
         proofs.exact(record["lane_proof_sha256"], proofs.digest(evidence))
         proofs.exact(record["fixed_commit"], evidence["semantic"]["fixed_commit"])
@@ -444,12 +477,12 @@ def validate_matrix(records, phase):
         else:
             profiles.validate_evidence(record["scorpio"]["read_profile"])
             proofs.exact(record["scorpio"]["read_profile"]["status"], "MEASURED")
-    return 108 if phase == "fair" else 18
+    return full_oracle_walks(profile) * (6 if phase == "fair" else 1)
 
 
-def summaries(records):
+def summaries(records, profile="smoke"):
     result = []
-    for version in common.SCENARIOS:
+    for version in common.scenarios(profile):
         pairs = []
         for number in range(1, 4):
             pair = {r["client"]: r for r in records if r["round"] == number and r["version"] == version}
@@ -476,7 +509,7 @@ def summaries(records):
 
 def execute(options):
     fixture_admission = common.fixture_size.admit_backend(options.profile, True)
-    if options.profile == "large":
+    if options.profile in ("large", "history-large"):
         root, _ = ci.hosted_root(options.run_root)
         fixture_admission["campaign_disk"] = common.fixture_size.admit_campaign_disk(options.profile, root)
     pair = builds.comparison_pair(options.baseline_sha, options.candidate_sha)
@@ -551,8 +584,9 @@ def execute(options):
         for client in clients:
             builds.validate(client, deadline)
             proofs.exact(source_expectations(options, client, deadline, harness), sources[client.label])
-        fair_walks, diagnostic_walks = validate_matrix(fair, "fair"), validate_matrix(diagnostic, "diagnostic")
-        for row in summaries(fair):
+        fair_walks = validate_matrix(fair, "fair", options.profile)
+        diagnostic_walks = validate_matrix(diagnostic, "diagnostic", options.profile)
+        for row in summaries(fair, options.profile):
             append(measurements / "fair/measurements.jsonl", row, "fair", deadline)
         backends._check(deadline)
         cleanup_limit = budget.cleanup_stage_deadline()
@@ -572,7 +606,7 @@ def execute(options):
             "cleanup_deadline_monotonic": budget.cleanup_deadline, "sources": sources, "canonical_seed": group.seed,
             "server_build": server.build,
             "server_build_receipt_sha256": backends._digest(Path(options.server_build_receipt)),
-            "fair_records": 24, "diagnostic_records": 4, "fair_full_oracle_walks": fair_walks,
+            "fair_records": len(fair), "diagnostic_records": len(diagnostic), "fair_full_oracle_walks": fair_walks,
             "diagnostic_full_oracle_walks": diagnostic_walks, "cleanup": cleanup,
             "phase_measurements_sha256": {phase: common.fixture_size.file_sha256(
                                               measurements / phase / "measurements.jsonl", cleanup_limit)

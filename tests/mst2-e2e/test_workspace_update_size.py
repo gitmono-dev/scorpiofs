@@ -24,6 +24,41 @@ def manifest():
 
 
 class FixtureSizeTests(unittest.TestCase):
+    def test_history_plan_covers_ten_complete_trees_under_frozen_cumulative_limits(self):
+        report = size.plan("history-large")
+        self.assertEqual((report["logical_files"], report["logical_directories"], report["logical_entries"]),
+                         (17026, 170, 17196))
+        history = report["history_admission"]
+        self.assertEqual((history["versions"], history["source_files_rewritten_per_increment"],
+                          history["source_bytes_rewritten_per_increment"], history["full_oracle_walks_per_lane"]),
+                         (10, 16384, 128 * 1024 ** 2, 75))
+        self.assertEqual(history["source_entry_references_upper"], 10 * report["logical_entries"] + 1024)
+        self.assertEqual(history["resident_metadata_pages_upper"], 10 * report["metadata_pages_upper"] + 64)
+        for key, limit in size.HISTORY_LIMITS.items():
+            self.assertLessEqual(history[key], limit)
+        for key in size.HISTORY_LIMITS:
+            with patch.dict(size.HISTORY_LIMITS, {key: 0}), self.assertRaises(ValueError):
+                size.plan("history-large")
+        # A current tree can fit while ten immutable source dictionaries do not.
+        with patch.dict(size.PROFILES, {"history-large": size.PROFILES["large"]}), \
+                self.assertRaisesRegex(ValueError, "retained source_entry"):
+            size.plan("history-large")
+
+    def test_history_disk_reservation_counts_every_new_body_and_seventy_worktrees(self):
+        fixture = size.plan("history-large")
+        report = size.campaign_disk_plan("history-large")
+        self.assertEqual((report["lanes"], report["versions_per_lane"], report["retained_git_detached_checkouts"]), (7, 10, 70))
+        self.assertEqual(report["retained_unique_content_bytes"] - report["cold_unique_content_bytes"],
+                         9 * 128 * 1024 ** 2)
+        self.assertGreaterEqual(report["components_bytes"]["retained_git_detached_checkouts"],
+                                70 * fixture["logical_content_bytes"])
+        self.assertEqual(report["minimum_free_bytes"], sum(report["components_bytes"].values()))
+        self.assertGreater(report["minimum_free_bytes"], 100 * 1024 ** 3)
+        self.assertLess(report["minimum_free_bytes"], 116412113924)
+        with self.assertRaises(ValueError):
+            size.admit_backend("history-large", False)
+        self.assertEqual(size.admit_backend("history-large", True)["profile"], "history-large")
+
     def test_existing_runner_label_is_explicit_and_strictly_bounded(self):
         for label in ("ubuntu-latest", "perf-linux-large", "self-hosted", "a.b_1", "a" * 64):
             self.assertEqual(size.runner_label(label), label)

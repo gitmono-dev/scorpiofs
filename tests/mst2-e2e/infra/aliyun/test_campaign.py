@@ -37,6 +37,18 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "FRESH_STATE"):
             cloud.plan(configuration(), self.directory)
 
+    def test_history_profile_reaches_the_same_bounded_isolated_workflow(self):
+        value = configuration() | {"profile": "history-large"}
+        state = cloud.plan(value, Path(self.temp.name) / "history-campaign")
+        controller = cloud.Campaign(Path(self.temp.name) / "history-campaign")
+        controller.record(**cloud.schedule(datetime.now(timezone.utc)))
+        inputs = controller.workflow_inputs()
+        self.assertEqual(inputs["profile"], "history-large")
+        self.assertEqual(inputs["comparison"], "isolated")
+        self.assertEqual(inputs["rounds"], "3")
+        self.assertEqual(inputs["recover_original_window"], "false")
+        self.assertEqual(state["status"], "PREPARED_LOCAL_ONLY")
+
     def test_state_inside_repository_is_rejected_before_creation(self):
         with self.assertRaisesRegex(ValueError, "OUTSIDE_REPOSITORY"):
             cloud.external_directory(cloud.HERE / "runtime-state")

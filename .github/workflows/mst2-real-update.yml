@@ -27,8 +27,8 @@ on:
         default: '1700000000'
       profile:
         type: choice
-        description: Bounded /project fixture; large needs isolated backends and sufficient disk (checked before builds)
-        options: [smoke, medium, large]
+        description: Bounded /project fixture; history-large measures ten bulk commits; large and history-large require isolated backends
+        options: [smoke, medium, large, history-large]
         default: smoke
       rounds:
         description: Complete cold/single/rename/batch repetitions (3 to 10)
@@ -95,11 +95,11 @@ jobs:
           if comparison not in ('single', 'paired', 'isolated'):
               raise ValueError('invalid comparison mode')
           admit_backend(os.environ['PROFILE'], comparison == 'isolated')
-          if os.environ['PROFILE'] == 'large':
+          if os.environ['PROFILE'] in ('large', 'history-large'):
               from pathlib import Path
               import json
               owned_root = Path(os.environ['RUNNER_TEMP']) / ('mst2-real-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'])
-              print(json.dumps({'campaign_disk_admission': admit_campaign_disk('large', owned_root)}))
+              print(json.dumps({'campaign_disk_admission': admit_campaign_disk(os.environ['PROFILE'], owned_root)}))
           if comparison in ('paired', 'isolated'):
               if os.environ['ROUNDS'] != '3' or any(not re.fullmatch(r'[0-9a-f]{40}', os.environ[k]) for k in ('BASELINE_SHA', 'CANDIDATE_SHA')):
                   raise ValueError('paired measurement requires two immutable SHAs and three rounds')

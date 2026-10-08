@@ -60,7 +60,7 @@ def config(value):
     require(value["zone"].startswith(value["region"] + "-"), "ZONE_REGION_MISMATCH")
     require(value["instance_type"] == "ecs.u1-c1m4.2xlarge", "REVIEWED_NON_BURSTABLE_SKU_REQUIRED")
     require(re.fullmatch(r"[0-9a-f]{40}", value["harness_sha"] or ""), "IMMUTABLE_HARNESS_REQUIRED")
-    require(value["profile"] in ("smoke", "medium", "large"), "INVALID_PROFILE")
+    require(value["profile"] in ("smoke", "medium", "large", "history-large"), "INVALID_PROFILE")
     parent = ipaddress.IPv4Network(value["vpc_cidr"])
     child = ipaddress.IPv4Network(value["vswitch_cidr"])
     require(child.subnet_of(parent), "SUBNET_OUTSIDE_VPC")

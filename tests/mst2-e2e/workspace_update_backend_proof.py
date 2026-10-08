@@ -422,7 +422,7 @@ def validate_lane_values(record, capture):
         exact(capture["client_build"]["label"], runtime["client"])
         shape(record, LANE_FIELDS)
         integer(record["revision"], 1, True)
-        integer(record["version"], 4, True)
+        integer(record["version"], 10, True)
         for key in ("phase", "round", "client"):
             exact(record[key], runtime[key])
         sources(record["sources"])
