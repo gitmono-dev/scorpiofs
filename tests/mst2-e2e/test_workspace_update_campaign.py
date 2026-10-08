@@ -248,9 +248,11 @@ class CampaignWorkloadTests(unittest.TestCase):
                     replay.doCleanups()
 
     def test_producer_second_backend_start_failure_retires_both_admitted_owners_without_complete(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(budgets.time, "time", return_value=0), \
+                patch.object(budgets.time, "monotonic", return_value=1000):
             root = Path(directory) / "owned"
-            deadline = (datetime.now(timezone.utc) + timedelta(minutes=235)).isoformat()
+            deadline = "1970-01-01T03:55:00Z"
             budget = budgets.IsolatedCampaignBudget(deadline, 3)
             options = SimpleNamespace(run_root=root, mega_sha="1" * 40)
             primary = RuntimeError("second backend failed")

@@ -237,7 +237,8 @@ class SessionBudgetTests(unittest.TestCase):
             start.assert_not_called()
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "unused"
-            opts = SimpleNamespace(run_root=root, mega_sha="1" * 40, budget=shared)
+            opts = SimpleNamespace(run_root=root, mega_sha="1" * 40, budget=shared,
+                                   profile="medium", paired=False)
             with patch.object(ci, "hosted_root", return_value=(root, "owned")), \
                     patch.object(ci, "dependencies") as deps:
                 with self.assertRaises(TimeoutError):
@@ -555,7 +556,8 @@ class SessionBudgetTests(unittest.TestCase):
             opts = SimpleNamespace(run_root=root, mega_sha="1" * 40, mega_source=source,
                                    mega_binary=binary, driver=driver,
                                    driver_sha256=hashlib.sha256(b"fixed").hexdigest(), budget=shared,
-                                   session_deadline_utc=shared.deadline_utc, profile="medium", rounds=3)
+                                   session_deadline_utc=shared.deadline_utc, profile="medium", paired=False,
+                                   rounds=3)
             cleanup_deadlines = []
             service_pids = []
             original_stop = ci.stop_owned
