@@ -232,6 +232,10 @@ def install(config):
     for key in ('session_started_utc', 'session_deadline_utc', 'hard_release_utc'):
         if ready[key] != config[key]:
             raise ValueError('ORIGINAL_BOOTSTRAP_WINDOW_MISMATCH')
+    # Recheck the actual host before consuming an execution receipt. The ready
+    # file predates source transfer and cannot establish current maintenance state.
+    subprocess.run(['/usr/local/sbin/scorpiofs-benchmark-bootstrap',
+                    '--check-maintenance-isolation'], check=True, timeout=10)
     token = metadata('api/token', method='PUT')
     if metadata('meta-data/instance-id', token=token) != config['instance_id']:
         raise ValueError('ACTUAL_INSTANCE_MISMATCH')
