@@ -23,6 +23,59 @@ fail() { printf 'benchmark bootstrap refused: %s\n' "$1" >&2; exit 1; }
 test "$(id -u)" = 0 || fail root_required
 test "$(uname -m)" = x86_64 || fail wrong_architecture
 test "$(date -u +%s)" -lt "$(date -u -d "$EXPIRES_AT" +%s)" || fail original_window_expired
+
+# Only this new disposable ECS is isolated for its original four-hour lease.
+# Mask services without stopping them: an existing dpkg must finish by itself.
+readonly MAINTENANCE_UNITS=(apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service)
+readonly APT_PERIODIC_KEYS=(Enable Update-Package-Lists Download-Upgradeable-Packages Unattended-Upgrade AutocleanInterval)
+check_maintenance_units() {
+  local unit state
+  for unit in "$${MAINTENANCE_UNITS[@]}"; do
+    test "$(systemctl show --property=UnitFileState --value "$unit")" = masked || fail maintenance_unit_not_masked
+    state=$(systemctl show --property=ActiveState --value "$unit")
+    case "$state" in inactive|failed) ;; *) fail maintenance_unit_not_quiescent ;; esac
+  done
+}
+check_maintenance_isolation() {
+  local key
+  check_maintenance_units
+  for key in "$${APT_PERIODIC_KEYS[@]}"; do
+    test "$(apt-config shell value "APT::Periodic::$key")" = "value='0'" || fail apt_periodic_policy_not_disabled
+  done
+  test -f /etc/needrestart/conf.d/99-scorpiofs-benchmark-list-only.conf || fail needrestart_policy_missing
+  # Read the same ordered configuration layers as needrestart, including later
+  # overrides. A policy file's presence alone does not establish effective mode.
+  perl -e '
+    our %nrconf;
+    for my $path ("/etc/needrestart/needrestart.conf", sort glob "/etc/needrestart/conf.d/*.conf") {
+      next unless -f $path;
+      defined(do $path) or die "cannot read needrestart policy: $path";
+    }
+    exit(($nrconf{restart} // "") eq "l" ? 0 : 1);
+  ' || fail needrestart_policy_not_list_only
+}
+if test "$#" -gt 0; then
+  test "$#" = 1 && test "$1" = --check-maintenance-isolation || fail unsupported_bootstrap_argument
+  check_maintenance_isolation
+  exit 0
+fi
+systemctl stop apt-daily.timer apt-daily-upgrade.timer
+systemctl mask "$${MAINTENANCE_UNITS[@]}"
+check_maintenance_units
+install -d -m 0755 /etc/apt/apt.conf.d /etc/needrestart/conf.d
+cat > /etc/apt/apt.conf.d/99-scorpiofs-benchmark-no-periodic <<'APT_POLICY'
+APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::Unattended-Upgrade "0";
+APT::Periodic::AutocleanInterval "0";
+APT_POLICY
+cat > /etc/needrestart/conf.d/99-scorpiofs-benchmark-list-only.conf <<'NEEDRESTART_POLICY'
+$nrconf{restart} = 'l';
+NEEDRESTART_POLICY
+export NEEDRESTART_MODE=l
+check_maintenance_isolation
+
 for program in lsblk blkid wipefs blockdev findmnt mountpoint mkfs.ext4; do
   command -v "$program" >/dev/null || fail missing_disk_tool
 done
@@ -167,6 +220,7 @@ done
 
 # The direct controller checks this receipt, the original window, and the mount.
 # The public instance type is separately checked by the external controller.
+check_maintenance_isolation
 TEST_UID=$(id -u benchmark)
 TEST_GID=$(id -g benchmark)
 export RUN_ID TEST_TIER MINIMUM_CPUS MINIMUM_MEMORY_GIB MINIMUM_FREE_BYTES STARTED_UTC DEADLINE_UTC EXPIRES_AT DATA_ROOT DEVICE UUID TEST_UID TEST_GID READY

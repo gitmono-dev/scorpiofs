@@ -35,8 +35,8 @@ run "fixed_window_and_run_owned_disk" {
     error_message = "Default deployment must select the direct history-large local-store campaign."
   }
   assert {
-    condition     = can(regex("readonly DEADLINE_UTC='2026-10-08T03:55:00Z'", local.bootstrap)) && can(regex("\\$\\{OWNER\\[0\\]\\}", local.bootstrap)) && can(regex("readonly TEST_TIER='history-large'", local.bootstrap)) && !strcontains(local.bootstrap, "\r")
-    error_message = "The bootstrap must preserve the session window, selected tier, and shell array references."
+    condition     = can(regex("readonly DEADLINE_UTC='2026-10-08T03:55:00Z'", local.bootstrap)) && can(regex("\\$\\{OWNER\\[0\\]\\}", local.bootstrap)) && can(regex("\\$\\{MAINTENANCE_UNITS\\[@\\]\\}", local.bootstrap)) && can(regex("readonly TEST_TIER='history-large'", local.bootstrap)) && !strcontains(local.bootstrap, "\r")
+    error_message = "The bootstrap must preserve the session window, selected tier, and disk/maintenance shell array references."
   }
 }
 
