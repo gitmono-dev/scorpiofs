@@ -51,6 +51,8 @@ pub use auth::{AuthorizedSnapshotContext, CacheDomain};
 pub use cache_retention::{CacheCollectionReport, CacheLimits};
 pub use client::Mst2Client;
 pub use closure::{SnapshotClosureMeters, SnapshotDirectory, ValidatedSnapshotClosure};
+#[cfg(test)]
+pub(crate) use content::{ContentBudget, PROCESS_CONSTRUCTION_BYTES};
 pub use content::{ContentBudgetLimits, ContentBudgetUsage, VerifiedContent, VerifiedContentBatch};
 pub use content_profile::OBJECT_CAP;
 pub use coordinator::{FetchCoordinator, FetchCoordinatorCounts, FetchCoordinatorLimits};
