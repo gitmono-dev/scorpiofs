@@ -45,8 +45,39 @@ fn fixture(version: u8) -> Fixture {
     fixture
 }
 
-fn managed(temp: &tempfile::TempDir, owner: u128, reader: &SnapshotReader) -> Arc<DurableStore> {
-    Arc::new(
+type ContentControls = BTreeMap<String, Vec<u8>>;
+
+fn content_controls(store: &DurableStore) -> ContentControls {
+    let mut controls = ContentControls::new();
+    for entry in fs::read_dir(store.content_dir()).unwrap() {
+        let entry = entry.unwrap();
+        assert!(
+            entry.file_type().unwrap().is_file(),
+            "metadata-only content directory contains a non-regular entry"
+        );
+        let name = entry.file_name().into_string().unwrap();
+        assert!(
+            matches!(name.as_str(), "authority.json" | "authority.lock"),
+            "unexpected metadata-only content entry: {name}"
+        );
+        assert!(controls
+            .insert(name, fs::read(entry.path()).unwrap())
+            .is_none());
+    }
+    assert_eq!(
+        controls.len(),
+        2,
+        "required content authority controls differ"
+    );
+    controls
+}
+
+fn managed(
+    temp: &tempfile::TempDir,
+    owner: u128,
+    reader: &SnapshotReader,
+) -> (Arc<DurableStore>, ContentControls) {
+    let store = Arc::new(
         DurableStore::open_for_workspace_with_cache_limits(
             temp.path(),
             &uuid::Uuid::from_u128(owner).to_string(),
@@ -66,7 +97,9 @@ fn managed(temp: &tempfile::TempDir, owner: u128, reader: &SnapshotReader) -> Ar
             },
         )
         .unwrap(),
-    )
+    );
+    let controls = content_controls(&store);
+    (store, controls)
 }
 
 fn scope(store: &DurableStore) -> PathBuf {
@@ -77,7 +110,7 @@ fn page_path(store: &DurableStore, bytes: &[u8]) -> PathBuf {
     scope(store).join("pages").join(hex::encode(page_id(bytes)))
 }
 
-fn metadata_only(store: &DurableStore, fixture: &Fixture) {
+fn metadata_only(store: &DurableStore, fixture: &Fixture, controls: &ContentControls) {
     assert!(!store.root().join("DURABLE_COMPLETE").exists());
     assert!(!store.cache_retention_known().unwrap());
     assert_eq!(fixture.object_calls.load(Ordering::SeqCst), 0);
@@ -85,7 +118,7 @@ fn metadata_only(store: &DurableStore, fixture: &Fixture) {
     assert_eq!(fixture.map_calls.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.leaf_calls.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.chunk_calls.load(Ordering::SeqCst), 0);
-    assert!(fs::read_dir(store.content_dir()).unwrap().next().is_none());
+    assert_eq!(content_controls(store), *controls);
 }
 
 async fn nested_file(view: &Mst2Fuse) -> u64 {
@@ -107,7 +140,7 @@ async fn cold_lazy_learning_reuses_unchanged_subtree_across_real_http_commit_upd
     let server = VersionServer::new(vec![fixture(0), fixture(1)]).await;
     let temp = tempfile::tempdir().unwrap();
     let old_reader = server.reader(0).await;
-    let old = managed(&temp, 741, &old_reader);
+    let (old, old_controls) = managed(&temp, 741, &old_reader);
     let old_view = Mst2Fuse::from_reader_lazy(old_reader.clone(), Some(old.clone()))
         .await
         .unwrap();
@@ -127,12 +160,12 @@ async fn cold_lazy_learning_reuses_unchanged_subtree_across_real_http_commit_upd
             Some(bytes.clone())
         );
     }
-    metadata_only(&old, old_fixture);
+    metadata_only(&old, old_fixture, &old_controls);
     drop(old_view);
     drop(old_reader);
 
     let reader = server.reader(1).await;
-    let live = managed(&temp, 742, &reader);
+    let (live, live_controls) = managed(&temp, 742, &reader);
     assert_ne!(live.root(), old.root());
     assert_eq!(live.content_dir(), old.content_dir());
     assert_ne!(reader.snapshot_id(), old_fixture.sid());
@@ -152,14 +185,14 @@ async fn cold_lazy_learning_reuses_unchanged_subtree_across_real_http_commit_upd
         fs::read(page_path(&live, &current.pages["/stable"])).unwrap(),
         current.pages["/stable"]
     );
-    metadata_only(&live, current);
-    metadata_only(&old, old_fixture);
+    metadata_only(&live, current, &live_controls);
+    metadata_only(&old, old_fixture, &old_controls);
 }
 
 #[tokio::test]
 async fn noncanonical_directory_proof_learns_no_wire_page_and_preserves_safe_hints() {
     let mut fixture = fixture(0);
-    let children: Vec<_> = [b'a', b'b']
+    let children: Vec<_> = (*b"ab")
         .into_iter()
         .map(|name| {
             Page::build(&[Entry::file(EntryKind::Regular, &[name], 1, hash(b"x"))]).unwrap()
@@ -172,7 +205,7 @@ async fn noncanonical_directory_proof_learns_no_wire_page_and_preserves_safe_hin
         terminal: None,
         children: children
             .iter()
-            .zip([b'a', b'b'])
+            .zip(*b"ab")
             .map(|(bytes, label)| BranchChild {
                 label,
                 subtree_entries: 1,
@@ -187,7 +220,7 @@ async fn noncanonical_directory_proof_learns_no_wire_page_and_preserves_safe_hin
     let server = Server::new(fixture).await;
     let reader = server.reader().await;
     let temp = tempfile::tempdir().unwrap();
-    let store = managed(&temp, 743, &reader);
+    let (store, controls) = managed(&temp, 743, &reader);
     let cache = ScopeCache::open(scope(&store)).unwrap();
     for bytes in &children {
         cache.put_page(&id(&page_id(bytes)), bytes).unwrap();
@@ -203,7 +236,7 @@ async fn noncanonical_directory_proof_learns_no_wire_page_and_preserves_safe_hin
     }
     assert_eq!(server.fixture.metadata_calls.load(Ordering::SeqCst), 1);
     assert_eq!(server.fixture.metadata_pages.load(Ordering::SeqCst), 1);
-    metadata_only(&store, &server.fixture);
+    metadata_only(&store, &server.fixture, &controls);
 }
 
 #[tokio::test]
@@ -252,7 +285,7 @@ async fn cancelled_lazy_page_learning_process_credit_worker() {
         .with_content_limits(ContentBudgetLimits::new(128 * 1024 * 1024, 1024).unwrap());
     let observed = reader.clone();
     let temp = tempfile::tempdir().unwrap();
-    let store = managed(&temp, 744, &reader);
+    let (store, _controls) = managed(&temp, 744, &reader);
     let directory = scope(&store);
     let root_path = page_path(&store, &server.fixture.pages["/"]);
     let owner_path = store.root().to_path_buf();
@@ -308,7 +341,7 @@ async fn cancelled_lazy_page_learning_process_credit_worker() {
     // the canceled actual writer prevents a second uncharged job or temp.
     let next_reader = server.reader().await;
     let next_observed = next_reader.clone();
-    let next = managed(&temp, 747, &next_reader);
+    let (next, next_controls) = managed(&temp, 747, &next_reader);
     let next_view = Mst2Fuse::from_reader_lazy(next_reader, Some(next.clone()))
         .await
         .unwrap();
@@ -327,7 +360,7 @@ async fn cancelled_lazy_page_learning_process_credit_worker() {
     );
     assert_eq!(fs::read_dir(directory.join("pages")).unwrap().count(), 1);
     assert!(!root_path.exists());
-    metadata_only(&next, &server.fixture);
+    metadata_only(&next, &server.fixture, &next_controls);
 
     barrier.release();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -368,7 +401,7 @@ async fn cancelled_lazy_page_learning_process_credit_worker() {
         FetchCoordinator::process_content_usage().construction_bytes,
         PROCESS_CONSTRUCTION_BYTES - 1024
     );
-    metadata_only(&next, &server.fixture);
+    metadata_only(&next, &server.fixture, &next_controls);
     drop(first_fill);
     drop(second_fill);
     assert_eq!(
@@ -383,7 +416,7 @@ async fn failed_learning_preserves_old_safe_pages_and_proved_view_then_retry_lea
     let server = VersionServer::new(vec![fixture(0), fixture(1)]).await;
     let temp = tempfile::tempdir().unwrap();
     let reader = server.reader(0).await;
-    let old = managed(&temp, 745, &reader);
+    let (old, _old_controls) = managed(&temp, 745, &reader);
     let old_view = Mst2Fuse::from_reader_lazy(reader, Some(old.clone()))
         .await
         .unwrap();
@@ -396,7 +429,7 @@ async fn failed_learning_preserves_old_safe_pages_and_proved_view_then_retry_lea
         .map(|bytes| (page_path(&old, bytes), bytes.clone()))
         .collect();
     let reader = server.reader(1).await;
-    let live = managed(&temp, 746, &reader);
+    let (live, live_controls) = managed(&temp, 746, &reader);
     let current = &server.fixture.versions[1];
     let new_root = page_path(&live, &current.pages["/"]);
     let use_before = fs::read(live.root().join("CACHE_USE.json")).unwrap();
@@ -434,7 +467,7 @@ async fn failed_learning_preserves_old_safe_pages_and_proved_view_then_retry_lea
         fs::read(live.root().join("CACHE_USE.json")).unwrap(),
         use_before
     );
-    metadata_only(&live, current);
+    metadata_only(&live, current, &live_controls);
     drop(view);
     let target = live.clone();
     let retry_task =
@@ -456,5 +489,5 @@ async fn failed_learning_preserves_old_safe_pages_and_proved_view_then_retry_lea
     for (path, bytes) in old_pages {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
-    metadata_only(&live, current);
+    metadata_only(&live, current, &live_controls);
 }
