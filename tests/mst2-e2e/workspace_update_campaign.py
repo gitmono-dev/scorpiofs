@@ -318,7 +318,8 @@ def _run_phase(group, clients, sources, phase, number, deadline, harness):
         else:
             owner = group.admit("diagnostic", 1, "b", deadline)
             owners.append(owner)
-            owner.start(deadline)
+            with common.phase("backend_start"):
+                owner.start(deadline)
         seed = canonical_seed(group, owners[0], deadline)
         current = {}
         for owner in owners:
@@ -710,7 +711,17 @@ def verify_cleanup_from_disk(options, *, operation_deadline=None):
             if common.command(argv, deadline).strip():
                 raise AssertionError("campaign cleanup left owned dependency resources")
         client_root = root / "measurements" / owner["phase"] / f"round-{owner['round']:02}" / ("client-" + owner["client"])
-        receipt = cleanup_receipts(client_root, deadline)
+        if (owner["service_pid"] is None and owner["service_starttime"] is None
+                and owner["initial_path_commit"] is None
+                and not client_root.exists()):
+            # Backend setup precedes client-root creation. Only this recorded
+            # pre-service failure may have no client cleanup receipts; a
+            # started service or an existing client root still requires both.
+            for component in [*client_root.parents, client_root]:
+                proofs.require(not component.is_symlink())
+            receipt = {"not_started": True}
+        else:
+            receipt = cleanup_receipts(client_root, deadline)
         inventory.append({"owner": owner, "client_cleanup": receipt,
                           "dependency_containers_remaining": 0, "dependency_networks_remaining": 0})
     if mounts_under(root):

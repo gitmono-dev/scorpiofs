@@ -22,7 +22,7 @@ import workspace_update_git_performance as git_performance
 import workspace_update_directory as directory_probe
 from workspace_update_size import consume_regular
 
-ROOT_FILES = {"campaign.json", "canonical-seed.json", "backend-owners.json", "failure.json"}
+ROOT_FILES = {"campaign.json", "canonical-seed.json", "backend-owners.json", "failure.json", "cleanup-failure.json"}
 CLIENT_FILES = {"workspace-observation.jsonl", "owned-workspace-daemon.json", "owned-workspace-worker.json"}
 OWNER_FIELDS = {"phase", "round", "client", "project", "database", "instance_id", "root", "state",
                 "operation_deadline_monotonic", "service_pid", "service_starttime", "initial_path_commit"}
@@ -94,6 +94,8 @@ def allowed(relative):
     parts = Path(relative).parts
     if len(parts) == 1:
         return parts[0] in ROOT_FILES
+    if len(parts) == 2 and parts[0] == "measurements" and parts[1] in {"failure.json", "cleanup-failure.json"}:
+        return True
     if parts[0] != "measurements" or parts[1] not in ("fair", "diagnostic"):
         return False
     if len(parts) == 3:

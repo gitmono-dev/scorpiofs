@@ -247,7 +247,8 @@ class BackendGroup:
             for label in ("a", "b"):
                 backend = self.admit("fair", number, label, deadline)
                 owners.append(backend)
-                backend.start(deadline)
+                with common.phase("backend_start"):
+                    backend.start(deadline)
             assert_isolated(*(b.verify_runtime(deadline, ready=False) for b in owners))
             return tuple(owners)
         except BaseException as primary:
@@ -396,12 +397,13 @@ class OwnedBackend:
                     or service not in SERVICES or service in services):
                 raise AssertionError("dependency container owner changed")
             state = item["State"]
-            if service == "rustfs-init":
-                if (state.get("Running") is not False or type(state.get("ExitCode")) is not int
-                        or state["ExitCode"] != 0):
-                    raise AssertionError("owned storage initialization is incomplete")
-            elif state.get("Running") is not True:
-                raise AssertionError("owned dependency stopped")
+            # The fixed server template keeps rustfs-init alive after bucket
+            # creation so Compose --wait can verify its bucket healthcheck.
+            # An exited initializer is not this template's readiness contract.
+            if (state.get("Running") is not True or type(state.get("ExitCode")) is not int
+                    or state["ExitCode"] != 0 or type(state.get("Health")) is not dict
+                    or state["Health"].get("Status") != "healthy"):
+                raise AssertionError("owned dependency is not running and healthy")
             if service in ("postgres", "redis", "rustfs"):
                 target = {"postgres": "5432/tcp", "redis": "6379/tcp", "rustfs": "9000/tcp"}[service]
                 exposed = item["NetworkSettings"]["Ports"].get(target)
@@ -448,14 +450,17 @@ class OwnedBackend:
         _write(self.root / "owned.json", owned, new=True)
         self.owned_digest = _digest(self.root / "owned.json")
         self._transition("starting")
-        common.command(["docker", "compose", "-p", self.project, "-f", str(compose_path),
-                        "up", "-d", "--wait", "--wait-timeout", "180"],
-                       min(deadline, time.monotonic() + 240))
-        self._probe_dependencies(deadline)
+        with common.phase("dependency_startup"):
+            common.command(["docker", "compose", "-p", self.project, "-f", str(compose_path),
+                            "up", "-d", "--wait", "--wait-timeout", "180"],
+                           min(deadline, time.monotonic() + 240))
+        with common.phase("dependency_probe"):
+            self._probe_dependencies(deadline)
         env = common.clean_env({"PGHOST": "127.0.0.1", "PGPORT": str(self.ports["postgres"]),
                                 "PGUSER": "mega2", "PGPASSWORD": "mega2_test_password", "PGDATABASE": "mega2"})
-        common.command(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE " + self.database],
-                       deadline, env=env)
+        with common.phase("database_create"):
+            common.command(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE " + self.database],
+                           deadline, env=env)
         env["PGDATABASE"] = self.database
         git_token, token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         # Mask before any child can output a token; tokens remain private files.
@@ -489,22 +494,26 @@ class OwnedBackend:
                                             "MEGA_CACHE_DIR": str(self.root / "cache"),
                                             "MEGA_GIT_OBJECT_CACHE_PREFIX": self.project})
         prefix = [str(self.binary), "--config", str(config_path)]
-        common.command(prefix + ["config", "validate"], deadline, env=self.service_env)
+        with common.phase("server_config_validate"):
+            common.command(prefix + ["config", "validate"], deadline, env=self.service_env)
         timestamp = getattr(self.group.options, "bootstrap_commit_time", None)
         init_args = ["service", "init", "--yes"]
         if timestamp is not None:
             if type(timestamp) is not int or not 0 <= timestamp <= (1 << 32) - 1:
                 raise ValueError("canonical bootstrap time must be a uint32")
-            help_text = common.command(prefix + ["service", "init", "--help"], deadline,
-                                       env=self.service_env)
-            if (len(help_text) > 65536 or re.search(
-                    rb"(?m)^\s+--commit-time(?:\s|$)", help_text) is None):
-                raise AssertionError("fixed server lacks reproducible bootstrap capability")
+            with common.phase("server_bootstrap_capability"):
+                help_text = common.command(prefix + ["service", "init", "--help"], deadline,
+                                           env=self.service_env)
+                if (len(help_text) > 65536 or re.search(
+                        rb"(?m)^\s+--commit-time(?:\s|$)", help_text) is None):
+                    raise AssertionError("fixed server lacks reproducible bootstrap capability")
             init_args += ["--commit-time", str(timestamp)]
-        common.command(prefix + init_args, deadline, env=self.service_env)
+        with common.phase("server_service_init"):
+            common.command(prefix + init_args, deadline, env=self.service_env)
         # Existing maintenance bootstrap installs only INITIALIZING, never a
         # READY certificate. Common semantic seed publication is normal Git.
-        ci.initialize_owned_native(self.database, self.instance_id, env, deadline)
+        with common.phase("owned_native_initialization"):
+            ci.initialize_owned_native(self.database, self.instance_id, env, deadline)
         self.pg_env = dict(env, M2_TOKEN=token, M2_GIT_TOKEN=git_token)
         self.git_env = common.clean_env({"GIT_CONFIG_COUNT": "3", "GIT_CONFIG_KEY_0": "http.extraHeader",
                                         "GIT_CONFIG_VALUE_0": "Authorization: Bearer " + git_token,
