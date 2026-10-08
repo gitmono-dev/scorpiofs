@@ -1,6 +1,7 @@
 """Run one pinned native campaign directly on its disposable Aliyun instance."""
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -11,6 +12,7 @@ try:
 except ImportError:
     pwd = None
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -54,6 +56,119 @@ def save(path, value):
     temporary.replace(path)
 
 
+def error_fields(error):
+    line, trace = None, error.__traceback__
+    while trace is not None:
+        if Path(trace.tb_frame.f_code.co_filename).resolve() == Path(__file__).resolve():
+            line = trace.tb_lineno
+        trace = trace.tb_next
+    return {'error_type': type(error).__name__,
+        'error_errno': error.errno if isinstance(error, OSError) and type(error.errno) is int else None,
+        'remote_source_line': line}
+
+
+class ActiveExecution(Exception):
+    pass
+
+
+@contextmanager
+def execution_claim(config):
+    # The immutable root-owned receipt is the common inode for every entry.
+    # A contender must never overwrite the owner's status or clean its work.
+    import fcntl
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    import workspace_update_execution as execution
+    context = execution.identity()
+    path = Path(os.environ['MST2_EXECUTION_RECEIPT'])
+    if (str(path) != config['execution_receipt'] or context['campaign_id'] != config['campaign_id']
+            or context['instance_id'] != config['instance_id']):
+        raise ValueError('EXECUTION_CLAIM_IDENTITY_MISMATCH')
+    before = path.lstat()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(descriptor)
+        fields = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                                value.st_gid, value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        if (fields(before) != fields(opened) or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != 0 or opened.st_gid != 0 or opened.st_nlink != 1
+                or opened.st_mode & 0o022):
+            raise ValueError('EXECUTION_CLAIM_RECEIPT_CHANGED')
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ActiveExecution() from None
+        raw = os.read(descriptor, 32769)
+        if (not 0 < len(raw) <= 32768 or hashlib.sha256(raw).hexdigest() != context['execution_receipt_sha256']
+                or fields(os.fstat(descriptor)) != fields(opened) or fields(path.lstat()) != fields(opened)):
+            raise ValueError('EXECUTION_CLAIM_RECEIPT_CHANGED')
+        yield context
+    finally:
+        os.close(descriptor)
+
+
+def prepare_dependencies(config, workspace, user):
+    """Resolve the actual locked clients from verified local Git mirrors first."""
+    import direct_sources
+    import tomllib
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    import commit_update_budget as budgets
+    receipt_path = workspace / direct_sources.DEPENDENCY_RECEIPT_FILE
+    if receipt_path.is_symlink() or not receipt_path.is_file() or receipt_path.stat().st_size > 65536:
+        raise ValueError('INVALID_DEPENDENCY_RECEIPT')
+    direct_sources.validate_dependency_receipt(json.loads(receipt_path.read_bytes()), workspace,
+                                               config['source']['dependencies'])
+    cargo = DATA / 'cargo'
+    path = cargo / 'config.toml'
+    base = {'source': {'crates-io': {'replace-with': 'rsproxy-sparse'},
+                      'rsproxy-sparse': {'registry': 'sparse+https://rsproxy.cn/index/'}},
+            'http': {'multiplexing': False}}
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
+        raise ValueError('INVALID_CARGO_CONFIGURATION')
+    raw = path.read_text(encoding='utf-8')
+    if tomllib.loads(raw) != base:
+        raise ValueError('INVALID_CARGO_CONFIGURATION')
+    for label, identity in sorted(direct_sources.DEPENDENCIES.items()):
+        original, mirror = 'pinned-' + label, 'local-' + label
+        uri = direct_sources.dependency_repository(workspace, label).as_uri()
+        raw += ('\n[source.' + json.dumps(original) + ']\ngit = ' + json.dumps(identity['url'])
+            + '\nrev = ' + json.dumps(identity['sha']) + '\nreplace-with = ' + json.dumps(mirror)
+            + '\n\n[source.' + json.dumps(mirror) + ']\ngit = ' + json.dumps(uri)
+            + '\nrev = ' + json.dumps(identity['sha']) + '\n')
+    tomllib.loads(raw)
+    temporary = path.with_suffix('.new')
+    with temporary.open('x', encoding='utf-8') as stream:
+        stream.write(raw)
+    os.chown(temporary, user.pw_uid, user.pw_gid)
+    temporary.chmod(0o640)
+    temporary.replace(path)
+    env = {'HOME': str(DATA / 'test-home'), 'CARGO_HOME': str(cargo), 'RUSTUP_HOME': str(DATA / 'rustup'),
+           'TMPDIR': str(DATA / 'tmp'), 'PATH': str(cargo / 'bin') + ':/usr/local/bin:/usr/bin:/bin'}
+    rows = {}
+    for label, sha in (('a', config['baseline_sha']), ('b', config['candidate_sha'])):
+        source = workspace / ('client-' + label)
+        lock = source / 'Cargo.lock'
+        if lock.is_symlink() or not lock.is_file() or lock.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError('INVALID_CLIENT_LOCK')
+        before = hashlib.sha256(lock.read_bytes()).hexdigest()
+        seconds = (datetime.fromisoformat(config['preflight_deadline_utc'].replace('Z', '+00:00'))
+                   - datetime.now(timezone.utc)).total_seconds()
+        if seconds <= 0:
+            raise TimeoutError('ORIGINAL_PREFLIGHT_EXPIRED')
+        started = time.perf_counter_ns()
+        deadline = time.monotonic() + min(300, seconds)
+        code, _, _ = budgets.run_process(['runuser', '-u', 'benchmark', '--', 'env', '-i',
+            *[key + '=' + value for key, value in env.items()], 'cargo', 'fetch', '--locked',
+            '--target', 'x86_64-unknown-linux-gnu', '--manifest-path', str(source / 'Cargo.toml')],
+            deadline, capture=True)
+        if code:
+            raise RuntimeError('LOCKED_DEPENDENCY_FETCH_FAILED')
+        if hashlib.sha256(lock.read_bytes()).hexdigest() != before:
+            raise ValueError('CLIENT_LOCK_CHANGED_DURING_PREPARATION')
+        rows[label] = {'source_sha': sha, 'cargo_lock_sha256': before,
+            'wall_ms': (time.perf_counter_ns() - started) / 1_000_000, 'locked': True}
+    return {'revision': 1, 'target': 'x86_64-unknown-linux-gnu', 'clients': rows}
+
+
 def install(config):
     if os.getuid() != 0:
         raise ValueError('ROOT_INSTALL_REQUIRED')
@@ -95,6 +210,7 @@ def install(config):
         os.chown(directory, user.pw_uid, user.pw_gid)
         for name in dirs + files:
             os.chown(Path(directory) / name, user.pw_uid, user.pw_gid, follow_symlinks=False)
+    dependency_preparation = prepare_dependencies(config, workspace, user)
     config['execution_receipt'] = str(receipt_path)
     config['status_path'] = str(DATA / 'evidence' / config['campaign_id'] / 'status.json')
     configuration = CONTROL / ('direct-config-' + config['campaign_id'] + '.json')
@@ -119,10 +235,10 @@ def install(config):
         check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {'status': 'DIRECT_STARTED', 'campaign_id': config['campaign_id'], 'instance_id': config['instance_id'],
         'unit': unit, 'execution_receipt_sha256': hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
-        'status_path': config['status_path']}
+        'status_path': config['status_path'], 'dependency_preparation': dependency_preparation}
 
 
-def execute(config):
+def execute(config, context, progress):
     harness = Path(config['workspace']) / 'scorpiofs'
     scripts = harness / 'tests/mst2-e2e'
     sys.path.insert(0, str(scripts))
@@ -133,14 +249,10 @@ def execute(config):
     import workspace_update_size as size
     import workspace_update_git_performance as git_performance
     os.environ.update(STARTED_INPUT=config['session_started_utc'], DEADLINE_INPUT=config['session_deadline_utc'])
-    context = execution.identity()
     status_path = Path(config['status_path'])
     evidence = status_path.parent
     performance_path = evidence / 'git-performance.jsonl'
-    with performance_path.open('xb'):
-        pass
-    performance_path.chmod(0o600)
-    os.environ['MST2_GIT_PERFORMANCE_PATH'] = str(performance_path)
+    os.environ.pop('MST2_GIT_PERFORMANCE_PATH', None)
     workspace = Path(config['workspace'])
     os.environ.update(STARTED_INPUT=config['session_started_utc'], DEADLINE_INPUT=config['session_deadline_utc'],
         MST2_SESSION_STARTED=config['session_started_utc'], MST2_SESSION_DEADLINE=config['session_deadline_utc'],
@@ -153,7 +265,11 @@ def execute(config):
     receipts = {label: evidence / (label + '-build.json') for label in ('server', 'a', 'b')}
     base = {'revision': 1, 'campaign_id': config['campaign_id'], 'instance_id': config['instance_id'],
         'harness_sha': config['harness_sha'], 'profile': config['profile']}
+    def failure(error):
+        if progress['failure'] is None:
+            progress['failure'] = {'failed_stage': progress['stage'], **error_fields(error)}
     def status(state, stage, **fields):
+        progress['stage'] = stage
         metric_stage = (stage if stage in ('server-build', 'client-a-build', 'client-b-build', 'cleanup')
                         else 'fences' if stage == 'correctness-fences'
                         else 'setup' if stage == 'native-commit-measurements' else 'report')
@@ -161,7 +277,14 @@ def execute(config):
                         'cleanup' if metric_stage == 'cleanup' else 'setup')
         os.environ['MST2_GIT_PERFORMANCE_CONTEXT'] = json.dumps(
             dict(stage=metric_stage, phase=metric_phase, round=None, client=None, version=None))
-        save(status_path, {**base, 'status': state, 'stage': stage, **fields})
+        value = {**base, 'status': state, 'stage': stage, 'primary_failure': progress['failure'], **fields}
+        try:
+            save(status_path, value)
+            return True
+        except BaseException as error:
+            failure(error)
+            print(json.dumps({'status': 'STATUS_WRITE_FAILED', **error_fields(error)}), file=sys.stderr, flush=True)
+            return False
     def run(args, deadline, *, build=False, fences=False):
         env = dict(os.environ)
         if fences:
@@ -175,22 +298,33 @@ def execute(config):
         if code:
             raise RuntimeError('NATIVE_STAGE_FAILED')
     python = sys.executable
-    success, cleanup_ok, export_ok = False, False, False
+    success, cleanup_ok, export_ok, metrics_created, complete = False, False, False, False, False
+    cleanup_error = metrics_error = None
     try:
+        with performance_path.open('xb'):
+            pass
+        metrics_created = True
+        performance_path.chmod(0o600)
+        os.environ['MST2_GIT_PERFORMANCE_PATH'] = str(performance_path)
         size.admit_backend(config['profile'], True)
         size.admit_campaign_disk(config['profile'], context['owned_root'])
         for stage, label, folder, sha in (('server-build', 'server', 'mega2', config['mega_sha']),
                 ('client-a-build', 'a', 'client-a', config['baseline_sha']),
                 ('client-b-build', 'b', 'client-b', config['candidate_sha'])):
-            status('RUNNING', stage)
+            if not status('RUNNING', stage):
+                raise RuntimeError('STATUS_WRITE_FAILED')
             run([python, '-B', str(scripts / 'workspace_update_build.py'), '--label', label,
                 '--source', str(workspace / folder), '--source-sha', sha, '--receipt', str(receipts[label])],
                 budget.stage_deadline(stage), build=True)
-        status('RUNNING', 'correctness-fences')
+        if not status('RUNNING', 'correctness-fences'):
+            raise RuntimeError('STATUS_WRITE_FAILED')
         deadline = budget.stage_deadline('fences')
         for pattern in ('test_commit_update_*.py', 'test_workspace_update_*.py'):
             run([python, '-B', '-m', 'unittest', 'discover', '-s', str(scripts), '-p', pattern], deadline, fences=True)
-        status('RUNNING', 'native-commit-measurements')
+        run([python, '-B', '-m', 'unittest', 'discover', '-s', str(scripts / 'infra/aliyun'),
+            '-p', 'test_*.py'], deadline, fences=True)
+        if not status('RUNNING', 'native-commit-measurements'):
+            raise RuntimeError('STATUS_WRITE_FAILED')
         args = [python, '-B', str(scripts / 'commit_update_ci.py'), '--execute', '--projection-traces',
             '--run-root', context['owned_root'], '--mega-source', str(workspace / 'mega2'), '--mega-sha', config['mega_sha'],
             '--mega-binary', str(workspace / 'mega2/target/release/mega2'), '--paired', '--build-a', str(receipts['a']),
@@ -203,7 +337,8 @@ def execute(config):
     except BaseException as error:
         # The controller must leave the instance alive until cleanup and the
         # allowlisted partial export have finished.
-        status('COLLECTING', 'native-execution-failed', error_type=type(error).__name__)
+        failure(error)
+        status('COLLECTING', 'native-execution-failed')
     finally:
         status('COLLECTING', 'cleanup', native_completed=success)
         try:
@@ -211,21 +346,22 @@ def execute(config):
                 '--run-root', context['owned_root'], '--session-started-utc', config['session_started_utc'],
                 '--session-deadline-utc', config['session_deadline_utc'], '--rounds', '3'], anchor)
             cleanup_ok = True
-        except BaseException:
-            pass
+        except BaseException as error:
+            cleanup_error = error_fields(error)
         try:
             safe = evidence / 'safe-export'
             present = [(label, path) for label, path in receipts.items() if path.is_file()]
             metrics_closed = False
-            if cleanup_ok:
+            if cleanup_ok and metrics_created:
                 try:
                     git_performance.finalize(performance_path)
                     metrics_closed = True
-                except (OSError, ValueError, TimeoutError):
-                    pass
+                except (OSError, ValueError, TimeoutError) as error:
+                    metrics_error = error_fields(error)
             exporter.export(Path(context['owned_root']), safe, config['session_deadline_utc'], present,
-                run_metadata=exporter.run_metadata_from_env(), git_performance_path=performance_path,
-                complete_allowed=success and cleanup_ok and metrics_closed)
+                run_metadata=exporter.run_metadata_from_env(),
+                git_performance_path=performance_path if metrics_created else None,
+                complete_allowed=success and cleanup_ok and metrics_created and metrics_closed and progress['failure'] is None)
             import tarfile
             archive = evidence / 'safe-evidence.tar.gz'
             with tarfile.open(archive, 'w:gz') as stream:
@@ -239,32 +375,54 @@ def execute(config):
                 headers={'x-oss-server-side-encryption': 'AES256', 'x-oss-object-acl': 'private', 'x-oss-forbid-overwrite': 'true'})
             export_ok = True
             manifest = json.loads((safe / 'safe-export.json').read_bytes())
-            complete = success and cleanup_ok and manifest['complete_campaign'] is True
+            complete = (success and cleanup_ok and metrics_created and metrics_closed
+                        and progress['failure'] is None and manifest['complete_campaign'] is True)
             status('COMPLETE_VERIFIED' if complete else 'FAILED', 'finished', native_completed=success,
                 cleanup_verified=cleanup_ok, git_metrics_closed=metrics_closed,
+                cleanup_failure=cleanup_error, git_metrics_failure=metrics_error,
                 evidence_uploaded=True, evidence_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
                 evidence_bytes=archive.stat().st_size)
         except BaseException as error:
             status('FAILED', 'safe-export', native_completed=success, cleanup_verified=cleanup_ok,
-                evidence_uploaded=False, error_type=type(error).__name__)
-    return 0 if success and cleanup_ok and export_ok else 1
+                evidence_uploaded=False, export_failure=error_fields(error),
+                cleanup_failure=cleanup_error, git_metrics_failure=metrics_error)
+    return 0 if complete and export_ok and progress['failure'] is None else 1
 
 
-if __name__ == '__main__':
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=('install', 'execute'))
     parser.add_argument('--config', required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     configuration = json.loads(Path(args.config).read_bytes())
     if args.action == 'install':
         print(json.dumps(install(configuration)))
+        return 0
     else:
+        progress = {'stage': 'execution-admission', 'failure': None}
         try:
-            result = execute(configuration)
+            with execution_claim(configuration) as context:
+                try:
+                    return execute(configuration, context, progress)
+                except BaseException as error:
+                    value = {'revision': 1, 'status': 'FAILED', 'stage': progress['stage'],
+                        'campaign_id': configuration['campaign_id'], 'instance_id': configuration['instance_id'],
+                        'harness_sha': configuration['harness_sha'], 'profile': configuration['profile'],
+                        'primary_failure': progress['failure'] or {'failed_stage': progress['stage'], **error_fields(error)},
+                        'outer_failure': error_fields(error), 'evidence_uploaded': False}
+                    try:
+                        save(Path(configuration['status_path']), value)
+                    except BaseException as save_error:
+                        print(json.dumps({'status': 'STATUS_WRITE_FAILED', **error_fields(save_error)}), file=sys.stderr, flush=True)
+                    return 1
+        except ActiveExecution:
+            print(json.dumps({'status': 'ACTIVE_EXECUTION_ALREADY_OWNS_CAMPAIGN'}), file=sys.stderr, flush=True)
+            return 1
         except BaseException as error:
-            save(Path(configuration['status_path']), {'revision': 1, 'status': 'FAILED', 'stage': 'execution-admission',
-                'campaign_id': configuration['campaign_id'], 'instance_id': configuration['instance_id'],
-                'harness_sha': configuration['harness_sha'], 'profile': configuration['profile'],
-                'error_type': type(error).__name__, 'evidence_uploaded': False})
-            result = 1
-        raise SystemExit(result)
+            # Failure before the claim grants no right to touch canonical state.
+            print(json.dumps({'status': 'EXECUTION_CLAIM_FAILED', **error_fields(error)}), file=sys.stderr, flush=True)
+            return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

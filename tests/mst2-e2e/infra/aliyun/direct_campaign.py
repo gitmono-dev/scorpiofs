@@ -28,7 +28,7 @@ CANDIDATE = 'f18b99645d7bbbc5b4ea3374165e57dc4ff9f922'
 MAX_EVIDENCE = 512 * 1024 * 1024
 MAX_EXPANDED_EVIDENCE = 2 * 1024 * 1024 * 1024
 CONFIG_FIELDS = {'region', 'zone', 'image_id', 'instance_type', 'vpc_cidr', 'vswitch_cidr',
-                 'harness_sha', 'profile', 'scorpiofs_source', 'mega2_source'}
+                 'harness_sha', 'profile', 'scorpiofs_source', 'mega2_source', 'dependency_sources'}
 
 
 def require(ok, code):
@@ -70,6 +70,7 @@ def config(value):
     require(ipaddress.IPv4Network(value['vswitch_cidr']).subnet_of(ipaddress.IPv4Network(value['vpc_cidr'])), 'SUBNET_OUTSIDE_VPC')
     for key in ('scorpiofs_source', 'mega2_source'):
         require(type(value[key]) is str and Path(value[key]).is_absolute(), 'ABSOLUTE_SOURCE_PATH_REQUIRED')
+    direct_sources.dependency_sources(value['dependency_sources'])
     return dict(value)
 
 
@@ -149,7 +150,8 @@ with archive.open('xb') as out:
 if size!=c['source']['bytes'] or digest.hexdigest()!=c['source']['sha256']: raise ValueError('SOURCE_DIGEST_MISMATCH')
 with tarfile.open(archive,'r:gz') as t:
     members=t.getmembers()
-    if len(members)!=6 or any(not m.isfile() or m.size>512*1024*1024 for m in members) or sum(m.size for m in members)>2*1024**3: raise ValueError('INVALID_SOURCE_MEMBERS')
+    names={'scorpiofs.pack','mega2.pack','client-a.pack','client-b.pack','rk8s.pack','mst2-codec.pack','manifest.json','bootstrap.py'}
+    if len(members)!=len(names) or {m.name for m in members}!=names or any(not m.isfile() or not 0<=m.size<=512*1024*1024 for m in members) or sum(m.size for m in members)>2*1024**3: raise ValueError('INVALID_SOURCE_MEMBERS')
     raw=t.extractfile('bootstrap.py').read(1024*1024+1)
 if len(raw)>1024*1024 or hashlib.sha256(raw).hexdigest()!=c['source']['bootstrap_sha256']: raise ValueError('BOOTSTRAP_DIGEST_MISMATCH')
 helper=Path('/var/lib/scorpiofs-benchmark')/('restore-'+c['campaign_id']+'.py')
@@ -302,7 +304,7 @@ class Campaign:
             'mega2': {'path': self.cfg['mega2_source'], 'sha': SERVER},
             'client-a': {'path': self.cfg['scorpiofs_source'], 'sha': BASELINE},
             'client-b': {'path': self.cfg['scorpiofs_source'], 'sha': CANDIDATE}}
-        source = direct_sources.create(sources, self.directory / 'sources.tar.gz')
+        source = direct_sources.create(sources, self.directory / 'sources.tar.gz', self.cfg['dependency_sources'])
         source['key'] = 'sources/' + self.state['campaign_id'] + '/sources.tar.gz'
         self.record(source=source, evidence_object='runs/' + self.state['campaign_id'] + '/safe-evidence.tar.gz')
         self.admit_cloud_shape()

@@ -24,7 +24,8 @@ def configuration():
     return {"region": "cn-hangzhou", "zone": "cn-hangzhou-h", "image_id": "ubuntu_24_04_x64_reviewed_image",
             "instance_type": "ecs.u1-c1m4.2xlarge", "vpc_cidr": "172.26.0.0/16", "vswitch_cidr": "172.26.1.0/24",
             "harness_sha": "e" * 40, "profile": "history-large",
-            "scorpiofs_source": str(root / "scorpiofs"), "mega2_source": str(root / "mega2")}
+            "scorpiofs_source": str(root / "scorpiofs"), "mega2_source": str(root / "mega2"),
+            "dependency_sources": {"rk8s": str(root / "rk8s.git"), "mst2-codec": str(root / "mst2-codec.git")}}
 
 
 class FakeTools:
