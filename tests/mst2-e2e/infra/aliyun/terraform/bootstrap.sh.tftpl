@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Runs only on a newly created disposable Ubuntu amd64 benchmark ECS.
+# Credentials, Actions registration, and measured workloads are deliberately absent.
+set -Eeuo pipefail
+umask 022
+
+readonly RUN_ID='${run_id}'
+readonly STARTED_UTC='${session_started_utc}'
+readonly DEADLINE_UTC='${session_deadline_utc}'
+readonly EXPIRES_AT='${expires_at}'
+readonly DEVICE='${data_disk_device}'
+readonly DISK_GIB='${data_disk_size_gib}'
+readonly DATA_ROOT=/srv/scorpiofs-benchmark
+readonly CONTROL_ROOT=/var/lib/scorpiofs-benchmark
+readonly DISK_RECEIPT=$CONTROL_ROOT/disk-owner
+readonly READY=$CONTROL_ROOT/bootstrap-ready.json
+
+fail() { printf 'benchmark bootstrap refused: %s\n' "$1" >&2; exit 1; }
+test "$(id -u)" = 0 || fail root_required
+test "$(uname -m)" = x86_64 || fail wrong_architecture
+test "$(date -u +%s)" -lt "$(date -u -d "$EXPIRES_AT" +%s)" || fail original_window_expired
+for program in lsblk blkid wipefs blockdev findmnt mountpoint mkfs.ext4; do
+  command -v "$program" >/dev/null || fail missing_disk_tool
+done
+install -d -m 0755 -o root -g root "$CONTROL_ROOT"
+test ! -L "$CONTROL_ROOT" && test ! -L "$DISK_RECEIPT" && test ! -L "$READY" || fail unsafe_control_path
+
+# The inline ECS data disk is created with the instance. Still wait for udev;
+# never guess a different disk or silently place the campaign on the system disk.
+for attempt in $(seq 1 60); do
+  test -b "$DEVICE" && break
+  sleep 5
+done
+test -b "$DEVICE" && test ! -L "$DEVICE" || fail expected_new_data_disk_missing
+test "$(lsblk -dnro TYPE "$DEVICE")" = disk || fail expected_whole_new_disk
+test "$(blockdev --getsize64 "$DEVICE")" -ge "$((DISK_GIB * 1024 * 1024 * 1024))" || fail undersized_data_disk
+ROOT_DEVICE=$(findmnt -e -n -o SOURCE /)
+ROOT_ANCESTORS=$(lsblk -snrpo NAME "$ROOT_DEVICE")
+test -n "$ROOT_ANCESTORS" || fail system_disk_identity_unavailable
+if printf '%s\n' "$ROOT_ANCESTORS" | grep -qxF "$DEVICE"; then
+  fail system_disk_selected
+fi
+
+if test -f "$DISK_RECEIPT"; then
+  mapfile -t OWNER < "$DISK_RECEIPT"
+  test "$${#OWNER[@]}" = 3 || fail invalid_disk_owner_receipt
+  test "$${OWNER[0]}" = "$RUN_ID" && test "$${OWNER[1]}" = "$DEVICE" || fail disk_owner_mismatch
+  UUID=$(blkid -s UUID -o value "$DEVICE")
+  test "$UUID" = "$${OWNER[2]}" && test "$(blkid -s TYPE -o value "$DEVICE")" = ext4 || fail disk_identity_changed
+else
+  # Any partition, signature, or mount makes the disk ineligible for formatting.
+  test "$(lsblk -nrpo TYPE "$DEVICE")" = disk || fail existing_partitions
+  MOUNTPOINTS=$(lsblk -nrpo MOUNTPOINTS "$DEVICE")
+  SIGNATURES=$(wipefs --no-act --noheadings "$DEVICE")
+  test -z "$(printf '%s' "$MOUNTPOINTS" | tr -d '[:space:]')" || fail disk_already_mounted
+  test -z "$SIGNATURES" || fail existing_disk_signature
+  mkfs.ext4 -F -m 0 -L scorpio-bench "$DEVICE"
+  UUID=$(blkid -s UUID -o value "$DEVICE")
+  [[ "$UUID" =~ ^[a-f0-9-]{36}$ ]] || fail invalid_new_filesystem_uuid
+  printf '%s\n%s\n%s\n' "$RUN_ID" "$DEVICE" "$UUID" > "$DISK_RECEIPT.new"
+  chmod 0600 "$DISK_RECEIPT.new"
+  mv -T "$DISK_RECEIPT.new" "$DISK_RECEIPT"
+fi
+
+test ! -L "$DATA_ROOT" || fail unsafe_data_mount_path
+install -d -m 0755 -o root -g root "$DATA_ROOT"
+FSTAB_LINE="UUID=$UUID $DATA_ROOT ext4 defaults 0 2"
+if awk -v point="$DATA_ROOT" '$2 == point {found=1} END {exit !found}' /etc/fstab; then
+  grep -qxF "$FSTAB_LINE" /etc/fstab || fail existing_mount_configuration
+else
+  printf '%s\n' "$FSTAB_LINE" >> /etc/fstab
+fi
+mountpoint -q "$DATA_ROOT" || mount "$DATA_ROOT"
+test "$(findmnt -n -o UUID --target "$DATA_ROOT")" = "$UUID" || fail mounted_wrong_filesystem
+test "$(findmnt -n -o TARGET --target "$DATA_ROOT")" = "$DATA_ROOT" || fail data_mount_missing
+test "$(df -B1 --output=avail "$DATA_ROOT" | tail -1 | tr -d ' ')" -ge 116412113924 || fail insufficient_campaign_disk
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg sudo git jq python3 pkg-config libssl-dev libfuse3-dev fuse3 protobuf-compiler postgresql-client build-essential
+install -d -m 0755 /etc/apt/keyrings
+curl --retry 2 --max-time 90 --proto '=https' --tlsv1.2 -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod 0644 /etc/apt/keyrings/docker.asc
+. /etc/os-release
+test "$ID" = ubuntu || fail unsupported_distribution
+case "$VERSION_ID" in 22.04|24.04) ;; *) fail unsupported_ubuntu_version ;; esac
+printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://mirrors.aliyun.com/docker-ce/linux/ubuntu %s stable\n' "$VERSION_CODENAME" > /etc/apt/sources.list.d/docker.list
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+if ! id benchmark >/dev/null 2>&1; then
+  useradd --create-home --home-dir "$DATA_ROOT/runner-home" --shell /bin/bash benchmark
+fi
+test "$(getent passwd benchmark | cut -d: -f6)" = "$DATA_ROOT/runner-home" || fail runner_home_mismatch
+usermod -aG docker benchmark
+for directory in cargo rustup runner-home work tmp evidence; do
+  install -d -m 0750 -o benchmark -g benchmark "$DATA_ROOT/$directory"
+done
+install -d -m 0711 -o root -g root "$DATA_ROOT/docker"
+install -d -m 0755 -o root -g root /etc/docker
+printf '{"data-root":"%s/docker","registry-mirrors":["https://docker.m.daocloud.io"]}\n' "$DATA_ROOT" > /etc/docker/daemon.json
+systemctl enable --now docker
+systemctl restart docker
+test "$(docker info --format '{{.DockerRootDir}}')" = "$DATA_ROOT/docker" || fail docker_storage_not_on_data_disk
+docker compose version
+
+printf 'benchmark ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/scorpiofs-benchmark
+chmod 0440 /etc/sudoers.d/scorpiofs-benchmark
+visudo -cf /etc/sudoers.d/scorpiofs-benchmark
+grep -qxF user_allow_other /etc/fuse.conf || printf '\nuser_allow_other\n' >> /etc/fuse.conf
+test -c /dev/fuse || modprobe fuse
+test -c /dev/fuse || fail fuse_device_missing
+chmod 0666 /dev/fuse
+runuser -u benchmark -- test -r /dev/fuse
+runuser -u benchmark -- test -w /dev/fuse
+fusermount3 --version
+
+export CARGO_HOME=$DATA_ROOT/cargo
+export RUSTUP_HOME=$DATA_ROOT/rustup
+export TMPDIR=$DATA_ROOT/tmp
+export PATH=$CARGO_HOME/bin:$PATH
+runuser -u benchmark -- env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" TMPDIR="$TMPDIR" bash -euo pipefail -c \
+  "curl --retry 2 --max-time 120 --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path"
+for program in cargo rustc rustup; do
+  ln -sfn "$CARGO_HOME/bin/$program" "/usr/local/bin/$program"
+done
+printf 'export CARGO_HOME=%s/cargo\nexport RUSTUP_HOME=%s/rustup\nexport TMPDIR=%s/tmp\nexport PATH=%s/cargo/bin:$PATH\n' "$DATA_ROOT" "$DATA_ROOT" "$DATA_ROOT" "$DATA_ROOT" > /etc/profile.d/scorpiofs-benchmark.sh
+runuser -u benchmark -- env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" rustc --version
+
+# Registration checks this root-owned receipt, the original window, and the mount.
+# The public instance type is separately checked by the external controller.
+RUNNER_UID=$(id -u benchmark)
+RUNNER_GID=$(id -g benchmark)
+export RUN_ID STARTED_UTC DEADLINE_UTC EXPIRES_AT DATA_ROOT DEVICE UUID RUNNER_UID RUNNER_GID READY
+python3 - <<'PY'
+import datetime
+import json
+import os
+from pathlib import Path
+import shutil
+
+env = os.environ
+memory = int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines()
+                  if line.startswith('MemTotal:'))) * 1024
+cpus = os.cpu_count()
+free = shutil.disk_usage(env['DATA_ROOT']).free
+if cpus < 8 or memory < 30 * 1024 ** 3 or free < 116412113924:
+    raise SystemExit('benchmark runtime shape or remaining disk is insufficient')
+if datetime.datetime.now(datetime.timezone.utc) >= datetime.datetime.fromisoformat(env['EXPIRES_AT'].replace('Z', '+00:00')):
+    raise SystemExit('original hard release deadline is exhausted')
+receipt = dict(revision=1, status='ready', campaign_id=env['RUN_ID'],
+               runner_label='scorpiofs-' + env['RUN_ID'],
+               session_started_utc=env['STARTED_UTC'], session_deadline_utc=env['DEADLINE_UTC'],
+               hard_release_utc=env['EXPIRES_AT'], data_root=env['DATA_ROOT'],
+               runner_arch='linux-x64', runner_user='benchmark',
+               runner_uid=int(env['RUNNER_UID']), runner_gid=int(env['RUNNER_GID']),
+               disk_device=env['DEVICE'], disk_uuid=env['UUID'], disk_free_bytes=free,
+               logical_cpus=cpus, memory_bytes=memory)
+target = Path(env['READY'])
+temporary = target.with_suffix('.new')
+with temporary.open('x', encoding='utf-8') as stream:
+    json.dump(receipt, stream, sort_keys=True)
+    stream.write('\n')
+    stream.flush()
+    os.fsync(stream.fileno())
+temporary.chmod(0o644)
+temporary.replace(target)
+PY
+printf 'benchmark bootstrap ready: %s\n' "$RUN_ID"

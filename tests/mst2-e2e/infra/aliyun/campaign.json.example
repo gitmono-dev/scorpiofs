@@ -1,0 +1,14 @@
+{
+  "region": "cn-hangzhou",
+  "zone": "cn-hangzhou-h",
+  "image_id": "REPLACE_WITH_REVIEWED_UBUNTU_AMD64_IMAGE",
+  "instance_type": "ecs.u1-c1m4.2xlarge",
+  "vpc_cidr": "172.26.0.0/16",
+  "vswitch_cidr": "172.26.1.0/24",
+  "ssh_operator_cidrs": ["REPLACE_WITH_OPERATOR_PUBLIC_IP/32"],
+  "ssh_public_key": "REPLACE_WITH_EXISTING_PUBLIC_KEY_ONLY",
+  "ssh_identity_file": "REPLACE_WITH_ABSOLUTE_EXISTING_IDENTITY_PATH",
+  "harness_ref": "REPLACE_WITH_REVIEWED_HARNESS_BRANCH_OR_TAG",
+  "harness_sha": "REPLACE_WITH_IMMUTABLE_40_HEX_HARNESS_COMMIT",
+  "profile": "large"
+}

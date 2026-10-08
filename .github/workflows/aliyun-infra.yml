@@ -1,0 +1,37 @@
+name: Aliyun v3 campaign infrastructure
+
+on:
+  pull_request:
+    paths:
+      - tests/mst2-e2e/infra/aliyun/**
+      - .github/workflows/aliyun-infra.yml
+      - .github/workflows/mst2-real-update.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Check lifecycle and runner installation without cloud access
+        run: python3 -B -m unittest discover -s tests/mst2-e2e/infra/aliyun -p 'test_*.py' -v
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - name: Check the exact provider schema and mock-only resource plans
+        working-directory: tests/mst2-e2e/infra/aliyun/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false -lockfile=readonly
+          terraform validate
+          terraform test -no-color
