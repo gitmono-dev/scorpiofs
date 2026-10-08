@@ -124,7 +124,7 @@ class CampaignWorkloadTests(unittest.TestCase):
     def test_producer_worker_footer_collector_and_teardown_failures_never_emit_complete(self):
         import test_workspace_update_campaign_export as replay_tests
         import workspace_update_resources as resource_module
-        for boundary in ("worker", "footer", "collector", "teardown"):
+        for boundary in ("worker", "footer", "collector", "teardown", "success"):
             with self.subTest(boundary=boundary):
                 replay = replay_tests.CampaignExportTests(methodName="runTest")
                 replay.setUp()
@@ -223,14 +223,26 @@ class CampaignWorkloadTests(unittest.TestCase):
                             (campaign.proofs, "capture_lane_runtime", Mock(side_effect=lambda owner, *_args, **_kwargs: captures[owner.client])),
                             (campaign, "cleanup_receipts", Mock(side_effect=lambda lane_root, *_args: lanes[lane_root.name[-1]][0][0]["cleanup_receipts"]))):
                             stack.enter_context(patch.object(obj, name, replacement))
-                        with self.assertRaises(RuntimeError) as caught:
-                            campaign.run_phase(group, clients, {label: captures[label].evidence["sources"] for label in captures},
-                                               "fair", 1, deadline, root)
-                        self.assertIs(caught.exception, primary)
+                        if boundary == "success":
+                            records = campaign.run_phase(group, clients,
+                                {label: captures[label].evidence["sources"] for label in captures},
+                                "fair", 1, deadline, root)
+                            self.assertEqual(len(records), 8)
+                            self.assertTrue(all(isinstance(row["manifest"], campaign.ManifestFacts) for row in records))
+                            wire = [json.loads(line) for line in (root / "measurements/fair/measurements.jsonl").read_text().splitlines()]
+                            self.assertEqual(len(wire), 8)
+                            self.assertTrue(all(type(row["manifest"]) is dict for row in wire))
+                            for compact, emitted in zip(records, wire):
+                                self.assertEqual(compact["manifest"].fingerprint, campaign.proofs.digest(emitted["manifest"]))
+                        else:
+                            with self.assertRaises(RuntimeError) as caught:
+                                campaign.run_phase(group, clients, {label: captures[label].evidence["sources"] for label in captures},
+                                                   "fair", 1, deadline, root)
+                            self.assertIs(caught.exception, primary)
                     self.assertIn("a", stopped)
                     self.assertIn("b", stopped)
                     self.assertEqual(group.cleanup_deadline, h)
-                    self.assertFalse((root / "measurements/fair/measurements.jsonl").exists())
+                    self.assertEqual((root / "measurements/fair/measurements.jsonl").exists(), boundary == "success")
                     self.assertFalse((root / "campaign.json").exists())
                 finally:
                     replay.doCleanups()

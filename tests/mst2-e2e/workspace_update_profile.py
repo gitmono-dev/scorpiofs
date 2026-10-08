@@ -284,10 +284,11 @@ def validate_artifact(path, *, diagnostic_required=False):
     try:
         with Path(path).open("rb") as stream:
             while True:
-                line = stream.readline(16 * 1024 * 1024 + 1)
+                from workspace_update_size import EVIDENCE_ROW_LIMIT
+                line = stream.readline(EVIDENCE_ROW_LIMIT + 1)
                 if not line:
                     break
-                _require(len(line) <= 16 * 1024 * 1024)
+                _require(len(line) <= EVIDENCE_ROW_LIMIT)
                 row = json.loads(line, object_pairs_hook=pairs, parse_constant=constant)
                 _require(type(row) is dict)
                 scorpio = row.get("scorpio")

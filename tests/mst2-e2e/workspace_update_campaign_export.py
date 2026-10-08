@@ -16,6 +16,8 @@ import workspace_update_build as builds
 import workspace_update_campaign as campaign
 import workspace_update_observation as observation
 import workspace_update_profile as profiles
+import workspace_update_size as fixture_size
+from workspace_update_size import consume_regular
 
 ROOT_FILES = {"campaign.json", "canonical-seed.json", "backend-owners.json", "failure.json"}
 CLIENT_FILES = {"workspace-observation.jsonl", "owned-workspace-daemon.json", "owned-workspace-worker.json"}
@@ -48,11 +50,10 @@ def validate_run_metadata(value, complete=None):
         proofs.require(type(value[key]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", value[key]))
     for key in ("harness_sha", "mega_sha", "baseline_sha", "candidate_sha"):
         proofs.hex_digest(value[key], 40)
-    proofs.exact(value["baseline_sha"], campaign.BASELINE)
-    proofs.exact(value["candidate_sha"], campaign.CANDIDATE)
+    builds.comparison_pair(value["baseline_sha"], value["candidate_sha"])
     proofs.exact(value["rounds"], 3)
     proofs.exact(value["comparison"], "isolated")
-    proofs.require(value["profile"] in ("smoke", "medium"))
+    fixture_size.plan(value["profile"])
     proofs.integer(value["bootstrap_commit_time"], (1 << 32) - 1)
     proofs.finite(value["cleanup_deadline_monotonic"])
     proofs.require(type(value["owned_root"]) is str and PurePosixPath(value["owned_root"]).is_absolute()
@@ -65,6 +66,8 @@ def validate_run_metadata(value, complete=None):
         for label in ("a", "b"):
             proofs.exact(value["harness_sha"], complete["sources"][label]["harness_source_sha"])
             proofs.exact(value["mega_sha"], complete["sources"][label]["server_source_sha"])
+            proofs.exact(value["baseline_sha" if label == "a" else "candidate_sha"],
+                         complete["sources"][label]["client_source_sha"])
     return value
 
 
@@ -86,63 +89,37 @@ def allowed(relative):
             and parts[4] in CLIENT_FILES)
 
 
-def read_regular(path, cap=32 * 1024 * 1024):
-    """Pin every ancestor and the exact regular inode while reading."""
-    path = Path(path).absolute()
-    chain = [*reversed(path.parents)]
-    identities = {}
-    for directory in chain:
-        info = directory.lstat()
-        if not stat.S_ISDIR(info.st_mode):
-            raise AssertionError("safe evidence ancestor is not a real directory")
-        identities[directory] = (info.st_dev, info.st_ino)
-    before = path.lstat()
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > cap:
-        raise AssertionError("safe evidence file is not a bounded independent regular file")
-    parent_fd = None
-    file_fd = None
-    try:
-        if os.name == "posix":
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            parent_fd = os.open(path.anchor, flags)
-            current = Path(path.anchor)
-            for part in path.parts[1:-1]:
-                child = os.open(part, flags, dir_fd=parent_fd)
-                os.close(parent_fd)
-                parent_fd = child
-                current /= part
-                info = os.fstat(parent_fd)
-                if (info.st_dev, info.st_ino) != identities[current]:
-                    raise AssertionError("safe evidence ancestor was replaced")
-            file_fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
-        else:
-            file_fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
-        opened = os.fstat(file_fd)
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-            raise AssertionError("safe evidence file was replaced before read")
-        with os.fdopen(file_fd, "rb", closefd=False) as stream:
-            raw = stream.read(cap + 1)
-        after = os.fstat(file_fd)
-        current = path.lstat()
-        fields = lambda v: (v.st_dev, v.st_ino, v.st_size, v.st_mtime_ns, v.st_ctime_ns, v.st_nlink)
-        path_fields = lambda v: (v.st_dev, v.st_ino, v.st_size, v.st_mtime_ns, v.st_nlink)
-        # Windows fstat and lstat expose different ctime meanings. Compare
-        # descriptor change-time with itself and pathname birth-time with
-        # itself; Linux retains the full descriptor/path change-time check.
-        path_changed = (fields(opened) != fields(current) if os.name == "posix" else
-                        path_fields(opened) != path_fields(current) or before.st_ctime_ns != current.st_ctime_ns)
-        if len(raw) > cap or fields(opened) != fields(after) or path_changed:
+def read_regular(path, cap=fixture_size.ORACLE_MANIFEST_LIMIT):
+    def read(stream):
+        raw = stream.read(cap + 1)
+        if len(raw) > cap:
             raise AssertionError("safe evidence file changed during read")
-        for directory, identity in identities.items():
-            info = directory.lstat()
-            if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
-                raise AssertionError("safe evidence ancestor changed during read")
         return raw
-    finally:
-        if file_fd is not None:
-            os.close(file_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
+    return consume_regular(path, cap, read)
+
+
+def scan_rows(path, consume, *, deadline_utc=None):
+    """Hash and validate one bounded line at a time from one pinned inode."""
+    def scan(stream):
+        digest, count, total = hashlib.sha256(), 0, 0
+        while True:
+            if deadline_utc is not None:
+                budgets.require_external_time(deadline_utc)
+            line = stream.readline(fixture_size.EVIDENCE_ROW_LIMIT + 1)
+            if not line:
+                break
+            count += 1
+            total += len(line)
+            if (not line.endswith(b"\n") or len(line) > fixture_size.EVIDENCE_ROW_LIMIT
+                    or total > fixture_size.EVIDENCE_FILE_LIMIT
+                    or count > fixture_size.EVIDENCE_RECORD_LIMIT):
+                raise AssertionError("campaign evidence stream exceeds bound or is incomplete")
+            value = observation.parse(line)
+            proofs.require(type(value) is dict)
+            digest.update(line)
+            consume(value)
+        return digest.hexdigest()
+    return consume_regular(path, fixture_size.EVIDENCE_FILE_LIMIT, scan)
 
 
 def rows(path):
@@ -151,7 +128,7 @@ def rows(path):
         raise AssertionError("campaign evidence has an incomplete JSONL line")
     values = []
     for line in raw.split(b"\n")[:-1]:
-        if len(line) > 16 * 1024 * 1024:
+        if len(line) > fixture_size.EVIDENCE_ROW_LIMIT:
             raise AssertionError("campaign evidence line exceeds bound")
         value = observation.parse(line)
         proofs.require(type(value) is dict)
@@ -191,7 +168,7 @@ def write_safe(output, relative, raw, bindings):
         else:
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
         with os.fdopen(fd, "wb", closefd=False) as stream:
-            stream.write(raw)
+            result = raw(stream) if callable(raw) else stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
         for directory, identity in bindings.items():
@@ -203,6 +180,26 @@ def write_safe(output, relative, raw, bindings):
             os.close(fd)
         if parent_fd is not None:
             os.close(parent_fd)
+    return result
+
+
+def copy_safe(source, output, relative, bindings, deadline_utc):
+    """Copy a potentially large JSONL file without retaining its contents."""
+    def write(destination):
+        def copy(stream):
+            digest, total = hashlib.sha256(), 0
+            while True:
+                budgets.require_external_time(deadline_utc)
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    return digest.hexdigest()
+                total += len(chunk)
+                if total > fixture_size.EVIDENCE_FILE_LIMIT:
+                    raise AssertionError("campaign evidence copy exceeds bound")
+                digest.update(chunk)
+                destination.write(chunk)
+        return consume_regular(source, fixture_size.EVIDENCE_FILE_LIMIT, copy)
+    return write_safe(output, relative, write, bindings)
 
 
 def workspace_sink(path, records):
@@ -268,10 +265,13 @@ def validate_saved_lane(root, records, owner, expected_sources, client_build):
         proofs.exact(lane["version"], list(campaign.common.SCENARIOS).index(record["version"]) + 1)
         relative = record["manifest_relative_path"]
         proofs.exact(relative, f"measurements/{record['phase']}/round-{record['round']:02}/{record['version']}-expected.json")
-        raw = read_regular(root / relative, 16 * 1024 * 1024)
+        raw = read_regular(root / relative, fixture_size.ORACLE_MANIFEST_LIMIT)
         proofs.exact(hashlib.sha256(raw).hexdigest(), record["oracle_manifest_sha256"])
         manifest = observation.parse(raw)
-        proofs.exact(manifest, record["manifest"])
+        if isinstance(record["manifest"], campaign.ManifestFacts):
+            proofs.exact(proofs.digest(manifest), record["manifest"].fingerprint)
+        else:
+            proofs.exact(manifest, record["manifest"])
         proofs.publication(record["publication"])
         proofs.exact(lane["publication"], record["publication"])
         proofs.require(record["publication"]["visible_monotonic"] <= proofs.finite(record["operation_started_monotonic"])
@@ -321,7 +321,7 @@ def validate_seed(value):
     return value
 
 
-def validate_complete(root, build_receipts=None, *, run_metadata=None):
+def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_utc=None):
     """Replay complete artifacts; this is not authority to start a backend."""
     root = Path(root)
     value = observation.parse(read_regular(root / "campaign.json", 2 * 1024 * 1024))
@@ -364,7 +364,7 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None):
     for label in ("a", "b"):
         source, build = value["sources"][label], actual_builds[label]
         proofs.sources(source)
-        proofs.exact(build["source_sha"], campaign.BASELINE if label == "a" else campaign.CANDIDATE)
+        proofs.exact(build["source_sha"], metadata["baseline_sha" if label == "a" else "candidate_sha"])
         for source_key, build_key in (("client_source_sha", "source_sha"), ("client_cargo_lock_sha256", "cargo_lock_sha256"),
                 ("client_binary_sha256", "binary_sha256"), ("rustc_version", "rustc_version"), ("cargo_version", "cargo_version")):
             proofs.exact(source[source_key], build[build_key])
@@ -410,8 +410,20 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None):
                      for item in value["cleanup"]["inventory"]}
     phases = {}
     for phase in ("fair", "diagnostic"):
-        raw, all_rows = rows(root / "measurements" / phase / "measurements.jsonl")
-        proofs.exact(hashlib.sha256(raw).hexdigest(), value["phase_measurements_sha256"][phase])
+        all_rows = []
+        def retain(row):
+            if row.get("record") == "round":
+                manifest = row.pop("manifest")
+                facts = campaign.ManifestFacts(manifest)
+                if len(proofs.canonical(row).encode("utf8")) > fixture_size.COMPACT_RECORD_LIMIT:
+                    raise AssertionError("compact campaign evidence exceeds bound")
+                row["manifest"] = facts
+            elif len(proofs.canonical(row).encode("utf8")) > fixture_size.COMPACT_RECORD_LIMIT:
+                raise AssertionError("campaign control evidence exceeds bound")
+            all_rows.append(row)
+        digest = scan_rows(root / "measurements" / phase / "measurements.jsonl", retain,
+                           deadline_utc=deadline_utc)
+        proofs.exact(digest, value["phase_measurements_sha256"][phase])
         profiles.validate_artifact_tree(root / "measurements" / phase, diagnostic_required=phase == "diagnostic")
         records = [row for row in all_rows if row.get("record") == "round"]
         for record in records:
@@ -459,7 +471,7 @@ def export(root, output, deadline_utc, receipts=(), *, run_metadata=None):
         if root.is_symlink() or not root.is_dir():
             raise AssertionError("safe export owned root changed")
         if (root / "campaign.json").exists():
-            validate_complete(root, dict(receipts), run_metadata=run_metadata)
+            validate_complete(root, dict(receipts), run_metadata=run_metadata, deadline_utc=deadline_utc)
     output.mkdir(mode=0o700)
     bindings = {}
     for directory in [*reversed(output.parents), output]:
@@ -492,9 +504,12 @@ def export(root, output, deadline_utc, receipts=(), *, run_metadata=None):
                 if not allowed(relative):
                     continue
                 budgets.require_external_time(deadline_utc)
-                raw = read_regular(source)
-                write_safe(output, relative, raw, bindings)
-                copied[relative.as_posix()] = hashlib.sha256(raw).hexdigest()
+                if name == "measurements.jsonl":
+                    copied[relative.as_posix()] = copy_safe(source, output, relative, bindings, deadline_utc)
+                else:
+                    raw = read_regular(source)
+                    write_safe(output, relative, raw, bindings)
+                    copied[relative.as_posix()] = hashlib.sha256(raw).hexdigest()
                 budgets.require_external_time(deadline_utc)
     for label, receipt in receipts:
         if Path(receipt).exists():
@@ -506,7 +521,7 @@ def export(root, output, deadline_utc, receipts=(), *, run_metadata=None):
             copied[target.name] = hashlib.sha256(raw).hexdigest()
             budgets.require_external_time(deadline_utc)
     if (output / "campaign.json").exists():
-        validate_complete(output)
+        validate_complete(output, deadline_utc=deadline_utc)
     for phase in ("fair", "diagnostic"):
         subtree = output / "measurements" / phase
         if subtree.exists():

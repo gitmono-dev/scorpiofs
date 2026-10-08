@@ -3,6 +3,10 @@ name: MST2 shipped workspace v3 commit updates
 on:
   workflow_dispatch:
     inputs:
+      runner_label:
+        description: Existing Linux Actions runner label; large requires sufficient free disk (about 109 GiB)
+        required: true
+        default: ubuntu-latest
       mega_sha:
         description: Immutable reviewed native server SHA
         required: true
@@ -16,14 +20,14 @@ on:
         default: 'd265e31169fb2f8b137ce9922784ebd0238c6397'
       candidate_sha:
         description: Immutable candidate client SHA, separate from workflow harness H
-        default: 'bb0b485abc919aa53507c614020c0a184eda3e3c'
+        default: 'f18b99645d7bbbc5b4ea3374165e57dc4ff9f922'
       bootstrap_commit_time:
         description: Common uint32 bootstrap seconds; isolated mode requires reproducible server init
         default: '1700000000'
       profile:
         type: choice
-        description: Fixture size; start with smoke to verify both real sinks
-        options: [smoke, medium]
+        description: Bounded /project fixture; large needs isolated backends and sufficient disk (checked before builds)
+        options: [smoke, medium, large]
         default: smoke
       rounds:
         description: Complete cold/single/rename/batch repetitions (3 to 10)
@@ -49,7 +53,7 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label || 'ubuntu-latest' }}
     timeout-minutes: 235
     env:
       CARGO_BUILD_JOBS: '2'
@@ -68,6 +72,7 @@ jobs:
       RECOVERY_INPUT: ${{ inputs.recover_original_window }}
       READ_PROFILE_INPUT: ${{ inputs.workspace_read_profile }}
       BOOTSTRAP_COMMIT_TIME: ${{ inputs.bootstrap_commit_time }}
+      RUNNER_LABEL: ${{ inputs.runner_label || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -82,10 +87,18 @@ jobs:
           import os, sys
           sys.path.insert(0, 'scorpiofs/tests/mst2-e2e')
           from commit_update_projection import window_anchor
+          from workspace_update_size import admit_backend, admit_campaign_disk, runner_label
           import re
+          runner_label(os.environ.get('RUNNER_LABEL', 'ubuntu-latest'))
           comparison = os.environ.get('COMPARISON', 'single')
           if comparison not in ('single', 'paired', 'isolated'):
               raise ValueError('invalid comparison mode')
+          admit_backend(os.environ['PROFILE'], comparison == 'isolated')
+          if os.environ['PROFILE'] == 'large':
+              from pathlib import Path
+              import json
+              owned_root = Path(os.environ['RUNNER_TEMP']) / ('mst2-real-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'])
+              print(json.dumps({'campaign_disk_admission': admit_campaign_disk('large', owned_root)}))
           if comparison in ('paired', 'isolated'):
               if os.environ['ROUNDS'] != '3' or any(not re.fullmatch(r'[0-9a-f]{40}', os.environ[k]) for k in ('BASELINE_SHA', 'CANDIDATE_SHA')):
                   raise ValueError('paired measurement requires two immutable SHAs and three rounds')
@@ -95,10 +108,11 @@ jobs:
           if recovery not in ('false', 'true'):
               raise ValueError('invalid original-window recovery flag')
           if comparison == 'isolated':
-              from workspace_update_campaign import BASELINE, CANDIDATE, commit_time
-              if (os.environ['BASELINE_SHA'] != BASELINE or os.environ['CANDIDATE_SHA'] != CANDIDATE
-                      or recovery != 'false' or os.environ.get('READ_PROFILE_INPUT', 'false') != 'false'):
-                  raise ValueError('isolated campaign requires the fixed fair sources, no recovery and separate diagnostic')
+              from workspace_update_campaign import commit_time
+              from workspace_update_build import comparison_pair
+              comparison_pair(os.environ['BASELINE_SHA'], os.environ['CANDIDATE_SHA'])
+              if recovery != 'false' or os.environ.get('READ_PROFILE_INPUT', 'false') != 'false':
+                  raise ValueError('isolated campaign requires immutable sources, no recovery and separate diagnostic')
               commit_time(os.environ['BOOTSTRAP_COMMIT_TIME'])
           anchor = window_anchor(os.environ['STARTED_INPUT'], os.environ['DEADLINE_INPUT'], admission=recovery == 'false')
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
@@ -247,7 +261,7 @@ jobs:
             exit 1
           fi
           if test "$COMPARISON" != single; then
-            client_args=(--paired --build-a "$MST2_BUILD_A" --build-b "$MST2_BUILD_B")
+            client_args=(--paired --build-a "$MST2_BUILD_A" --build-b "$MST2_BUILD_B" --baseline-sha "$BASELINE_SHA" --candidate-sha "$CANDIDATE_SHA")
           else
             DRIVER="$GITHUB_WORKSPACE/scorpiofs/target/release/scorpio"
             DRIVER_SHA=$(sha256sum "$DRIVER" | cut -d ' ' -f 1)
