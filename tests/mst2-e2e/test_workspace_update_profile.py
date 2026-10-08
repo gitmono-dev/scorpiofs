@@ -462,7 +462,7 @@ class ActualHttpCheckpointTests(unittest.TestCase):
         worker.daemon_uid = 0
         worker._expected_path, worker._expected_digest = Path("oracle"), "a" * 64
         worker._create_workspace = Mock(return_value=self.status)
-        worker._hydrate = Mock(return_value=(self.status, 1, 2))
+        worker._hydrate = Mock(return_value=(self.status, 1, 2, 1.5, {}))
         worker._assert_status_path = Mock(return_value=Path("private-mount"))
         worker._retain_view = Mock()
         worker._views = [object()]
@@ -475,7 +475,7 @@ class ActualHttpCheckpointTests(unittest.TestCase):
                 return {"verified": True}
             worker._oracle = Mock(side_effect=oracle)
             with patch.object(worker_module, "_mount_record", return_value={}):
-                result = worker._measure_scorpio({}, time.monotonic() + 10)
+                result = worker._measure_scorpio({"files": [], "directories": [""]}, time.monotonic() + 10)
             self.assertEqual(len(self.requests), 2 if mode == "enabled" else 0)
             if mode == "disabled":
                 self.assertNotIn("read_profile", result)
@@ -492,14 +492,14 @@ class ActualHttpCheckpointTests(unittest.TestCase):
         worker.daemon_uid = 0
         worker._expected_path, worker._expected_digest = Path("oracle"), "a" * 64
         worker._create_workspace = Mock(return_value=self.status)
-        worker._hydrate = Mock(return_value=(self.status, 1, 2))
+        worker._hydrate = Mock(return_value=(self.status, 1, 2, 1.5, {}))
         worker._assert_status_path = Mock(return_value=Path("private-mount"))
         worker._retain_view = Mock()
         worker._views = [object()]
         self.payload_change = lambda _raw: time.sleep(0.05)
         worker._oracle = Mock(return_value={"verified": True})
         with patch.object(worker_module, "_mount_record", return_value={}):
-            result = worker._measure_scorpio({}, time.monotonic() + 10)
+            result = worker._measure_scorpio({"files": [], "directories": [""]}, time.monotonic() + 10)
         value = result["read_profile"]
         self.assertGreater(value["checkpoint_overhead_ns"], 70_000_000)
         self.assertLess(value["profiled_current_oracle_ns"], value["checkpoint_overhead_ns"] / 2)

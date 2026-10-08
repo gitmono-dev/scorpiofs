@@ -25,6 +25,7 @@ import uuid
 import commit_update_budget as budget_module
 import commit_update_projection as projection_module
 import workspace_update_size as fixture_size
+import workspace_update_git_performance as git_performance
 
 try:
     import tomllib
@@ -186,7 +187,13 @@ class PhaseFailure(AssertionError):
 @contextmanager
 def phase(name):
     try:
-        yield
+        stages = {"fixture_and_git_oracle": "fixture", "git_publication_push": "publication",
+                  "initial_git_identity": "validation", "initial_git_identity_seed": "validation",
+                  "updated_publication_identity": "validation",
+                  "shipped_workspace_and_git_measurement": "measure"}
+        labels = {"stage": stages[name]} if name in stages else {}
+        with git_performance.context(**labels):
+            yield
     except PhaseFailure:
         raise
     except Exception as error:
@@ -236,7 +243,8 @@ def failure_record(error):
 
 def clean_env(extra=None):
     env = {k: os.environ[k] for k in ("HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TZ",
-                                    "CARGO_HOME", "RUSTUP_HOME", "TMPDIR")
+                                    "CARGO_HOME", "RUSTUP_HOME", "TMPDIR",
+                                    "MST2_GIT_PERFORMANCE_PATH", "MST2_GIT_PERFORMANCE_CONTEXT")
            if k in os.environ}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
                GIT_TERMINAL_PROMPT="0", NO_PROXY="127.0.0.1,localhost",
@@ -809,7 +817,7 @@ if __name__ == "__main__":
                           "scenarios": [version + "-" + scenario for version, scenario in scenarios(opts.profile).items()],
                           "max_wall_seconds": min(opts.deadline_seconds, 14400),
                           "service_or_resource_changes": False,
-                          "git_baseline": "cold depth=1 fetch, incremental shared bare ODB fetch, new detached worktree per fixed commit, retained old worktrees, shared streamed oracle",
+                          "git_baseline": "cold real clone --depth=1 with checkout; incremental fetch into the same ODB and a new detached worktree; retained old checkouts; actual directory probes and shared streamed oracle",
                           "publication_mode": opts.publication_mode}, indent=2))
     else:
         try:

@@ -11,6 +11,7 @@ import time
 from types import SimpleNamespace
 
 import commit_update_bench as common
+import workspace_update_git_performance as git_performance
 
 BUILD_ENV = {"CARGO_BUILD_JOBS": "2", "CARGO_INCREMENTAL": "0",
              "CARGO_PROFILE_RELEASE_DEBUG": "0"}
@@ -36,7 +37,12 @@ def remaining(deadline):
 
 
 def output(argv, deadline, env=None):
-    return subprocess.check_output(argv, env=env or common.clean_env(), timeout=remaining(deadline))
+    if not git_performance.is_git(argv):
+        return subprocess.check_output(argv, env=env or common.clean_env(), timeout=remaining(deadline))
+    status, output, errors = common.budget_module.run_process(argv, deadline, env=env or common.clean_env())
+    if status:
+        raise subprocess.CalledProcessError(status, argv, output=output, stderr=errors)
+    return output
 
 
 def fixed_source(source, source_sha, deadline):

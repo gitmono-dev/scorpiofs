@@ -18,6 +18,8 @@ import workspace_update_observation as observation
 import workspace_update_profile as profiles
 import workspace_update_size as fixture_size
 import workspace_update_execution as execution
+import workspace_update_git_performance as git_performance
+import workspace_update_directory as directory_probe
 from workspace_update_size import consume_regular
 
 ROOT_FILES = {"campaign.json", "canonical-seed.json", "backend-owners.json", "failure.json"}
@@ -28,6 +30,7 @@ RUN_FIELDS = {"revision", "run_id", "attempt", "harness_sha", "mega_sha", "basel
               "profile", "rounds", "comparison", "bootstrap_commit_time", "session_started_utc",
               "session_deadline_utc", "cleanup_deadline_monotonic", "owned_root"}
 DIRECT_RUN_FIELDS = RUN_FIELDS | execution.DIRECT_FIELDS
+GIT_PERFORMANCE_FILES = {"git-performance.jsonl", "git-performance-summary.json"}
 
 
 def run_metadata_from_env():
@@ -152,6 +155,35 @@ def rows(path):
     return raw, values
 
 
+def git_performance_evidence(path, *, require_complete=False, deadline_utc=None):
+    """Validate the actual bounded stream before producing a public summary."""
+    if deadline_utc is not None:
+        budgets.require_external_time(deadline_utc)
+    raw = read_regular(path, git_performance.MAX_BYTES)
+    proofs.require(not raw or raw.endswith(b"\n"))
+    values = []
+    for line in raw.splitlines(keepends=True):
+        if deadline_utc is not None:
+            budgets.require_external_time(deadline_utc)
+        proofs.require(line.endswith(b"\n") and len(line) <= git_performance.MAX_LINE_BYTES)
+        proofs.require(len(values) < git_performance.MAX_RECORDS)
+        value = observation.parse(line)
+        proofs.exact(line, (proofs.canonical(value) + "\n").encode("ascii"))
+        values.append(value)
+    validated = git_performance.validate_records(values, require_complete=require_complete)
+    return raw, git_performance.summarize(validated)
+
+
+def validate_git_performance_export(root, *, require_complete=False, deadline_utc=None):
+    """Recompute every public metric; an uploaded summary is never trusted."""
+    root = Path(root)
+    _, expected = git_performance_evidence(root / "git-performance.jsonl",
+        require_complete=require_complete, deadline_utc=deadline_utc)
+    actual = observation.parse(read_regular(root / "git-performance-summary.json", git_performance.MAX_SUMMARY_BYTES))
+    proofs.exact(actual, expected)
+    return expected
+
+
 def write_safe(output, relative, raw, bindings):
     """Write only beneath the pinned fresh export directory."""
     target = output / relative
@@ -242,6 +274,35 @@ def workspace_sink(path, records, profile="smoke"):
     return raw
 
 
+def validate_directory_readiness(record, manifest):
+    """Replay directory results against the same fixed manifest and operation."""
+    operation_start = proofs.finite(record["operation_started_monotonic"])
+    operation_end = proofs.finite(record["operation_finished_monotonic"])
+    for side, verified in (("scorpio", "durable_verified_ms"), ("git", "verified_ms")):
+        result = record[side]
+        directory_probe.validate_record(result["directory_probe"], manifest, git_checkout=side == "git")
+        started = proofs.finite(result["operation_started_monotonic"])
+        finished = proofs.finite(result["operation_finished_monotonic"])
+        ready = proofs.finite(result["directory_ready_ms"])
+        verified_ms = proofs.finite(result[verified])
+        proofs.require(operation_start <= started <= finished <= operation_end)
+        proofs.require(result["directory_probe"]["timings_ms"]["total"] <= ready <= verified_ms
+                       <= (finished - started) * 1000)
+    scorpio, git = record["scorpio"], record["git"]
+    proofs.require(proofs.finite(scorpio["metadata_ready_ms"]) <= scorpio["directory_ready_ms"])
+    proofs.exact(git["commit"], record["fixed_commit"])
+    proofs.require(proofs.finite(git["fetch_ms"]) <= git["directory_ready_ms"])
+    first = record["version"] == "v1"
+    proofs.exact(git["baseline_kind"], "shallow-clone" if first else "incremental-fetch-worktree")
+    proofs.exact(git["clone_depth"], 1 if first else None)
+    proofs.exact(git["repository_is_shallow"], True if first else None)
+    proofs.exact(git["head_history_commits"], 1 if first else None)
+    if first:
+        proofs.require(proofs.finite(git["clone_ms"]) <= git["fetch_ms"])
+    else:
+        proofs.exact(git["clone_ms"], None)
+
+
 def validate_saved_lane(root, records, owner, expected_sources, client_build, profile="smoke"):
     entries = []
     for record in records:
@@ -289,6 +350,7 @@ def validate_saved_lane(root, records, owner, expected_sources, client_build, pr
             proofs.exact(proofs.digest(manifest), record["manifest"].fingerprint)
         else:
             proofs.exact(manifest, record["manifest"])
+        validate_directory_readiness(record, manifest)
         proofs.publication(record["publication"])
         proofs.exact(lane["publication"], record["publication"])
         proofs.require(record["publication"]["visible_monotonic"] <= proofs.finite(record["operation_started_monotonic"])
@@ -525,6 +587,9 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_
                 validate_saved_lane(root, lane, owner_map[(phase, number, label)], value["sources"][label], actual_builds[label], profile)
                 for record in lane:
                     proofs.exact(inventory_map[(phase, number, label)]["client_cleanup"], record["cleanup_receipts"])
+        expected_summaries = ([dict(summary, phase="fair") for summary in campaign.summaries(records, profile)]
+                              if phase == "fair" else [])
+        proofs.exact([row for row in all_rows if row.get("record") == "paired_summary"], expected_summaries)
         phases[phase] = records
     for number in range(1, 4):
         for version in scenarios:
@@ -533,8 +598,10 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_
     return value
 
 
-def export(root, output, deadline_utc, receipts=(), *, run_metadata=None):
+def export(root, output, deadline_utc, receipts=(), *, run_metadata=None, git_performance_path=None,
+           complete_allowed=True):
     budgets.require_external_time(deadline_utc)
+    proofs.require(type(complete_allowed) is bool)
     root, output = Path(root).absolute(), Path(output).absolute()
     if output.exists() or output.is_symlink() or output.is_relative_to(root):
         raise ValueError("safe export destination must be fresh and outside the owned campaign")
@@ -545,6 +612,13 @@ def export(root, output, deadline_utc, receipts=(), *, run_metadata=None):
             raise AssertionError("safe export owned root changed")
         if (root / "campaign.json").exists():
             validate_complete(root, dict(receipts), run_metadata=run_metadata, deadline_utc=deadline_utc)
+    git_evidence = None
+    if git_performance_path is not None:
+        source = Path(os.path.abspath(git_performance_path))
+        proofs.require(not source.is_relative_to(Path(os.path.abspath(root)))
+                       and not source.is_relative_to(Path(os.path.abspath(output))))
+        git_evidence = git_performance_evidence(source,
+            require_complete=(root / "campaign.json").exists() and complete_allowed, deadline_utc=deadline_utc)
     output.mkdir(mode=0o700)
     bindings = {}
     for directory in [*reversed(output.parents), output]:
@@ -552,6 +626,15 @@ def export(root, output, deadline_utc, receipts=(), *, run_metadata=None):
         proofs.require(stat.S_ISDIR(info.st_mode))
         bindings[directory] = (info.st_dev, info.st_ino)
     copied = {}
+    if git_evidence is not None:
+        raw, summary = git_evidence
+        for name, content in (("git-performance.jsonl", raw), ("git-performance-summary.json",
+                (proofs.canonical(summary) + "\n").encode("ascii"))):
+            write_safe(output, name, content, bindings)
+            copied[name] = hashlib.sha256(content).hexdigest()
+            budgets.require_external_time(deadline_utc)
+        validate_git_performance_export(output, require_complete=(root / "campaign.json").exists() and complete_allowed,
+                                        deadline_utc=deadline_utc)
     if run_metadata is not None:
         validate_run_metadata(run_metadata)
         raw = (proofs.canonical(run_metadata) + "\n").encode("ascii")
@@ -601,7 +684,8 @@ def export(root, output, deadline_utc, receipts=(), *, run_metadata=None):
             profiles.validate_artifact_tree(subtree, diagnostic_required=phase == "diagnostic")
     budgets.require_external_time(deadline_utc)
     write_safe(output, "safe-export.json", (proofs.canonical({"revision": 1, "files_sha256": copied,
-        "complete_campaign": (output / "campaign.json").exists(), "private_logs_exported": False}) + "\n").encode("ascii"), bindings)
+        "complete_campaign": (output / "campaign.json").exists() and complete_allowed,
+        "private_logs_exported": False}) + "\n").encode("ascii"), bindings)
     budgets.require_external_time(deadline_utc)
     return copied
 
@@ -615,11 +699,14 @@ def main():
     parser.add_argument("--build-b", type=Path)
     parser.add_argument("--server-build", type=Path)
     parser.add_argument("--with-run-metadata", action="store_true")
+    parser.add_argument("--git-performance", type=Path)
+    parser.add_argument("--partial", action="store_true")
     options = parser.parse_args()
     return export(options.run_root, options.output, options.session_deadline_utc,
                   [(label, path) for label, path in (("a", options.build_a), ("b", options.build_b),
                                                     ("server", options.server_build)) if path],
-                  run_metadata=run_metadata_from_env() if options.with_run_metadata else None)
+                  run_metadata=run_metadata_from_env() if options.with_run_metadata else None,
+                  git_performance_path=options.git_performance, complete_allowed=not options.partial)
 
 
 if __name__ == "__main__":

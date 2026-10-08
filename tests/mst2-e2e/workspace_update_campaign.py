@@ -32,6 +32,7 @@ import workspace_update_observation as observation
 import workspace_update_oracle as oracle
 import workspace_update_profile as profiles
 import workspace_update_execution as execution
+import workspace_update_git_performance as git_performance
 from workspace_update_daemon import WorkspaceDaemon, mounts_under
 from workspace_update_worker import WorkerSession, DIRTY_BYTES, DIRTY_SENTINEL
 
@@ -243,6 +244,11 @@ def cleanup_receipts(root, deadline):
 
 
 def publication(owner, fixture, commit, tree, previous, deadline):
+    with git_performance.context(stage="publication", client=owner.client):
+        return _publication(owner, fixture, commit, tree, previous, deadline)
+
+
+def _publication(owner, fixture, commit, tree, previous, deadline):
     before = owner.verify_runtime(deadline)
     proofs.exact(before.identity, previous.identity)
     started, started_utc = time.monotonic(), utc_now()
@@ -281,10 +287,11 @@ def prepare_history(fixture, round_root, profile, number, seed, deadline, *, fix
     """Build the real ten-commit chain before either lane starts measuring."""
     prepared, receipts, previous = {}, [], None
     for version in common.scenarios(profile):
-        commit, tree = common.create_version(fixture, fixture_round, version, profile, deadline)
-        expected = common.expected_manifest(fixture, commit, deadline)
-        common.fixture_size.validate_manifest(expected)
-        receipt = common.commit_receipt(fixture, commit, version, expected, previous, deadline)
+        with git_performance.context(stage="fixture", version=version, client=None):
+            commit, tree = common.create_version(fixture, fixture_round, version, profile, deadline)
+            expected = common.expected_manifest(fixture, commit, deadline)
+            common.fixture_size.validate_manifest(expected)
+            receipt = common.commit_receipt(fixture, commit, version, expected, previous, deadline)
         proofs.exact(receipt["parent"], receipts[-1]["commit"] if receipts else seed)
         receipts.append(receipt)
         write_json(round_root / f"{version}-expected.json", expected, deadline)
@@ -296,6 +303,11 @@ def prepare_history(fixture, round_root, profile, number, seed, deadline, *, fix
 
 
 def run_phase(group, clients, sources, phase, number, deadline, harness):
+    with git_performance.context(stage="setup", phase=phase, round=number, client=None, version=None):
+        return _run_phase(group, clients, sources, phase, number, deadline, harness)
+
+
+def _run_phase(group, clients, sources, phase, number, deadline, harness):
     owners, active, records, validated = [], [], [], []
     path = group.root / "measurements" / phase
     round_root = path / f"round-{number:02}"
@@ -342,7 +354,7 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
             lane.worker = WorkerSession(lane_root, lane.daemon.url, lane.daemon.workspace_root,
                 lane_root / "git.git", owner.git_url, owner.git_env, deadline=deadline,
                 env=common.clean_env(), daemon_uid=lane.daemon.uid,
-                read_profile_mode=mode)
+                read_profile_mode=mode, git_performance_client=client.label)
             from workspace_update_resources import ProcessResources
             lane.resources = ProcessResources(lane.daemon.process.pid, lane.daemon.started, lane.daemon.uid).start()
         for scenario_number, version in enumerate(scenarios, 1):
@@ -362,7 +374,8 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
                 builds.validate(lane.client, deadline)
                 lane.daemon.check_owner(socket_required=True)
                 owner = lane.backend
-                runtime, published, push_ms = publication(owner, fixture, commit, tree, current[lane.client.label], deadline)
+                with git_performance.context(version=version, client=lane.client.label):
+                    runtime, published, push_ms = publication(owner, fixture, commit, tree, current[lane.client.label], deadline)
                 current[lane.client.label] = runtime
                 capture = proofs.capture_lane_runtime(owner, lane.client.receipt, sources[lane.client.label],
                                                      deadline, harness_root=harness)
@@ -497,7 +510,29 @@ def summaries(records, profile="smoke"):
                 "git_b_over_a": pair["b"]["git"]["verified_ms"] / pair["a"]["git"]["verified_ms"]
                                   if pair["a"]["git"]["verified_ms"] else None})
         values = [p["b_minus_a_ms"] for p in pairs]
+        directory = {}
+        for label in ("a", "b"):
+            samples = sorted([row for row in records if row["version"] == version and row["client"] == label],
+                             key=lambda row: row["round"])
+            proofs.require(len(samples) == 3)
+            expected_kind = "shallow-clone" if version == "v1" else "incremental-fetch-worktree"
+            for sample in samples:
+                proofs.exact(sample["git"]["baseline_kind"], expected_kind)
+                proofs.exact(sample["git"]["clone_depth"], 1 if version == "v1" else None)
+                for side in ("scorpio", "git"):
+                    proofs.finite(sample[side]["directory_ready_ms"])
+            scorpio = [row["scorpio"]["directory_ready_ms"] for row in samples]
+            git = [row["git"]["directory_ready_ms"] for row in samples]
+            directory[label] = {"baseline_kind": expected_kind, "clone_depth": 1 if version == "v1" else None,
+                "scorpio_directory_ready_ms": measurement.sample_summary(scorpio, True),
+                "git_directory_ready_ms": measurement.sample_summary(git, True),
+                "scorpio_over_git": measurement.sample_summary([left / right for left, right in zip(scorpio, git)], True)
+                                      if all(git) else "NOT_MEASURED_ZERO_DENOMINATOR",
+                "samples": [{"round": row["round"], "scorpio_ms": left, "git_ms": right}
+                            for row, left, right in zip(samples, scorpio, git)]}
         result.append({"record": "paired_summary", "version": version, "pairs": pairs,
+            "directory_ready_comparison": directory,
+            "directory_timing_scope": "workspace create or Git clone/fetch start through actual root/nested directory open and readdir; excludes full byte oracle; includes observation overhead",
             "b_minus_a_ms": {"median": statistics.median(values), "min": min(values), "max": max(values)},
             "git_b_minus_a_ms": measurement.sample_summary([p["git_b_minus_a_ms"] for p in pairs], True),
             "b_over_a": measurement.sample_summary([p["b_over_a"] for p in pairs], True)
@@ -565,6 +600,8 @@ def execute(options):
                 **execution_metadata,
                 "backend_isolation": "fresh separately owned PG/Redis/Local object storage/process/cache per lane and round",
                 "cache_conditions": "host page caches, CPU scheduling and dependency image layers uncontrolled; no host cache flush",
+                "directory_baseline": "v1 real git clone --depth=1 with checkout into a fresh directory; v2+ fetch and new retained detached worktree using the same object database",
+                "directory_completion": "actual mounted root and one common materialized nested directory open/readdir; full content verification is reported separately",
                 "session_started_utc": options.session_started_utc, "session_deadline_utc": options.session_deadline_utc,
                 "cleanup_deadline_monotonic": budget.cleanup_deadline,
                 "read_profile_scope": "warm current full oracle after durable hydrate only" if phase == "diagnostic" else "disabled",
