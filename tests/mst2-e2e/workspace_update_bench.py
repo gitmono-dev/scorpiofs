@@ -190,7 +190,7 @@ def execute(options):
           "cache_conditions": "each client has fresh daemon/store/CAS/domain and Git bare ODB per round, shared only across its own updates; OS and shared server cache uncontrolled; client and side order alternate",
           "shared_server_order_cost": "first resolve may initialize projection/cache; both traces and order are retained; second client publication delay includes prior client measurement",
           "fixture_content": "distinct deterministic 32-byte blocks repeated to source-like synthetic file lengths",
-          "git_baseline": "depth=1 cold fetch; incremental fetch into shared bare ODB; each commit gets a new detached worktree; previous detached worktrees retained; no Git dirty sentinel/files are created",
+          "git_baseline": "real cold clone --depth=1 with checkout; incremental fetch into the same ODB and new detached worktrees; previous checkouts retained; no Git dirty sentinel/files are created",
           "git_durability_synchronization": "NOT_MEASURED; no additional fsync imposed on the default checkout baseline",
           "oracle_timing_scope": "oracle_walk_and_hash_ms covers namespace walk, metadata checks, file reads, SHA256 and path revalidation; isolated_oracle_process_ms additionally includes child startup/imports, manifest read/hash/parse and result IPC; both remain inside full-side verified times",
           "resource_measurement_scope": "sampled RSS peak is each operation interval; VmHWM is the daemon round lifetime high-water mark; idle sampled intervals are not retained; store disk is aggregate and excludes mounted views",

@@ -4,7 +4,10 @@ import base64
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -251,6 +254,16 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cloud.oss_buckets({"IsTruncated": flag, "Buckets": None}, bucket)
 
+    def test_empty_oss_xml_can_omit_false_fields_but_requires_success_owner_envelope(self):
+        value = {"Buckets": None, "Owner": {"ID": "1234567890123456", "DisplayName": "operator"}}
+        self.assertEqual(cloud.oss_buckets(value, "owned"), [])
+        for bad in ({"Buckets": None}, {**value, "NextMarker": "more"},
+                    {**value, "Owner": {"ID": "account"}},
+                    {**value, "Buckets": {"Bucket": {"Name": "owned"}}},
+                    {**value, "IsTruncated": True}):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                cloud.oss_buckets(bad, "owned")
+
     def test_cleanup_stops_exact_instance_before_objects_and_terraform(self):
         self.resources()
         owned = {"InstanceId": "i-owned", "InstanceName": "scorpiofs-" + self.state["campaign_id"]}
@@ -383,6 +396,51 @@ class EvidenceArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "EXPANDED_EVIDENCE_TOO_LARGE"):
                 cloud.extract_evidence(self.archive, self.output)
         self.assertFalse(self.output.exists())
+
+    def test_controller_rechecks_git_metrics_pair_and_recomputes_summary(self):
+        sys.path.insert(0, str(cloud.HERE.parents[1]))
+        import workspace_update_campaign_export as exporter
+        import workspace_update_execution as execution
+        import workspace_update_git_performance as metrics
+        self.output.mkdir()
+        state = cloud.plan(configuration(), self.root / "planned")
+        state.update(cloud.schedule(datetime.now(timezone.utc)))
+        state.update(resources={"instance_id": "i-owned"},
+                     direct_start_receipt={"execution_receipt_sha256": "a" * 64})
+        metadata = {"execution_provider": "aliyun-direct", "campaign_id": state["campaign_id"],
+            "instance_id": "i-owned", "execution_receipt_sha256": "a" * 64,
+            "run_id": execution.run_id_for_campaign(state["campaign_id"]), "attempt": "1",
+            "rounds": 3, "comparison": "isolated", "bootstrap_commit_time": 1700000000,
+            "harness_sha": state["config"]["harness_sha"], "mega_sha": cloud.SERVER,
+            "baseline_sha": cloud.BASELINE, "candidate_sha": cloud.CANDIDATE,
+            "profile": state["config"]["profile"],
+            **{key: state[key] for key in ("session_started_utc", "session_deadline_utc", "hard_release_utc")}}
+        (self.output / "run.json").write_text(json.dumps(metadata), encoding="utf-8")
+        performance = self.output / "git-performance.jsonl"
+        with patch.dict(os.environ, {metrics.PATH_ENV: str(performance)}):
+            with metrics.measure(["git", "--version"]) as metric:
+                result = subprocess.run(metric.args, capture_output=True, timeout=10)
+                metric.complete(result.returncode)
+        metrics.finalize(performance)
+        summary = metrics.summarize(metrics.read_records(performance))
+        summary_path = self.output / "git-performance-summary.json"
+        def manifest():
+            files = {path.name: cloud.direct_sources.digest(path) for path in self.output.iterdir()
+                     if path.is_file() and path.name != "safe-export.json"}
+            (self.output / "safe-export.json").write_text(json.dumps({"revision": 1,
+                "files_sha256": files, "complete_campaign": False, "private_logs_exported": False}), encoding="utf-8")
+        manifest()
+        with self.assertRaisesRegex(ValueError, "INCOMPLETE_GIT_PERFORMANCE_EXPORT"):
+            cloud.validate_evidence(self.output, state, require_complete=False)
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        manifest()
+        with patch.object(exporter, "validate_run_metadata", return_value=metadata):
+            cloud.validate_evidence(self.output, state, require_complete=False)
+        summary["started"] += 1
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        manifest()
+        with self.assertRaises((ValueError, AssertionError)):
+            cloud.validate_evidence(self.output, state, require_complete=False)
 
 
 if __name__ == "__main__":

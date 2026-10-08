@@ -27,6 +27,9 @@ from workspace_update_worker import (
     _status_hydration_substage,
     _status,
 )
+import workspace_update_directory as directory_probe
+import workspace_update_git_performance as git_performance
+import commit_update_bench as common
 
 
 def valid_status(**changes):
@@ -230,7 +233,7 @@ class WorkerFullProfileTests(unittest.TestCase):
                               valid_status()]
         started = time.monotonic()
         first = worker._create_workspace(deadline)
-        status, metadata_ms, complete_ms = worker._hydrate(first, deadline, started,
+        status, metadata_ms, complete_ms, _, _ = worker._hydrate(first, deadline, started,
                                                           initial_metadata_ms=7.25)
         workspace_path = "/v3/workspaces/" + first["workspace_id"]
         self.assertEqual(self.requests, [
@@ -283,7 +286,7 @@ class WorkerFullProfileTests(unittest.TestCase):
         worker = self.worker()
         started = time.monotonic()
         first = worker._create_workspace(time.monotonic() + 5)
-        status, metadata_ms, complete_ms = worker._hydrate(first, time.monotonic() + 5, started)
+        status, metadata_ms, complete_ms, _, _ = worker._hydrate(first, time.monotonic() + 5, started)
         self.assertEqual(status, first)
         self.assertGreaterEqual(metadata_ms, 0)
         self.assertGreaterEqual(complete_ms, 0)
@@ -301,6 +304,34 @@ class WorkerFullProfileTests(unittest.TestCase):
         self.assertEqual(failed.exception.worker_stage, "create")
         self.assertEqual(worker._workspace_ids, [])
         self.assertEqual(self.requests[0][2]["delivery"], "full")
+
+    def test_actual_directory_probe_happens_before_waiting_for_durable_completion(self):
+        worker = self.worker()
+        expected = {"files": [{"rel_path": "nested/file"}], "directories": ["", "nested", "empty"]}
+        plan = directory_probe.plan(expected)
+        report = dict(directory_probe.expected_record(expected),
+                      timings_ms=dict(root_open=0, root_readdir=0, nested_open=0, nested_readdir=0, total=0))
+        first = valid_status(hydration_state="running", local_pin_state="incomplete")
+        def probe(*_args):
+            self.assertEqual(self.requests, [])
+            return report
+        worker._directory_probe = mock.Mock(side_effect=probe)
+        self.poll_statuses = [valid_status()]
+        _, metadata, durable, directory_ms, actual = worker._hydrate(
+            first, time.monotonic() + 5, time.monotonic(), probe_plan=plan)
+        worker._directory_probe.assert_called_once()
+        self.assertEqual(actual, report)
+        self.assertLessEqual(metadata, directory_ms)
+        self.assertLessEqual(directory_ms, durable)
+
+    def test_directory_probe_failure_cannot_be_replaced_by_durable_status_flag(self):
+        worker = self.worker()
+        worker._directory_probe = mock.Mock(side_effect=WorkerError("workspace oracle directory probe failed"))
+        expected = {"files": [], "directories": [""]}
+        with self.assertRaises(WorkerError):
+            worker._hydrate(valid_status(), time.monotonic() + 5, time.monotonic(),
+                            probe_plan=directory_probe.plan(expected))
+        self.assertEqual(self.requests, [])
 
 
 class WorkerReceiptTests(unittest.TestCase):
@@ -329,6 +360,89 @@ class WorkerReceiptTests(unittest.TestCase):
                                daemon_uid=os.getuid() if hasattr(os, "getuid") else 0)
         self.workers.append(worker)
         return worker
+
+    def test_real_depth_one_clone_then_incremental_fetch_reuses_objects_and_retains_old_checkout(self):
+        worker = self.worker()
+        if os.name != "posix":
+            # Windows does not run the Linux anchor. Keep this a real Git and
+            # probe integration test; Linux exercises the actual owned anchor.
+            def portable(args, deadline, *, env=None, data=None):
+                return subprocess.check_output(args, env=env or worker.env, input=data,
+                    timeout=max(.001, deadline - time.monotonic()), stderr=subprocess.PIPE)
+            worker._owned_command = portable
+        source = self.root / "source"
+        source.mkdir()
+        env = common.clean_env({"GIT_AUTHOR_NAME": "fixture", "GIT_COMMITTER_NAME": "fixture",
+                                "GIT_AUTHOR_EMAIL": "fixture@example.invalid", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"})
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(source), *args], env=env, stderr=subprocess.PIPE)
+        git("init", "-q", "-b", "main")
+        (source / "nested").mkdir()
+        (source / "nested/file").write_bytes(b"first commit")
+        git("add", ".")
+        git("commit", "-qm", "first")
+        first = git("rev-parse", "HEAD").decode().strip()
+        # A parent before v1 proves --depth=1 really excludes prior history.
+        (source / "nested/file").write_bytes(b"version one")
+        git("add", ".")
+        git("commit", "-qm", "v1")
+        v1 = git("rev-parse", "HEAD").decode().strip()
+        performance_path = self.root / "native-worker-git-performance.jsonl"
+        if sys.platform == "linux":
+            env[git_performance.PATH_ENV] = str(performance_path)
+        worker.git_url, worker.git_env = source.as_uri(), env
+        worker._expected_path, worker._expected_digest = self.root / "expected.json", "a" * 64
+        expected = {"directories": ["", "nested", "empty"], "files": [{"rel_path": "nested/file"}]}
+        # This test isolates real Git transport/checkout/probe; the separate
+        # oracle tests exercise complete byte and raw-empty-tree verification.
+        worker._oracle = mock.Mock(return_value={"verified_files": 1})
+        calls = []
+        original_git = worker._git
+        def trace(deadline, *args):
+            calls.append(args)
+            return original_git(deadline, *args)
+        worker._git = trace
+        result1 = worker._measure_git(expected, v1, time.monotonic() + 20)
+        self.assertEqual(result1["baseline_kind"], "shallow-clone")
+        self.assertEqual(result1["clone_depth"], 1)
+        self.assertTrue(result1["repository_is_shallow"])
+        self.assertEqual(result1["head_history_commits"], 1)
+        path1 = Path(result1["worktree"])
+        self.assertTrue((path1 / ".git").is_file())
+        self.assertEqual((path1 / "nested/file").read_bytes(), b"version one")
+        self.assertEqual(worker._git_active_store, self.root / "git-clone.git")
+        self.assertFalse((self.git / "objects").exists())
+        self.assertNotEqual(first, v1)
+        (source / "nested/file").write_bytes(b"version two")
+        git("add", ".")
+        git("commit", "-qm", "v2")
+        v2 = git("rev-parse", "HEAD").decode().strip()
+        result2 = worker._measure_git(expected, v2, time.monotonic() + 20)
+        self.assertEqual(result2["baseline_kind"], "incremental-fetch-worktree")
+        self.assertIsNone(result2["clone_depth"])
+        self.assertIsNone(result2["clone_ms"])
+        self.assertEqual((Path(result2["worktree"]) / "nested/file").read_bytes(), b"version two")
+        self.assertEqual((path1 / "nested/file").read_bytes(), b"version one")
+        self.assertEqual(sum(args[0] == "clone" for args in calls), 1)
+        self.assertTrue(any(args[:3] == ("--git-dir", str(self.root / "git-clone.git"), "fetch") for args in calls))
+        self.assertTrue(any(args[:3] == ("--git-dir", str(self.root / "git-clone.git"), "worktree") for args in calls))
+        self.assertEqual(len(worker._git_worktrees), 2)
+        for result in (result1, result2):
+            directory_probe.validate_record(result["directory_probe"], expected, git_checkout=True)
+            self.assertGreaterEqual(result["directory_ready_ms"], result["fetch_ms"])
+            self.assertGreaterEqual(result["verified_ms"], result["directory_ready_ms"])
+        if sys.platform == "linux":
+            # Seal only after the actual anchor/writers stop. This Linux fence
+            # exercises GNU time inside the real worker IPC/group contract.
+            worker._stop_anchor(time.monotonic() + 10)
+            git_performance.finalize(performance_path)
+            records = git_performance.validate_stream(performance_path)
+            terminals = [row for row in records if row["event"] == "end"]
+            self.assertEqual(len(terminals), 7)
+            self.assertEqual([row["operation"] for row in terminals],
+                             ["clone", "rev-parse", "rev-parse", "rev-list", "fetch", "rev-parse", "worktree"])
+            self.assertTrue(all(row["status"] == "completed" and row["resource_collection"] == "gnu-time"
+                                and row["resources"] is not None for row in terminals))
 
     def test_medium_manifest_uses_local_oracle_budget(self):
         worker = self.worker()

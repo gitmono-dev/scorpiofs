@@ -449,5 +449,36 @@ class CampaignWorkloadTests(unittest.TestCase):
             self.assertEqual(row["measurement_interpretation"], campaign.profiles.DIAGNOSTIC_INTERPRETATION)
 
 
+class DirectorySummaryTests(unittest.TestCase):
+    def samples(self):
+        return [{"client": label, "round": number, "version": version,
+                 "client_order": ["a", "b"],
+                 "scorpio": {"directory_ready_ms": 10.0 if label == "a" else 5.0,
+                             "durable_verified_ms": 50.0},
+                 "git": {"directory_ready_ms": 100.0, "verified_ms": 200.0,
+                         "baseline_kind": "shallow-clone" if version == "v1" else "incremental-fetch-worktree",
+                         "clone_depth": 1 if version == "v1" else None}}
+                for version in campaign.common.scenarios("smoke") for number in range(1, 4)
+                for label in ("a", "b")]
+
+    def test_actual_directory_ready_and_full_verification_are_summarized_separately(self):
+        summaries = campaign.summaries(self.samples())
+        cold = summaries[0]["directory_ready_comparison"]
+        self.assertEqual(cold["a"]["baseline_kind"], "shallow-clone")
+        self.assertEqual(cold["b"]["clone_depth"], 1)
+        self.assertEqual(cold["a"]["scorpio_over_git"]["median"], .1)
+        self.assertEqual(cold["b"]["scorpio_over_git"]["median"], .05)
+        self.assertEqual(summaries[0]["pairs"][0]["b_verified_ms"], 50)
+        self.assertEqual(summaries[1]["directory_ready_comparison"]["a"]["baseline_kind"],
+                         "incremental-fetch-worktree")
+        self.assertIsNone(summaries[1]["directory_ready_comparison"]["a"]["clone_depth"])
+
+    def test_cold_fetch_cannot_be_relabelled_as_shallow_clone_in_summary(self):
+        records = self.samples()
+        records[0]["git"].update(baseline_kind="incremental-fetch-worktree", clone_depth=None)
+        with self.assertRaises(AssertionError):
+            campaign.summaries(records)
+
+
 if __name__ == "__main__":
     unittest.main()

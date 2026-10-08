@@ -131,10 +131,16 @@ def execute(config):
     import workspace_update_execution as execution
     import workspace_update_campaign_export as exporter
     import workspace_update_size as size
+    import workspace_update_git_performance as git_performance
     os.environ.update(STARTED_INPUT=config['session_started_utc'], DEADLINE_INPUT=config['session_deadline_utc'])
     context = execution.identity()
     status_path = Path(config['status_path'])
     evidence = status_path.parent
+    performance_path = evidence / 'git-performance.jsonl'
+    with performance_path.open('xb'):
+        pass
+    performance_path.chmod(0o600)
+    os.environ['MST2_GIT_PERFORMANCE_PATH'] = str(performance_path)
     workspace = Path(config['workspace'])
     os.environ.update(STARTED_INPUT=config['session_started_utc'], DEADLINE_INPUT=config['session_deadline_utc'],
         MST2_SESSION_STARTED=config['session_started_utc'], MST2_SESSION_DEADLINE=config['session_deadline_utc'],
@@ -148,6 +154,13 @@ def execute(config):
     base = {'revision': 1, 'campaign_id': config['campaign_id'], 'instance_id': config['instance_id'],
         'harness_sha': config['harness_sha'], 'profile': config['profile']}
     def status(state, stage, **fields):
+        metric_stage = (stage if stage in ('server-build', 'client-a-build', 'client-b-build', 'cleanup')
+                        else 'fences' if stage == 'correctness-fences'
+                        else 'setup' if stage == 'native-commit-measurements' else 'report')
+        metric_phase = ('build' if metric_stage.endswith('build') else
+                        'cleanup' if metric_stage == 'cleanup' else 'setup')
+        os.environ['MST2_GIT_PERFORMANCE_CONTEXT'] = json.dumps(
+            dict(stage=metric_stage, phase=metric_phase, round=None, client=None, version=None))
         save(status_path, {**base, 'status': state, 'stage': stage, **fields})
     def run(args, deadline, *, build=False, fences=False):
         env = dict(os.environ)
@@ -203,8 +216,16 @@ def execute(config):
         try:
             safe = evidence / 'safe-export'
             present = [(label, path) for label, path in receipts.items() if path.is_file()]
+            metrics_closed = False
+            if cleanup_ok:
+                try:
+                    git_performance.finalize(performance_path)
+                    metrics_closed = True
+                except (OSError, ValueError, TimeoutError):
+                    pass
             exporter.export(Path(context['owned_root']), safe, config['session_deadline_utc'], present,
-                run_metadata=exporter.run_metadata_from_env())
+                run_metadata=exporter.run_metadata_from_env(), git_performance_path=performance_path,
+                complete_allowed=success and cleanup_ok and metrics_closed)
             import tarfile
             archive = evidence / 'safe-evidence.tar.gz'
             with tarfile.open(archive, 'w:gz') as stream:
@@ -220,7 +241,8 @@ def execute(config):
             manifest = json.loads((safe / 'safe-export.json').read_bytes())
             complete = success and cleanup_ok and manifest['complete_campaign'] is True
             status('COMPLETE_VERIFIED' if complete else 'FAILED', 'finished', native_completed=success,
-                cleanup_verified=cleanup_ok, evidence_uploaded=True, evidence_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+                cleanup_verified=cleanup_ok, git_metrics_closed=metrics_closed,
+                evidence_uploaded=True, evidence_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
                 evidence_bytes=archive.stat().st_size)
         except BaseException as error:
             status('FAILED', 'safe-export', native_completed=success, cleanup_verified=cleanup_ok,

@@ -108,10 +108,12 @@ class Tools:
 
 def launcher(configuration, source):
     """A small cloud command downloads the exact reviewed code from private OSS."""
-    value = dict(configuration, source=source)
+    # The controller retains local pack timings; they are not remote inputs.
+    value = dict(configuration, source={key: item for key, item in source.items()
+                                       if key != 'source_pack_performance'})
     payload = base64.b64encode(json.dumps(value).encode()).decode()
     sdk_program = r'''
-import base64, hashlib, json, subprocess, sys, tarfile, time
+import base64, hashlib, json, runpy, subprocess, sys, tarfile, time
 from pathlib import Path
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from datetime import datetime
@@ -154,11 +156,17 @@ helper=Path('/var/lib/scorpiofs-benchmark')/('restore-'+c['campaign_id']+'.py')
 helper.write_bytes(raw); helper.chmod(0o644)
 pins={'scorpiofs':c['harness_sha'],'mega2':c['mega_sha'],'client-a':c['baseline_sha'],'client-b':c['candidate_sha']}
 subprocess.run([sys.executable,str(helper),'--bundle',str(archive),'--output',c['workspace'],'--pins',json.dumps(pins)],check=True,timeout=remaining(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+performance_path=Path(c['workspace'])/'source-git-performance.json'
+if performance_path.is_symlink() or not performance_path.is_file() or performance_path.stat().st_size>65536: raise ValueError('INVALID_SOURCE_PERFORMANCE')
+source_performance=runpy.run_path(str(helper))['validate_performance'](json.loads(performance_path.read_bytes()),phase='restore',require_success=True)
 target=Path('/var/lib/scorpiofs-benchmark')/('launch-'+c['campaign_id']+'.json')
 target.write_text(json.dumps(c)); target.chmod(0o644)
 remote=Path(c['workspace'])/'scorpiofs/tests/mst2-e2e/infra/aliyun/direct_remote.py'
 result=subprocess.run([sys.executable,str(remote),'install','--config',str(target)],capture_output=True,check=True,timeout=remaining())
-remaining(); print(result.stdout.decode().strip())
+response=json.loads(result.stdout)
+if type(response) is not dict or 'source_restore_performance' in response: raise ValueError('INVALID_DIRECT_INSTALL_RESPONSE')
+response['source_restore_performance']=source_performance
+remaining(); print(json.dumps(response,separators=(',',':')))
 '''
     wait_program = "\n".join([
         'import base64,json,os,subprocess,time', 'from pathlib import Path', 'from datetime import datetime',
@@ -326,7 +334,7 @@ class Campaign:
                 self.remaining('preflight_deadline_utc', 1)
                 time.sleep(5)
             self.record(status='DIRECT_START_INTENT')
-            receipt = self.command(launcher(self.remote_config(), source), self.remaining('preflight_deadline_utc', 600), 'install')
+            receipt = self.command(launcher(self.remote_config(), source), self.remaining('preflight_deadline_utc', 900), 'install')
             require(receipt['status'] == 'DIRECT_STARTED' and receipt['campaign_id'] == self.state['campaign_id']
                     and receipt['instance_id'] == resources['instance_id'], 'DIRECT_START_BINDING_MISMATCH')
             require(re.fullmatch(r'[0-9a-f]{64}', receipt['execution_receipt_sha256']), 'EXECUTION_RECEIPT_REQUIRED')
@@ -482,7 +490,14 @@ class Campaign:
 
 
 def oss_buckets(value, expected):
-    require(type(value) is dict and (value.get('IsTruncated') is False or value.get('IsTruncated') == 'false'), 'OSS_INVENTORY_TRUNCATED')
+    require(type(value) is dict, 'INVALID_OSS_INVENTORY')
+    # ListBuckets omits false/empty XML fields for an empty successful result.
+    # Accept that observed shape only with its owner envelope and no cursor.
+    empty = ('IsTruncated' not in value and value.get('Buckets') is None
+             and type(value.get('Owner')) is dict and set(value['Owner']) == {'ID', 'DisplayName'}
+             and all(type(item) is str and item for item in value['Owner'].values())
+             and not value.get('NextMarker'))
+    require(value.get('IsTruncated') is False or value.get('IsTruncated') == 'false' or empty, 'OSS_INVENTORY_TRUNCATED')
     container = value.get('Buckets')
     require(container is None or type(container) is dict, 'INVALID_OSS_INVENTORY')
     rows = None if container is None else container.get('Bucket')
@@ -530,9 +545,16 @@ def validate_evidence(root, state, *, require_complete):
         if relative == 'safe-export.json':
             continue
         require(relative in files and (exporter.allowed(Path(relative)) or relative in
-                ('run.json', 'server-build.json', 'client-a-build.json', 'client-b-build.json')), 'UNEXPECTED_EXPORT_FILE')
+                ('run.json', 'server-build.json', 'client-a-build.json', 'client-b-build.json')
+                or relative in exporter.GIT_PERFORMANCE_FILES), 'UNEXPECTED_EXPORT_FILE')
         require(direct_sources.digest(path) == files[relative], 'EVIDENCE_HASH_MISMATCH')
     require(actual == set(files) | {'safe-export.json'}, 'MISSING_EXPORT_FILE')
+    git_files = set(files) & exporter.GIT_PERFORMANCE_FILES
+    require(not git_files or git_files == exporter.GIT_PERFORMANCE_FILES, 'INCOMPLETE_GIT_PERFORMANCE_EXPORT')
+    require(not (require_complete or manifest['complete_campaign']) or bool(git_files), 'MISSING_GIT_PERFORMANCE_EXPORT')
+    if git_files:
+        exporter.validate_git_performance_export(root, require_complete=require_complete or manifest['complete_campaign'],
+                                                deadline_utc=state['collection_deadline_utc'])
     metadata = exporter.validate_run_metadata(json.loads((root / 'run.json').read_bytes()))
     expected = {'execution_provider': 'aliyun-direct', 'campaign_id': state['campaign_id'],
         'instance_id': state['resources']['instance_id'], 'execution_receipt_sha256': state['direct_start_receipt']['execution_receipt_sha256'],

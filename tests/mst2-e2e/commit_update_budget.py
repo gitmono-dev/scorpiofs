@@ -12,6 +12,8 @@ import subprocess
 import sys
 import time
 
+import workspace_update_git_performance as git_performance
+
 
 EXTERNAL_RESERVE = 15 * 60
 CLEANUP_RESERVE = 10 * 60
@@ -366,6 +368,13 @@ def abort_startup(process, deadline):
 
 
 def run_process(args, deadline, env=None, data=None, capture=True):
+    with git_performance.measure(args, env=env) as metric:
+        result = _run_process(metric.args, deadline, env=env, data=data, capture=capture)
+        metric.complete(result[0])
+        return result
+
+
+def _run_process(args, deadline, env=None, data=None, capture=True):
     """Terminate and reap the owned child group within this same deadline."""
     now = time.monotonic()
     remaining = deadline - now

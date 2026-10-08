@@ -28,6 +28,7 @@ import uuid
 import commit_update_budget as budget
 from workspace_update_daemon import mounts_under
 import workspace_update_profile as read_profile
+import workspace_update_directory as directory_probe
 
 
 STATUS_FIELDS = frozenset({
@@ -595,7 +596,8 @@ class WorkerSession:
     """Own one daemon round's workspace mounts and Git comparison checkouts."""
 
     def __init__(self, round_root, daemon_url, workspace_root, git_store, git_url,
-                 git_env, *, deadline, env, daemon_uid, read_profile_mode="disabled"):
+                 git_env, *, deadline, env, daemon_uid, read_profile_mode="disabled",
+                 git_performance_client=None):
         if type(read_profile_mode) is not str or read_profile_mode not in read_profile.MODES:
             raise ValueError("read profile mode is invalid")
         self.read_profile_mode = read_profile_mode
@@ -604,6 +606,7 @@ class WorkerSession:
         self.git_store = Path(git_store).resolve(strict=True)
         self.git_url = git_url
         self.git_env = dict(git_env or {})
+        self._git_performance_client = git_performance_client
         self.env = dict(env or os.environ)
         self.daemon_uid = daemon_uid
         self.default_deadline = deadline
@@ -619,6 +622,7 @@ class WorkerSession:
         self._active_identity = None
         self._last_identity = None
         self._git_fetched = False
+        self._git_active_store = None
         self._git_index = 0
         self._oracle_index = 0
         self._expected_path = None
@@ -778,6 +782,13 @@ class WorkerSession:
         return process.poll() is None
 
     def _owned_command(self, args, deadline, *, env=None, data=None):
+        import workspace_update_git_performance as git_performance
+        with git_performance.context(client=getattr(self, "_git_performance_client", None)):
+            with git_performance.measure(args, env=env or self.env) as metric:
+                return self._owned_command_impl(metric.args, deadline, env=env, data=data,
+                                                git_metric=metric)
+
+    def _owned_command_impl(self, args, deadline, *, env=None, data=None, git_metric=None):
         _check_deadline(deadline)
         if not args or any(type(value) is not str for value in args):
             raise ValueError("owned command arguments must be strings")
@@ -811,11 +822,15 @@ class WorkerSession:
                 raise WorkerError("worker command response encoding is invalid") from None
             if len(output) > COMMAND_OUTPUT_LIMIT or len(errors) > COMMAND_OUTPUT_LIMIT:
                 raise WorkerError("owned command output is too large")
+            if git_metric is not None:
+                git_metric.complete(result["status"])
             if result["status"] != 0:
                 raise WorkerError("owned Git command failed")
             _check_deadline(deadline)
             return output
-        except (TimeoutError, BrokenPipeError, EOFError, OSError):
+        except (TimeoutError, BrokenPipeError, EOFError, OSError) as error:
+            if git_metric is not None:
+                git_metric.abort(error)
             self._stop_anchor(deadline)
             raise WorkerError("worker process-group anchor failed") from None
         finally:
@@ -990,7 +1005,40 @@ class WorkerSession:
         self._assert_status_path(value)
         return value
 
-    def _hydrate(self, first, deadline, timing_start, initial_metadata_ms=None):
+    def _directory_probe(self, root, probe_plan, deadline):
+        _check_deadline(deadline)
+        raw = json.dumps(probe_plan, sort_keys=True, separators=(",", ":"))
+        if len(raw.encode("utf-8")) > HTTP_BODY_LIMIT // 2:
+            raise WorkerError("workspace oracle directory probe plan is too large")
+        code = (
+            "import json,sys\n"
+            "from workspace_update_directory import verify\n"
+            "try:\n"
+            " value=verify(sys.argv[1],json.loads(sys.argv[2]),float(sys.argv[3]))\n"
+            " print(json.dumps({'ok':True,'result':value},separators=(',',':')),flush=True)\n"
+            "except BaseException as error:\n"
+            " print(json.dumps({'ok':False,'error_type':type(error).__name__},separators=(',',':')),flush=True)\n"
+        )
+        env = dict(self.env)
+        module_dir = str(Path(__file__).resolve().parent)
+        env["PYTHONPATH"] = module_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        with self._stage("oracle"):
+            output = self._owned_command([sys.executable, "-c", code, str(root), raw, str(deadline)], deadline, env=env)
+            response = _decode_anchor_json(output.rstrip(b"\n"))
+            if type(response) is not dict or type(response.get("ok")) is not bool:
+                raise WorkerError("workspace oracle directory probe response is invalid")
+            if not response["ok"]:
+                if response.get("error_type") == "TimeoutError":
+                    raise TimeoutError("workspace directory probe exceeded its original deadline")
+                raise WorkerError("workspace oracle directory probe failed")
+            try:
+                value = directory_probe.validate_plan_record(response.get("result"), probe_plan)
+            except ValueError:
+                raise WorkerError("workspace oracle directory probe result is invalid") from None
+            _check_deadline(deadline)
+            return value
+
+    def _hydrate(self, first, deadline, timing_start, initial_metadata_ms=None, probe_plan=None):
         """Wait for the full create's automatic hydration to finish.
 
         ``delivery=full`` starts the hydration task as part of workspace
@@ -1005,45 +1053,38 @@ class WorkerSession:
         with self._stage("hydrate"):
             status = self._fixed_status(first, first)
         metadata_ms = initial_metadata_ms
-        if status["mount_state"] == "mounted" and status["metadata_ready"] and metadata_ms is None:
-            metadata_ms = (time.monotonic() - timing_start) * 1000
-        if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
-                or status["last_error"] is not None):
-            backend_code, snapshot_code = _status_error_codes(status)
-            hydration_substage = _status_hydration_substage(status)
-            raise WorkerError("workspace hydration failed", stage="hydrate",
-                               backend_code=backend_code, snapshot_code=snapshot_code,
-                               hydration_substage=hydration_substage)
-        if (status["mount_state"] == "mounted" and status["metadata_ready"]
-                and status["hydration_state"] == "complete"
-                and status["local_pin_state"] == "complete_snapshot"
-                and status["lease_state"] == "granted_locally"
-                and status["last_error"] is None):
-            complete_ms = (time.monotonic() - timing_start) * 1000
-            return status, metadata_ms, complete_ms
-        complete_ms = None
+        directory_ms, probe = None, None
+        def observe(value):
+            nonlocal metadata_ms, directory_ms, probe
+            if (value["mount_state"] == "failed" or value["hydration_state"] in {"failed", "cancelled"}
+                    or value["last_error"] is not None):
+                backend_code, snapshot_code = _status_error_codes(value)
+                raise WorkerError("workspace hydration failed", stage="hydrate", backend_code=backend_code,
+                    snapshot_code=snapshot_code, hydration_substage=_status_hydration_substage(value))
+            ready = value["mount_state"] == "mounted" and value["metadata_ready"]
+            if ready and metadata_ms is None:
+                metadata_ms = (time.monotonic() - timing_start) * 1000
+            complete = (ready and value["hydration_state"] == "complete"
+                        and value["local_pin_state"] == "complete_snapshot"
+                        and value["lease_state"] == "granted_locally")
+            # Preserve when durable status was observed, including the case
+            # where create already completed before the first directory probe.
+            complete_ms = (time.monotonic() - timing_start) * 1000 if complete else None
+            if ready and probe is None and probe_plan is not None:
+                probe = self._directory_probe(self._assert_status_path(value), probe_plan, deadline)
+                directory_ms = (time.monotonic() - timing_start) * 1000
+            return complete_ms
+        complete_ms = observe(status)
+        if complete_ms is not None:
+            return status, metadata_ms, complete_ms, directory_ms, probe
         while True:
             with self._stage("poll"):
                 _check_deadline(deadline)
                 status = self._fixed_status(first, self.http.request(
                     "GET", "/v3/workspaces/" + quote(first["workspace_id"], safe=""), deadline))
-                if status["mount_state"] == "mounted" and status["metadata_ready"]:
-                    if metadata_ms is None:
-                        metadata_ms = (time.monotonic() - timing_start) * 1000
-                if (status["mount_state"] == "failed" or status["hydration_state"] in {"failed", "cancelled"}
-                        or status["last_error"] is not None):
-                    backend_code, snapshot_code = _status_error_codes(status)
-                    hydration_substage = _status_hydration_substage(status)
-                    raise WorkerError("workspace hydration failed",
-                                       backend_code=backend_code, snapshot_code=snapshot_code,
-                                       hydration_substage=hydration_substage)
-                if (status["mount_state"] == "mounted" and status["metadata_ready"]
-                        and status["hydration_state"] == "complete"
-                        and status["local_pin_state"] == "complete_snapshot"
-                        and status["lease_state"] == "granted_locally"
-                        and status["last_error"] is None):
-                    complete_ms = (time.monotonic() - timing_start) * 1000
-                    return status, metadata_ms, complete_ms
+                complete_ms = observe(status)
+                if complete_ms is not None:
+                    return status, metadata_ms, complete_ms, directory_ms, probe
                 pause = min(POLL_SECONDS, max(0, deadline - time.monotonic()))
                 if pause <= 0:
                     raise TimeoutError("workspace hydration did not become durable before its deadline")
@@ -1143,11 +1184,13 @@ class WorkerSession:
             return checkpoint, time.monotonic_ns() - started_ns
 
     def _measure_scorpio(self, expected, deadline):
+        probe_plan = directory_probe.plan(expected)
         started = time.monotonic()
         first = self._create_workspace(deadline)
         initial_metadata_ms = ((time.monotonic() - started) * 1000
                                if first["mount_state"] == "mounted" and first["metadata_ready"] else None)
-        status, metadata_ms, complete_ms = self._hydrate(first, deadline, started, initial_metadata_ms)
+        status, metadata_ms, complete_ms, directory_ms, probe = self._hydrate(
+            first, deadline, started, initial_metadata_ms, probe_plan=probe_plan)
         mount = self._assert_status_path(status)
         mount_identity = _mount_record(mount, self.daemon_uid)
         mode = getattr(self, "read_profile_mode", "disabled")
@@ -1190,6 +1233,7 @@ class WorkerSession:
         result = {
             "actual_status": dict(status), "complete_status": dict(status),
             "metadata_ready_ms": metadata_ms, "durable_complete_ms": complete_ms,
+            "directory_ready_ms": directory_ms, "directory_probe": probe,
             "durable_verified_ms": verified_ms, "oracle": oracle,
             "mount": mount_identity, "verification_endpoint_ms": verification_endpoint_ms,
             "retain_view_ms": retain_view_ms, "old_views": old,
@@ -1204,37 +1248,71 @@ class WorkerSession:
             if type(commit) is not str or COMMIT_RE.fullmatch(commit) is None:
                 raise ValueError("fixed Git commit must be a lowercase SHA-1")
             self._git_index += 1
+            probe_plan = directory_probe.plan(expected, git_checkout=True)
             ref = f"refs/mst2-workspace/{self._git_index:04d}-{commit}"
-            git_start = time.monotonic()
-            fetch_start = time.monotonic()
-            args = ["--git-dir", str(self.git_store), "fetch", "--no-tags"]
-            if not self._git_fetched:
-                args.append("--depth=1")
-            args.extend([self.git_url, "refs/heads/main:" + ref])
-            self._git(deadline, *args)
-            self._git_fetched = True
-            fetched = self._git(deadline, "--git-dir", str(self.git_store), "rev-parse", ref).decode().strip()
-            if fetched != commit:
-                raise WorkerError("Git target ref differs from the fixed commit")
-            fetch_ms = (time.monotonic() - fetch_start) * 1000
             path = self.root / "git-worktrees" / f"{self._git_index:04d}-{commit[:12]}"
             path.parent.mkdir(mode=0o700, exist_ok=True)
             if path.exists() or path.is_symlink():
                 raise WorkerError("Git detached worktree path already exists")
-            self._git(deadline, "--git-dir", str(self.git_store), "worktree", "add", "--detach",
-                      str(path), commit)
+            git_start = time.monotonic()
+            fetch_start = time.monotonic()
+            clone_ms = None
+            repository_is_shallow = head_history_commits = None
+            if not self._git_fetched:
+                active_store = self.root / "git-clone.git"
+                if active_store.exists() or active_store.is_symlink():
+                    raise WorkerError("Git clone object store already exists")
+                clone_start = time.monotonic()
+                self._git(deadline, "clone", "--depth=1", "--single-branch", "--branch", "main", "--no-tags",
+                          "--separate-git-dir", str(active_store), self.git_url, str(path))
+                clone_ms = (time.monotonic() - clone_start) * 1000
+                fetched = self._git(deadline, "-C", str(path), "rev-parse", "HEAD").decode().strip()
+                shallow = self._git(deadline, "-C", str(path), "rev-parse", "--is-shallow-repository").decode().strip()
+                history = self._git(deadline, "-C", str(path), "rev-list", "--count", "HEAD").decode().strip()
+                if fetched != commit or shallow != "true" or history != "1":
+                    raise WorkerError("Git shallow clone differs from its fixed depth-one commit")
+                repository_is_shallow, head_history_commits = True, 1
+                self._git_active_store = active_store
+                self._git_fetched = True
+                baseline_kind, clone_depth = "shallow-clone", 1
+                # Compatibility: on the first sample fetch_ms includes the
+                # real clone and its fixed-ref/shallow-history verification.
+                fetch_ms = (time.monotonic() - fetch_start) * 1000
+            else:
+                active_store = self._git_active_store
+                if active_store is None or active_store.is_symlink() or not active_store.is_dir():
+                    raise WorkerError("Git active clone object store changed")
+                self._git(deadline, "--git-dir", str(active_store), "fetch", "--no-tags",
+                          self.git_url, "refs/heads/main:" + ref)
+                fetched = self._git(deadline, "--git-dir", str(active_store), "rev-parse", ref).decode().strip()
+                if fetched != commit:
+                    raise WorkerError("Git target ref differs from the fixed commit")
+                fetch_ms = (time.monotonic() - fetch_start) * 1000
+                self._git(deadline, "--git-dir", str(active_store), "worktree", "add", "--detach", str(path), commit)
+                baseline_kind, clone_depth = "incremental-fetch-worktree", None
             self._git_worktrees.append(path)
+            probe = self._directory_probe(path, probe_plan, deadline)
+            directory_ms = (time.monotonic() - git_start) * 1000
             oracle = self._oracle(path, expected, deadline, git_checkout=True,
                                   manifest_path=self._expected_path,
                                   manifest_digest=self._expected_digest)
             verified_ms = (time.monotonic() - git_start) * 1000
             return {"commit": commit, "worktree": str(path), "fetch_ms": fetch_ms,
+                    "baseline_kind": baseline_kind, "clone_depth": clone_depth, "clone_ms": clone_ms,
+                    "repository_is_shallow": repository_is_shallow, "head_history_commits": head_history_commits,
+                    "directory_ready_ms": directory_ms, "directory_probe": probe,
                     "verified_ms": verified_ms, "side_total_ms": verified_ms,
                     # Keep the old key for consumers that have not migrated to
                     # the unambiguous full-side timing name yet.
                     "checkout_verified_ms": verified_ms, "oracle": oracle}
 
     def measure(self, expected_path, commit, side_order, version, round_number, deadline):
+        import workspace_update_git_performance as git_performance
+        with git_performance.context(stage="git", client=getattr(self, "_git_performance_client", None),
+                                     round=round_number, version=version):
+            return self._measure_impl(expected_path, commit, side_order, version, round_number, deadline)
+
+    def _measure_impl(self, expected_path, commit, side_order, version, round_number, deadline):
         if side_order not in {"scorpio-first", "git-first"}:
             raise ValueError("invalid measurement side order")
         _check_deadline(deadline)

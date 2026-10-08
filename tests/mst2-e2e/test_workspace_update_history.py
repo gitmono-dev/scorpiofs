@@ -1,7 +1,9 @@
 """Real Git history receipts; these fixtures are not performance results."""
 
 from copy import deepcopy
+from contextlib import ExitStack
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,12 +13,17 @@ from unittest.mock import patch
 
 import workspace_update_campaign as campaign
 import workspace_update_campaign_export as export
+import workspace_update_git_performance as git_performance
 
 
 class HistoryReplayTests(unittest.TestCase):
     def test_ten_real_commits_are_prepared_before_measurement_and_replayed(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
             root = Path(temporary)
+            performance = root / "git-performance.jsonl"
+            stack.enter_context(patch.dict(os.environ, {git_performance.PATH_ENV: str(performance)}))
+            stack.enter_context(git_performance.context(stage="setup", phase="fair", round=1,
+                                                      client=None, version=None))
             repo = root / "fixture"
             subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
             deadline = time.monotonic() + 120
@@ -65,6 +72,17 @@ class HistoryReplayTests(unittest.TestCase):
                 last_manifest.write_bytes((folder / "v9-expected.json").read_bytes())
                 with self.assertRaises((AssertionError, ValueError)):
                     export.validate_history(root, "fair", 1, seed, records, "history-large")
+                git_performance.finalize(performance)
+                events = git_performance.read_records(performance)
+                commands = [row for row in events if row["event"] == "end"]
+                self.assertTrue(commands)
+                self.assertTrue(all(row["status"] == "completed" for row in commands))
+                for version in campaign.common.scenarios("history-large"):
+                    per_version = [row for row in commands if row["context"]["version"] == version]
+                    self.assertTrue(per_version, version)
+                    self.assertTrue(all(row["context"]["stage"] == "fixture" for row in per_version))
+                    self.assertTrue({"commit-tree", "update-ref", "ls-tree", "cat-file"}
+                                    <= {row["operation"] for row in per_version})
 
 
 if __name__ == "__main__":
