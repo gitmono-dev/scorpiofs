@@ -33,28 +33,34 @@ class RemoteFailureTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
-        self.evidence = self.root / 'evidence'
-        self.evidence.mkdir()
+        self.evidence = self.root / 'evidence' / ('v3-' + 'a' * 20)
+        self.evidence.mkdir(parents=True)
         self.config = {'workspace': str(self.root / 'sources'), 'status_path': str(self.evidence / 'status.json'),
             'campaign_id': 'v3-' + 'a' * 20, 'instance_id': 'i-owned', 'harness_sha': 'b' * 40,
             'profile': 'history-large', 'mega_sha': 'c' * 40, 'baseline_sha': 'd' * 40,
             'candidate_sha': 'e' * 40, 'session_started_utc': '2026-10-08T00:00:00Z',
             'session_deadline_utc': '2026-10-08T03:55:00Z', 'evidence_prefix': 'runs/owned/'}
-        self.context = {'owned_root': str(self.root / 'owned')}
+        self.context = {'owned_root': str(self.root / 'owned'), 'execution_receipt_sha256': 'f' * 64}
         self.progress = {'stage': 'execution-admission', 'failure': None}
 
-    def exercise(self, *, save_error=False):
+    def exercise(self, *, save_error=False, admission_error=False, metadata_reader=None):
         def export(root, output, *args, **kwargs):
+            self.exported_metadata = kwargs['run_metadata']
             output.mkdir()
             (output / 'safe-export.json').write_text(json.dumps({'complete_campaign': False}), encoding='utf-8')
+        original_anchor = time.monotonic() + 60
+        def anchor(*args, **kwargs):
+            if admission_error and kwargs.get('admission'):
+                raise projection.TraceRejected('PRIVATE_VALUE')
+            return original_anchor
         with patch.dict(os.environ, {}, clear=False), \
-                patch.object(projection, 'window_anchor', return_value=time.monotonic() + 60), \
+                patch.object(projection, 'window_anchor', side_effect=anchor), \
                 patch.object(budgets, 'IsolatedCampaignBudget'), \
                 patch.object(budgets, 'run_process', return_value=(0, b'', b'')) as run, \
                 patch.object(budgets, 'require_external_time'), \
                 patch.object(size, 'admit_backend'), patch.object(size, 'admit_campaign_disk'), \
                 patch.object(exporter, 'export', side_effect=export) as exported, \
-                patch.object(exporter, 'run_metadata_from_env', return_value={}), \
+                patch.object(exporter, 'run_metadata_from_env', side_effect=metadata_reader or (lambda: {})), \
                 patch.object(remote, 'bucket', return_value=Mock()), \
                 patch('sys.stderr', new_callable=io.StringIO) as errors:
             if save_error:
@@ -87,7 +93,7 @@ class RemoteFailureTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertIn('--cleanup', run.call_args.args[0])
         self.assertFalse(exported.call_args.kwargs['complete_allowed'])
-        self.assertEqual(self.progress['failure']['failed_stage'], 'server-build')
+        self.assertEqual(self.progress['failure']['failed_stage'], 'execution-admission')
         self.assertEqual(self.progress['failure']['error_errno'], errno.EEXIST)
         self.assertNotIn('PRIVATE_VALUE', errors)
 
@@ -113,13 +119,146 @@ class RemoteFailureTests(unittest.TestCase):
         def fail(config, context, progress):
             progress['stage'] = 'cleanup'
             raise FileExistsError(errno.EEXIST, 'PRIVATE_VALUE', '/PRIVATE_PATH')
-        with patch.object(remote, 'execution_claim', side_effect=claim), patch.object(remote, 'execute', side_effect=fail):
+        with patch.object(remote, 'DATA', self.root), patch.object(remote, 'execution_claim', side_effect=claim), \
+                patch.object(remote, 'execute', side_effect=fail):
             self.assertEqual(remote.main(['execute', '--config', str(configuration)]), 1)
         value = json.loads(Path(self.config['status_path']).read_bytes())
         self.assertEqual(value['stage'], 'cleanup')
         self.assertEqual(value['primary_failure']['failed_stage'], 'cleanup')
         self.assertEqual(value['outer_failure']['error_errno'], errno.EEXIST)
         self.assertNotIn('PRIVATE', json.dumps(value))
+
+    def test_admission_rejection_still_cleans_and_exports_before_terminal_status(self):
+        context = {'revision': 1, 'execution_provider': 'aliyun-direct',
+            'campaign_id': self.config['campaign_id'], 'instance_id': 'i-bp1abcdefgh12345', 'attempt': '1',
+            'run_uid': 1001, 'run_gid': 1001, 'data_root': self.root.as_posix(), 'data_device': '/dev/vdb',
+            'data_uuid': '11111111-2222-3333-4444-555555555555',
+            'owned_root': (self.root / 'work' / ('mst2-direct-' + self.config['campaign_id'] + '-1')).as_posix(),
+            'session_started_utc': self.config['session_started_utc'],
+            'session_deadline_utc': self.config['session_deadline_utc'], 'hard_release_utc': '2026-10-08T04:00:00Z',
+            'run_id': execution.run_id_for_campaign(self.config['campaign_id']), 'execution_receipt_sha256': 'f' * 64}
+        self.context['owned_root'] = context['owned_root']
+        reader = exporter.run_metadata_from_env
+        with patch.dict(os.environ, {}, clear=True), patch.object(execution, 'DATA_ROOT', self.root), \
+                patch.object(execution, 'identity', return_value=context):
+            result, run, exported, errors = self.exercise(admission_error=True, metadata_reader=reader)
+        self.assertEqual(result, 1)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn('--cleanup', run.call_args.args[0])
+        self.assertIsNone(exported.call_args.kwargs['git_performance_path'])
+        self.assertFalse(exported.call_args.kwargs['complete_allowed'])
+        final = json.loads(Path(self.config['status_path']).read_bytes())
+        self.assertEqual(final['primary_failure']['failed_stage'], 'execution-admission')
+        self.assertEqual(final['primary_failure']['error_type'], 'TraceRejected')
+        self.assertTrue(final['cleanup_verified'])
+        self.assertTrue(final['evidence_uploaded'])
+        self.assertEqual(self.exported_metadata['cleanup_deadline_monotonic'], run.call_args.args[1])
+        self.assertEqual(self.exported_metadata['session_started_utc'], self.config['session_started_utc'])
+        self.assertEqual(self.exported_metadata['session_deadline_utc'], self.config['session_deadline_utc'])
+        self.assertEqual([row['status'] for row in final['history']],
+                         ['RUNNING', 'COLLECTING', 'COLLECTING', 'FAILED'])
+        self.assertNotIn('PRIVATE_VALUE', json.dumps(final) + errors)
+
+    def exercise_repeat_entry(self, claim):
+        configuration = self.root / 'config.json'
+        configuration.write_text(json.dumps(self.config), encoding='utf-8')
+        status = Path(self.config['status_path'])
+        artifact = self.evidence / 'first-evidence.bin'
+        artifact.write_bytes(b'FIRST_OWNER_EVIDENCE\n')
+        def execute(config, context, progress):
+            remote.save(status, remote.status_record(config, progress, 'FAILED', 'finished', evidence_uploaded=True))
+            return 1
+        with patch.object(remote, 'DATA', self.root), patch.object(remote, 'execution_claim', side_effect=claim), \
+                patch.object(remote, 'execute', side_effect=execute) as entered, \
+                patch('sys.stderr', new_callable=io.StringIO) as errors:
+            self.assertEqual(remote.main(['execute', '--config', str(configuration)]), 1)
+            first = status.read_bytes()
+            marker = (self.evidence / 'execution-start.json').read_bytes()
+            self.assertEqual(remote.main(['execute', '--config', str(configuration)]), 1)
+        self.assertEqual(entered.call_count, 1)
+        self.assertEqual(status.read_bytes(), first)
+        self.assertEqual((self.evidence / 'execution-start.json').read_bytes(), marker)
+        self.assertEqual(artifact.read_bytes(), b'FIRST_OWNER_EVIDENCE\n')
+        self.assertIn('EXECUTION_ALREADY_CONSUMED', errors.getvalue())
+        owner = json.loads(first)['execution']
+        self.assertEqual(owner['execution_receipt_sha256'], self.context['execution_receipt_sha256'])
+        self.assertEqual(owner['pid'], os.getpid())
+
+    def test_completed_entry_cannot_replace_first_failure_or_evidence(self):
+        @contextmanager
+        def claim(config):
+            yield self.context
+        self.exercise_repeat_entry(claim)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'actual Linux flock required')
+    def test_released_actual_linux_claim_cannot_restart_canonical_execution(self):
+        path = self.root / 'receipt.json'
+        raw = b'{"immutable":"receipt"}\n'
+        path.write_bytes(raw)
+        path.chmod(0o644)
+        if os.geteuid() != 0:
+            if shutil.which('sudo') is None:
+                self.skipTest('fixture requires root ownership')
+            child = subprocess.run(['sudo', '-n', 'chown', '0:0', str(path)], capture_output=True, timeout=10)
+            if child.returncode:
+                self.skipTest('fixture requires passwordless chown')
+        self.context.update(campaign_id=self.config['campaign_id'], instance_id=self.config['instance_id'],
+                            execution_receipt_sha256=hashlib.sha256(raw).hexdigest())
+        self.config['execution_receipt'] = str(path)
+        original_claim = remote.execution_claim
+        with patch.dict(os.environ, {'MST2_EXECUTION_RECEIPT': str(path)}), \
+                patch.object(execution, 'identity', return_value=self.context):
+            self.exercise_repeat_entry(original_claim)
+
+    def test_existing_status_without_marker_is_preserved(self):
+        status = Path(self.config['status_path'])
+        status.write_bytes(b'PREEXISTING_OWNER_STATUS\n')
+        with patch.object(remote, 'DATA', self.root):
+            with self.assertRaises(remote.ConsumedExecution):
+                remote.begin_execution(self.config, self.context)
+        self.assertEqual(status.read_bytes(), b'PREEXISTING_OWNER_STATUS\n')
+        self.assertFalse((self.evidence / 'execution-start.json').exists())
+
+    def test_marker_without_status_prevents_restart_after_early_exit(self):
+        configuration = self.root / 'config.json'
+        configuration.write_text(json.dumps(self.config), encoding='utf-8')
+        @contextmanager
+        def claim(config):
+            yield self.context
+        with patch.object(remote, 'DATA', self.root):
+            remote.begin_execution(self.config, self.context)
+            marker = (self.evidence / 'execution-start.json').read_bytes()
+            with patch.object(remote, 'execution_claim', side_effect=claim), patch.object(remote, 'execute') as execute, \
+                    patch('sys.stderr', new_callable=io.StringIO):
+                self.assertEqual(remote.main(['execute', '--config', str(configuration)]), 1)
+        execute.assert_not_called()
+        self.assertFalse(Path(self.config['status_path']).exists())
+        self.assertEqual((self.evidence / 'execution-start.json').read_bytes(), marker)
+
+    def test_preexisting_hardlinked_marker_never_truncates_borrowed_file(self):
+        target = self.root / 'borrowed'
+        target.write_bytes(b'BORROWED_BYTES\n')
+        os.link(target, self.evidence / 'execution-start.json')
+        with patch.object(remote, 'DATA', self.root), self.assertRaises(remote.ConsumedExecution):
+            remote.begin_execution(self.config, self.context)
+        self.assertEqual(target.read_bytes(), b'BORROWED_BYTES\n')
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX symlinks required')
+    def test_preexisting_symlink_marker_never_follows_borrowed_file(self):
+        target = self.root / 'borrowed'
+        target.write_bytes(b'BORROWED_BYTES\n')
+        (self.evidence / 'execution-start.json').symlink_to(target)
+        with patch.object(remote, 'DATA', self.root), self.assertRaises(remote.ConsumedExecution):
+            remote.begin_execution(self.config, self.context)
+        self.assertEqual(target.read_bytes(), b'BORROWED_BYTES\n')
+
+    def test_stage_history_retains_first_events_and_reports_truncation(self):
+        for number in range(40):
+            value = remote.status_record(self.config, self.progress, 'RUNNING', str(number))
+        self.assertEqual(len(value['history']), 32)
+        self.assertEqual([row['stage'] for row in value['history']], [str(n) for n in range(32)])
+        self.assertTrue(value['history_truncated'])
+        self.assertEqual(value['stage'], '39')
 
     @unittest.skipUnless(sys.platform == 'linux', 'actual Linux flock required')
     def test_read_only_root_receipt_lock_excludes_second_entry_then_releases(self):

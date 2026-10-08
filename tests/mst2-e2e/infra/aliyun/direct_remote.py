@@ -2,11 +2,12 @@
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 try:
     import pwd
 except ImportError:
@@ -69,6 +70,56 @@ def error_fields(error):
 
 class ActiveExecution(Exception):
     pass
+
+
+class ConsumedExecution(Exception):
+    pass
+
+
+def begin_execution(config, context):
+    """Consume this receipt once, including after its live flock is released."""
+    campaign = config['campaign_id']
+    if not re.fullmatch(r'v3-[0-9a-f]{20}', campaign):
+        raise ValueError('INVALID_EXECUTION_CAMPAIGN')
+    root = DATA / 'evidence' / campaign
+    if (Path(config['status_path']) != root / 'status.json' or not root.is_dir()
+            or any(path.is_symlink() for path in (root, *root.parents))):
+        raise ValueError('INVALID_EXECUTION_EVIDENCE_ROOT')
+    if (root / 'status.json').exists() or (root / 'status.json').is_symlink():
+        raise ConsumedExecution()
+    starttime = (Path('/proc') / str(os.getpid()) / 'stat').read_text().rsplit(') ', 1)[1].split()[19] if sys.platform == 'linux' else None
+    record = {'revision': 1, 'campaign_id': campaign, 'instance_id': config['instance_id'],
+        'harness_sha': config['harness_sha'], 'execution_receipt_sha256': context['execution_receipt_sha256'],
+        'pid': os.getpid(), 'starttime_ticks': starttime, 'started_utc': datetime.now(timezone.utc).isoformat()}
+    try:
+        with (root / 'execution-start.json').open('x', encoding='utf-8') as stream:
+            if os.name == 'posix':
+                os.fchmod(stream.fileno(), 0o600)
+            stream.write(json.dumps(record, sort_keys=True) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name == 'posix':
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    except FileExistsError:
+        raise ConsumedExecution() from None
+    return record
+
+
+def status_record(config, progress, state, stage, **fields):
+    """Keep bounded first-owner stage history in every controller observation."""
+    history = progress.setdefault('history', [])
+    if len(history) < 32:
+        history.append({'status': state, 'stage': stage, 'utc': datetime.now(timezone.utc).isoformat()})
+    else:
+        progress['history_truncated'] = True
+    return {'revision': 1, 'campaign_id': config['campaign_id'], 'instance_id': config['instance_id'],
+        'harness_sha': config['harness_sha'], 'profile': config['profile'], 'status': state, 'stage': stage,
+        'primary_failure': progress['failure'], 'execution': progress.get('execution'),
+        'history': list(history), 'history_truncated': progress.get('history_truncated', False), **fields}
 
 
 @contextmanager
@@ -259,12 +310,8 @@ def execute(config, context, progress):
         SCORPIO_SHA=config['harness_sha'], MEGA_SHA=config['mega_sha'], BASELINE_SHA=config['baseline_sha'],
         CANDIDATE_SHA=config['candidate_sha'], PROFILE=config['profile'], ROUNDS='3', COMPARISON='isolated',
         BOOTSTRAP_COMMIT_TIME='1700000000', MST2_OWNED_ROOT=context['owned_root'])
-    anchor = projection.window_anchor(config['session_started_utc'], config['session_deadline_utc'], admission=True)
-    os.environ['MST2_WORK_CLEANUP_DEADLINE_MONOTONIC'] = repr(anchor)
-    budget = budgets.IsolatedCampaignBudget(config['session_deadline_utc'], 3, anchor)
+    anchor = None
     receipts = {label: evidence / (label + '-build.json') for label in ('server', 'a', 'b')}
-    base = {'revision': 1, 'campaign_id': config['campaign_id'], 'instance_id': config['instance_id'],
-        'harness_sha': config['harness_sha'], 'profile': config['profile']}
     def failure(error):
         if progress['failure'] is None:
             progress['failure'] = {'failed_stage': progress['stage'], **error_fields(error)}
@@ -277,7 +324,7 @@ def execute(config, context, progress):
                         'cleanup' if metric_stage == 'cleanup' else 'setup')
         os.environ['MST2_GIT_PERFORMANCE_CONTEXT'] = json.dumps(
             dict(stage=metric_stage, phase=metric_phase, round=None, client=None, version=None))
-        value = {**base, 'status': state, 'stage': stage, 'primary_failure': progress['failure'], **fields}
+        value = status_record(config, progress, state, stage, **fields)
         try:
             save(status_path, value)
             return True
@@ -301,6 +348,11 @@ def execute(config, context, progress):
     success, cleanup_ok, export_ok, metrics_created, complete = False, False, False, False, False
     cleanup_error = metrics_error = None
     try:
+        if not status('RUNNING', 'execution-admission'):
+            raise RuntimeError('STATUS_WRITE_FAILED')
+        anchor = projection.window_anchor(config['session_started_utc'], config['session_deadline_utc'], admission=True)
+        os.environ['MST2_WORK_CLEANUP_DEADLINE_MONOTONIC'] = repr(anchor)
+        budget = budgets.IsolatedCampaignBudget(config['session_deadline_utc'], 3, anchor)
         with performance_path.open('xb'):
             pass
         metrics_created = True
@@ -341,10 +393,21 @@ def execute(config, context, progress):
         status('COLLECTING', 'native-execution-failed')
     finally:
         status('COLLECTING', 'cleanup', native_completed=success)
+        if anchor is None:
+            # Metadata may describe an expired original boundary. It never
+            # authorizes cleanup: the strict live window check below still does.
+            cutoff = datetime.fromisoformat(config['session_deadline_utc'].replace('Z', '+00:00')) - timedelta(minutes=15)
+            os.environ['MST2_WORK_CLEANUP_DEADLINE_MONOTONIC'] = repr(
+                time.monotonic() + (cutoff - datetime.now(timezone.utc)).total_seconds())
         try:
+            # An initial admission failure still gets the original cleanup
+            # boundary; this does not grant a new preflight or execution slot.
+            cleanup_anchor = anchor if anchor is not None else projection.window_anchor(
+                config['session_started_utc'], config['session_deadline_utc'], admission=False)
+            os.environ['MST2_WORK_CLEANUP_DEADLINE_MONOTONIC'] = repr(cleanup_anchor)
             run([python, '-B', str(scripts / 'commit_update_ci.py'), '--cleanup', '--paired', '--isolated-backends',
                 '--run-root', context['owned_root'], '--session-started-utc', config['session_started_utc'],
-                '--session-deadline-utc', config['session_deadline_utc'], '--rounds', '3'], anchor)
+                '--session-deadline-utc', config['session_deadline_utc'], '--rounds', '3'], cleanup_anchor)
             cleanup_ok = True
         except BaseException as error:
             cleanup_error = error_fields(error)
@@ -402,14 +465,13 @@ def main(argv=None):
         progress = {'stage': 'execution-admission', 'failure': None}
         try:
             with execution_claim(configuration) as context:
+                progress['execution'] = begin_execution(configuration, context)
                 try:
                     return execute(configuration, context, progress)
                 except BaseException as error:
-                    value = {'revision': 1, 'status': 'FAILED', 'stage': progress['stage'],
-                        'campaign_id': configuration['campaign_id'], 'instance_id': configuration['instance_id'],
-                        'harness_sha': configuration['harness_sha'], 'profile': configuration['profile'],
-                        'primary_failure': progress['failure'] or {'failed_stage': progress['stage'], **error_fields(error)},
-                        'outer_failure': error_fields(error), 'evidence_uploaded': False}
+                    progress['failure'] = progress['failure'] or {'failed_stage': progress['stage'], **error_fields(error)}
+                    value = status_record(configuration, progress, 'FAILED', progress['stage'],
+                        outer_failure=error_fields(error), evidence_uploaded=False)
                     try:
                         save(Path(configuration['status_path']), value)
                     except BaseException as save_error:
@@ -417,6 +479,10 @@ def main(argv=None):
                     return 1
         except ActiveExecution:
             print(json.dumps({'status': 'ACTIVE_EXECUTION_ALREADY_OWNS_CAMPAIGN'}), file=sys.stderr, flush=True)
+            return 1
+        except ConsumedExecution:
+            # A later entry has no right to replace even a failed first owner.
+            print(json.dumps({'status': 'EXECUTION_ALREADY_CONSUMED'}), file=sys.stderr, flush=True)
             return 1
         except BaseException as error:
             # Failure before the claim grants no right to touch canonical state.
