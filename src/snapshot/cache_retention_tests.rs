@@ -11,6 +11,14 @@ use mst2_codec::{
 use super::*;
 use crate::snapshot::{auth::AuthorizedSnapshotContext, ScopeCache, ViewMeta};
 
+fn canonical_retention_tempdir() -> tempfile::TempDir {
+    // Retirement opens every ancestor with O_NOFOLLOW. Resolve the system
+    // temporary parent (for example macOS /var) before creating the fixture;
+    // cache paths and deliberately symlinked parents are never normalized.
+    let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+    tempfile::tempdir_in(parent).unwrap()
+}
+
 struct ReleaseActualJob(Option<std::sync::mpsc::Sender<()>>);
 impl ReleaseActualJob {
     fn release(mut self) {
@@ -27,7 +35,7 @@ impl Drop for ReleaseActualJob {
 
 #[tokio::test]
 async fn cancelled_real_collector_waiter_keeps_fence_and_live_use_until_actual_job_exit() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 81);
     store.retain_snapshot_root(&closure).unwrap();
@@ -151,7 +159,7 @@ fn scope(store: &DurableStore) -> PathBuf {
 
 #[test]
 fn regular_cas_leaf_keeps_managed_ancestor_fence_and_unmanaged_io_semantics() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 131);
     store.retain_snapshot_root(&closure).unwrap();
@@ -180,7 +188,7 @@ fn regular_cas_leaf_keeps_managed_ancestor_fence_and_unmanaged_io_semantics() {
     );
     fs::write(directory.join(POLICY), policy_before).unwrap();
 
-    let unmanaged = tempfile::tempdir().unwrap();
+    let unmanaged = canonical_retention_tempdir();
     let file = unmanaged.path().join("actual-file");
     fs::write(&file, b"ordinary").unwrap();
     assert!(managed_scope(&file).unwrap().is_none());
@@ -200,7 +208,7 @@ fn torn_control_temp(directory: &Path, final_name: &str, bytes: &[u8]) -> PathBu
 
 #[test]
 fn torn_control_crash_recovery_keeps_authority_live_use_and_valid_writer_declaration() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 101);
     store.retain_snapshot_root(&closure).unwrap();
@@ -288,7 +296,7 @@ fn torn_control_crash_recovery_keeps_authority_live_use_and_valid_writer_declara
 
 #[test]
 fn torn_intent_control_never_declares_an_unpublished_body_temporary() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 102);
     store.retain_snapshot_root(&closure).unwrap();
@@ -331,7 +339,7 @@ fn unknown_names_corrupt_current_controls_symlink_oversize_and_busy_block_all_re
     .iter()
     .enumerate()
     {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_retention_tempdir();
         let (context, closure) = root(&[("live", b"live")]);
         let store = managed(&temp, &context, 110 + offset as u128);
         store.retain_snapshot_root(&closure).unwrap();
@@ -411,7 +419,7 @@ fn unknown_names_corrupt_current_controls_symlink_oversize_and_busy_block_all_re
 
 #[tokio::test]
 async fn actual_control_recovery_rejects_a_replaced_temporary_lifetime_before_any_unlink() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 121);
     store.retain_snapshot_root(&closure).unwrap();
@@ -449,7 +457,7 @@ async fn actual_control_recovery_rejects_a_replaced_temporary_lifetime_before_an
 
 #[tokio::test]
 async fn same_policy_reopen_and_new_commit_owner_preserve_a_held_actual_writer() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (old_context, _) = root(&[("old", b"old")]);
     let (new_context, _) = root(&[("new", b"new")]);
     let old = managed(&temp, &old_context, 91);
@@ -513,7 +521,7 @@ async fn same_policy_reopen_and_new_commit_owner_preserve_a_held_actual_writer()
 
 #[test]
 fn existing_policy_reuse_keeps_strict_validation_while_a_managed_writer_is_held() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, _) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 93);
     let directory = scope(&store);
@@ -552,7 +560,7 @@ fn existing_policy_reuse_keeps_strict_validation_while_a_managed_writer_is_held(
 
 #[test]
 fn released_live_use_survives_and_retired_old_unique_objects_are_actually_collected() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (old_context, old_root) = root(&[("old", b"old-only"), ("shared", b"shared")]);
     let (new_context, new_root) = root(&[("new", b"new-only"), ("shared", b"shared")]);
     let old = managed(&temp, &old_context, 11);
@@ -610,7 +618,7 @@ fn released_live_use_survives_and_retired_old_unique_objects_are_actually_collec
 
 #[test]
 fn unknown_zero_delete_then_real_canonical_promotion_and_exact_idempotence() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 21);
     let live = blob(&store, b"live");
@@ -652,7 +660,7 @@ fn unknown_zero_delete_then_real_canonical_promotion_and_exact_idempotence() {
 
 #[tokio::test]
 async fn cancellation_keeps_actual_blocking_fd_and_peak_reservation_until_retirement() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 31);
     store.retain_snapshot_root(&closure).unwrap();
@@ -697,7 +705,7 @@ async fn cancellation_keeps_actual_blocking_fd_and_peak_reservation_until_retire
 
 #[test]
 fn same_digest_concurrent_physical_temps_are_charged_before_io() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 41);
     store.retain_snapshot_root(&closure).unwrap();
@@ -737,7 +745,7 @@ fn same_digest_concurrent_physical_temps_are_charged_before_io() {
 
 #[test]
 fn durable_exact_orphan_declaration_recovers_temp_before_its_intent() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 51);
     store.retain_snapshot_root(&closure).unwrap();
@@ -768,7 +776,7 @@ fn durable_exact_orphan_declaration_recovers_temp_before_its_intent() {
 #[test]
 fn malformed_symlink_busy_oversized_and_small_inventory_budget_all_delete_zero() {
     use std::os::unix::fs::symlink;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 61);
     store.retain_snapshot_root(&closure).unwrap();
@@ -821,7 +829,7 @@ fn malformed_symlink_busy_oversized_and_small_inventory_budget_all_delete_zero()
 #[test]
 fn prepared_unlink_rejects_a_recreated_same_digest_lifetime_and_parent_symlink() {
     use std::os::unix::fs::symlink;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let name = "f".repeat(64);
     let path = temp.path().join(&name);
     fs::write(&path, b"same").unwrap();
@@ -842,9 +850,56 @@ fn prepared_unlink_rejects_a_recreated_same_digest_lifetime_and_parent_symlink()
     assert!(path.exists());
 }
 
+#[test]
+fn prepared_unlink_rejects_a_symlinked_ancestor_before_any_unlink() {
+    use std::os::unix::fs::symlink;
+
+    let temp = canonical_retention_tempdir();
+    assert_eq!(fs::canonicalize(temp.path()).unwrap(), temp.path());
+    let real = temp.path().join("real");
+    let directory = real.join("objects");
+    fs::create_dir_all(&directory).unwrap();
+    let name = "f".repeat(64);
+    let path = directory.join(&name);
+    fs::write(&path, b"retained body").unwrap();
+    let identity =
+        secure_fs::RegularIdentity::from_metadata(&fs::symlink_metadata(&path).unwrap()).unwrap();
+    let alias = temp.path().join("system-style-alias");
+    symlink(&real, &alias).unwrap();
+
+    let error = secure_fs::prepare_current_regular(&alias.join("objects"), &name, identity)
+        .err()
+        .expect("retirement must reject an intermediate directory symlink");
+    assert!(matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTDIR) | Some(libc::ELOOP)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), b"retained body");
+    assert!(fs::symlink_metadata(&alias)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn prepared_unlink_preserves_enotdir_for_a_regular_parent_before_any_unlink() {
+    let temp = canonical_retention_tempdir();
+    let parent = temp.path().join("regular-parent");
+    fs::write(&parent, b"retained parent").unwrap();
+    let identity =
+        secure_fs::RegularIdentity::from_metadata(&fs::symlink_metadata(&parent).unwrap()).unwrap();
+
+    let error = secure_fs::prepare_current_regular(&parent, &"f".repeat(64), identity)
+        .err()
+        .expect("retirement must reject a regular file used as its parent");
+    assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+    assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    assert_eq!(fs::read(&parent).unwrap(), b"retained parent");
+}
+
 #[tokio::test]
 async fn upfront_capacity_rejection_preserves_complete_and_retention_never_skips_body_sha() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_retention_tempdir();
     let (context, closure) = root(&[("live", b"live")]);
     let store = managed(&temp, &context, 71);
     let view = ViewMeta {
