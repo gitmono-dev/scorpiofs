@@ -127,13 +127,28 @@ export CARGO_HOME=$DATA_ROOT/cargo
 export RUSTUP_HOME=$DATA_ROOT/rustup
 export TMPDIR=$DATA_ROOT/tmp
 export PATH=$CARGO_HOME/bin:$PATH
-runuser -u benchmark -- env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" TMPDIR="$TMPDIR" bash -euo pipefail -c \
-  "curl --retry 2 --max-time 120 --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path"
+export RUSTUP_DIST_SERVER=https://rsproxy.cn
+export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+runuser -u benchmark -- env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" TMPDIR="$TMPDIR" \
+  RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER" RUSTUP_UPDATE_ROOT="$RUSTUP_UPDATE_ROOT" bash -euo pipefail -c '
+    installer_dir=$(mktemp -d "$TMPDIR/rustup-bootstrap.XXXXXX")
+    trap '\''rm -rf -- "$installer_dir"'\'' EXIT
+    curl --retry 2 --max-time 120 --proto "=https" --tlsv1.2 -fsSL \
+      "$RUSTUP_UPDATE_ROOT/dist/x86_64-unknown-linux-gnu/rustup-init" -o "$installer_dir/rustup-init"
+    chmod 0700 "$installer_dir/rustup-init"
+    "$installer_dir/rustup-init" -y --profile minimal --default-toolchain 1.98.1 \
+      --component rustfmt --component clippy --no-modify-path
+  '
 for program in cargo rustc rustup; do
   ln -sfn "$CARGO_HOME/bin/$program" "/usr/local/bin/$program"
 done
 printf 'export CARGO_HOME=%s/cargo\nexport RUSTUP_HOME=%s/rustup\nexport TMPDIR=%s/tmp\nexport PATH=%s/cargo/bin:$PATH\n' "$DATA_ROOT" "$DATA_ROOT" "$DATA_ROOT" "$DATA_ROOT" > /etc/profile.d/scorpiofs-benchmark.sh
 runuser -u benchmark -- env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" rustc --version
+runuser -u benchmark -- env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" rustc --version | grep -q '^rustc 1\.98\.1 ' || fail rust_toolchain_version_mismatch
+for component in rustfmt clippy; do
+  runuser -u benchmark -- env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+    rustup component list --toolchain 1.98.1 --installed | grep -qx "$component-x86_64-unknown-linux-gnu" || fail rust_toolchain_component_missing
+done
 
 # The direct controller checks this receipt, the original window, and the mount.
 # The public instance type is separately checked by the external controller.
