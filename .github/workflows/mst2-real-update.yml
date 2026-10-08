@@ -1,4 +1,5 @@
 name: MST2 shipped workspace v3 commit updates
+run-name: MST2 v3 ${{ inputs.runner_label }} ${{ inputs.session_started_utc }}
 
 on:
   workflow_dispatch:
