@@ -520,7 +520,7 @@ class BackendOwnershipTests(unittest.TestCase):
         query.assert_not_called()
 
 
-    def startup_mocks(self, failing_boundary=None):
+    def startup_mocks(self, failing_boundary=None, capabilities=None):
         deployed = {"value": False}
         self.patch("workspace_update_backend.ci.free_port", side_effect=range(10001, 10101))
         self.patch("workspace_update_backend.ci.dependencies", return_value={"services": {}})
@@ -531,10 +531,12 @@ class BackendOwnershipTests(unittest.TestCase):
         self.patch("workspace_update_backend.budget_module.PinnedProcess", side_effect=RuntimeError("launch") if failing_boundary == "process_launch" else None, return_value=process)
         abort = self.patch("workspace_update_backend.budget_module.abort_startup")
         stop_group = self.patch("workspace_update_backend.budget_module.stop_group")
-        response = Mock()
-        response.__enter__ = Mock(return_value=SimpleNamespace(status=200))
-        response.__exit__ = Mock(return_value=False)
-        self.patch("workspace_update_backend.urlopen", return_value=response)
+        if capabilities is None:
+            capabilities = {"protocol_versions": [2], "features": dict.fromkeys(
+                ("strict_publication", "directory", "lookup", "metadata_pages", "raw_blob",
+                 "small_objects", "chunk_reads", "full_hydration"), True)}
+        body = capabilities if isinstance(capabilities, bytes) else json.dumps(capabilities).encode()
+        self.patch("workspace_update_backend.budget_module.run_process", return_value=(0, body, b""))
         def git(_source, _deadline, *args):
             return {("rev-parse", "HEAD"): b"1" * 40, ("rev-parse", "HEAD^{tree}"): b"2" * 40,
                     ("status", "--porcelain"): b""}[args]
@@ -602,6 +604,84 @@ class BackendOwnershipTests(unittest.TestCase):
                                     "MEGA_GIT_OBJECT_CACHE_PREFIX": owner.project})
         self.assertEqual(json.loads(owner.root.joinpath("owned.json").read_text())["service"],
                          {"pid": 123, "pgid": 123, "sid": 123, "starttime": "42"})
+        config = backend.common.tomllib.loads(owner.root.joinpath("service.toml").read_text())
+        self.assertEqual(config["object_storage"], {
+            "storage_type": "local",
+            "local": {"root_dir": str(owner.root / "service-data" / "objects")},
+        })
+        self.group.close()
+
+    def test_missing_or_invalid_delivery_capabilities_fail_before_measured_work_and_retain_cleanup(self):
+        complete = {"protocol_versions": [2], "features": dict.fromkeys(
+            ("strict_publication", "directory", "lookup", "metadata_pages", "raw_blob",
+             "small_objects", "chunk_reads", "full_hydration"), True)}
+        invalid = [b"invalid-json", b"x" * 65537, [], {"protocol_versions": [2]},
+                   {"protocol_versions": [3], "features": {}},
+                   {"protocol_versions": [2], "features": {"raw_blob": False}},
+                   {**complete, "protocol_versions": [2.0]},
+                   {**complete, "features": {**complete["features"], "chunk_reads": 1}},
+                   {**complete, "features": {**complete["features"], "full_hydration": False}}]
+        for index, capabilities in enumerate(invalid):
+            with self.subTest(capabilities=index), ExitStack() as stack:
+                self.root = self.base / ("invalid-capabilities-" + str(index))
+                self.options.run_root = self.root
+                self.hosted.return_value = (self.root, "m2perf-77-1")
+                self.group = backend.BackendGroup(self.options, self.budget)
+                with patch.object(self, "patch", side_effect=lambda target, **kwargs:
+                                  stack.enter_context(patch(target, **kwargs))):
+                    stopped, _, _ = self.startup_mocks(capabilities=capabilities)
+                owner = self.admit()
+                with redirect_stdout(io.StringIO()), self.assertRaisesRegex(AssertionError, "capabilities"):
+                    owner.start(1000)
+                backend.OwnedBackend.tip.assert_not_called()
+                backend.OwnedBackend.verify_runtime.assert_not_called()
+                self.assertTrue(owner.root.joinpath("owned.json").is_file())
+                self.group.close()
+                stopped.assert_called_once_with(owner.root, owner.project, self.budget.cleanup_deadline, owner.process)
+                self.assertEqual(owner.state, "retired")
+
+    def test_capabilities_retry_uses_owned_child_and_original_readiness_deadline(self):
+        self.startup_mocks()
+        complete = backend.budget_module.run_process.return_value
+        deadlines = []
+        def probe(argv, deadline, **kwargs):
+            self.assertEqual(argv, [backend.sys.executable, "-I", "-c",
+                                    backend.CAPABILITY_PROBE, "10004"])
+            self.assertEqual(kwargs, {"env": backend.common.clean_env()})
+            deadlines.append(deadline)
+            if len(deadlines) == 1:
+                self.clock["now"] = 278.0
+                return (3, b"", b"")
+            return complete
+        backend.budget_module.run_process.side_effect = probe
+        owner = self.admit()
+        with redirect_stdout(io.StringIO()), patch.object(backend.time, "sleep"):
+            owner.start(1000)
+        self.assertEqual(deadlines, [105.0, 280.0])
+        self.group.close()
+
+    def test_capabilities_child_timeout_preserves_registered_cleanup_and_stops_before_seed(self):
+        stopped, _, _ = self.startup_mocks()
+        backend.budget_module.run_process.side_effect = TimeoutError("probe absolute deadline")
+        owner = self.admit()
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(TimeoutError, "absolute deadline"):
+            owner.start(1000)
+        self.assertEqual(backend.budget_module.run_process.call_args.args[1], 105.0)
+        backend.OwnedBackend.tip.assert_not_called()
+        backend.OwnedBackend.verify_runtime.assert_not_called()
+        self.assertTrue(owner.root.joinpath("owned.json").is_file())
+        self.group.close()
+        stopped.assert_called_once_with(owner.root, owner.project, self.budget.cleanup_deadline, owner.process)
+        self.assertEqual(owner.state, "retired")
+
+    def test_capabilities_unexpected_child_failure_stops_before_seed(self):
+        self.startup_mocks()
+        backend.budget_module.run_process.return_value = (1, b"", b"")
+        owner = self.admit()
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(AssertionError, "probe failed"):
+            owner.start(1000)
+        backend.OwnedBackend.tip.assert_not_called()
+        backend.OwnedBackend.verify_runtime.assert_not_called()
         self.group.close()
 
     def test_failed_pid_persistence_and_abort_preserve_direct_child_retry_authority(self):
