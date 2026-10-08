@@ -26,7 +26,7 @@ class HistoryReplayTests(unittest.TestCase):
             seed = campaign.common.git(repo, deadline, "rev-parse", "HEAD").decode().strip()
             folder = root / "measurements/fair/round-01"
             folder.mkdir(parents=True)
-            with patch.dict(campaign.common.fixture_size.PROFILES, {"history-large": (8, 1, 2, 1024)}):
+            with patch.dict(campaign.common.fixture_size.PROFILES, {"history-large": (40, 1, 2, 1024)}):
                 commits = campaign.prepare_history(repo, folder, "history-large", 1, seed, deadline, fixture_round=1)
                 self.assertEqual(list(commits), [f"v{number}" for number in range(1, 11)])
                 self.assertEqual(len({commit for commit, _ in commits.values()}), 10)

@@ -34,7 +34,7 @@ except ModuleNotFoundError:
 
 SCENARIOS = {"v1": "cold", "v2": "single-file", "v3": "subtree-rename",
              "v4": "batch-file-update"}
-HISTORY_SCENARIOS = {"v1": "cold", **{f"v{number}": "full-module-rewrite"
+HISTORY_SCENARIOS = {"v1": "cold", **{f"v{number}": "module-cohort-rewrite"
                      for number in range(2, 11)}}
 
 
@@ -235,7 +235,8 @@ def failure_record(error):
 
 
 def clean_env(extra=None):
-    env = {k: os.environ[k] for k in ("HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TZ")
+    env = {k: os.environ[k] for k in ("HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TZ",
+                                    "CARGO_HOME", "RUSTUP_HOME", "TMPDIR")
            if k in os.environ}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
                GIT_TERMINAL_PROMPT="0", NO_PROXY="127.0.0.1,localhost",
@@ -577,10 +578,10 @@ def create_version(repo, round_number, version, profile, deadline):
                                                   ((65536 if smoke else 2097152) // 32))
         git(repo, deadline, "add", "--", prefix)
     elif profile == "history-large":
-        # Each measured incremental commit replaces all module bodies. The
+        # Each incremental commit replaces one of five module cohorts. The
         # version salt prevents later commits from repeating identical bytes.
         # Keep the namespace stable so old-view checks exercise byte retention.
-        for module in range(modules):
+        for module in fixture_size.history_modules(version):
             for bucket in range(buckets):
                 for number in range(files):
                     if time.monotonic() >= deadline:
@@ -661,7 +662,7 @@ def manifest_changes(expected, previous=None):
 
 
 def history_change(previous, current, version):
-    """Require the complete version-specific rewrite, without alias credit."""
+    """Require the exact rotating cohort and preserve every unselected body."""
     if version not in HISTORY_SCENARIOS:
         raise ValueError("unknown measured history version")
     files, old = _manifest_files(current), _manifest_files(previous)
@@ -669,13 +670,16 @@ def history_change(previous, current, version):
     fresh = {path: file for path, file in files.items() if source.fullmatch(path)}
     prior = {path: file for path, file in old.items() if source.fullmatch(path)}
     modules, buckets, count, body_size = fixture_size.shape("history-large")
-    minimum = modules * buckets * count
+    selected = fixture_size.history_modules(version)
+    minimum = len(selected) * buckets * count
     prefixes = {path.split("/")[0] for path in fresh}
     if len(prefixes) != 1:
         raise AssertionError("history source round prefix differs")
     prefix = next(iter(prefixes))
     wanted = {f"{prefix}/m{module:03}/d{bucket:02}/f{number:03}"
               for module in range(modules) for bucket in range(buckets) for number in range(count)}
+    selected_paths = {f"{prefix}/m{module:03}/d{bucket:02}/f{number:03}"
+                      for module in selected for bucket in range(buckets) for number in range(count)}
     if (fresh.keys() != wanted or any(file["size"] != body_size
             or file["fs_kind"] != "regular" for file in fresh.values())):
         raise AssertionError("history source namespace or body size differs")
@@ -686,12 +690,24 @@ def history_change(previous, current, version):
         if previous is not None or len(added) != minimum:
             raise AssertionError("history cold commit must populate an empty tracked namespace")
     elif (previous is None or fresh.keys() != prior.keys() or files.keys() != old.keys()
-          or current["directories"] != previous["directories"] or len(changed) != minimum
+          or current["directories"] != previous["directories"] or changed != selected_paths
           or any(fresh[path]["fs_kind"] != prior[path]["fs_kind"]
                  or fresh[path]["size"] != prior[path]["size"] for path in fresh)
+          or any(fresh[path] != prior[path] for path in wanted - selected_paths)
           or any(files[path] != old[path] for path in files.keys() - fresh.keys()
                  if not path.startswith("alias-"))):
-        raise AssertionError("history commit did not rewrite every stable source file")
+        raise AssertionError("history commit did not rewrite exactly its stable source cohort")
+    alias_prefix = f"alias-{prefix}-m007/"
+    alias_paths = {path for path in files if path.startswith("alias-")}
+    expected_alias = {alias_prefix + f"d{bucket:02}/f{number:03}"
+                      for bucket in range(buckets) for number in range(count)}
+    if alias_paths != expected_alias:
+        raise AssertionError("history directory alias namespace differs")
+    for path in alias_paths:
+        original = f"{prefix}/m007/" + path[len(alias_prefix):]
+        if {key: value for key, value in files[path].items() if key != "rel_path"} != {
+                key: value for key, value in fresh[original].items() if key != "rel_path"}:
+            raise AssertionError("history directory alias differs from its source bytes")
     changed_bytes = sum(fresh[path]["size"] for path in changed)
     distinct = len({fresh[path]["content_digest"] for path in changed})
     if len(changed) != minimum or changed_bytes != minimum * body_size or distinct != minimum:

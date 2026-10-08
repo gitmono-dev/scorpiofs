@@ -24,15 +24,20 @@ def manifest():
 
 
 class FixtureSizeTests(unittest.TestCase):
-    def test_history_plan_covers_ten_complete_trees_under_frozen_cumulative_limits(self):
+    def test_history_plan_covers_fivefold_tree_and_rotating_cohorts_under_frozen_limits(self):
         report = size.plan("history-large")
         self.assertEqual((report["logical_files"], report["logical_directories"], report["logical_entries"]),
-                         (17026, 170, 17196))
+                         (85122, 835, 85957))
         history = report["history_admission"]
         self.assertEqual((history["versions"], history["source_files_rewritten_per_increment"],
                           history["source_bytes_rewritten_per_increment"], history["full_oracle_walks_per_lane"]),
-                         (10, 16384, 128 * 1024 ** 2, 75))
-        self.assertEqual(history["source_entry_references_upper"], 10 * report["logical_entries"] + 1024)
+                         (10, 16896, 132 * 1024 ** 2, 75))
+        self.assertEqual((history["cohort_count"], history["modules_rewritten_per_increment"],
+                          history["modules_preserved_per_increment"]), (5, 33, 132))
+        self.assertEqual(history["source_dictionary_entries_per_increment_upper"], 17716)
+        self.assertEqual(history["source_entry_references_upper"], 246425)
+        self.assertEqual(history["source_entry_references_upper"], report["logical_entries"]
+                         + 9 * history["source_dictionary_entries_per_increment_upper"] + 1024)
         self.assertEqual(history["resident_metadata_pages_upper"], 10 * report["metadata_pages_upper"] + 64)
         for key, limit in size.HISTORY_LIMITS.items():
             self.assertLessEqual(history[key], limit)
@@ -40,7 +45,7 @@ class FixtureSizeTests(unittest.TestCase):
             with patch.dict(size.HISTORY_LIMITS, {key: 0}), self.assertRaises(ValueError):
                 size.plan("history-large")
         # A current tree can fit while ten immutable source dictionaries do not.
-        with patch.dict(size.PROFILES, {"history-large": size.PROFILES["large"]}), \
+        with patch.dict(size.PROFILES, {"history-large": (240, 4, 128, 8192)}), \
                 self.assertRaisesRegex(ValueError, "retained source_entry"):
             size.plan("history-large")
 
@@ -49,15 +54,28 @@ class FixtureSizeTests(unittest.TestCase):
         report = size.campaign_disk_plan("history-large")
         self.assertEqual((report["lanes"], report["versions_per_lane"], report["retained_git_detached_checkouts"]), (7, 10, 70))
         self.assertEqual(report["retained_unique_content_bytes"] - report["cold_unique_content_bytes"],
-                         9 * 128 * 1024 ** 2)
+                         9 * 132 * 1024 ** 2)
         self.assertGreaterEqual(report["components_bytes"]["retained_git_detached_checkouts"],
                                 70 * fixture["logical_content_bytes"])
         self.assertEqual(report["minimum_free_bytes"], sum(report["components_bytes"].values()))
-        self.assertGreater(report["minimum_free_bytes"], 100 * 1024 ** 3)
-        self.assertLess(report["minimum_free_bytes"], 116412113924)
+        self.assertGreater(report["minimum_free_bytes"], 190 * 1024 ** 3)
+        self.assertLess(report["minimum_free_bytes"], 300 * 1024 ** 3)
         with self.assertRaises(ValueError):
             size.admit_backend("history-large", False)
         self.assertEqual(size.admit_backend("history-large", True)["profile"], "history-large")
+
+    def test_history_cohorts_cover_all_modules_once_then_repeat_without_reusing_bytes(self):
+        self.assertEqual(size.history_modules("v1"), tuple(range(165)))
+        cohorts = [size.history_modules(f"v{version}") for version in range(2, 7)]
+        self.assertTrue(all(len(cohort) == 33 for cohort in cohorts))
+        self.assertEqual(tuple(module for cohort in cohorts for module in cohort), tuple(range(165)))
+        self.assertEqual(size.history_modules("v7"), cohorts[0])
+        self.assertEqual(size.history_modules("v10"), cohorts[3])
+        for invalid in (None, True, "v0", "v01", "v11", "V2"):
+            with self.assertRaises(ValueError):
+                size.history_modules(invalid)
+        with patch.dict(size.PROFILES, {"history-large": (164, 4, 128, 8192)}), self.assertRaises(ValueError):
+            size.plan("history-large")
 
     def test_existing_runner_label_is_explicit_and_strictly_bounded(self):
         for label in ("ubuntu-latest", "perf-linux-large", "self-hosted", "a.b_1", "a" * 64):

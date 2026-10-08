@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -320,7 +320,7 @@ class CampaignExportTests(unittest.TestCase):
         sources = deepcopy(fixture.sources)
         server = {"revision": 1, "label": "server", "source": "/immutable/server", "source_sha": "1" * 40,
             "cargo_lock_sha256": "4" * 64, "binary": "/immutable/server/target/release/mega2", "binary_sha256": "3" * 64,
-            "build_argv": export_module.builds.build_argv(Path("/immutable/server"), "mega2"),
+            "build_argv": export_module.builds.build_argv(PurePosixPath("/immutable/server"), "mega2"),
             "build_env": export_module.builds.BUILD_ENV, "rustc_version": sources["a"]["rustc_version"],
             "cargo_version": sources["a"]["cargo_version"]}
         server_path = Path(self.temp.name) / "server-build.json"

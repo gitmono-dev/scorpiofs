@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 import re
 import stat
 from datetime import timedelta
@@ -17,6 +17,7 @@ import workspace_update_campaign as campaign
 import workspace_update_observation as observation
 import workspace_update_profile as profiles
 import workspace_update_size as fixture_size
+import workspace_update_execution as execution
 from workspace_update_size import consume_regular
 
 ROOT_FILES = {"campaign.json", "canonical-seed.json", "backend-owners.json", "failure.json"}
@@ -26,10 +27,12 @@ OWNER_FIELDS = {"phase", "round", "client", "project", "database", "instance_id"
 RUN_FIELDS = {"revision", "run_id", "attempt", "harness_sha", "mega_sha", "baseline_sha", "candidate_sha",
               "profile", "rounds", "comparison", "bootstrap_commit_time", "session_started_utc",
               "session_deadline_utc", "cleanup_deadline_monotonic", "owned_root"}
+DIRECT_RUN_FIELDS = RUN_FIELDS | execution.DIRECT_FIELDS
 
 
 def run_metadata_from_env():
-    value = {"revision": 1, "run_id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+    context = execution.identity()
+    value = {"revision": 1, "run_id": context["run_id"], "attempt": context["attempt"],
         "harness_sha": os.environ["SCORPIO_SHA"], "mega_sha": os.environ["MEGA_SHA"],
         "baseline_sha": os.environ["BASELINE_SHA"], "candidate_sha": os.environ["CANDIDATE_SHA"],
         "profile": os.environ["PROFILE"], "rounds": int(os.environ["ROUNDS"]), "comparison": os.environ["COMPARISON"],
@@ -37,14 +40,22 @@ def run_metadata_from_env():
         "session_started_utc": os.environ["STARTED_INPUT"], "session_deadline_utc": os.environ["DEADLINE_INPUT"],
         "cleanup_deadline_monotonic": float(os.environ["MST2_WORK_CLEANUP_DEADLINE_MONOTONIC"]),
         "owned_root": os.environ["MST2_OWNED_ROOT"]}
-    proofs.exact(value["harness_sha"], os.environ["GITHUB_SHA"])
-    proofs.exact(value["owned_root"], str(PurePosixPath(os.environ["RUNNER_TEMP"]) / f"mst2-real-{value['run_id']}-{value['attempt']}"))
+    if context["execution_provider"] == "github-actions":
+        proofs.exact(value["harness_sha"], os.environ["GITHUB_SHA"])
+        proofs.exact(value["owned_root"], str(PurePosixPath(os.environ["RUNNER_TEMP"]) / f"mst2-real-{value['run_id']}-{value['attempt']}"))
+    else:
+        value.update(execution.metadata_fields(context))
+        for key in ("owned_root", "session_started_utc", "session_deadline_utc"):
+            proofs.exact(value[key], context[key])
     validate_run_metadata(value)
     return value
 
 
 def validate_run_metadata(value, complete=None):
-    proofs.shape(value, RUN_FIELDS)
+    direct = type(value) is dict and "execution_provider" in value
+    proofs.shape(value, DIRECT_RUN_FIELDS if direct else RUN_FIELDS)
+    if direct:
+        execution.validate_metadata(value)
     proofs.exact(value["revision"], 1)
     for key in ("run_id", "attempt"):
         proofs.require(type(value[key]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", value[key]))
@@ -56,10 +67,15 @@ def validate_run_metadata(value, complete=None):
     fixture_size.plan(value["profile"])
     proofs.integer(value["bootstrap_commit_time"], (1 << 32) - 1)
     proofs.finite(value["cleanup_deadline_monotonic"])
-    proofs.require(type(value["owned_root"]) is str and PurePosixPath(value["owned_root"]).is_absolute()
-                   and PurePosixPath(value["owned_root"]).name == f"mst2-real-{value['run_id']}-{value['attempt']}")
+    if not direct:
+        proofs.require(type(value["owned_root"]) is str and PurePosixPath(value["owned_root"]).is_absolute()
+                       and PurePosixPath(value["owned_root"]).name == f"mst2-real-{value['run_id']}-{value['attempt']}")
     proofs.exact(budgets.utc(value["session_deadline_utc"]), budgets.utc(value["session_started_utc"]) + timedelta(minutes=235))
     if complete is not None:
+        proofs.exact("execution_provider" in complete, direct)
+        if direct:
+            for key in execution.DIRECT_FIELDS:
+                proofs.exact(value[key], complete[key])
         for key in ("session_started_utc", "session_deadline_utc", "cleanup_deadline_monotonic"):
             proofs.exact(value[key], complete[key])
         proofs.exact(value["bootstrap_commit_time"], complete["canonical_seed"]["bootstrap_commit_time"])
@@ -370,10 +386,11 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_
     """Replay complete artifacts; this is not authority to start a backend."""
     root = Path(root)
     value = observation.parse(read_regular(root / "campaign.json", 2 * 1024 * 1024))
-    proofs.shape(value, {"revision", "record", "correctness", "session_started_utc", "session_deadline_utc",
+    complete_fields = {"revision", "record", "correctness", "session_started_utc", "session_deadline_utc",
         "cleanup_deadline_monotonic", "sources", "canonical_seed", "server_build", "server_build_receipt_sha256",
         "fair_records", "diagnostic_records", "fair_full_oracle_walks", "diagnostic_full_oracle_walks", "cleanup",
-        "phase_measurements_sha256", "elapsed_execution_seconds", "performance_claims"})
+        "phase_measurements_sha256", "elapsed_execution_seconds", "performance_claims"}
+    proofs.shape(value, complete_fields | (execution.DIRECT_FIELDS if "execution_provider" in value else set()))
     proofs.exact(value["revision"], 1)
     proofs.shape(value["sources"], {"a", "b"})
     proofs.shape(value["phase_measurements_sha256"], {"fair", "diagnostic"})
@@ -403,7 +420,10 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_
         proofs.exact(build["revision"], 1)
         proofs.exact(build["label"], label)
         proofs.exact(build["build_env"], builds.BUILD_ENV)
-        proofs.exact(build["build_argv"], builds.build_argv(Path(build["source"]), "mega2" if label == "server" else "scorpio"))
+        # Replay the producer's path syntax, independently of this machine.
+        source_path = (PurePosixPath(build["source"]) if build["source"].startswith("/")
+                       else PureWindowsPath(build["source"]))
+        proofs.exact(build["build_argv"], builds.build_argv(source_path, "mega2" if label == "server" else "scorpio"))
         actual_builds[label] = build
         actual_build_hashes[label] = hashlib.sha256(raw).hexdigest()
         if label == "server":
@@ -484,6 +504,9 @@ def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_
             proofs.exact(environment[0][key], value[key])
         proofs.exact(environment[0]["run_id"], metadata["run_id"])
         proofs.exact(environment[0]["run_attempt"], metadata["attempt"])
+        if "execution_provider" in metadata:
+            for key in execution.DIRECT_FIELDS:
+                proofs.exact(environment[0][key], metadata[key])
         proofs.exact(environment[0]["profile"], metadata["profile"])
         proofs.exact(environment[0]["rounds"], 3 if phase == "fair" else 1)
         campaign.validate_matrix(records, phase, profile)

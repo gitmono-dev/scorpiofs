@@ -13,11 +13,11 @@ variable "zone" {
 }
 
 variable "image_id" {
-  description = "Explicit Ubuntu 22.04 or 24.04 amd64 cloud image ID."
+  description = "Explicit Ubuntu 24.04 amd64 cloud image ID, with Python 3.12."
   type        = string
   validation {
-    condition     = length(trimspace(var.image_id)) > 3 && !strcontains(var.image_id, "\n")
-    error_message = "image_id must name an explicitly reviewed Ubuntu amd64 image."
+    condition     = can(regex("^ubuntu_24_04_x64_[A-Za-z0-9_.-]+$", var.image_id))
+    error_message = "image_id must name an explicitly reviewed Ubuntu 24.04 amd64 image."
   }
 }
 
@@ -36,6 +36,16 @@ variable "run_id" {
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{5,31}$", var.run_id)) && !endswith(var.run_id, "-")
     error_message = "run_id must contain 6 to 32 lowercase letters, digits, or hyphens and start with a letter."
+  }
+}
+
+variable "test_tier" {
+  description = "One campaign tier per disposable instance; use smoke admission fences before measurement."
+  type        = string
+  default     = "history-large"
+  validation {
+    condition     = contains(["smoke", "medium", "history-large"], var.test_tier)
+    error_message = "test_tier must be smoke, medium, or history-large."
   }
 }
 
@@ -76,7 +86,7 @@ variable "vswitch_cidr" {
 }
 
 variable "data_disk_size_gib" {
-  description = "Run-owned ESSD PL1 work disk; source, Docker, Cargo, and runner work share this disk."
+  description = "Run-owned ESSD PL1 work disk shared by source, Docker, Cargo, and campaign work."
   type        = number
   default     = 300
   validation {
@@ -96,32 +106,12 @@ variable "data_disk_device" {
 }
 
 variable "internet_max_bandwidth_out" {
-  description = "PayByTraffic public egress cap for dependency downloads and Actions; no EIP/NAT is created."
+  description = "PayByTraffic public egress cap for dependency downloads; no EIP/NAT is created."
   type        = number
   default     = 20
   validation {
     condition     = var.internet_max_bandwidth_out >= 1 && var.internet_max_bandwidth_out <= 100 && floor(var.internet_max_bandwidth_out) == var.internet_max_bandwidth_out
     error_message = "Public egress must be an integer from 1 to 100 Mbps."
-  }
-}
-
-variable "ssh_operator_cidrs" {
-  description = "Optional single IPv4 operator addresses; SSH is closed by default."
-  type        = set(string)
-  default     = []
-  validation {
-    condition     = alltrue([for value in var.ssh_operator_cidrs : can(cidrnetmask(value)) && endswith(value, "/32")])
-    error_message = "Every optional SSH source must be an explicit IPv4 /32."
-  }
-}
-
-variable "ssh_public_key" {
-  description = "Optional existing public key to import; no private key is generated or written."
-  type        = string
-  default     = ""
-  validation {
-    condition     = var.ssh_public_key == "" || (can(regex("^(ssh-ed25519|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^\\r\\n]+)?$", var.ssh_public_key)) && !strcontains(var.ssh_public_key, "PRIVATE"))
-    error_message = "Provide only a single-line existing OpenSSH public key, or leave SSH disabled."
   }
 }
 

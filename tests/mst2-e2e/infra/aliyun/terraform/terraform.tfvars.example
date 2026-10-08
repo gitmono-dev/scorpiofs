@@ -5,6 +5,7 @@ zone          = "cn-hangzhou-h"
 image_id      = "<reviewed-ubuntu-amd64-image-id>"
 instance_type = "<available-8vcpu-32gib-ecs-type>"
 run_id        = "<globally-unique-run-id>"
+test_tier     = "history-large"
 
 # The controller replaces these together once, before the first create.
 session_started_utc = "2026-10-08T00:00:00Z"
@@ -16,7 +17,3 @@ data_disk_size_gib         = 300
 data_disk_device           = "/dev/vdb"
 internet_max_bandwidth_out = 20
 evidence_retention_days    = 7
-
-# Optional SSH requires both values. Never provide a private key.
-ssh_operator_cidrs = []
-ssh_public_key     = ""

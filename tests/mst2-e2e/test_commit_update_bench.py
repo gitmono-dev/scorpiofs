@@ -37,9 +37,9 @@ class CommitUpdateBenchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             BENCH.scenarios("unknown")
 
-    def test_ten_real_history_commits_rewrite_distinct_bytes_and_reproduce_exact_parents(self):
+    def test_ten_real_history_commits_rotate_exact_cohorts_and_reproduce_exact_parents(self):
         with tempfile.TemporaryDirectory() as temp, \
-                patch.dict(BENCH.fixture_size.PROFILES, {"history-large": (8, 1, 2, 1024)}):
+                patch.dict(BENCH.fixture_size.PROFILES, {"history-large": (40, 1, 2, 1024)}):
             deadline = time.monotonic() + 120
             runs = []
             for repetition in range(2):
@@ -59,22 +59,43 @@ class CommitUpdateBenchTests(unittest.TestCase):
                     body = bytes.fromhex(receipt["commit_body_hex"])
                     self.assertEqual(hashlib.sha1(b"commit " + str(len(body)).encode() + b"\0" + body).hexdigest(), commit)
                     self.assertIn(b" +0000\n", body)
+                    selected = BENCH.fixture_size.history_modules(version)
+                    count = 2 * len(selected)
                     self.assertEqual(receipt["source_changes"], {
-                        "changed_source_files": 16, "changed_source_bytes": 16 * 1024,
-                        "distinct_changed_source_blobs": 16,
-                        "added_source_files": 16 if version == "v1" else 0, "removed_source_files": 0})
+                        "changed_source_files": count, "changed_source_bytes": count * 1024,
+                        "distinct_changed_source_blobs": count,
+                        "added_source_files": count if version == "v1" else 0, "removed_source_files": 0})
                     changes = receipt["change_counts"]
                     if version == "v1":
-                        self.assertEqual(changes["files_added"], 16 + 2 + 130)
+                        self.assertEqual(changes["files_added"], 80 + 2 + 130)
                         sample = (repo / "r01/m000/d00/f000").read_bytes()
                         self.assertGreaterEqual(len(zlib.compress(sample)), len(sample))
                     else:
+                        alias_count = 2 if 7 in selected else 0
                         self.assertEqual(changes, {"files_added": 0, "files_deleted": 0,
-                            "files_modified": 18, "added_or_modified_bytes": 18 * 1024})
-                        bad = deepcopy(expected)
+                            "files_modified": count + alias_count,
+                            "added_or_modified_bytes": (count + alias_count) * 1024})
                         old = {file["rel_path"]: file for file in previous["files"]}
-                        source = next(file for file in bad["files"] if file["rel_path"] == "r01/m000/d00/f000")
+                        current = {file["rel_path"]: file for file in expected["files"]}
+                        changed_modules = {int(path.split("/")[1][1:]) for path in current
+                            if path.startswith("r01/m") and current[path] != old[path]}
+                        self.assertEqual(changed_modules, set(selected))
+                        bad = deepcopy(expected)
+                        source = next(file for file in bad["files"]
+                            if file["rel_path"] == f"r01/m{selected[0]:03}/d00/f000")
                         source["content_digest"] = old[source["rel_path"]]["content_digest"]
+                        with self.assertRaises(AssertionError):
+                            BENCH.history_change(previous, bad, version)
+                        bad = deepcopy(expected)
+                        untouched = next(module for module in range(40) if module not in selected)
+                        source = next(file for file in bad["files"]
+                            if file["rel_path"] == f"r01/m{untouched:03}/d00/f000")
+                        source["content_digest"] = "sha256:" + "f" * 64
+                        with self.assertRaises(AssertionError):
+                            BENCH.history_change(previous, bad, version)
+                        bad = deepcopy(expected)
+                        alias = next(file for file in bad["files"] if file["rel_path"].startswith("alias-"))
+                        alias["content_digest"] = "sha256:" + "f" * 64
                         with self.assertRaises(AssertionError):
                             BENCH.history_change(previous, bad, version)
                     retained.append((commit, expected))

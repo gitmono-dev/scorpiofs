@@ -31,6 +31,7 @@ import workspace_update_bench as measurement
 import workspace_update_observation as observation
 import workspace_update_oracle as oracle
 import workspace_update_profile as profiles
+import workspace_update_execution as execution
 from workspace_update_daemon import WorkspaceDaemon, mounts_under
 from workspace_update_worker import WorkerSession, DIRTY_BYTES, DIRTY_SENTINEL
 
@@ -508,6 +509,7 @@ def summaries(records, profile="smoke"):
 
 
 def execute(options):
+    execution.bind_options(options)
     fixture_admission = common.fixture_size.admit_backend(options.profile, True)
     if options.profile in ("large", "history-large"):
         root, _ = ci.hosted_root(options.run_root)
@@ -542,6 +544,8 @@ def execute(options):
     # Preparation is inside setup; actual per-round startup/seed remains in its
     # 25-minute lifetime. Pulling dependency layers is not a timed cache flush.
     group = backends.BackendGroup(options, budget)
+    execution_context = execution.identity()
+    execution_metadata = execution.metadata_fields(execution_context)
     group.seed = None
     started = time.monotonic()
     fair, diagnostic = [], []
@@ -557,7 +561,8 @@ def execute(options):
                 "architecture": "workspace-v3", "publication_mode": "native",
                 "runner_os": platform.system(), "runner_kernel_release": platform.release(),
                 "runner_machine": platform.machine(), "runner_logical_cpus": os.cpu_count(),
-                "run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                "run_id": execution_context["run_id"], "run_attempt": execution_context["attempt"],
+                **execution_metadata,
                 "backend_isolation": "fresh separately owned PG/Redis/Local object storage/process/cache per lane and round",
                 "cache_conditions": "host page caches, CPU scheduling and dependency image layers uncontrolled; no host cache flush",
                 "session_started_utc": options.session_started_utc, "session_deadline_utc": options.session_deadline_utc,
@@ -602,6 +607,7 @@ def execute(options):
                 "campaign_cleanup_complete": True}, phase, cleanup_limit)
             profiles.validate_artifact_tree(measurements / phase, diagnostic_required=phase == "diagnostic")
         campaign = {"revision": 1, "record": "isolated_campaign_complete", "correctness": "PASS",
+            **execution_metadata,
             "session_started_utc": options.session_started_utc, "session_deadline_utc": options.session_deadline_utc,
             "cleanup_deadline_monotonic": budget.cleanup_deadline, "sources": sources, "canonical_seed": group.seed,
             "server_build": server.build,

@@ -10,7 +10,7 @@ terraform {
 }
 
 # Authentication uses the provider's standard environment or workload identity.
-# No access key, runner token, or private SSH key is accepted by this module.
+# No access key, runner token, or SSH key is accepted by this module.
 provider "alicloud" {
   region = var.region
 }
