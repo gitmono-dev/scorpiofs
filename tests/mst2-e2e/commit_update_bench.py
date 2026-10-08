@@ -202,7 +202,21 @@ def phase(name):
 
 def failure_record(error):
     record = {"execution_failed": True, "error_type": type(error).__name__}
-    if isinstance(error, PhaseFailure):
+    if isinstance(error, BaseExceptionGroup):
+        # Cleanup groups retain the original failure first. Preserve each
+        # closed leaf without exporting group messages, notes or tracebacks.
+        pending, leaves, truncated = [(error, 0)], [], False
+        while pending and len(leaves) < 32:
+            item, depth = pending.pop()
+            if isinstance(item, BaseExceptionGroup) and depth < 4:
+                truncated |= len(item.exceptions) > 32
+                pending.extend((child, depth + 1) for child in reversed(item.exceptions[:32]))
+            else:
+                leaves.append({"execution_failed": True, "error_type": type(item).__name__}
+                              if isinstance(item, BaseExceptionGroup) else failure_record(item))
+                truncated |= isinstance(item, BaseExceptionGroup)
+        record.update(failures=leaves, failure_details_truncated=truncated or bool(pending))
+    elif isinstance(error, PhaseFailure):
         record.update(error_type=error.failure_type, phase=error.phase)
         if error.error_code is not None:
             record["error_code"] = error.error_code

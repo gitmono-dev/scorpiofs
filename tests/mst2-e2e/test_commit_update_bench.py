@@ -196,6 +196,31 @@ class CommitUpdateBenchTests(unittest.TestCase):
                     raise KeyError("private-connection-string")
         self.assertEqual(BENCH.failure_record(nested.exception)["phase"], "updated_publication_identity")
 
+    def test_cleanup_exception_groups_keep_original_phase_and_safe_leaves_in_order(self):
+        primary = BENCH.PhaseFailure("dependency_probe", AssertionError("private-token"))
+        group = BaseExceptionGroup("private connection", [
+            BaseExceptionGroup("private path", [primary, KeyboardInterrupt("private signal")]),
+            BENCH.CommandFailure("docker", 7, b"private stderr")])
+        record = BENCH.failure_record(group)
+        self.assertEqual(record["failures"], [BENCH.failure_record(primary),
+            {"execution_failed": True, "error_type": "KeyboardInterrupt"},
+            {"execution_failed": True, "error_type": "CommandFailure", "command": "docker", "exit_status": 7}])
+        self.assertFalse(record["failure_details_truncated"])
+        self.assertNotIn("private", json.dumps(record))
+
+    def test_cleanup_group_diagnostics_have_bounded_depth_and_count(self):
+        wide = ExceptionGroup("private", [RuntimeError("private") for _ in range(40)])
+        record = BENCH.failure_record(wide)
+        self.assertEqual(len(record["failures"]), 32)
+        self.assertTrue(record["failure_details_truncated"])
+        deep = RuntimeError("private")
+        for _ in range(20):
+            deep = ExceptionGroup("private", [deep])
+        record = BENCH.failure_record(deep)
+        self.assertTrue(record["failure_details_truncated"])
+        self.assertEqual(len(record["failures"]), 1)
+        self.assertNotIn("private", json.dumps(record))
+
     def test_worker_failure_record_carries_only_a_closed_error_code(self):
         private = "private-token /run/secret response body"
         inner = BENCH.PhaseFailure(
@@ -298,6 +323,30 @@ class CommitUpdateBenchTests(unittest.TestCase):
                 "error_type": "WorkerError",
                 "execution_failed": True,
             })
+
+    def test_actual_cleanup_cli_persists_grouped_interrupt_without_overwriting_primary(self):
+        import io
+        import runpy
+        import sys
+        from contextlib import redirect_stderr
+        import workspace_update_campaign as campaign
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "measurements").mkdir()
+            CI.persist_failure_record(root, CI.bench.PhaseFailure("dependency_probe", RuntimeError("private")))
+            before = (root / "measurements/failure.json").read_bytes()
+            grouped = BaseExceptionGroup("private", [KeyboardInterrupt("private"), TimeoutError("private")])
+            argv = [str(SOURCE.with_name("commit_update_ci.py")), "--cleanup", "--isolated-backends", "--paired",
+                    "--run-root", str(root)]
+            with patch.object(sys, "argv", argv), redirect_stderr(io.StringIO()), \
+                    patch.object(campaign, "verify_cleanup_from_disk", side_effect=grouped):
+                with self.assertRaises(SystemExit) as caught:
+                    runpy.run_path(str(SOURCE.with_name("commit_update_ci.py")), run_name="__main__")
+            self.assertEqual(caught.exception.code, 1)
+            self.assertEqual((root / "measurements/failure.json").read_bytes(), before)
+            record = json.loads((root / "measurements/cleanup-failure.json").read_bytes())
+            self.assertEqual([row["error_type"] for row in record["failures"]], ["KeyboardInterrupt", "TimeoutError"])
+            self.assertNotIn("private", json.dumps(record))
 
     def test_command_failure_keeps_only_closed_fields(self):
         private = b'private-token and child stderr must never be copied into the record\n'

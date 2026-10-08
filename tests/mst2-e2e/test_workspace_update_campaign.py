@@ -265,14 +265,47 @@ class CampaignWorkloadTests(unittest.TestCase):
                 group = backend_module.BackendGroup(options, budget)
                 (root / "measurements/fair").mkdir(parents=True)
                 h = budget.cleanup_deadline
-                with self.assertRaises(RuntimeError) as caught:
+                with self.assertRaises(campaign.common.PhaseFailure) as caught:
                     campaign.run_phase(group, [], {}, "fair", 1, budget.round_deadline(1), root)
-                self.assertIs(caught.exception, primary)
+                self.assertEqual(campaign.common.failure_record(caught.exception), {
+                    "execution_failed": True, "error_type": "RuntimeError", "phase": "backend_start"})
                 self.assertEqual([owner.state for owner in group.backends], ["retired", "retired"])
                 self.assertTrue(group.closed)
                 self.assertEqual(h, budget.cleanup_deadline)
                 self.assertFalse((root / "measurements/fair/measurements.jsonl").exists())
                 self.assertFalse((root / "campaign.json").exists())
+
+    def test_partial_cleanup_accepts_only_absent_client_before_service_start(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(budgets.time, "time", return_value=0), \
+                patch.object(budgets.time, "monotonic", return_value=1000):
+            root = Path(directory) / "owned"
+            budget = budgets.IsolatedCampaignBudget("1970-01-01T03:55:00Z", 3)
+            options = SimpleNamespace(run_root=root, mega_sha="1" * 40, budget=budget,
+                                      paired=True, isolated_backends=True)
+            with patch.object(backend_module.ci, "hosted_root", return_value=(root, "owned-campaign")), \
+                    patch.object(campaign.common, "command", return_value=b""), \
+                    patch.object(campaign, "mounts_under", return_value=[]), \
+                    patch.object(budgets, "group_members", return_value=[]):
+                group = backend_module.BackendGroup(options, budget)
+                owner = group.admit("fair", 1, "a", budget.round_deadline(1))
+                group.close()
+                result = campaign.verify_cleanup_from_disk(options)
+                self.assertEqual(result["inventory"][0]["client_cleanup"], {"not_started": True})
+                self.assertFalse((root / "campaign.json").exists())
+                for field, value in (("service_pid", 123), ("service_starttime", "42"),
+                                     ("initial_path_commit", "1" * 40)):
+                    original = json.loads(group.state_path.read_bytes())
+                    changed = deepcopy(original)
+                    changed["backends"][0][field] = value
+                    group.state_path.write_text(json.dumps(changed))
+                    with self.subTest(field=field), self.assertRaises((AssertionError, FileNotFoundError)):
+                        campaign.verify_cleanup_from_disk(options)
+                    group.state_path.write_text(json.dumps(original))
+                client = root / "measurements/fair/round-01/client-a"
+                client.mkdir(parents=True)
+                with self.assertRaisesRegex(AssertionError, "receipt"):
+                    campaign.verify_cleanup_from_disk(options)
 
     def test_partial_pair_failure_retains_interrupt_and_both_cleanup_errors(self):
         with tempfile.TemporaryDirectory() as directory:

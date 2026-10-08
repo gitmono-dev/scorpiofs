@@ -50,6 +50,23 @@ class CampaignExportTests(unittest.TestCase):
                 self.assertNotIn(b"PRIVATE_SENTINEL", path.read_bytes())
         self.assertFalse(json.loads((self.safe / "safe-export.json").read_text())["complete_campaign"])
 
+    def test_actual_ci_measurements_failure_is_exported_without_private_logs(self):
+        import commit_update_ci as ci
+        import commit_update_bench as bench
+        (self.root / "measurements").mkdir()
+        self.write("measurements/fair/round-01/client-a/scorpio-private.log", {"PRIVATE_SENTINEL": True})
+        ci.persist_failure_record(self.root, bench.PhaseFailure("dependency_probe", RuntimeError("PRIVATE_SENTINEL")))
+        ci.persist_failure_record(self.root, TimeoutError("PRIVATE_SENTINEL"))
+        ci.persist_failure_record(self.root, FileNotFoundError("PRIVATE_SENTINEL"), cleanup=True)
+        copied = export_module.export(self.root, self.safe, self.deadline, complete_allowed=False)
+        self.assertEqual(set(copied), {"measurements/failure.json", "measurements/cleanup-failure.json"})
+        self.assertEqual(json.loads((self.safe / "measurements/failure.json").read_bytes()), {
+            "execution_failed": True, "error_type": "RuntimeError", "phase": "dependency_probe"})
+        self.assertEqual(json.loads((self.safe / "measurements/cleanup-failure.json").read_bytes()), {
+            "execution_failed": True, "error_type": "FileNotFoundError"})
+        self.assertFalse(json.loads((self.safe / "safe-export.json").read_bytes())["complete_campaign"])
+        self.assertNotIn(b"PRIVATE_SENTINEL", (self.safe / "measurements/failure.json").read_bytes())
+
     def git_stream(self, *, pending=False, sealed=True):
         """Synthetic schema fixtures are never native performance evidence."""
         path = Path(self.temp.name) / "evidence" / "git-performance.jsonl"

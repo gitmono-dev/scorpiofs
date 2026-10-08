@@ -175,9 +175,10 @@ class BackendOwnershipTests(unittest.TestCase):
     def test_second_startup_failure_preserves_primary_when_cleanup_also_fails(self):
         primary = RuntimeError("second startup failed")
         with patch.object(backend.OwnedBackend, "start", side_effect=[None, primary]), patch.object(backend.OwnedBackend, "stop", side_effect=TimeoutError("cleanup failed")) as stopped:
-            with self.assertRaises(RuntimeError) as caught:
+            with self.assertRaises(backend.common.PhaseFailure) as caught:
                 self.group.start_pair(1, 1000)
-        self.assertIs(caught.exception, primary)
+        self.assertEqual(backend.common.failure_record(caught.exception), {
+            "execution_failed": True, "error_type": "RuntimeError", "phase": "backend_start"})
         self.assertEqual(stopped.call_count, 2)
         self.assertFalse(self.group.closed)
         self.assertEqual(len(self.group.backends), 2)
@@ -407,7 +408,8 @@ class BackendOwnershipTests(unittest.TestCase):
                 ports[target] = [{"HostIp": "127.0.0.1", "HostPort": str(owner.ports[service])}]
             result.append({"Id": str(number) * 64,
                 "Config": {"Labels": {"com.docker.compose.project": owner.project, "com.docker.compose.service": service}},
-                "State": {"Running": service != "rustfs-init", "ExitCode": 0}, "NetworkSettings": {"Ports": ports}})
+                "State": {"Running": True, "ExitCode": 0, "Health": {"Status": "healthy"}},
+                "NetworkSettings": {"Ports": ports}})
         return result
 
     def test_dependency_probe_pins_actual_ids_owners_endpoints_and_integer_exit(self):
@@ -424,6 +426,10 @@ class BackendOwnershipTests(unittest.TestCase):
             mutations = [lambda: inventory[0]["Config"]["Labels"].update({"com.docker.compose.project": "borrowed"}),
                          lambda: inventory[0]["NetworkSettings"]["Ports"]["5432/tcp"][0].update(HostIp="0.0.0.0"),
                          lambda: inventory[-1]["State"].update(ExitCode=False),
+                         lambda: inventory[-1]["State"].update(Running=False),
+                         lambda: inventory[-1]["State"].update(Health=None),
+                         lambda: inventory[-1]["State"].update(Health={"Status": "unhealthy"}),
+                         lambda: inventory[-1]["State"].update(Health={"Status": "starting"}),
                          lambda: inventory[0]["State"].update(Running=1),
                          lambda: inventory[0].update(Id="9" * 64),
                          lambda: inventory[0].update(Config=None)]
@@ -581,8 +587,16 @@ class BackendOwnershipTests(unittest.TestCase):
                     with patch.object(self, "patch", side_effect=local_patch):
                         stopped, abort, stop_group = self.startup_mocks(boundary)
                     owner = self.admit()
-                    with redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                    phases = {"compose_up": "dependency_startup", "dependency_probe": "dependency_probe",
+                              "database": "database_create", "config_validate": "server_config_validate",
+                              "service_init": "server_service_init", "native_init": "owned_native_initialization"}
+                    expected = backend.common.PhaseFailure if boundary in phases else RuntimeError
+                    with redirect_stdout(io.StringIO()), self.assertRaises(expected) as caught:
                         owner.start(1000)
+                    if boundary in phases:
+                        record = backend.common.failure_record(caught.exception)
+                        self.assertEqual(record, {"execution_failed": True, "error_type": "RuntimeError",
+                                                  "phase": phases[boundary]})
                     self.assertEqual(len(self.group.backends), 1)
                     self.assertTrue(owner.root.joinpath("owned.json").is_file())
                     self.group.close()
