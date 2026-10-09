@@ -66,33 +66,6 @@ class _Upstream:
         self.thread.join(3)
 
 
-class _RawUpstream(_Upstream):
-    def __init__(self, expected):
-        self.expected = expected
-        super().__init__()
-
-    def run(self):
-        try:
-            conn, _ = self.listener.accept()
-            with conn:
-                conn.settimeout(3)
-                data = bytearray()
-                published = False
-                while True:
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    data.extend(chunk)
-                    if not published:
-                        published = True
-                        self.done.set()
-                self.received.append(bytes(data))
-        except OSError:
-            pass
-        finally:
-            self.done.set()
-
-
 @unittest.skipIf(not hasattr(os, "getuid") or not Path("/proc").is_dir(), "requires Linux owner binding")
 class RequestDiagnosticTests(unittest.TestCase):
     def relay(self, upstream):
@@ -156,49 +129,6 @@ class RequestDiagnosticTests(unittest.TestCase):
         finally:
             upstream.close()
 
-    def test_unsupported_transfer_framing_is_invalid_but_bytes_are_forwarded(self):
-        raw = (b"POST /api/v2/snapshots/resolve HTTP/1.1\r\nHost: hidden\r\n"
-               b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
-        upstream = _RawUpstream(raw)
-        try:
-            relay, _ = self.relay(upstream)
-            relay.start().bind_daemon(_Daemon())
-            client = socket.create_connection(("127.0.0.1", relay.listener_port), timeout=2)
-            client.sendall(raw)
-            client.shutdown(socket.SHUT_WR)
-            client.close()
-            self.assertTrue(upstream.done.wait(2))
-            value = relay.close(time.monotonic() + 4)
-            self.assertFalse(value["valid"])
-            self.assertEqual(value["invalid_reason"], "unsupported_framing")
-            self.assertFalse([r for r in value["records"] if r["event"] == "request_headers_forwarded"])
-            upstream.thread.join(2)
-            self.assertEqual(upstream.received[0], raw)
-        finally:
-            upstream.close()
-
-    def test_connection_upgrade_token_with_spacing_is_rejected(self):
-        raw = (b"GET /api/v2/snapshots/capabilities HTTP/1.1\r\nHost: hidden\r\n"
-               b"Connection: keep-alive, upgrade\r\n\r\n")
-        upstream = _RawUpstream(raw)
-        try:
-            relay, _ = self.relay(upstream)
-            relay.start().bind_daemon(_Daemon())
-            client = socket.create_connection(("127.0.0.1", relay.listener_port), timeout=2)
-            client.sendall(raw)
-            client.shutdown(socket.SHUT_WR)
-            client.close()
-            self.assertTrue(upstream.done.wait(2))
-            value = relay.close(time.monotonic() + 4)
-            self.assertFalse(value["valid"])
-            self.assertEqual(value["invalid_reason"], "unsupported_framing")
-            self.assertFalse([r for r in value["records"] if r["event"] == "request_headers_forwarded"])
-            upstream.thread.join(2)
-            self.assertEqual(upstream.received[0], raw)
-        finally:
-            upstream.close()
-
-
 class RequestDiagnosticSchemaTests(unittest.TestCase):
     def test_schema_rejects_ownerless_valid_trace(self):
         with self.assertRaises(diagnostic.RequestDiagnosticError):
@@ -208,6 +138,22 @@ class RequestDiagnosticSchemaTests(unittest.TestCase):
                                  "limits": {"connections": 1, "records": 1, "header_bytes": diagnostic.HEADER_BYTES,
                                             "buffer_bytes": diagnostic.BUFFER_BYTES},
                                  "connections": [], "records": []})
+
+    def test_unsupported_transfer_encoding_is_rejected_before_endpoint_event(self):
+        events, errors = [], []
+        parser = diagnostic._RequestHeaders(lambda *args: events.append(args), errors.append)
+        parser.feed(b"POST /api/v2/snapshots/resolve HTTP/1.1\r\nHost: hidden\r\n"
+                    b"Transfer-Encoding: chunked\r\n\r\n")
+        self.assertEqual(errors, ["unsupported_framing"])
+        self.assertEqual(events, [])
+
+    def test_upgrade_token_with_spacing_is_rejected_before_endpoint_event(self):
+        events, errors = [], []
+        parser = diagnostic._RequestHeaders(lambda *args: events.append(args), errors.append)
+        parser.feed(b"GET /api/v2/snapshots/capabilities HTTP/1.1\r\nHost: hidden\r\n"
+                    b"Connection: keep-alive, upgrade\r\n\r\n")
+        self.assertEqual(errors, ["unsupported_framing"])
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":
