@@ -77,12 +77,18 @@ class _RawUpstream(_Upstream):
             with conn:
                 conn.settimeout(3)
                 data = bytearray()
+                published = False
                 while True:
                     chunk = conn.recv(65536)
                     if not chunk:
                         break
                     data.extend(chunk)
-                self.received.append(bytes(data))
+                    if not published and len(data) >= len(self.expected):
+                        self.received.append(bytes(data))
+                        published = True
+                        self.done.set()
+                if not published:
+                    self.received.append(bytes(data))
         except OSError:
             pass
         finally:
