@@ -83,12 +83,10 @@ class _RawUpstream(_Upstream):
                     if not chunk:
                         break
                     data.extend(chunk)
-                    if not published and len(data) >= len(self.expected):
-                        self.received.append(bytes(data))
+                    if not published:
                         published = True
                         self.done.set()
-                if not published:
-                    self.received.append(bytes(data))
+                self.received.append(bytes(data))
         except OSError:
             pass
         finally:
@@ -120,6 +118,7 @@ class RequestDiagnosticTests(unittest.TestCase):
             self.assertEqual(value["owner"]["pid"], os.getpid())
             self.assertEqual([x["endpoint"] for x in value["records"] if x["event"] == "request_headers_forwarded"],
                              ["capabilities", "resolve"])
+            upstream.thread.join(2)
             self.assertEqual(upstream.received, [first, second])
             raw = (directory / "request-diagnostic.json").read_bytes()
             self.assertNotIn(b"secret.local", raw)
@@ -173,6 +172,7 @@ class RequestDiagnosticTests(unittest.TestCase):
             self.assertFalse(value["valid"])
             self.assertEqual(value["invalid_reason"], "unsupported_framing")
             self.assertFalse([r for r in value["records"] if r["event"] == "request_headers_forwarded"])
+            upstream.thread.join(2)
             self.assertEqual(upstream.received[0], raw)
         finally:
             upstream.close()
@@ -193,6 +193,7 @@ class RequestDiagnosticTests(unittest.TestCase):
             self.assertFalse(value["valid"])
             self.assertEqual(value["invalid_reason"], "unsupported_framing")
             self.assertFalse([r for r in value["records"] if r["event"] == "request_headers_forwarded"])
+            upstream.thread.join(2)
             self.assertEqual(upstream.received[0], raw)
         finally:
             upstream.close()
