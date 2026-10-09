@@ -13,6 +13,7 @@ import binascii
 from contextlib import contextmanager
 import hashlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -377,6 +378,68 @@ def _loopback_url(url, *, path=None):
     return parsed
 
 
+class HTTPConnectTimeout(TimeoutError):
+    """The bounded loopback connection attempt timed out."""
+
+
+class HTTPRequestTimeout(TimeoutError):
+    """Sending the request exhausted its original deadline."""
+
+
+class HTTPHeaderTimeout(TimeoutError):
+    """Waiting for response headers exhausted the original deadline."""
+
+
+class HTTPBodyTimeout(TimeoutError):
+    """Reading the response body exhausted the original deadline."""
+
+
+def _http_remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("worker HTTP exceeded its original operation deadline")
+    return remaining
+
+
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, raw, socket, deadline):
+        self.raw, self.socket, self.deadline = raw, socket, deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.socket.settimeout(_http_remaining(self.deadline))
+        count = self.raw.readinto(buffer)
+        _check_deadline(self.deadline)
+        return count
+
+    def close(self):
+        try:
+            self.raw.close()
+        finally:
+            super().close()
+
+
+class _DeadlineSocket:
+    """Keep each send/recv inside one deadline, including buffered HTTP reads."""
+
+    def __init__(self, socket, deadline):
+        self.socket, self.deadline = socket, deadline
+
+    def __getattr__(self, name):
+        return getattr(self.socket, name)
+
+    def sendall(self, data):
+        self.socket.settimeout(_http_remaining(self.deadline))
+        self.socket.sendall(data)
+        _check_deadline(self.deadline)
+
+    def makefile(self, mode):
+        raw = self.socket.makefile(mode, buffering=0)
+        return io.BufferedReader(_DeadlineReader(raw, self.socket, self.deadline))
+
+
 class _NoRedirectHTTP:
     """Small HTTP client with no redirect handling and one absolute deadline."""
 
@@ -397,11 +460,18 @@ class _NoRedirectHTTP:
                 raise WorkerError("worker HTTP request is too large")
             headers["Content-Type"] = "application/json"
             headers["Content-Length"] = str(len(payload))
-        timeout = min(30.0, max(0.001, deadline - time.monotonic()))
+        timeout = min(30.0, _http_remaining(deadline))
         connection = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+        timeout_error = HTTPConnectTimeout
         try:
+            connection.connect()
+            _check_deadline(deadline)
+            connection.sock = _DeadlineSocket(connection.sock, deadline)
+            timeout_error = HTTPRequestTimeout
             connection.request(method, path, body=payload, headers=headers)
+            timeout_error = HTTPHeaderTimeout
             response = connection.getresponse()
+            timeout_error = HTTPBodyTimeout
             if 300 <= response.status < 400:
                 raise WorkerError("worker HTTP redirects are rejected")
             length = response.getheader("Content-Length")
@@ -411,18 +481,14 @@ class _NoRedirectHTTP:
                         raise WorkerError("worker HTTP body is too large")
                 except ValueError:
                     raise WorkerError("worker HTTP content length is invalid") from None
-            # Read in bounded chunks while shortening the socket timeout to
-            # the same absolute deadline on every iteration.  A peer that
-            # drips one byte per timeout interval cannot extend this request.
+            # The raw reader also shortens the timeout between recv calls
+            # inside HTTP's buffered header/body reads. Connection: close may
+            # already have cleared connection.sock; its response still owns it.
             raw_parts = []
             total = 0
             expected_length = int(length) if length is not None else None
             while True:
                 _check_deadline(deadline)
-                remaining = max(0.001, deadline - time.monotonic())
-                socket = getattr(connection, "sock", None)
-                if socket is not None:
-                    socket.settimeout(remaining)
                 chunk = response.read(min(64 * 1024, HTTP_BODY_LIMIT + 1 - total))
                 if not chunk:
                     break
@@ -464,7 +530,11 @@ class _NoRedirectHTTP:
                 value = None
             _check_deadline(deadline)
             return value
-        except (TimeoutError, WorkerError):
+        except TimeoutError:
+            # Only a fixed class name reaches the existing failure record;
+            # URLs, response bodies and arbitrary socket text are omitted.
+            raise timeout_error("worker HTTP transport timed out") from None
+        except WorkerError:
             raise
         except (OSError, http.client.HTTPException):
             raise WorkerError("worker HTTP request failed") from None
