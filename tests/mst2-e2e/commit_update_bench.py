@@ -88,6 +88,9 @@ SAFE_SNAPSHOT_CODES = frozenset({
     "DigestMismatch", "IntegrityError", "ObjectUnavailable", "RangeNotSupported",
     "SymlinkTraversal", "DurableViewConflict", "TemporaryUnavailable", "Internal",
 })
+SAFE_SNAPSHOT_MESSAGE_SHAPES = frozenset({
+    "exact_request_deadline", "network_prefix", "other_temporary_unavailable",
+})
 
 
 def _safe_worker_error_code(error):
@@ -118,6 +121,14 @@ def _safe_backend_error_code(error):
 def _safe_snapshot_code(error):
     code = getattr(error, "snapshot_code", None)
     return code if code in SAFE_SNAPSHOT_CODES else None
+
+
+def _safe_snapshot_message_shape(error):
+    shape = getattr(error, "snapshot_message_shape", None)
+    if (_safe_backend_error_code(error) != "SNAPSHOT_ERROR"
+            or _safe_snapshot_code(error) != "TemporaryUnavailable"):
+        return None
+    return shape if type(shape) is str and shape in SAFE_SNAPSHOT_MESSAGE_SHAPES else None
 
 
 IDENTITY_SQL = """BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
@@ -181,6 +192,7 @@ class PhaseFailure(AssertionError):
         self.hydration_substage = _safe_hydration_substage(error)
         self.backend_code = _safe_backend_error_code(error)
         self.snapshot_code = _safe_snapshot_code(error)
+        self.snapshot_message_shape = _safe_snapshot_message_shape(error)
         super().__init__(phase + " failed")
 
 
@@ -230,6 +242,9 @@ def failure_record(error):
             record["backend_code"] = error.backend_code
         if error.snapshot_code is not None:
             record["snapshot_code"] = error.snapshot_code
+        snapshot_message_shape = _safe_snapshot_message_shape(error)
+        if snapshot_message_shape is not None:
+            record["snapshot_message_shape"] = snapshot_message_shape
         record.update(error.details)
     elif isinstance(error, CommandFailure):
         record.update(error.details)
@@ -252,6 +267,9 @@ def failure_record(error):
         snapshot_code = _safe_snapshot_code(error)
         if snapshot_code is not None:
             record["snapshot_code"] = snapshot_code
+        snapshot_message_shape = _safe_snapshot_message_shape(error)
+        if snapshot_message_shape is not None:
+            record["snapshot_message_shape"] = snapshot_message_shape
     return record
 
 

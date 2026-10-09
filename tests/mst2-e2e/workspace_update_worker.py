@@ -130,6 +130,13 @@ SNAPSHOT_ERROR_CODES = frozenset({
     "SymlinkTraversal", "DurableViewConflict", "TemporaryUnavailable", "Internal",
 })
 
+# Describe only the message shape retained by the workspace HTTP envelope.
+# It has already discarded the upstream status and request identity, so these
+# labels must never be interpreted as an upstream HTTP status or root cause.
+SNAPSHOT_MESSAGE_SHAPES = frozenset({
+    "exact_request_deadline", "network_prefix", "other_temporary_unavailable",
+})
+
 
 def _snapshot_code_from_workspace_message(message):
     """Extract only a known SnapshotErrorCode from a workspace error shape."""
@@ -143,6 +150,18 @@ def _snapshot_code_from_workspace_message(message):
     if not separator or not re.fullmatch(r"[A-Z][A-Za-z0-9]*", code):
         return None
     return code if code in SNAPSHOT_ERROR_CODES else None
+
+
+def _snapshot_message_shape_from_workspace_message(message):
+    """Classify a known TemporaryUnavailable envelope without retaining text."""
+    if _snapshot_code_from_workspace_message(message) != "TemporaryUnavailable":
+        return None
+    detail = message.partition(": ")[2].partition(":")[2]
+    if detail == " snapshot request deadline exceeded":
+        return "exact_request_deadline"
+    if detail.startswith(" network: "):
+        return "network_prefix"
+    return "other_temporary_unavailable"
 
 
 def _status_error_codes(status):
@@ -258,13 +277,14 @@ class WorkerError(RuntimeError):
 
     ``str(error)`` remains useful to local callers, but only the closed
     ``error_code``, ``worker_stage``, ``retention_substage``, ``hydration_substage``,
-    ``backend_code`` and ``snapshot_code``
+    ``backend_code``, ``snapshot_code`` and ``snapshot_message_shape``
     fields may cross into CI evidence.  Unknown or caller-supplied codes are
     discarded.
     """
 
     def __init__(self, message="", error_code=None, stage=None, retention_substage=None,
-                 hydration_substage=None, backend_code=None, snapshot_code=None):
+                 hydration_substage=None, backend_code=None, snapshot_code=None,
+                 snapshot_message_shape=None):
         inferred = _message_error_code(message) if error_code is None else error_code
         self.error_code = inferred if inferred in WORKER_ERROR_CODES else WORKER_ERROR
         self.worker_stage = stage if type(stage) is str and stage in WORKER_STAGES else None
@@ -274,6 +294,11 @@ class WorkerError(RuntimeError):
                                    and hydration_substage in HYDRATION_SUBSTAGES else None)
         self.backend_code = (backend_code if backend_code in BACKEND_ERROR_CODES else None)
         self.snapshot_code = (snapshot_code if snapshot_code in SNAPSHOT_ERROR_CODES else None)
+        self.snapshot_message_shape = (
+            snapshot_message_shape if self.backend_code == "SNAPSHOT_ERROR"
+            and self.snapshot_code == "TemporaryUnavailable"
+            and type(snapshot_message_shape) is str
+            and snapshot_message_shape in SNAPSHOT_MESSAGE_SHAPES else None)
         super().__init__(message)
 
 
@@ -506,6 +531,7 @@ class _NoRedirectHTTP:
             if response.status not in expected:
                 backend_code = None
                 snapshot_code = None
+                snapshot_message_shape = None
                 if 400 <= response.status < 600:
                     try:
                         value = _decode_json(raw)
@@ -517,8 +543,11 @@ class _NoRedirectHTTP:
                             backend_code = candidate
                         if candidate == "SNAPSHOT_ERROR":
                             snapshot_code = _snapshot_code_from_workspace_message(value.get("message"))
+                            snapshot_message_shape = _snapshot_message_shape_from_workspace_message(
+                                value.get("message"))
                 raise WorkerError(f"worker HTTP status {response.status} was not accepted",
-                                   backend_code=backend_code, snapshot_code=snapshot_code)
+                                   backend_code=backend_code, snapshot_code=snapshot_code,
+                                   snapshot_message_shape=snapshot_message_shape)
             if response.status != 204:
                 ctype = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
                 if ctype != "application/json":
