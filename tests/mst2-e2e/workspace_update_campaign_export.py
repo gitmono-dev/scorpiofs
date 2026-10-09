@@ -22,8 +22,13 @@ import workspace_update_git_performance as git_performance
 import workspace_update_directory as directory_probe
 from workspace_update_size import consume_regular
 
-ROOT_FILES = {"campaign.json", "canonical-seed.json", "backend-owners.json", "failure.json", "cleanup-failure.json"}
+ROOT_FILES = {"campaign.json", "canonical-seed.json", "backend-owners.json", "failure.json", "cleanup-failure.json",
+              "request-diagnostic-mode.json"}
 CLIENT_FILES = {"workspace-observation.jsonl", "owned-workspace-daemon.json", "owned-workspace-worker.json"}
+REQUEST_DIAGNOSTIC_FILES = {"request-diagnostic.json", "request-diagnostic-context.json"}
+REQUEST_DIAGNOSTIC_LEAF = Path("measurements/fair/round-01/client-a")
+REQUEST_DIAGNOSTIC_MODE = {"revision": 1, "diagnostic_only": True, "formal_performance_accepted": False,
+                           "client": "a", "round": 1, "version": "v1"}
 OWNER_FIELDS = {"phase", "round", "client", "project", "database", "instance_id", "root", "state",
                 "operation_deadline_monotonic", "service_pid", "service_starttime", "initial_path_commit"}
 RUN_FIELDS = {"revision", "run_id", "attempt", "harness_sha", "mega_sha", "baseline_sha", "candidate_sha",
@@ -106,8 +111,97 @@ def allowed(relative):
         return False
     if len(parts) == 4:
         return parts[3] == "git-history.json" or re.fullmatch(r"v(?:[1-9]|10)-expected\.json", parts[3]) is not None
+    if parts[4] in REQUEST_DIAGNOSTIC_FILES:
+        return Path(relative).parent == REQUEST_DIAGNOSTIC_LEAF
     return (parts[3] in (("client-a", "client-b") if parts[1] == "fair" else ("client-b",))
             and parts[4] in CLIENT_FILES)
+
+
+def validate_request_diagnostics(root, *, run_metadata=None):
+    """Read only the closed observer schema, cross-bound to source and owners."""
+    root = Path(root)
+    leaf = root / REQUEST_DIAGNOSTIC_LEAF
+    marker = root / "request-diagnostic-mode.json"
+    trace_path = leaf / "request-diagnostic.json"
+    context_path = leaf / "request-diagnostic-context.json"
+    exists = marker.exists() or trace_path.exists() or context_path.exists()
+    if not exists:
+        return []
+    proofs.require(marker.exists())
+    mode = observation.parse(read_regular(marker, 4096))
+    proofs.shape(mode, set(REQUEST_DIAGNOSTIC_MODE))
+    for key, value in REQUEST_DIAGNOSTIC_MODE.items():
+        proofs.exact(mode[key], value)
+    proofs.require(not (root / "campaign.json").exists())
+    context = None
+    if context_path.exists():
+        context = observation.parse(read_regular(context_path, 32768))
+        fields = set(REQUEST_DIAGNOSTIC_MODE) | {"sources", "published_commit", "published_tree", "service_pid",
+            "service_starttime", "upstream_port", "daemon_pid", "daemon_starttime", "daemon_uid", "create_outcome"}
+        proofs.shape(context, fields)
+        for key, value in REQUEST_DIAGNOSTIC_MODE.items():
+            proofs.exact(context[key], value)
+        proofs.sources(context["sources"])
+        for key in ("published_commit", "published_tree"):
+            proofs.hex_digest(context[key], 40)
+        for key in ("service_pid", "daemon_pid"):
+            proofs.integer(context[key], positive=True)
+        proofs.integer(context["daemon_uid"])
+        proofs.integer(context["upstream_port"], 65535, True)
+        for key in ("service_starttime", "daemon_starttime"):
+            proofs.require(type(context[key]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", context[key]))
+        proofs.require(type(context["create_outcome"]) is str and context["create_outcome"] in {"failed", "returned"})
+        rows = read_regular(root / "measurements/fair/measurements.jsonl", 262144).splitlines()
+        proofs.require(len(rows) == 1)
+        environment = observation.parse(rows[0])
+        proofs.exact(environment["record"], "environment")
+        proofs.exact(environment["phase"], "fair")
+        proofs.exact(context["sources"], environment["sources"]["a"])
+        if run_metadata is not None:
+            for source_key, run_key in (("harness_source_sha", "harness_sha"), ("server_source_sha", "mega_sha"),
+                                        ("client_source_sha", "baseline_sha")):
+                proofs.exact(context["sources"][source_key], run_metadata[run_key])
+        owners_path = root / "backend-owners.json"
+        if context is not None:
+            proofs.require(owners_path.exists())
+        if owners_path.exists():
+            owners_value = observation.parse(read_regular(owners_path, 65536))
+            proofs.shape(owners_value, {"revision", "project", "session_deadline_utc", "cleanup_deadline_monotonic",
+                                        "measurement_deadline_monotonic", "backends", "closed"})
+            proofs.exact(owners_value["revision"], 1)
+            proofs.exact(owners_value["closed"], True)
+            candidates = []
+            for owner in owners_value["backends"]:
+                proofs.shape(owner, OWNER_FIELDS)
+                if (owner["phase"], owner["round"], owner["client"]) == ("fair", 1, "a"):
+                    candidates.append(owner)
+            proofs.require(len(candidates) == 1)
+            owner = candidates[0]
+            proofs.exact(owner["service_pid"], context["service_pid"])
+            proofs.exact(owner["service_starttime"], context["service_starttime"])
+    if not trace_path.exists():
+        proofs.require(context is None)
+        return [mode]
+    from workspace_update_request_diagnostic import validate
+    trace = observation.parse(read_regular(trace_path, 131072))
+    validate(trace)
+    if trace["valid"]:
+        # A daemon/relay can fail before the native create window begins. An
+        # empty, owner-bound, closed trace is safe partial evidence; it carries
+        # no endpoint observation and must never be treated as a request result.
+        if context is None:
+            proofs.require(not trace["connections"] and not trace["records"])
+    if context is not None:
+        proofs.require(trace["owner"] is not None)
+        proofs.exact(trace["owner"], {"pid": context["daemon_pid"],
+            "starttime_ticks": context["daemon_starttime"], "uid": context["daemon_uid"]})
+        proofs.exact(trace["upstream_port"], context["upstream_port"])
+        receipt = observation.parse(read_regular(leaf / "owned-workspace-daemon.json", 4096))
+        proofs.shape(receipt, {"pid", "starttime", "cleanup_complete"})
+        proofs.exact(receipt["pid"], context["daemon_pid"])
+        proofs.exact(receipt["starttime"], context["daemon_starttime"])
+        proofs.require(type(receipt["cleanup_complete"]) is bool)
+    return [mode, trace]
 
 
 def read_regular(path, cap=fixture_size.ORACLE_MANIFEST_LIMIT):
@@ -449,6 +543,8 @@ def validate_seed(value):
 def validate_complete(root, build_receipts=None, *, run_metadata=None, deadline_utc=None):
     """Replay complete artifacts; this is not authority to start a backend."""
     root = Path(root)
+    proofs.require(not (root / "request-diagnostic-mode.json").exists()
+                   and not any((root / REQUEST_DIAGNOSTIC_LEAF / name).exists() for name in REQUEST_DIAGNOSTIC_FILES))
     value = observation.parse(read_regular(root / "campaign.json", 2 * 1024 * 1024))
     complete_fields = {"revision", "record", "correctness", "session_started_utc", "session_deadline_utc",
         "cleanup_deadline_monotonic", "sources", "canonical_seed", "server_build", "server_build_receipt_sha256",
@@ -614,6 +710,7 @@ def export(root, output, deadline_utc, receipts=(), *, run_metadata=None, git_pe
             raise AssertionError("safe export owned root changed")
         if (root / "campaign.json").exists():
             validate_complete(root, dict(receipts), run_metadata=run_metadata, deadline_utc=deadline_utc)
+        validate_request_diagnostics(root, run_metadata=run_metadata)
     git_evidence = None
     if git_performance_path is not None:
         source = Path(os.path.abspath(git_performance_path))
@@ -680,6 +777,7 @@ def export(root, output, deadline_utc, receipts=(), *, run_metadata=None, git_pe
             budgets.require_external_time(deadline_utc)
     if (output / "campaign.json").exists():
         validate_complete(output, deadline_utc=deadline_utc)
+    validate_request_diagnostics(output, run_metadata=run_metadata)
     for phase in ("fair", "diagnostic"):
         subtree = output / "measurements" / phase
         if subtree.exists():

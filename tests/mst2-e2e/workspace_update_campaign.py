@@ -38,6 +38,31 @@ from workspace_update_worker import WorkerSession, DIRTY_BYTES, DIRTY_SENTINEL
 
 BASELINE = builds.DEFAULT_BASELINE
 CANDIDATE = builds.DEFAULT_CANDIDATE
+
+
+class RequestEndpointDiagnosticFinished(RuntimeError):
+    """A create-only diagnostic deliberately cannot finish the formal matrix."""
+
+
+def request_endpoint_diagnostic(lane, captured, commit, tree, deadline, cleanup_deadline):
+    """Use the shipped daemon's real create path, without a timed oracle lane."""
+    runtime = captured.evidence["runtime"]
+    proofs.exact(runtime["identity"]["project_commit"], commit)
+    proofs.exact(runtime["identity"]["project_tree"], tree)
+    context = {"revision": 1, "diagnostic_only": True, "formal_performance_accepted": False,
+        "client": "a", "round": 1, "version": "v1", "sources": captured.evidence["sources"],
+        "published_commit": commit, "published_tree": tree,
+        "service_pid": runtime["service_pid"], "service_starttime": runtime["service_starttime"],
+        "upstream_port": lane.backend.ports["http"],
+        "daemon_pid": lane.daemon.process.pid, "daemon_starttime": lane.daemon.started,
+        "daemon_uid": lane.daemon.uid}
+    outcome = "failed"
+    try:
+        lane.worker._create_workspace(deadline)
+        outcome = "returned"
+    finally:
+        write_json(lane.root / "request-diagnostic-context.json", dict(context, create_outcome=outcome), cleanup_deadline)
+    raise RequestEndpointDiagnosticFinished("create-only request diagnostic finished")
 ORACLE_FIELDS = frozenset({"verified_files", "verified_directories", "verified_bytes",
     "regular_read_calls", "oracle_walk_and_hash_ms", "isolated_oracle_process_ms",
     "raw_empty_tree_directories_omitted_by_git"})
@@ -309,6 +334,7 @@ def run_phase(group, clients, sources, phase, number, deadline, harness):
 
 def _run_phase(group, clients, sources, phase, number, deadline, harness):
     owners, active, records, validated = [], [], [], []
+    endpoint_diagnostic = getattr(getattr(group, "options", None), "request_endpoint_diagnostic", False)
     path = group.root / "measurements" / phase
     round_root = path / f"round-{number:02}"
     round_root.mkdir(mode=0o700)
@@ -342,22 +368,30 @@ def _run_phase(group, clients, sources, phase, number, deadline, harness):
             lane_root = round_root / ("client-" + client.label)
             lane_root.mkdir(mode=0o700)
             lane = SimpleNamespace(client=client, backend=owner, root=lane_root,
-                daemon=None, worker=None, resources=None, entries=[])
+                daemon=None, worker=None, resources=None, request_relay=None, entries=[])
             active.append(lane)
             builds.validate(client, deadline)
             common.command(["git", "init", "--bare", str(lane_root / "git.git")], deadline)
             mode = builds.read_profile_mode(client, phase == "diagnostic", deadline)
             if phase == "diagnostic" and mode != "enabled":
                 raise AssertionError("fixed diagnostic B lacks requested read profiling")
-            lane.daemon = WorkspaceDaemon(client.driver, client.driver_sha256, lane_root, owner.base_url,
+            upstream = owner.base_url
+            if endpoint_diagnostic and client.label == "a":
+                from workspace_update_request_diagnostic import RequestRelay
+                lane.request_relay = RequestRelay(owner.base_url, lane_root / "request-diagnostic.json", deadline).start()
+                upstream = lane.request_relay.url
+            lane.daemon = WorkspaceDaemon(client.driver, client.driver_sha256, lane_root, upstream,
                 owner.pg_env["M2_TOKEN"], str(uuid.uuid4()), common.clean_env(), deadline,
                 read_profile=phase == "diagnostic")
+            if lane.request_relay is not None:
+                lane.request_relay.bind_daemon(lane.daemon)
             lane.worker = WorkerSession(lane_root, lane.daemon.url, lane.daemon.workspace_root,
                 lane_root / "git.git", owner.git_url, owner.git_env, deadline=deadline,
                 env=common.clean_env(), daemon_uid=lane.daemon.uid,
                 read_profile_mode=mode, git_performance_client=client.label)
             from workspace_update_resources import ProcessResources
-            lane.resources = ProcessResources(lane.daemon.process.pid, lane.daemon.started, lane.daemon.uid).start()
+            if not endpoint_diagnostic:
+                lane.resources = ProcessResources(lane.daemon.process.pid, lane.daemon.started, lane.daemon.uid).start()
         for scenario_number, version in enumerate(scenarios, 1):
             manifest_path = round_root / f"{version}-expected.json"
             if prepared is not None:
@@ -380,6 +414,9 @@ def _run_phase(group, clients, sources, phase, number, deadline, harness):
                 current[lane.client.label] = runtime
                 capture = proofs.capture_lane_runtime(owner, lane.client.receipt, sources[lane.client.label],
                                                      deadline, harness_root=harness)
+                if endpoint_diagnostic:
+                    proofs.require(phase == "fair" and number == 1 and version == "v1" and lane.client.label == "a")
+                    request_endpoint_diagnostic(lane, capture, commit, tree, deadline, group.cleanup_deadline)
                 side = "scorpio-first" if (number + scenario_number + (0 if lane.client.label == "a" else 1)) % 2 == 0 else "git-first"
                 before = measurement.resources_before(lane, deadline)
                 operation_started = time.monotonic()
@@ -459,6 +496,12 @@ def _run_phase(group, clients, sources, phase, number, deadline, harness):
         return records
     finally:
         errors = measurement.abort_lanes(active, group.cleanup_deadline)
+        for lane in reversed(active):
+            if lane.request_relay is not None:
+                try:
+                    lane.request_relay.close(group.cleanup_deadline)
+                except BaseException as error:
+                    errors.append(error)
         for owner in reversed(owners):
             try:
                 owner.stop(group.cleanup_deadline)
@@ -546,6 +589,9 @@ def summaries(records, profile="smoke"):
 
 def execute(options):
     execution.bind_options(options)
+    endpoint_diagnostic = getattr(options, "request_endpoint_diagnostic", False)
+    if type(endpoint_diagnostic) is not bool:
+        raise ValueError("request endpoint diagnostics require an explicit boolean opt-in")
     fixture_admission = common.fixture_size.admit_backend(options.profile, True)
     if options.profile in ("large", "history-large"):
         root, _ = ci.hosted_root(options.run_root)
@@ -588,6 +634,10 @@ def execute(options):
     try:
         measurements = group.root / "measurements"
         measurements.mkdir(mode=0o700)
+        if endpoint_diagnostic:
+            write_json(group.root / "request-diagnostic-mode.json", {
+                "revision": 1, "diagnostic_only": True, "formal_performance_accepted": False,
+                "client": "a", "round": 1, "version": "v1"}, deadline)
         for phase in ("fair", "diagnostic"):
             (measurements / phase).mkdir(mode=0o700)
             append(measurements / phase / "measurements.jsonl", {

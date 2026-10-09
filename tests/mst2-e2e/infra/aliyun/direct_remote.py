@@ -388,6 +388,10 @@ def execute(config, context, progress):
             '--isolated-backends', '--harness-sha', config['harness_sha'], '--bootstrap-commit-time', '1700000000',
             '--server-build-receipt', str(receipts['server']), '--profile', config['profile'], '--rounds', '3',
             '--session-started-utc', config['session_started_utc'], '--session-deadline-utc', config['session_deadline_utc']]
+        if type(config.get('request_endpoint_diagnostic', False)) is not bool:
+            raise ValueError('INVALID_DIAGNOSTIC_OPT_IN')
+        if config.get('request_endpoint_diagnostic', False):
+            args.append('--request-endpoint-diagnostic')
         run(args, anchor)
         success = True
     except BaseException as error:

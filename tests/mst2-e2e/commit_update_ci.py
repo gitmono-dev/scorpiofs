@@ -407,6 +407,8 @@ def configure_owned_local_storage(config, root):
 
 def execute(options):
     execution.bind_options(options)
+    if getattr(options, "request_endpoint_diagnostic", False) and not options.isolated_backends:
+        raise ValueError("request endpoint diagnostics require isolated backend ownership")
     bench.fixture_size.admit_backend(options.profile, getattr(options, "isolated_backends", False))
     from workspace_update_build import comparison_pair
     if options.paired:
@@ -610,6 +612,7 @@ if __name__ == "__main__":
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--projection-traces", action="store_true")
     parser.add_argument("--isolated-backends", action="store_true")
+    parser.add_argument("--request-endpoint-diagnostic", action="store_true")
     parser.add_argument("--harness-sha")
     from workspace_update_campaign import commit_time
     parser.add_argument("--bootstrap-commit-time", type=commit_time)
