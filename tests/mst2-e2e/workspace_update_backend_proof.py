@@ -27,7 +27,7 @@ SCRIPT_PATHS = frozenset({
       for name in ("bench", "budget", "ci", "projection")},
     *{"tests/mst2-e2e/workspace_update_" + name + ".py"
       for name in ("backend", "backend_proof", "bench", "build", "campaign", "campaign_export", "daemon",
-                   "directory", "execution", "git_performance", "observation", "oracle", "profile", "resources", "size", "worker")},
+                   "directory", "execution", "git_performance", "observation", "oracle", "profile", "request_diagnostic", "resources", "size", "worker")},
 })
 SOURCE_FIELDS = frozenset({
     "server_source_sha", "server_source_tree", "server_binary_sha256",

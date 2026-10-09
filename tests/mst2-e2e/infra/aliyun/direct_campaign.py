@@ -58,7 +58,8 @@ def schedule(start):
 
 
 def config(value):
-    require(type(value) is dict and set(value) == CONFIG_FIELDS, 'INVALID_CONFIG_FIELDS')
+    require(type(value) is dict and set(value) in (CONFIG_FIELDS, CONFIG_FIELDS | {'request_endpoint_diagnostic'}), 'INVALID_CONFIG_FIELDS')
+    require(type(value.get('request_endpoint_diagnostic', False)) is bool, 'INVALID_DIAGNOSTIC_OPT_IN')
     for key in ('region', 'zone', 'image_id', 'instance_type'):
         require(type(value[key]) is str and re.fullmatch(r'[A-Za-z0-9_.-]{2,160}', value[key])
                 and not value[key].startswith('-'), 'INVALID_CONFIG_VALUE')
@@ -296,7 +297,8 @@ class Campaign:
             **{key: resources[key] for key in ('instance_id', 'ram_role_name', 'evidence_bucket', 'evidence_internal_endpoint', 'evidence_prefix', 'bootstrap_ready_path')},
             'workspace': '/srv/scorpiofs-benchmark/work/' + self.state['campaign_id'],
             'harness_sha': self.cfg['harness_sha'], 'mega_sha': SERVER, 'baseline_sha': BASELINE,
-            'candidate_sha': CANDIDATE, 'profile': self.cfg['profile']}
+            'candidate_sha': CANDIDATE, 'profile': self.cfg['profile'],
+            **({'request_endpoint_diagnostic': True} if self.cfg.get('request_endpoint_diagnostic', False) else {})}
 
     def run(self):
         require(self.state['status'] == 'PREPARED_LOCAL_ONLY', 'CAMPAIGN_CANNOT_BE_RESTARTED')
@@ -533,8 +535,12 @@ def validate_evidence(root, state, *, require_complete):
     manifest = json.loads((root / 'safe-export.json').read_bytes())
     require(set(manifest) == {'revision', 'files_sha256', 'complete_campaign', 'private_logs_exported'}
             and manifest['revision'] == 1 and manifest['private_logs_exported'] is False, 'INVALID_SAFE_EXPORT')
+    if state['config'].get('request_endpoint_diagnostic', False):
+        require(not require_complete and manifest['complete_campaign'] is False, 'DIAGNOSTIC_IS_NOT_FORMAL_EVIDENCE')
     files = manifest['files_sha256']
     require(type(files) is dict and len(files) <= 256, 'INVALID_EXPORT_FILES')
+    require('request-diagnostic-mode.json' not in files or state['config'].get('request_endpoint_diagnostic', False),
+            'UNREQUESTED_ENDPOINT_DIAGNOSTIC')
     actual, total = set(), 0
     for path in root.rglob('*'):
         require(not path.is_symlink(), 'SYMLINK_IN_EVIDENCE')
@@ -565,6 +571,7 @@ def validate_evidence(root, state, *, require_complete):
         'baseline_sha': BASELINE, 'candidate_sha': CANDIDATE, 'profile': state['config']['profile'],
         **{key: state[key] for key in ('session_started_utc', 'session_deadline_utc', 'hard_release_utc')}}
     require(all(metadata.get(key) == value for key, value in expected.items()), 'EVIDENCE_RUN_BINDING_MISMATCH')
+    exporter.validate_request_diagnostics(root, run_metadata=metadata)
     if require_complete or manifest['complete_campaign']:
         require(manifest['complete_campaign'] is True, 'SUCCESS_REQUIRES_COMPLETE_CAMPAIGN')
         exporter.validate_complete(root, run_metadata=metadata, deadline_utc=state['collection_deadline_utc'])

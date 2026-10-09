@@ -46,6 +46,32 @@ class FakeTools:
 
 
 class CampaignTests(unittest.TestCase):
+    def test_endpoint_diagnostic_is_explicit_boolean_without_changing_default_config(self):
+        original = configuration()
+        self.assertEqual(cloud.config(original), original)
+        self.assertEqual(cloud.config(dict(original, request_endpoint_diagnostic=True))["request_endpoint_diagnostic"], True)
+        for invalid in (0, 1, "true", None, [], {}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "INVALID_DIAGNOSTIC_OPT_IN"):
+                cloud.config(dict(original, request_endpoint_diagnostic=invalid))
+
+    def test_diagnostic_opt_in_is_carried_to_remote_configuration_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for enabled in (False, True):
+                path = Path(temporary) / str(enabled)
+                settings = configuration()
+                if enabled:
+                    settings["request_endpoint_diagnostic"] = True
+                cloud.plan(settings, path)
+                campaign = cloud.Campaign(path)
+                campaign.record(**cloud.schedule(START), resources={
+                    key: "test-only-fixture" for key in ('instance_id', 'ram_role_name', 'evidence_bucket',
+                        'evidence_internal_endpoint', 'evidence_prefix', 'bootstrap_ready_path')})
+                remote = campaign.remote_config()
+                self.assertEqual(remote.get("request_endpoint_diagnostic", False), enabled)
+                self.assertEqual(remote["mega_sha"], cloud.SERVER)
+                self.assertEqual(remote["baseline_sha"], cloud.BASELINE)
+                self.assertEqual(remote["candidate_sha"], cloud.CANDIDATE)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
