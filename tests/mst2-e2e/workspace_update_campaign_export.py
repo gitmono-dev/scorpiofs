@@ -185,6 +185,7 @@ def validate_request_diagnostics(root, *, run_metadata=None):
     from workspace_update_request_diagnostic import validate
     trace = observation.parse(read_regular(trace_path, 131072))
     validate(trace)
+    proofs.exact(trace["closed"], True)
     if trace["valid"]:
         # A daemon/relay can fail before the native create window begins. An
         # empty, owner-bound, closed trace is safe partial evidence; it carries

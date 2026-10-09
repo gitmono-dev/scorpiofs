@@ -77,8 +77,8 @@ class _RawUpstream(_Upstream):
             with conn:
                 conn.settimeout(3)
                 data = bytearray()
-                while len(data) < len(self.expected):
-                    chunk = conn.recv(len(self.expected) - len(data))
+                while True:
+                    chunk = conn.recv(65536)
                     if not chunk:
                         break
                     data.extend(chunk)

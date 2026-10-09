@@ -68,7 +68,7 @@ def validate(value):
     reason = value["invalid_reason"]
     if ((value["valid"] and reason is not None)
             or (not value["valid"] and (type(reason) is not str or reason not in INVALID_REASONS))
-            or (not value["closed"] and value["valid"])):
+            or value["closed"] is not True):
         raise RequestDiagnosticError("invalid_schema")
     limits = value["limits"]
     _shape(limits, {"connections", "records", "header_bytes", "buffer_bytes"})
@@ -412,6 +412,8 @@ class RequestRelay:
         observer = _RequestHeaders(
             lambda index, endpoint: self._emit("request_headers_forwarded", row["connection_id"],
                                                request_index=index, endpoint=endpoint), self._invalidate)
+        observer_finished = False
+        queues = None
         try:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
@@ -423,7 +425,6 @@ class RequestRelay:
             sockets = (daemon, upstream)
             queues = {daemon: bytearray(), upstream: bytearray()}
             ended, shut = set(), set()
-            observer_finished = False
             first_upstream = False
             while not self._stop.is_set():
                 remaining = self.deadline - time.monotonic()
@@ -475,6 +476,11 @@ class RequestRelay:
                 reason = "socket_error"
                 self._invalidate("socket_error")
         finally:
+            if queues is not None and queues[upstream]:
+                self._invalidate("truncated_request")
+            if not observer_finished:
+                observer.finish()
+                observer_finished = True
             with self._lock:
                 for stream in (daemon, upstream):
                     stream.close()
