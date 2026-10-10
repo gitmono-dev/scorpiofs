@@ -490,6 +490,29 @@ impl Mst2Fuse {
         store: Option<Arc<DurableStore>>,
         metadata_limits: MetadataProofLimits,
     ) -> std::result::Result<Self, SnapshotError> {
+        Self::from_reader_lazy_with_limits_inner(reader, store, metadata_limits, true).await
+    }
+
+    /// Build a lazy view without proving the root page during admission.
+    ///
+    /// A v3 workspace only needs the immutable metadata root identity before
+    /// exposing its mount. The root page is still fully verified when the
+    /// kernel first asks for lookup/readdir/opendir, but deferring that proof
+    /// keeps workspace creation independent of the size of the root directory.
+    pub(crate) async fn from_reader_lazy_deferred(
+        reader: SnapshotReader,
+        store: Option<Arc<DurableStore>>,
+        metadata_limits: MetadataProofLimits,
+    ) -> std::result::Result<Self, SnapshotError> {
+        Self::from_reader_lazy_with_limits_inner(reader, store, metadata_limits, false).await
+    }
+
+    async fn from_reader_lazy_with_limits_inner(
+        reader: SnapshotReader,
+        store: Option<Arc<DurableStore>>,
+        metadata_limits: MetadataProofLimits,
+        eager_root: bool,
+    ) -> std::result::Result<Self, SnapshotError> {
         if metadata_limits.max_directory_pages == 0
             || metadata_limits.max_directory_entries == 0
             || metadata_limits.max_cached_nodes == 0
@@ -548,7 +571,9 @@ impl Mst2Fuse {
             state: StdMutex::new(state),
             metadata_limits,
         };
-        view.ensure_dir_loaded(ROOT_INODE).await?;
+        if eager_root {
+            view.ensure_dir_loaded(ROOT_INODE).await?;
+        }
         Ok(view)
     }
 

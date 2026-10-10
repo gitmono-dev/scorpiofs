@@ -852,6 +852,25 @@ async fn destroying_failed_preparation_retires_unknown_cache_use_without_private
 }
 
 #[tokio::test]
+async fn lazy_creation_binds_root_identity_without_fetching_root_page() {
+    // A lazy v3 admission must not enumerate a large root directory just to
+    // expose the mount. The root proof remains on the first namespace access;
+    // denying it here proves create itself has no metadata-page dependency.
+    let h = Harness::new(RootFailure::Denied, false, 1, 2).await;
+    let response = h.create(request("lazy")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let status: Value = response.json().await.unwrap();
+    assert_eq!(status["mount_state"], "mounted");
+    assert_eq!(status["metadata_ready"], true);
+    assert_eq!(h.fixture.metadata.load(Ordering::SeqCst), 0);
+
+    let id = status["workspace_id"].as_str().unwrap();
+    h.destroy(id).await;
+    assert_eq!(h.fixture.metadata.load(Ordering::SeqCst), 0);
+    assert_eq!(h.list().await, json!([]));
+}
+
+#[tokio::test]
 async fn cancelled_caller_retains_creation_and_workspace_capacity_until_failed_entry_is_destroyed()
 {
     let h = Harness::new(RootFailure::Denied, true, 1, 2).await;
