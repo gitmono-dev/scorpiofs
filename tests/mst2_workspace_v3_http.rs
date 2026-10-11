@@ -858,7 +858,11 @@ async fn lazy_creation_binds_root_identity_without_fetching_root_page() {
     // denying it here proves create itself has no metadata-page dependency.
     let h = Harness::new(RootFailure::Denied, false, 1, 2).await;
     let response = h.create(request("lazy")).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        panic!("lazy admission failed with {status}: {body}");
+    }
     let status: Value = response.json().await.unwrap();
     assert_eq!(status["mount_state"], "mounted");
     assert_eq!(status["metadata_ready"], true);
