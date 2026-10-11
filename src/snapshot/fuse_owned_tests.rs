@@ -1701,6 +1701,52 @@ async fn lazy_actual_read_reuses_verified_directory_and_eager_seed_avoids_repeat
 }
 
 #[tokio::test]
+async fn concurrent_lazy_lookups_share_one_directory_proof() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let fs = Mst2Fuse::from_reader_lazy_deferred(
+        server.reader.clone(),
+        None,
+        MetadataProofLimits::default(),
+    )
+    .await
+    .unwrap();
+
+    let (left, right) = tokio::join!(
+        fs.lookup(Request::default(), ROOT_INODE, OsStr::new("file000")),
+        fs.lookup(Request::default(), ROOT_INODE, OsStr::new("file001")),
+    );
+    assert!(left.is_ok());
+    assert!(right.is_ok());
+    assert_eq!(server.fixture.metadata.lock().unwrap().as_slice(), ["/"]);
+}
+
+#[tokio::test]
+async fn deferred_lazy_admission_keeps_root_attr_probe_metadata_free() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let fs = Mst2Fuse::from_reader_lazy_deferred(
+        server.reader.clone(),
+        None,
+        MetadataProofLimits::default(),
+    )
+    .await
+    .unwrap();
+
+    // Mount setup probes the synthetic root attributes. That probe must not
+    // force the first directory proof; lookup/readdir still do so lazily.
+    fs.getattr(Request::default(), ROOT_INODE, None, 0)
+        .await
+        .unwrap();
+    assert!(server.fixture.metadata.lock().unwrap().is_empty());
+
+    fs.lookup(Request::default(), ROOT_INODE, OsStr::new("file000"))
+        .await
+        .unwrap();
+    assert_eq!(server.fixture.metadata.lock().unwrap().as_slice(), ["/"]);
+}
+
+#[tokio::test]
 async fn actual_raw_and_symlink_reply_owners_release_only_after_last_bytes() {
     let _serial = TEST_LOCK.lock().await;
     let server = Server::start(Fixture::new(false, false), 1024 * 1024).await;

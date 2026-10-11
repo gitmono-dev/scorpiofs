@@ -159,6 +159,68 @@ struct LocalCasScope {
     access: LocalCasAccess,
 }
 
+/// Coalesces concurrent lazy proof loads for one directory inode.
+///
+/// FUSE may issue lookup and readdir requests for the same inode at once. A
+/// shared gate ensures only one request pays for the metadata proof and that a
+/// cancelled owner wakes all waiters with a bounded error.
+struct DirectoryLoadGate {
+    notify: tokio::sync::Notify,
+    result: StdMutex<Option<std::result::Result<(), SnapshotError>>>,
+}
+
+impl DirectoryLoadGate {
+    fn new() -> Self {
+        Self {
+            notify: tokio::sync::Notify::new(),
+            result: StdMutex::new(None),
+        }
+    }
+}
+
+struct DirectoryLoadOwner {
+    inode: Inode,
+    gate: Arc<DirectoryLoadGate>,
+    loads: Arc<StdMutex<HashMap<Inode, Arc<DirectoryLoadGate>>>>,
+    finished: bool,
+}
+
+impl DirectoryLoadOwner {
+    fn new(
+        inode: Inode,
+        gate: Arc<DirectoryLoadGate>,
+        loads: Arc<StdMutex<HashMap<Inode, Arc<DirectoryLoadGate>>>>,
+    ) -> Self {
+        Self {
+            inode,
+            gate,
+            loads,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, result: std::result::Result<(), SnapshotError>) {
+        *self.gate.result.lock().unwrap() = Some(result);
+        self.gate.notify.notify_waiters();
+        self.loads.lock().unwrap().remove(&self.inode);
+        self.finished = true;
+    }
+}
+
+impl Drop for DirectoryLoadOwner {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        *self.gate.result.lock().unwrap() = Some(Err(SnapshotError::new(
+            SnapshotErrorCode::TemporaryUnavailable,
+            "lazy directory load was cancelled",
+        )));
+        self.gate.notify.notify_waiters();
+        self.loads.lock().unwrap().remove(&self.inode);
+    }
+}
+
 fn owned_cache(
     reader: Option<&SnapshotReader>,
     store: Option<&Arc<DurableStore>>,
@@ -256,6 +318,7 @@ pub struct Mst2Fuse {
     local_cas: Option<LocalCasScope>,
     state: StdMutex<State>,
     metadata_limits: MetadataProofLimits,
+    directory_loads: Arc<StdMutex<HashMap<Inode, Arc<DirectoryLoadGate>>>>,
 }
 
 impl Mst2Fuse {
@@ -490,6 +553,29 @@ impl Mst2Fuse {
         store: Option<Arc<DurableStore>>,
         metadata_limits: MetadataProofLimits,
     ) -> std::result::Result<Self, SnapshotError> {
+        Self::from_reader_lazy_with_limits_inner(reader, store, metadata_limits, true).await
+    }
+
+    /// Build a lazy view without proving the root page during admission.
+    ///
+    /// A v3 workspace only needs the immutable metadata root identity before
+    /// exposing its mount. The root page is still fully verified when the
+    /// kernel first asks for lookup/readdir/opendir, but deferring that proof
+    /// keeps workspace creation independent of the size of the root directory.
+    pub(crate) async fn from_reader_lazy_deferred(
+        reader: SnapshotReader,
+        store: Option<Arc<DurableStore>>,
+        metadata_limits: MetadataProofLimits,
+    ) -> std::result::Result<Self, SnapshotError> {
+        Self::from_reader_lazy_with_limits_inner(reader, store, metadata_limits, false).await
+    }
+
+    async fn from_reader_lazy_with_limits_inner(
+        reader: SnapshotReader,
+        store: Option<Arc<DurableStore>>,
+        metadata_limits: MetadataProofLimits,
+        eager_root: bool,
+    ) -> std::result::Result<Self, SnapshotError> {
         if metadata_limits.max_directory_pages == 0
             || metadata_limits.max_directory_entries == 0
             || metadata_limits.max_cached_nodes == 0
@@ -547,8 +633,11 @@ impl Mst2Fuse {
             local_cas: None,
             state: StdMutex::new(state),
             metadata_limits,
+            directory_loads: Arc::new(StdMutex::new(HashMap::new())),
         };
-        view.ensure_dir_loaded(ROOT_INODE).await?;
+        if eager_root {
+            view.ensure_dir_loaded(ROOT_INODE).await?;
+        }
         Ok(view)
     }
 
@@ -562,7 +651,42 @@ impl Mst2Fuse {
         inode: Inode,
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
         self.check_metadata_lease()?;
-        let result = self.load_directory(inode).await;
+        let (gate, owner) = {
+            let state = self.state.lock().unwrap();
+            if !matches!(state.nodes.get(&inode), Some(Node::Dir(d)) if !d.loaded) {
+                return Ok(());
+            }
+            let mut loads = self.directory_loads.lock().unwrap();
+            if let Some(gate) = loads.get(&inode) {
+                (gate.clone(), false)
+            } else {
+                let gate = Arc::new(DirectoryLoadGate::new());
+                loads.insert(inode, gate.clone());
+                (gate, true)
+            }
+        };
+        let result = if owner {
+            let mut owner_guard =
+                DirectoryLoadOwner::new(inode, gate.clone(), self.directory_loads.clone());
+            let result = self.load_directory(inode).await;
+            owner_guard.finish(result.clone());
+            result
+        } else {
+            let notified = gate.notify.notified();
+            let result = { gate.result.lock().unwrap().clone() };
+            if let Some(result) = result {
+                result
+            } else {
+                notified.await;
+                let result = { gate.result.lock().unwrap().clone() };
+                result.unwrap_or_else(|| {
+                    Err(SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        "lazy directory load ended without a result",
+                    ))
+                })
+            }
+        };
         self.check_metadata_lease()?;
         result
     }
@@ -958,6 +1082,7 @@ impl Mst2Fuse {
             local_cas: None,
             state: StdMutex::new(state),
             metadata_limits: MetadataProofLimits::default(),
+            directory_loads: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -1060,6 +1185,7 @@ impl Mst2Fuse {
             local_cas: None,
             state: StdMutex::new(state),
             metadata_limits: MetadataProofLimits::default(),
+            directory_loads: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -2302,6 +2428,34 @@ impl Filesystem for Mst2Fuse {
     }
 
     async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
+        // FUSE probes `.`/`..` while establishing a mount. These names are
+        // structural and do not require proving the directory's children;
+        // keeping them metadata-free is what lets deferred lazy admission
+        // finish without fetching the root page.
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            let inode = if name == OsStr::new(".") {
+                parent
+            } else {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .nodes
+                    .get(&parent)
+                    .and_then(|node| match node {
+                        Node::Dir(directory) => Some(directory.parent),
+                        Node::File(_) => None,
+                    })
+                    .ok_or_else(|| Errno::from(libc::ENOENT))?
+            };
+            self.check_metadata_lease().map_err(io_err)?;
+            let attr = self.node_attr(inode)?;
+            self.check_metadata_lease().map_err(io_err)?;
+            return Ok(ReplyEntry {
+                attr,
+                ttl: TTL,
+                generation: 0,
+            });
+        }
         self.ensure_loaded(parent).await?;
         let name = name.to_string_lossy();
         let child = {

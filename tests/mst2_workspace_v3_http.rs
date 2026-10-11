@@ -362,7 +362,7 @@ impl Harness {
         let service = self.service.clone();
         tokio::spawn(async move {
             service
-                .create(serde_json::from_value(request("lazy")).unwrap())
+                .create(serde_json::from_value(request("full")).unwrap())
                 .await
         })
     }
@@ -481,7 +481,7 @@ fn assert_observed_binding(
 async fn opted_in_read_checkpoints_are_bounded_owner_specific_and_do_not_change_strict_status() {
     for enabled in [false, true] {
         let h = Harness::new_options(RootFailure::Denied, false, 2, 2, None, enabled).await;
-        let response = h.create(request("lazy")).await;
+        let response = h.create(request("full")).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let statuses = h.list().await;
         let status = &statuses.as_array().unwrap()[0];
@@ -580,7 +580,7 @@ async fn observed_creation_records_its_only_actual_resolve_and_independent_owner
         Harness::new_with_observer(RootFailure::Denied, false, 2, 2, Some(observer.clone())).await;
     for _ in 0..2 {
         assert_eq!(
-            h.create(request("lazy")).await.status(),
+            h.create(request("full")).await.status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }
@@ -643,7 +643,7 @@ async fn ordinary_creation_has_no_observation_header_or_record() {
         WorkspaceObserver::channel("11111111-2222-4333-8444-666666666666", 1).unwrap();
     let h = Harness::new(RootFailure::Denied, false, 1, 2).await;
     assert_eq!(
-        h.create(request("lazy")).await.status(),
+        h.create(request("full")).await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(*h.fixture.resolve_ids.lock().unwrap(), [None]);
@@ -665,7 +665,7 @@ async fn full_observation_queue_is_sticky_but_preserves_failed_owners_and_cleanu
         Harness::new_with_observer(RootFailure::Denied, false, 2, 2, Some(observer.clone())).await;
     for _ in 0..2 {
         assert_eq!(
-            h.create(request("lazy")).await.status(),
+            h.create(request("full")).await.status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }
@@ -694,7 +694,7 @@ async fn full_observation_queue_is_sticky_but_preserves_failed_owners_and_cleanu
     }
     assert_eq!(h.list().await, json!([]));
     assert_eq!(
-        h.create(request("lazy")).await.status(),
+        h.create(request("full")).await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(
@@ -736,7 +736,7 @@ async fn dropped_observation_receiver_does_not_abandon_the_real_failed_workspace
     let h =
         Harness::new_with_observer(RootFailure::Denied, false, 1, 2, Some(observer.clone())).await;
     assert_eq!(
-        h.create(request("lazy")).await.status(),
+        h.create(request("full")).await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     let statuses = h.list().await;
@@ -759,7 +759,7 @@ async fn dropped_observation_receiver_does_not_abandon_the_real_failed_workspace
 #[tokio::test]
 async fn root_denial_and_bad_end_keep_fixed_failed_workspaces_without_mounting_or_dictionary_fallback(
 ) {
-    for (failure, delivery) in [(RootFailure::Denied, "lazy"), (RootFailure::BadEnd, "full")] {
+    for (failure, delivery) in [(RootFailure::Denied, "full"), (RootFailure::BadEnd, "full")] {
         let h = Harness::new(failure, false, 1, 2).await;
         let response = h.create(request(delivery)).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -802,7 +802,7 @@ async fn destroying_failed_preparation_retires_unknown_cache_use_without_private
         WorkspaceObserver::channel("11111111-2222-4333-8444-666666666667", 1).unwrap();
     let h = Harness::new_with_observer(RootFailure::Denied, false, 1, 2, Some(observer)).await;
     assert_eq!(
-        h.create(request("lazy")).await.status(),
+        h.create(request("full")).await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     let status = h.list().await;
@@ -881,7 +881,7 @@ async fn cancelled_caller_retains_creation_and_workspace_capacity_until_failed_e
     let next_service = h.service.clone();
     let next = tokio::spawn(async move {
         next_service
-            .create(serde_json::from_value(request("lazy")).unwrap())
+            .create(serde_json::from_value(request("full")).unwrap())
             .await
     });
     h.fixture.wait_for_resolve().await;
@@ -922,7 +922,7 @@ async fn operation_capacity_follows_cancelled_owned_creation_and_rejected_create
     let next_service = h.service.clone();
     let next = tokio::spawn(async move {
         next_service
-            .create(serde_json::from_value(request("lazy")).unwrap())
+            .create(serde_json::from_value(request("full")).unwrap())
             .await
     });
     h.fixture.wait_for_resolve().await;
@@ -959,7 +959,7 @@ async fn shutdown_waits_for_the_cancelled_callers_admitted_create_and_rejects_ne
         .unwrap();
     let error = h
         .service
-        .create(serde_json::from_value::<CreateWorkspace>(request("lazy")).unwrap())
+        .create(serde_json::from_value::<CreateWorkspace>(request("full")).unwrap())
         .await
         .unwrap_err();
     assert_eq!(error.code, "WORKSPACE_BUSY");
@@ -1019,7 +1019,7 @@ async fn failed_root_cannot_claim_a_host_created_empty_upper_and_cleanup_retries
 {
     let h = Harness::new(RootFailure::Denied, false, 1, 2).await;
     assert_eq!(
-        h.create(request("lazy")).await.status(),
+        h.create(request("full")).await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     let initial = h.list().await;
@@ -1095,7 +1095,7 @@ async fn failed_root_cannot_claim_a_host_created_empty_upper_and_cleanup_retries
     h.destroy(id).await;
     assert_eq!(h.list().await, json!([]));
     assert_eq!(
-        h.create(request("lazy")).await.status(),
+        h.create(request("full")).await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     let next = h.list().await;

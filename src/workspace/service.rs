@@ -483,16 +483,31 @@ impl WorkspaceService {
                 &self.config.cache_root,
             );
         }
+        // Lazy admission binds only the immutable metadata root identity.
+        // Full delivery keeps the eager root proof so hydration failures are
+        // reported by create; lazy mounts prove a directory on first access.
         let lower = Arc::new(
-            trace_async(
-                "root_metadata_proof",
-                Mst2Fuse::from_reader_lazy_with_limits(
-                    reader,
-                    Some(store),
-                    self.config.metadata_limits,
-                ),
-            )
-            .await?
+            (if matches!(request.delivery, WorkspaceDelivery::Lazy) {
+                trace_async(
+                    "root_metadata_bind",
+                    Mst2Fuse::from_reader_lazy_deferred(
+                        reader,
+                        Some(store),
+                        self.config.metadata_limits,
+                    ),
+                )
+                .await?
+            } else {
+                trace_async(
+                    "root_metadata_proof",
+                    Mst2Fuse::from_reader_lazy_with_limits(
+                        reader,
+                        Some(store),
+                        self.config.metadata_limits,
+                    ),
+                )
+                .await?
+            })
             .with_read_profile(runtime.read_profile.clone()),
         );
         runtime.lower = Some(lower.clone());
