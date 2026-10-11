@@ -159,6 +159,68 @@ struct LocalCasScope {
     access: LocalCasAccess,
 }
 
+/// Coalesces concurrent lazy proof loads for one directory inode.
+///
+/// FUSE may issue lookup and readdir requests for the same inode at once. A
+/// shared gate ensures only one request pays for the metadata proof and that a
+/// cancelled owner wakes all waiters with a bounded error.
+struct DirectoryLoadGate {
+    notify: tokio::sync::Notify,
+    result: StdMutex<Option<std::result::Result<(), SnapshotError>>>,
+}
+
+impl DirectoryLoadGate {
+    fn new() -> Self {
+        Self {
+            notify: tokio::sync::Notify::new(),
+            result: StdMutex::new(None),
+        }
+    }
+}
+
+struct DirectoryLoadOwner {
+    inode: Inode,
+    gate: Arc<DirectoryLoadGate>,
+    loads: Arc<StdMutex<HashMap<Inode, Arc<DirectoryLoadGate>>>>,
+    finished: bool,
+}
+
+impl DirectoryLoadOwner {
+    fn new(
+        inode: Inode,
+        gate: Arc<DirectoryLoadGate>,
+        loads: Arc<StdMutex<HashMap<Inode, Arc<DirectoryLoadGate>>>>,
+    ) -> Self {
+        Self {
+            inode,
+            gate,
+            loads,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, result: std::result::Result<(), SnapshotError>) {
+        *self.gate.result.lock().unwrap() = Some(result);
+        self.gate.notify.notify_waiters();
+        self.loads.lock().unwrap().remove(&self.inode);
+        self.finished = true;
+    }
+}
+
+impl Drop for DirectoryLoadOwner {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        *self.gate.result.lock().unwrap() = Some(Err(SnapshotError::new(
+            SnapshotErrorCode::TemporaryUnavailable,
+            "lazy directory load was cancelled",
+        )));
+        self.gate.notify.notify_waiters();
+        self.loads.lock().unwrap().remove(&self.inode);
+    }
+}
+
 fn owned_cache(
     reader: Option<&SnapshotReader>,
     store: Option<&Arc<DurableStore>>,
@@ -256,6 +318,7 @@ pub struct Mst2Fuse {
     local_cas: Option<LocalCasScope>,
     state: StdMutex<State>,
     metadata_limits: MetadataProofLimits,
+    directory_loads: Arc<StdMutex<HashMap<Inode, Arc<DirectoryLoadGate>>>>,
 }
 
 impl Mst2Fuse {
@@ -570,6 +633,7 @@ impl Mst2Fuse {
             local_cas: None,
             state: StdMutex::new(state),
             metadata_limits,
+            directory_loads: Arc::new(StdMutex::new(HashMap::new())),
         };
         if eager_root {
             view.ensure_dir_loaded(ROOT_INODE).await?;
@@ -587,7 +651,40 @@ impl Mst2Fuse {
         inode: Inode,
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
         self.check_metadata_lease()?;
-        let result = self.load_directory(inode).await;
+        let (gate, owner) = {
+            let state = self.state.lock().unwrap();
+            if !matches!(state.nodes.get(&inode), Some(Node::Dir(d)) if !d.loaded) {
+                return Ok(());
+            }
+            let mut loads = self.directory_loads.lock().unwrap();
+            if let Some(gate) = loads.get(&inode) {
+                (gate.clone(), false)
+            } else {
+                let gate = Arc::new(DirectoryLoadGate::new());
+                loads.insert(inode, gate.clone());
+                (gate, true)
+            }
+        };
+        let result = if owner {
+            let mut owner_guard =
+                DirectoryLoadOwner::new(inode, gate.clone(), self.directory_loads.clone());
+            let result = self.load_directory(inode).await;
+            owner_guard.finish(result.clone());
+            result
+        } else {
+            let notified = gate.notify.notified();
+            if let Some(result) = gate.result.lock().unwrap().clone() {
+                result
+            } else {
+                notified.await;
+                gate.result.lock().unwrap().clone().unwrap_or_else(|| {
+                    Err(SnapshotError::new(
+                        SnapshotErrorCode::Internal,
+                        "lazy directory load ended without a result",
+                    ))
+                })
+            }
+        };
         self.check_metadata_lease()?;
         result
     }
@@ -983,6 +1080,7 @@ impl Mst2Fuse {
             local_cas: None,
             state: StdMutex::new(state),
             metadata_limits: MetadataProofLimits::default(),
+            directory_loads: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -1085,6 +1183,7 @@ impl Mst2Fuse {
             local_cas: None,
             state: StdMutex::new(state),
             metadata_limits: MetadataProofLimits::default(),
+            directory_loads: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
