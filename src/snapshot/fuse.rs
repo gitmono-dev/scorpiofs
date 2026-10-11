@@ -673,11 +673,13 @@ impl Mst2Fuse {
             result
         } else {
             let notified = gate.notify.notified();
-            if let Some(result) = gate.result.lock().unwrap().clone() {
+            let result = { gate.result.lock().unwrap().clone() };
+            if let Some(result) = result {
                 result
             } else {
                 notified.await;
-                gate.result.lock().unwrap().clone().unwrap_or_else(|| {
+                let result = { gate.result.lock().unwrap().clone() };
+                result.unwrap_or_else(|| {
                     Err(SnapshotError::new(
                         SnapshotErrorCode::Internal,
                         "lazy directory load ended without a result",
