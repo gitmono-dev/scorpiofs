@@ -481,7 +481,7 @@ fn assert_observed_binding(
 async fn opted_in_read_checkpoints_are_bounded_owner_specific_and_do_not_change_strict_status() {
     for enabled in [false, true] {
         let h = Harness::new_options(RootFailure::Denied, false, 2, 2, None, enabled).await;
-        let response = h.create(request("lazy")).await;
+        let response = h.create(request("full")).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let statuses = h.list().await;
         let status = &statuses.as_array().unwrap()[0];
@@ -802,7 +802,7 @@ async fn destroying_failed_preparation_retires_unknown_cache_use_without_private
         WorkspaceObserver::channel("11111111-2222-4333-8444-666666666667", 1).unwrap();
     let h = Harness::new_with_observer(RootFailure::Denied, false, 1, 2, Some(observer)).await;
     assert_eq!(
-        h.create(request("lazy")).await.status(),
+        h.create(request("full")).await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     let status = h.list().await;
