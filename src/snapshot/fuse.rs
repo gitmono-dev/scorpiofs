@@ -2428,6 +2428,34 @@ impl Filesystem for Mst2Fuse {
     }
 
     async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
+        // FUSE probes `.`/`..` while establishing a mount. These names are
+        // structural and do not require proving the directory's children;
+        // keeping them metadata-free is what lets deferred lazy admission
+        // finish without fetching the root page.
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            let inode = if name == OsStr::new(".") {
+                parent
+            } else {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .nodes
+                    .get(&parent)
+                    .and_then(|node| match node {
+                        Node::Dir(directory) => Some(directory.parent),
+                        Node::File(_) => None,
+                    })
+                    .ok_or_else(|| Errno::from(libc::ENOENT))?
+            };
+            self.check_metadata_lease().map_err(io_err)?;
+            let attr = self.node_attr(inode)?;
+            self.check_metadata_lease().map_err(io_err)?;
+            return Ok(ReplyEntry {
+                attr,
+                ttl: TTL,
+                generation: 0,
+            });
+        }
         self.ensure_loaded(parent).await?;
         let name = name.to_string_lossy();
         let child = {
