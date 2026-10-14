@@ -24,7 +24,7 @@ jobs:
           python-version: '3.12'
       - name: Check lifecycle and runner installation without cloud access
         run: python3 -B -m unittest discover -s tests/mst2-e2e/infra/aliyun -p 'test_*.py' -v
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.9.8
           terraform_wrapper: false
