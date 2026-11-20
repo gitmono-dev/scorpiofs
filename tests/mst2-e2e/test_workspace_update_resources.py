@@ -206,22 +206,29 @@ class DiskResourceTests(unittest.TestCase):
         self.assertEqual(second["duplicate_inodes"], 1)
 
     def test_final_root_stat_cannot_extend_original_deadline(self):
-        clock, calls = {"now": 0}, {"root": 0}
-        original = Path.lstat
+        clock = {"now": 0}
+        state = {"scanned": False, "final_stat": 0}
+        resolved_root = self.root.resolve(strict=True)
+        original_lstat = Path.lstat
+        original_scandir = os.scandir
+
+        def tracked_scandir(*args, **kwargs):
+            state["scanned"] = True
+            return original_scandir(*args, **kwargs)
 
         def delayed(path, *args, **kwargs):
-            result = original(path, *args, **kwargs)
-            if path == self.root:
-                calls["root"] += 1
-                if calls["root"] == 3:
-                    clock["now"] = 2
+            result = original_lstat(path, *args, **kwargs)
+            if path == resolved_root and state["scanned"]:
+                state["final_stat"] += 1
+                clock["now"] = 2
             return result
 
         with patch("workspace_update_resources.time.monotonic", side_effect=lambda: clock["now"]):
-            with patch.object(Path, "lstat", delayed):
-                with self.assertRaises(TimeoutError):
-                    disk_usage(self.root, deadline=1, proc_root=self.proc)
-        self.assertEqual(calls["root"], 3)
+            with patch("workspace_update_resources.os.scandir", side_effect=tracked_scandir):
+                with patch.object(Path, "lstat", delayed):
+                    with self.assertRaises(TimeoutError):
+                        disk_usage(self.root, deadline=1, proc_root=self.proc)
+        self.assertEqual(state["final_stat"], 1)
 
 
 if __name__ == "__main__":
