@@ -1700,6 +1700,103 @@ async fn lazy_actual_read_reuses_verified_directory_and_eager_seed_avoids_repeat
     assert_eq!(server.fixture.metadata.lock().unwrap().len(), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_lazy_lookups_share_one_directory_proof() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let fs = Arc::new(
+        Mst2Fuse::from_reader_lazy_deferred(
+            server.reader.clone(),
+            None,
+            MetadataProofLimits::default(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let mut handles = Vec::new();
+    for name in ["file000", "file001", "file000", "file001"] {
+        let fs = Arc::clone(&fs);
+        handles.push(tokio::spawn(async move {
+            fs.lookup(Request::default(), ROOT_INODE, OsStr::new(name))
+                .await
+        }));
+    }
+    for handle in handles {
+        assert!(handle.await.unwrap().is_ok());
+    }
+    assert_eq!(server.fixture.metadata.lock().unwrap().as_slice(), ["/"]);
+}
+
+#[tokio::test]
+async fn directory_load_gate_wakes_late_waiter_and_cancelled_owner() {
+    // Late waiter: owner completes before waiter begins awaiting — must return
+    // immediately without a lost wakeup.
+    let loads = Arc::new(StdMutex::new(HashMap::new()));
+    let gate = Arc::new(DirectoryLoadGate::new());
+    loads.lock().unwrap().insert(ROOT_INODE, gate.clone());
+    let mut owner = DirectoryLoadOwner::new(ROOT_INODE, gate.clone(), loads.clone());
+    owner.finish(Ok(()));
+    assert!(!loads.lock().unwrap().contains_key(&ROOT_INODE));
+    tokio::time::timeout(std::time::Duration::from_secs(1), gate.wait())
+        .await
+        .expect("late waiter must not hang")
+        .expect("completed owner result must propagate");
+
+    // Cancelled owner: dropping owner without finish must wake active waiters
+    // with TemporaryUnavailable and clear the in-flight map entry for retries.
+    let cancel_gate = Arc::new(DirectoryLoadGate::new());
+    loads
+        .lock()
+        .unwrap()
+        .insert(ROOT_INODE, cancel_gate.clone());
+    let cancel_owner = DirectoryLoadOwner::new(ROOT_INODE, cancel_gate.clone(), loads.clone());
+    let waiter = tokio::spawn({
+        let cancel_gate = cancel_gate.clone();
+        async move { cancel_gate.wait().await }
+    });
+    tokio::task::yield_now().await;
+    drop(cancel_owner);
+    let err = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("waiter must wake when owner is cancelled")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code, SnapshotErrorCode::TemporaryUnavailable);
+    assert!(!loads.lock().unwrap().contains_key(&ROOT_INODE));
+}
+
+#[tokio::test]
+async fn deferred_lazy_admission_keeps_root_attr_probe_metadata_free() {
+    let _serial = TEST_LOCK.lock().await;
+    let server = Server::start(Fixture::new(false, true), 1024 * 1024).await;
+    let fs = Mst2Fuse::from_reader_lazy_deferred(
+        server.reader.clone(),
+        None,
+        MetadataProofLimits::default(),
+    )
+    .await
+    .unwrap();
+
+    // Mount setup probes the synthetic root attributes and `.`/`..`. Those
+    // probes must not force the first directory proof; real lookups still do.
+    fs.getattr(Request::default(), ROOT_INODE, None, 0)
+        .await
+        .unwrap();
+    fs.lookup(Request::default(), ROOT_INODE, OsStr::new("."))
+        .await
+        .unwrap();
+    fs.lookup(Request::default(), ROOT_INODE, OsStr::new(".."))
+        .await
+        .unwrap();
+    assert!(server.fixture.metadata.lock().unwrap().is_empty());
+
+    fs.lookup(Request::default(), ROOT_INODE, OsStr::new("file000"))
+        .await
+        .unwrap();
+    assert_eq!(server.fixture.metadata.lock().unwrap().as_slice(), ["/"]);
+}
+
 #[tokio::test]
 async fn actual_raw_and_symlink_reply_owners_release_only_after_last_bytes() {
     let _serial = TEST_LOCK.lock().await;
