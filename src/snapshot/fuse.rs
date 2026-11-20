@@ -162,19 +162,34 @@ struct LocalCasScope {
 /// Coalesces concurrent lazy proof loads for one directory inode.
 ///
 /// FUSE may issue lookup and readdir requests for the same inode at once. A
-/// shared gate ensures only one request pays for the metadata proof and that a
-/// cancelled owner wakes all waiters with a bounded error.
+/// shared watch gate ensures only one request pays for the metadata proof,
+/// eliminates lost wakeups between owner completion and waiter registration,
+/// and wakes all waiters with a bounded error if the owner is cancelled.
 struct DirectoryLoadGate {
-    notify: tokio::sync::Notify,
-    result: StdMutex<Option<std::result::Result<(), SnapshotError>>>,
+    result: tokio::sync::watch::Sender<Option<std::result::Result<(), SnapshotError>>>,
 }
 
 impl DirectoryLoadGate {
     fn new() -> Self {
-        Self {
-            notify: tokio::sync::Notify::new(),
-            result: StdMutex::new(None),
-        }
+        let (result, _) = tokio::sync::watch::channel(None);
+        Self { result }
+    }
+
+    async fn wait(&self) -> std::result::Result<(), SnapshotError> {
+        let mut rx = self.result.subscribe();
+        let result = match rx.wait_for(Option::is_some).await {
+            Ok(guard) => guard.clone().unwrap_or_else(|| {
+                Err(SnapshotError::new(
+                    SnapshotErrorCode::Internal,
+                    "lazy directory load ended without a result",
+                ))
+            }),
+            Err(_) => Err(SnapshotError::new(
+                SnapshotErrorCode::Internal,
+                "lazy directory load ended without a result",
+            )),
+        };
+        result
     }
 }
 
@@ -199,10 +214,22 @@ impl DirectoryLoadOwner {
         }
     }
 
+    fn release_entry(&self) {
+        let mut loads = self
+            .loads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if loads
+            .get(&self.inode)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
+        {
+            loads.remove(&self.inode);
+        }
+    }
+
     fn finish(&mut self, result: std::result::Result<(), SnapshotError>) {
-        *self.gate.result.lock().unwrap() = Some(result);
-        self.gate.notify.notify_waiters();
-        self.loads.lock().unwrap().remove(&self.inode);
+        self.release_entry();
+        self.gate.result.send_replace(Some(result));
         self.finished = true;
     }
 }
@@ -212,12 +239,11 @@ impl Drop for DirectoryLoadOwner {
         if self.finished {
             return;
         }
-        *self.gate.result.lock().unwrap() = Some(Err(SnapshotError::new(
+        self.release_entry();
+        self.gate.result.send_replace(Some(Err(SnapshotError::new(
             SnapshotErrorCode::TemporaryUnavailable,
             "lazy directory load was cancelled",
-        )));
-        self.gate.notify.notify_waiters();
-        self.loads.lock().unwrap().remove(&self.inode);
+        ))));
     }
 }
 
@@ -672,20 +698,7 @@ impl Mst2Fuse {
             owner_guard.finish(result.clone());
             result
         } else {
-            let notified = gate.notify.notified();
-            let result = { gate.result.lock().unwrap().clone() };
-            if let Some(result) = result {
-                result
-            } else {
-                notified.await;
-                let result = { gate.result.lock().unwrap().clone() };
-                result.unwrap_or_else(|| {
-                    Err(SnapshotError::new(
-                        SnapshotErrorCode::Internal,
-                        "lazy directory load ended without a result",
-                    ))
-                })
-            }
+            gate.wait().await
         };
         self.check_metadata_lease()?;
         result
