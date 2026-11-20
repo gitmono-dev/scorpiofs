@@ -396,7 +396,7 @@ jobs:
         if: always() && steps.safe_evidence.outcome == 'success' && steps.upload_admission.outcome == 'success'
         id: evidence_upload
         timeout-minutes: 9
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: mst2-v3-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mst2-safe-evidence
