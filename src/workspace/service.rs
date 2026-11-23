@@ -892,12 +892,28 @@ impl WorkspaceService {
             refuse_dirty(service.dirty(&workspace, &runtime).await?, policy)?;
             check_retired_mountpoint(&workspace, &runtime)?;
             if let Some(store) = &runtime.store {
-                let store = store.clone();
-                tokio::task::spawn_blocking(move || store.release_local_pin())
-                    .await
-                    .map_err(|_| {
-                        WorkspaceError::new("WORKSPACE_UNKNOWN", "pin revocation task failed")
-                    })??;
+                // `reconcile_hydrate(..., true)` aborts the async hydration task,
+                // which may still have an in-flight `spawn_blocking` call releasing
+                // `TRANSACTION_LOCK`. Wait briefly for that transaction guard to drop
+                // before failing pin revocation with `SnapshotNotReady`.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let store = store.clone();
+                    match tokio::task::spawn_blocking(move || store.release_local_pin())
+                        .await
+                        .map_err(|_| {
+                            WorkspaceError::new("WORKSPACE_UNKNOWN", "pin revocation task failed")
+                        })? {
+                        Ok(_) => break,
+                        Err(error)
+                            if error.code == SnapshotErrorCode::SnapshotNotReady
+                                && tokio::time::Instant::now() < deadline =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
             }
             check_private_paths(&workspace, &runtime)?;
             check_retired_mountpoint(&workspace, &runtime)?;
